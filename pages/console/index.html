@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MR Memory 控制台</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">MR MEMORY · MEMORY OBSERVATORY</p>
+          <h1>潜意识图记忆控制台</h1>
+          <p class="hero-copy">
+            查看每个群聊独立的原始证据、关联图谱与整理状态。
+          </p>
+        </div>
+        <div class="hero-status" aria-live="polite">
+          <span id="connection-dot" class="status-dot is-loading"></span>
+          <div>
+            <strong id="connection-label">正在连接 AstrBot</strong>
+            <small id="runtime-version">MR Memory</small>
+          </div>
+        </div>
+      </header>
+
+      <section class="metric-grid" aria-label="运行概览">
+        <article class="metric-card metric-primary">
+          <span>群范围</span>
+          <strong id="metric-scopes">—</strong>
+          <small>物理隔离数据库</small>
+        </article>
+        <article class="metric-card">
+          <span>原始消息</span>
+          <strong id="metric-messages">—</strong>
+          <small>可追溯证据</small>
+        </article>
+        <article class="metric-card">
+          <span>Episode</span>
+          <strong id="metric-episodes">—</strong>
+          <small>情节记忆</small>
+        </article>
+        <article class="metric-card">
+          <span>语义记忆</span>
+          <strong id="metric-semantics">—</strong>
+          <small>人物与属性</small>
+        </article>
+        <article class="metric-card">
+          <span>向量文档</span>
+          <strong id="metric-embeddings">—</strong>
+          <small id="metric-storage">数据库 —</small>
+        </article>
+      </section>
+
+      <section class="control-bar" aria-label="群范围控制">
+        <div class="scope-picker">
+          <label for="scope-select">当前群范围</label>
+          <select id="scope-select" disabled>
+            <option value="">正在读取…</option>
+          </select>
+          <p id="scope-meta">尚未选择群范围</p>
+        </div>
+        <div class="control-actions">
+          <button id="refresh-btn" class="button ghost" type="button">
+            <span aria-hidden="true">↻</span> 刷新
+          </button>
+          <button id="distill-btn" class="button primary" type="button" disabled>
+            <span aria-hidden="true">✦</span> 整理最近记忆
+          </button>
+        </div>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel graph-panel">
+          <div class="panel-heading graph-heading">
+            <div>
+              <p class="section-kicker">ASSOCIATIVE GRAPH</p>
+              <h2>记忆关联图</h2>
+            </div>
+            <div class="graph-tools">
+              <label>
+                节点上限
+                <select id="graph-limit">
+                  <option value="100">100</option>
+                  <option value="200" selected>200</option>
+                  <option value="350">350</option>
+                  <option value="500">500</option>
+                </select>
+              </label>
+              <button id="fit-graph-btn" class="icon-button" type="button" title="适应画布">
+                适应
+              </button>
+            </div>
+          </div>
+
+          <div class="legend" aria-label="节点类型筛选">
+            <label><input type="checkbox" data-node-type="cue" checked /><i class="cue"></i>线索</label>
+            <label><input type="checkbox" data-node-type="episode" checked /><i class="episode"></i>Episode</label>
+            <label><input type="checkbox" data-node-type="semantic" checked /><i class="semantic"></i>语义</label>
+            <label><input type="checkbox" data-node-type="topic" checked /><i class="topic"></i>Topic</label>
+          </div>
+
+          <div id="graph-stage" class="graph-stage">
+            <svg id="memory-graph" role="img" aria-label="群聊记忆关系图">
+              <defs>
+                <filter id="node-shadow" x="-30%" y="-30%" width="160%" height="160%">
+                  <feDropShadow dx="0" dy="4" stdDeviation="5" flood-opacity="0.16" />
+                </filter>
+                <marker id="edge-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                </marker>
+              </defs>
+              <g id="graph-viewport">
+                <g id="graph-edges"></g>
+                <g id="graph-edge-labels"></g>
+                <g id="graph-nodes"></g>
+              </g>
+            </svg>
+            <div id="graph-empty" class="empty-state hidden">
+              <span>○</span>
+              <strong>这个群还没有图记忆</strong>
+              <p>采集消息后执行一次“整理最近记忆”。</p>
+            </div>
+            <div id="graph-loading" class="loading-layer hidden">
+              <span class="spinner"></span>
+              <p>正在重建图谱视图…</p>
+            </div>
+          </div>
+          <p id="graph-caption" class="graph-caption">拖动画布、滚轮缩放，点击节点查看证据。</p>
+        </article>
+
+        <aside class="panel inspector-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">EVIDENCE INSPECTOR</p>
+              <h2>证据检查器</h2>
+            </div>
+          </div>
+          <div id="inspector-content" class="inspector-content">
+            <div class="inspector-placeholder">
+              <span>⌁</span>
+              <strong>选择一个节点</strong>
+              <p>Episode 可继续展开到关键词和原始聊天证据。</p>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel messages-panel">
+        <div class="panel-heading message-heading">
+          <div>
+            <p class="section-kicker">SOURCE OF TRUTH</p>
+            <h2>原始消息检索</h2>
+          </div>
+          <form id="message-search-form" class="message-search">
+            <label>
+              <span class="sr-only">消息关键词</span>
+              <input id="message-query" type="search" maxlength="500" placeholder="搜索消息内容…" />
+            </label>
+            <label>
+              <span class="sr-only">发送者</span>
+              <input id="message-sender" type="search" maxlength="200" placeholder="发送者（可选）" />
+            </label>
+            <button class="button secondary" type="submit">检索</button>
+          </form>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>发送者</th>
+                <th>内容</th>
+                <th>Source Key</th>
+              </tr>
+            </thead>
+            <tbody id="message-table-body">
+              <tr><td colspan="4" class="table-empty">选择群范围后显示最近消息。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="distill-dialog" class="dialog">
+      <form method="dialog" id="distill-form">
+        <div class="dialog-mark">✦</div>
+        <h2>整理最近记忆</h2>
+        <p>
+          将调用插件自己的潜意识 LLM，把当前群最近消息整理成 Episode、语义记忆和 Topic；若已启用本地 Embedding，会同步建立向量索引。
+        </p>
+        <label class="dialog-field">
+          本次消息数
+          <input id="distill-limit" type="number" min="4" max="500" value="80" />
+        </label>
+        <p class="cost-note">此操作会产生一次潜意识模型调用。</p>
+        <div class="dialog-actions">
+          <button id="distill-cancel" class="button ghost" type="button">取消</button>
+          <button id="distill-confirm" class="button primary" type="button">开始整理</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+    <script src="./script.js" defer></script>
+  </body>
+</html>

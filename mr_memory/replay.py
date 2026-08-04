@@ -27,11 +27,15 @@ def iter_jsonl(path: str | Path) -> Iterable[dict[str, Any]]:
 def replay_records(
     records: Iterable[dict[str, Any]],
     storage: MemoryStorage,
+    *,
+    before_sent_at: int | None = None,
 ) -> tuple[int, int]:
     inserted = 0
     updated = 0
     for record in records:
         message = NormalizedMessage.from_mapping(record)
+        if before_sent_at is not None and message.sent_at >= int(before_sent_at):
+            continue
         if storage.upsert_message(message):
             inserted += 1
         else:
