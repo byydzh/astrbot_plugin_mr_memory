@@ -1,0 +1,80 @@
+{
+  "capture_enabled": {
+    "description": "采集群消息",
+    "type": "bool",
+    "default": false,
+    "hint": "开发阶段保持关闭。开启后只写入本插件自己的 SQLite 数据库。"
+  },
+  "subconscious_enabled": {
+    "description": "启用独立潜意识记忆 Agent",
+    "type": "bool",
+    "default": true,
+    "hint": "使用插件专属 LLM 进行记忆重建，不占用 AstrBot 当前会话的主 LLM。"
+  },
+  "subconscious_provider_id": {
+    "description": "潜意识 LLM Provider ID",
+    "type": "string",
+    "default": "deepseek/deepseek-v4-flash",
+    "hint": "必须是 AstrBot 已配置的聊天模型 Provider ID。"
+  },
+  "wake_on_llm_request": {
+    "description": "主 LLM 请求前自动唤醒潜意识",
+    "type": "bool",
+    "default": true,
+    "hint": "仅在当前会话已有图记忆时调用潜意识 LLM；无记忆时不会产生模型费用。"
+  },
+  "consult_tool_enabled": {
+    "description": "向主 LLM 暴露潜意识咨询工具",
+    "type": "bool",
+    "default": true,
+    "hint": "主 LLM 只看到一个高层桥接工具，可在自动摘要不足时要求潜意识继续重建。"
+  },
+  "expose_traversal_tools": {
+    "description": "向主 LLM 暴露底层图遍历工具",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。七个底层工具只提供给潜意识 LLM，保持与主 LLM 低耦合。"
+  },
+  "max_loop_steps": {
+    "description": "潜意识单次最大遍历步数",
+    "type": "int",
+    "default": 6,
+    "hint": "实际范围 1 到 12；用于限制延迟和模型费用。"
+  },
+  "subconscious_timeout_seconds": {
+    "description": "潜意识单次超时秒数",
+    "type": "int",
+    "default": 45,
+    "hint": "超时后跳过记忆注入，不阻断主 LLM。"
+  },
+  "max_query_chars": {
+    "description": "传给潜意识的查询字符上限",
+    "type": "int",
+    "default": 4000,
+    "hint": "实际范围 256 到 16000。"
+  },
+  "max_brief_chars": {
+    "description": "注入主 LLM 的记忆摘要字符上限",
+    "type": "int",
+    "default": 3000,
+    "hint": "实际范围 256 到 12000，用于限制主 LLM 输入成本。"
+  },
+  "allowed_umos": {
+    "description": "允许访问记忆的群聊 UMO 白名单",
+    "type": "list",
+    "default": [],
+    "hint": "同时约束采集、重建和查询；留空表示允许所有群，生产试运行前建议显式填写。"
+  },
+  "max_search_results": {
+    "description": "单次检索结果上限",
+    "type": "int",
+    "default": 20,
+    "hint": "实际范围限制为 1 到 50。"
+  },
+  "log_message_content": {
+    "description": "在日志中记录消息正文",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，防止聊天内容进入运行日志。"
+  }
+}
