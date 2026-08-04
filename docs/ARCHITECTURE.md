@@ -70,36 +70,48 @@ At the current deployment's observed traffic, the expected steady-state growth
 is roughly 250--500 MB per year with structured traces. This estimate must be
 revisited before enabling attachment storage or per-message embeddings.
 
-## Feedback and revision TODO
+## Feedback working graph and revision
 
-Feedback-driven revision is a required architecture feature, not an optional
-extension. It will use append-only state transitions:
+Feedback-driven behavioral revision is implemented as an append-only evidence
+path plus a bounded active view:
 
 ```text
-candidate -> provisional -> confirmed
-                         -> disputed -> superseded / retracted
+request/action/response -> later feedback -> prospective hypothesis
+                                      \-> signed credit for activated paths
 ```
 
-Planned requirements:
+The host, not the maintenance LLM, enforces proposal binding, time order, group
+and sender scope, a configurable evidence threshold, and atomic writes. Generic
+style preferences use `activation_mode=always`; task-conditioned behavior uses
+`activation_mode=semantic` with evidence-derived lexical triggers and a bounded
+private-agent semantic gate. Utility and factual confidence are deliberately
+separate.
+
+Implemented retention rules:
 
 - preserve the original evidence and every revision;
 - distinguish activation/salience from factual confidence;
 - treat negative emotion as a strong review trigger, not sufficient proof alone;
-- allow explicit self-correction or administrator correction to supersede memory;
-- stage write proposals before committing them;
-- provide an administrator review queue with confirm/edit/reject/defer actions;
+- stage write proposals before one host-validated commit transaction;
 - retain evidence IDs through reconstruction so feedback can target the memory
   actually used by the main LLM;
-- use hysteresis so weak feedback flags a memory while stronger evidence is
-  required to reverse a recently revised conclusion.
+- decay utility, bound the active view, and make merge/unmerge reversible without
+  deleting provenance.
 
-## Wake-up policy TODO
+Still planned: administrator confirm/edit/reject/defer controls, explicit
+self-correction flows, and semantic-fact supersede/retract states. The current
+loop learns prospective behavior but does not rewrite an old factual claim.
+
+## Wake-up policy
 
 Use three complementary triggers:
 
-- background consolidation after a message threshold or idle interval;
-- a cheap deterministic gate before main-LLM requests;
-- explicit consultation from the main LLM when the injected brief is insufficient.
+- a cheap deterministic activation gate before main-LLM requests (implemented);
+- private semantic activation and bounded feedback maintenance on a main request
+  (implemented, default off);
+- explicit consultation from the main LLM when the injected brief is insufficient
+  (implemented);
+- background consolidation after a message threshold or idle interval (TODO).
 
 The persistent component is the scheduler, queue, graph revision, and activation
 state. LLM calls remain bounded and event-driven rather than continuously running.

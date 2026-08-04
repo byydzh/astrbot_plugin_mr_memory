@@ -3,7 +3,10 @@ const state = {
   scopeId: "",
   graph: null,
   selectedNodeId: "",
-  visibleTypes: new Set(["cue", "episode", "semantic", "topic"]),
+  visibleTypes: new Set([
+    "cue", "episode", "semantic", "topic",
+    "action", "feedback", "hypothesis",
+  ]),
   transform: { x: 0, y: 0, scale: 1 },
   virtualSize: { width: 1120, height: 680 },
   isPanning: false,
@@ -54,6 +57,9 @@ const typeNames = {
   episode: "情节 EPISODE",
   semantic: "语义 SEMANTIC",
   topic: "主题 TOPIC",
+  action: "行动 ACTION",
+  feedback: "反馈 FEEDBACK",
+  hypothesis: "前瞻假设 HYPOTHESIS",
 };
 
 function svgElement(name, attributes = {}) {
@@ -155,6 +161,7 @@ function renderOverview() {
 
   const runtimeParts = ["已连接"];
   runtimeParts.push(runtime.capture_enabled ? "采集开启" : "采集关闭");
+  runtimeParts.push(runtime.feedback_learning_enabled ? "反馈闭环开启" : "反馈闭环关闭");
   if (runtime.embedding_enabled) {
     if (!runtime.embedding_dependency_ready) {
       runtimeParts.push("FastEmbed 未安装");
@@ -208,6 +215,8 @@ function renderScopeMeta() {
     `UMO ${scope.umo}`,
     `${formatNumber(scope.cues)} cues`,
     `${formatNumber(scope.topics)} topics`,
+    `${formatNumber(scope.active_hypotheses)} active hypotheses`,
+    `${formatNumber(scope.feedback_links)} feedback links`,
     `最近消息 ${formatTime(scope.last_message_at)}`,
   ].join("  ·  ");
 }
@@ -275,12 +284,25 @@ async function loadGraph() {
 }
 
 function calculateLayout(nodes) {
-  const grouped = { cue: [], episode: [], semantic: [], topic: [] };
+  const grouped = {
+    cue: [], episode: [], semantic: [], topic: [],
+    action: [], feedback: [], hypothesis: [],
+  };
   nodes.forEach((node) => grouped[node.type]?.push(node));
   const maxPrimary = Math.max(grouped.cue.length, grouped.episode.length, 8);
   const rightCount = grouped.semantic.length + grouped.topic.length;
-  const height = Math.max(680, maxPrimary * 58 + 120, rightCount * 48 + 140);
-  const width = 1120;
+  const feedbackCount = Math.max(
+    grouped.action.length,
+    grouped.feedback.length,
+    grouped.hypothesis.length,
+  );
+  const height = Math.max(
+    680,
+    maxPrimary * 58 + 120,
+    rightCount * 48 + 140,
+    feedbackCount * 58 + 140,
+  );
+  const width = 1480;
   const positions = new Map();
 
   function distribute(items, x, minY, maxY, wobble = 0) {
@@ -295,17 +317,20 @@ function calculateLayout(nodes) {
     });
   }
 
-  distribute(grouped.cue, 120, 80, height - 80, 16);
-  distribute(grouped.episode, 530, 90, height - 90, 22);
+  distribute(grouped.cue, 100, 80, height - 80, 16);
+  distribute(grouped.episode, 390, 90, height - 90, 22);
   const topicEnd = grouped.topic.length ? Math.min(height * 0.4, 110 + grouped.topic.length * 62) : 90;
-  distribute(grouped.topic, 950, 90, topicEnd, 12);
+  distribute(grouped.topic, 700, 90, topicEnd, 12);
   distribute(
     grouped.semantic,
-    920,
+    690,
     grouped.topic.length ? Math.max(height * 0.48, topicEnd + 70) : 100,
     height - 90,
     18,
   );
+  distribute(grouped.action, 930, 90, height - 90, 14);
+  distribute(grouped.feedback, 1170, 100, height - 100, 12);
+  distribute(grouped.hypothesis, 1400, 90, height - 90, 16);
 
   state.virtualSize = { width, height };
   return positions;
@@ -359,7 +384,13 @@ function renderGraph() {
   nodes.forEach((node) => {
     const position = positions.get(node.id);
     if (!position) return;
-    const radius = node.type === "episode" ? 17 : node.type === "cue" ? 11 : 14;
+    const radius = node.type === "episode"
+      ? 17
+      : node.type === "cue"
+        ? 11
+        : node.type === "feedback"
+          ? 16
+          : 14;
     const group = svgElement("g", {
       class: "graph-node",
       transform: `translate(${position.x} ${position.y})`,
@@ -495,6 +526,12 @@ function renderInspector(node) {
     ["结束时间", node.ended_at ? formatTime(node.ended_at) : ""],
     ["原始证据", node.source_count ? `${node.source_count} 条` : ""],
     ["置信度", node.confidence !== undefined ? `${Math.round(node.confidence * 100)}%` : ""],
+    ["效用", node.utility !== undefined ? Number(node.utility).toFixed(3) : ""],
+    ["作用域", node.scope_type ? `${node.scope_type}:${node.scope_key || ""}` : ""],
+    ["激活模式", node.activation_mode || ""],
+    ["触发线索", Array.isArray(node.trigger_cues) ? node.trigger_cues.join(" · ") : ""],
+    ["状态", node.status || ""],
+    ["学习时间", node.learned_at ? formatTime(node.learned_at) : ""],
     ["Source Key", node.source_key || ""],
   ]);
   if (node.source_text) {

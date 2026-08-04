@@ -5,6 +5,54 @@
     "default": false,
     "hint": "开发阶段保持关闭。开启后只写入本插件自己的 SQLite 数据库。"
   },
+  "feedback_learning_enabled": {
+    "description": "启用反馈学习闭环",
+    "type": "bool",
+    "default": false,
+    "hint": "实验功能，默认关闭。需要同时开启消息采集；潜意识会把后续反馈追溯到主 Agent 的显式行动图并生成前瞻提示。"
+  },
+  "feedback_window_seconds": {
+    "description": "反馈候选时间窗（秒）",
+    "type": "int",
+    "default": 21600,
+    "hint": "后续消息可归因到此前响应的最长时间，实际范围 60 到 604800；最终语义归因由独立潜意识 LLM 决定。"
+  },
+  "feedback_trace_ttl_seconds": {
+    "description": "活动思考图 TTL（秒）",
+    "type": "int",
+    "default": 86400,
+    "hint": "实际范围 300 到 604800；过期后退出活动视图，但证据与结构不会被硬删除。"
+  },
+  "feedback_hypothesis_ttl_days": {
+    "description": "反馈假设 TTL（天）",
+    "type": "int",
+    "default": 180,
+    "hint": "实际范围 1 到 730；到期后转为 dormant，可追溯且可重新激活。"
+  },
+  "feedback_max_pending_per_wake": {
+    "description": "每次唤醒处理反馈数",
+    "type": "int",
+    "default": 2,
+    "hint": "实际范围 1 到 10，用于限制潜意识模型费用和主调用前延迟。"
+  },
+  "feedback_max_active_hypotheses": {
+    "description": "每群活动反馈假设上限",
+    "type": "int",
+    "default": 200,
+    "hint": "实际范围 10 到 5000；超额低效用假设进入 dormant，不删除原始证据。"
+  },
+  "feedback_maintenance_steps": {
+    "description": "反馈维护最大 Agent 步数",
+    "type": "int",
+    "default": 6,
+    "hint": "实际范围 3 到 10；包含检查证据、查找旧假设和提交事务。"
+  },
+  "feedback_min_commit_score": {
+    "description": "自动提交最低证据分",
+    "type": "float",
+    "default": 0.65,
+    "hint": "宿主按 |反馈强度| × 归因置信度校验，实际范围 0.05 到 1.0；群级规则至少需要 0.8。低于阈值的修改会被拒绝并保留审计记录。"
+  },
   "subconscious_enabled": {
     "description": "启用独立潜意识记忆 Agent",
     "type": "bool",
