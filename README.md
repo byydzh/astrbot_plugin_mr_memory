@@ -3,6 +3,7 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
+0.8.0 进一步加入可观察的主 Agent 工作图、后续反馈归因、反向效用更新和前瞻行为假设。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -15,6 +16,8 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 ## 安全默认值
 
 - `capture_enabled=false`：不采集任何线上消息。
+- `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
+  分数的宿主门禁约束，默认提交阈值为 `0.65`。
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：记忆推理与主 LLM 分离。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
@@ -41,6 +44,7 @@ SQLite truth store + FTS5 + layered memory graph
         +-- Cue--Tag--Episode
         +-- Person--Aspect--Semantic
         +-- Topic--Episode
+        +-- Action--Feedback--Prospective Hypothesis
         |
         v
 embedding candidate initialization (Cue / Episode / Semantic / Topic)
@@ -52,6 +56,7 @@ LLM-composable bounded traversal toolkit
 private provider tool loop (DeepSeek by default)
         |
         +-- automatic bounded memory brief before main LLM request
+        +-- bounded feedback maintenance and prospective activation
         +-- one optional consultation tool visible to the main LLM
 ```
 
@@ -87,6 +92,7 @@ private provider tool loop (DeepSeek by default)
 
 - 所有已知群范围的消息量、图记忆量、向量量和数据库占用概览；
 - Cue--Tag--Episode、Person--Aspect--Semantic、Topic--Episode 图谱；
+- 主 Agent Action--Feedback--Prospective Hypothesis 反馈图及激活模式、效用和状态；
 - 点击 Episode 回溯关键词和原始聊天证据；
 - 按正文或发送者检索当前群的原始消息；
 - 明确提示模型费用后，手动触发当前群的最近消息整理。
@@ -138,6 +144,17 @@ python -m scripts.reproduce_fixture `
 [开发记录](docs/DEVELOPMENT_LOG.md)。论文机制当前覆盖范围与缺口见
 [论文覆盖矩阵](docs/PAPER_COVERAGE.md)。
 
+## 反馈学习闭环
+
+启用后，插件为主 Agent 的每次请求保留不含隐藏思维链的可观察工作图。后续群消息由独立
+潜意识 Provider 在有界证据窗口内做归因，宿主再校验 proposal、群、发送者、时间、修改
+阈值和激活模式，并在一个事务中写入反馈边与前瞻假设。下一次请求先走廉价词面门，再由
+私有 Agent 处理真正的语义改写；主 LLM 只接收临时、有限的行为提示。
+
+反馈会反向调整实际激活路径的效用，但不会把情绪反馈伪装成事实置信度。TTL、遗忘和合并
+只改变活动视图，原始证据保持可追溯。完整设计与配置边界见
+[反馈图闭环](docs/FEEDBACK_LOOP.md)。
+
 ## 测试
 
 ```powershell
@@ -153,5 +170,7 @@ python -m unittest discover -s tests -v
 - 尚未下载或分析图片，仅允许在 `content` 中保留附件元数据。
 - 图构建目前由管理员显式触发；定时/定量后台整理尚未接入。
 - 宿主直接证据门控已在离线消融中验证，尚未接入运行时 runner。
-- semantic memory 聚合多条消息时仍需补齐多源 provenance 和反馈修订状态机。
+- semantic memory 聚合多条消息时仍需补齐多源 provenance；0.8.0 的反馈假设已有独立
+  provenance，但尚未直接改写旧 semantic fact。
+- 自动反馈提交已有阈值与审计记录；管理员 confirm/edit/reject 控制台仍是后续项。
 - 当前开发版本不自动部署线上；真实历史的首个遮罩 A/B 已完成，线上 canary 尚未开启。

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.0
+
+- Add a persistent, inspectable interaction graph for main-agent requests, tool
+  actions, visible responses, later feedback, and prospective hypotheses without
+  storing hidden chain-of-thought.
+- Add a private feedback-maintenance agent with evidence inspection, scoped
+  hypothesis lookup, and one atomic host-validated mutation transaction.
+- Add signed backward utility assignment while keeping factual evidence confidence
+  independent from behavioral feedback.
+- Add explicit `always` and `semantic` activation modes, a lexical fast gate, and
+  private-agent semantic activation for paraphrases.
+- Add configurable commit thresholds, strict group/sender/cutoff checks, bounded
+  media-redacted evidence, proposal binding, and fail-open runtime hooks.
+- Add decay, dormancy, bounded active views, and reversible hypothesis merges
+  without deleting provenance.
+- Extend the AstrBot Plugin Page graph with Action--Feedback--Prospective Hypothesis
+  nodes and add a strict real-history feedback A/B harness with token accounting.
+
 ## 0.7.0
 
 - Add strict historical cutoffs to graph search and all seven traversal tools.

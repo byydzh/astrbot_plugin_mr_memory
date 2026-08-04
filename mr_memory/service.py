@@ -9,6 +9,7 @@ from .distillation import (
     persist_distillation,
 )
 from .embedding import EmbeddingBackend
+from .feedback import FeedbackDecision
 from .models import NormalizedMessage, StoredMessage
 from .storage import MemoryStorage
 
@@ -269,6 +270,96 @@ class MemoryService:
             topic=topic,
             limit=limit,
             before_sent_at=before_sent_at,
+        )
+
+    async def start_interaction_trace(self, **kwargs: object) -> str:
+        return await asyncio.to_thread(
+            self.storage.start_interaction_trace, **kwargs
+        )
+
+    async def record_trace_node(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(self.storage.record_trace_node, **kwargs)
+
+    async def record_trace_edge(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(self.storage.record_trace_edge, **kwargs)
+
+    async def finish_interaction_trace(self, **kwargs: object) -> None:
+        await asyncio.to_thread(self.storage.finish_interaction_trace, **kwargs)
+
+    async def enqueue_feedback_candidate(self, **kwargs: object) -> int | None:
+        return await asyncio.to_thread(
+            self.storage.enqueue_feedback_candidate, **kwargs
+        )
+
+    async def pending_feedback_proposals(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.pending_feedback_proposals, **kwargs
+        )
+
+    async def inspect_feedback_proposal(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.inspect_feedback_proposal, **kwargs
+        )
+
+    async def search_feedback_hypotheses(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.search_feedback_hypotheses, **kwargs
+        )
+
+    async def feedback_hypothesis_candidates(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.feedback_hypothesis_candidates, **kwargs
+        )
+
+    async def activate_feedback_hypotheses(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.activate_feedback_hypotheses, **kwargs
+        )
+
+    async def apply_feedback_decision(
+        self,
+        *,
+        decision: FeedbackDecision,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.apply_feedback_decision,
+            decision=decision,
+            **kwargs,
+        )
+
+    async def reject_feedback_proposal(self, **kwargs: object) -> None:
+        await asyncio.to_thread(self.storage.reject_feedback_proposal, **kwargs)
+
+    async def feedback_proposal_status(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.feedback_proposal_status, **kwargs
+        )
+
+    async def compact_feedback_memory(
+        self, **kwargs: object
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.compact_feedback_memory, **kwargs
+        )
+
+    async def interaction_trace_graph(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.interaction_trace_graph, **kwargs
         )
 
     async def close(self) -> None:

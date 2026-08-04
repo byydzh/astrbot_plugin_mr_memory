@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 from .embedding import (
@@ -12,10 +14,16 @@ from .embedding import (
     encode_vector,
     normalize_vector,
 )
+from .feedback import (
+    FeedbackDecision,
+    backward_credit_delta,
+    hypothesis_fingerprint,
+    rank_hypotheses,
+)
 from .models import NormalizedMessage, StoredMessage
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class MemoryStorage:
@@ -287,8 +295,169 @@ class MemoryStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_reconstruction_steps_run
                     ON reconstruction_steps (run_id, arm, step_index);
+
+                CREATE TABLE IF NOT EXISTS interaction_traces (
+                    trace_id TEXT PRIMARY KEY,
+                    umo TEXT NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    request_source_key TEXT NOT NULL DEFAULT '',
+                    request_sent_at INTEGER NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    request_excerpt TEXT NOT NULL DEFAULT '',
+                    response_sha256 TEXT NOT NULL DEFAULT '',
+                    response_excerpt TEXT NOT NULL DEFAULT '',
+                    response_at INTEGER,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    expires_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_interaction_traces_scope_time
+                    ON interaction_traces (umo, request_sent_at DESC, trace_id);
+                CREATE INDEX IF NOT EXISTS idx_interaction_traces_feedback_window
+                    ON interaction_traces (umo, status, response_at DESC);
+
+                CREATE TABLE IF NOT EXISTS trace_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT NOT NULL REFERENCES interaction_traces(trace_id)
+                        ON DELETE CASCADE,
+                    umo TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    content_json TEXT NOT NULL DEFAULT '{}',
+                    activation REAL NOT NULL DEFAULT 0,
+                    utility REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    expires_at INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (trace_id, node_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_trace_nodes_scope_type
+                    ON trace_nodes (umo, node_type, id DESC);
+
+                CREATE TABLE IF NOT EXISTS trace_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT NOT NULL REFERENCES interaction_traces(trace_id)
+                        ON DELETE CASCADE,
+                    umo TEXT NOT NULL,
+                    source_node_id INTEGER NOT NULL REFERENCES trace_nodes(id),
+                    target_node_id INTEGER NOT NULL REFERENCES trace_nodes(id),
+                    relation TEXT NOT NULL,
+                    contribution REAL NOT NULL DEFAULT 0,
+                    eligibility REAL NOT NULL DEFAULT 0,
+                    credit REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (trace_id, source_node_id, target_node_id, relation)
+                );
+
+                CREATE TABLE IF NOT EXISTS feedback_hypotheses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    scope_type TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    aspect TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    prospective_cue TEXT NOT NULL,
+                    trigger_cues_json TEXT NOT NULL DEFAULT '[]',
+                    activation_mode TEXT NOT NULL DEFAULT 'semantic',
+                    evidence_confidence REAL NOT NULL DEFAULT 0,
+                    utility REAL NOT NULL DEFAULT 0,
+                    support_count INTEGER NOT NULL DEFAULT 0,
+                    contradict_count INTEGER NOT NULL DEFAULT 0,
+                    activation_count INTEGER NOT NULL DEFAULT 0,
+                    learned_at INTEGER NOT NULL,
+                    last_decay_at INTEGER NOT NULL,
+                    last_activated_at INTEGER,
+                    source_trace_id TEXT REFERENCES interaction_traces(trace_id),
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    merged_into INTEGER REFERENCES feedback_hypotheses(id),
+                    merge_previous_status TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_feedback_hypotheses_activation
+                    ON feedback_hypotheses (
+                        umo, status, scope_type, scope_key, learned_at
+                    );
+
+                CREATE TABLE IF NOT EXISTS hypothesis_activations (
+                    trace_id TEXT NOT NULL REFERENCES interaction_traces(trace_id)
+                        ON DELETE CASCADE,
+                    hypothesis_id INTEGER NOT NULL
+                        REFERENCES feedback_hypotheses(id),
+                    activation_score REAL NOT NULL,
+                    contribution REAL NOT NULL DEFAULT 1,
+                    credit REAL NOT NULL DEFAULT 0,
+                    activation_method TEXT NOT NULL DEFAULT 'lexical',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (trace_id, hypothesis_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS feedback_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    feedback_source_key TEXT NOT NULL,
+                    feedback_sent_at INTEGER NOT NULL,
+                    candidate_trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                    decision_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    decided_at TEXT,
+                    UNIQUE (umo, feedback_source_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_feedback_proposals_pending
+                    ON feedback_proposals (umo, status, feedback_sent_at);
+
+                CREATE TABLE IF NOT EXISTS feedback_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    trace_id TEXT NOT NULL REFERENCES interaction_traces(trace_id),
+                    feedback_source_key TEXT NOT NULL,
+                    feedback_sent_at INTEGER NOT NULL,
+                    link_method TEXT NOT NULL,
+                    link_confidence REAL NOT NULL,
+                    feedback_valence REAL NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, feedback_source_key, trace_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS hypothesis_evidence (
+                    hypothesis_id INTEGER NOT NULL
+                        REFERENCES feedback_hypotheses(id),
+                    feedback_source_key TEXT NOT NULL,
+                    trace_id TEXT NOT NULL REFERENCES interaction_traces(trace_id),
+                    relation TEXT NOT NULL,
+                    valence REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (hypothesis_id, feedback_source_key, relation)
+                );
                 """
             )
+            hypothesis_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(feedback_hypotheses)"
+                ).fetchall()
+            }
+            if "activation_mode" not in hypothesis_columns:
+                self._connection.execute(
+                    """
+                    ALTER TABLE feedback_hypotheses
+                    ADD COLUMN activation_mode TEXT NOT NULL DEFAULT 'semantic'
+                    """
+                )
+            if "merge_previous_status" not in hypothesis_columns:
+                self._connection.execute(
+                    """
+                    ALTER TABLE feedback_hypotheses
+                    ADD COLUMN merge_previous_status TEXT NOT NULL DEFAULT ''
+                    """
+                )
             self._connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)
@@ -721,6 +890,13 @@ class MemoryStorage:
                     (SELECT COUNT(*) FROM topics WHERE umo = ?) AS topics,
                     (SELECT COUNT(*) FROM memory_embeddings WHERE umo = ?)
                         AS embeddings,
+                    (SELECT COUNT(*) FROM interaction_traces WHERE umo = ?)
+                        AS interaction_traces,
+                    (SELECT COUNT(*) FROM feedback_hypotheses
+                     WHERE umo = ? AND status = 'ACTIVE')
+                        AS active_hypotheses,
+                    (SELECT COUNT(*) FROM feedback_links WHERE umo = ?)
+                        AS feedback_links,
                     (SELECT COUNT(DISTINCT lower(k.cue))
                      FROM episode_keywords AS k
                      JOIN episodes AS e ON e.id = k.episode_id
@@ -728,7 +904,7 @@ class MemoryStorage:
                     (SELECT MAX(sent_at) FROM messages
                      WHERE umo = ? AND is_deleted = 0) AS last_message_at
                 """,
-                (umo, umo, umo, umo, umo, umo, umo),
+                (umo, umo, umo, umo, umo, umo, umo, umo, umo, umo),
             ).fetchone()
             last_update = self._connection.execute(
                 """
@@ -740,9 +916,12 @@ class MemoryStorage:
                     UNION ALL
                     SELECT MAX(updated_at) AS value
                     FROM memory_embeddings WHERE umo = ?
+                    UNION ALL
+                    SELECT MAX(updated_at) AS value
+                    FROM feedback_hypotheses WHERE umo = ?
                 )
                 """,
-                (umo, umo, umo),
+                (umo, umo, umo, umo),
             ).fetchone()
             models = self._connection.execute(
                 """
@@ -775,6 +954,9 @@ class MemoryStorage:
             "semantic_memories": int(counts["semantic_memories"] or 0),
             "topics": int(counts["topics"] or 0),
             "embeddings": int(counts["embeddings"] or 0),
+            "interaction_traces": int(counts["interaction_traces"] or 0),
+            "active_hypotheses": int(counts["active_hypotheses"] or 0),
+            "feedback_links": int(counts["feedback_links"] or 0),
             "cues": int(counts["cues"] or 0),
             "last_message_at": (
                 int(counts["last_message_at"])
@@ -794,7 +976,7 @@ class MemoryStorage:
         umo: str,
         limit: int = 200,
     ) -> dict[str, object]:
-        """Build a compact Cue/Tag/Episode/Semantic/Topic graph for the UI."""
+        """Build a compact knowledge plus observable feedback-loop graph."""
         safe_limit = max(1, min(500, int(limit)))
         with self._lock:
             episode_rows = self._connection.execute(
@@ -852,6 +1034,53 @@ class MemoryStorage:
                 """,
                 (umo, safe_limit),
             ).fetchall()
+            hypothesis_rows = self._connection.execute(
+                """
+                SELECT id, scope_type, scope_key, aspect, statement,
+                       prospective_cue, trigger_cues_json, activation_mode,
+                       evidence_confidence, utility,
+                       support_count, contradict_count, status, learned_at
+                FROM feedback_hypotheses
+                WHERE umo = ? AND status <> 'MERGED'
+                ORDER BY learned_at DESC, id DESC
+                LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            feedback_rows = self._connection.execute(
+                """
+                SELECT l.id, l.trace_id, l.feedback_source_key,
+                       l.feedback_sent_at, l.link_confidence,
+                       l.feedback_valence, m.plain_text,
+                       he.hypothesis_id, he.relation
+                FROM feedback_links AS l
+                LEFT JOIN messages AS m
+                  ON m.umo = l.umo AND m.source_key = l.feedback_source_key
+                LEFT JOIN hypothesis_evidence AS he
+                  ON he.trace_id = l.trace_id
+                 AND he.feedback_source_key = l.feedback_source_key
+                WHERE l.umo = ?
+                ORDER BY l.feedback_sent_at DESC, l.id DESC
+                LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            feedback_trace_ids = list(
+                dict.fromkeys(str(row["trace_id"]) for row in feedback_rows)
+            )
+            trace_rows: list[sqlite3.Row] = []
+            if feedback_trace_ids:
+                placeholders = ",".join("?" for _ in feedback_trace_ids)
+                trace_rows = self._connection.execute(
+                    f"""
+                    SELECT trace_id, sender_id, request_sent_at,
+                           request_excerpt, response_excerpt, status
+                    FROM interaction_traces
+                    WHERE umo = ? AND trace_id IN ({placeholders})
+                    ORDER BY request_sent_at DESC
+                    """,
+                    (umo, *feedback_trace_ids),
+                ).fetchall()
 
         nodes: dict[str, dict[str, object]] = {}
         edges: list[dict[str, object]] = []
@@ -937,6 +1166,72 @@ class MemoryStorage:
                     "type": "cue_semantic",
                 }
             )
+        for row in reversed(hypothesis_rows):
+            hypothesis_id = f"hypothesis:{int(row['id'])}"
+            nodes[hypothesis_id] = {
+                "id": hypothesis_id,
+                "type": "hypothesis",
+                "entity_id": int(row["id"]),
+                "label": str(row["aspect"]),
+                "detail": str(row["prospective_cue"]),
+                "statement": str(row["statement"]),
+                "scope_type": str(row["scope_type"]),
+                "scope_key": str(row["scope_key"]),
+                "activation_mode": str(row["activation_mode"]),
+                "trigger_cues": json.loads(str(row["trigger_cues_json"])),
+                "confidence": float(row["evidence_confidence"]),
+                "utility": float(row["utility"]),
+                "status": str(row["status"]),
+                "learned_at": int(row["learned_at"]),
+                "support_count": int(row["support_count"]),
+                "contradict_count": int(row["contradict_count"]),
+            }
+        for row in trace_rows:
+            action_id = f"action:{str(row['trace_id'])}"
+            nodes[action_id] = {
+                "id": action_id,
+                "type": "action",
+                "label": str(row["request_excerpt"] or "主 Agent 调用"),
+                "detail": str(row["response_excerpt"] or ""),
+                "sender_id": str(row["sender_id"]),
+                "started_at": int(row["request_sent_at"]),
+                "status": str(row["status"]),
+            }
+        for row in reversed(feedback_rows):
+            feedback_id = f"feedback:{int(row['id'])}"
+            action_id = f"action:{str(row['trace_id'])}"
+            nodes[feedback_id] = {
+                "id": feedback_id,
+                "type": "feedback",
+                "entity_id": int(row["id"]),
+                "label": str(row["plain_text"] or "后续反馈"),
+                "detail": (
+                    f"valence={float(row['feedback_valence']):.2f} · "
+                    f"link={float(row['link_confidence']):.2f}"
+                ),
+                "source_key": str(row["feedback_source_key"]),
+                "sent_at": int(row["feedback_sent_at"]),
+            }
+            if action_id in nodes:
+                edges.append(
+                    {
+                        "source": action_id,
+                        "target": feedback_id,
+                        "relation": "后续反馈",
+                        "type": "action_feedback",
+                    }
+                )
+            if row["hypothesis_id"] is not None:
+                hypothesis_id = f"hypothesis:{int(row['hypothesis_id'])}"
+                if hypothesis_id in nodes:
+                    edges.append(
+                        {
+                            "source": feedback_id,
+                            "target": hypothesis_id,
+                            "relation": str(row["relation"] or "更新"),
+                            "type": "feedback_hypothesis",
+                        }
+                    )
 
         original_node_count = len(nodes)
         if original_node_count > safe_limit:
@@ -946,10 +1241,13 @@ class MemoryStorage:
                 degree[str(edge["target"])] = degree.get(str(edge["target"]), 0) + 1
 
             ratios = {
-                "episode": 0.40,
-                "cue": 0.30,
-                "semantic": 0.15,
-                "topic": 0.15,
+                "episode": 0.25,
+                "cue": 0.20,
+                "semantic": 0.10,
+                "topic": 0.10,
+                "action": 0.10,
+                "feedback": 0.10,
+                "hypothesis": 0.15,
             }
 
             def node_rank(item: dict[str, object]) -> tuple[object, ...]:
@@ -961,7 +1259,15 @@ class MemoryStorage:
                 return (-degree.get(str(item["id"]), 0), str(item["label"]).casefold())
 
             selected_ids: set[str] = set()
-            for node_type in ("episode", "cue", "semantic", "topic"):
+            for node_type in (
+                "episode",
+                "cue",
+                "semantic",
+                "topic",
+                "action",
+                "feedback",
+                "hypothesis",
+            ):
                 quota = int(safe_limit * ratios[node_type])
                 if quota <= 0 and not selected_ids:
                     quota = 1
@@ -1005,7 +1311,15 @@ class MemoryStorage:
                 and str(edge["target"]) in selected_ids
             ]
 
-        type_order = {"cue": 0, "episode": 1, "semantic": 2, "topic": 3}
+        type_order = {
+            "cue": 0,
+            "episode": 1,
+            "semantic": 2,
+            "topic": 3,
+            "action": 4,
+            "feedback": 5,
+            "hypothesis": 6,
+        }
         ordered_nodes = sorted(
             nodes.values(),
             key=lambda item: (
@@ -1799,6 +2113,1435 @@ class MemoryStorage:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _bounded_json(value: object, *, max_chars: int = 12000) -> str:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if len(encoded) > max_chars:
+            raise ValueError(f"structured trace payload exceeds {max_chars} characters")
+        return encoded
+
+    def _assert_scope(self, umo: str) -> None:
+        identity = self.get_scope_identity()
+        if identity is not None and identity["umo"] != umo:
+            raise ValueError("operation crosses the database group boundary")
+
+    def start_interaction_trace(
+        self,
+        *,
+        trace_id: str,
+        umo: str,
+        sender_id: str,
+        request_source_key: str,
+        request_sent_at: int,
+        query: str,
+        trace_ttl_seconds: int = 86400,
+    ) -> str:
+        """Open a bounded, externally inspectable working graph."""
+
+        self._assert_scope(umo)
+        normalized_id = trace_id.strip()
+        if not normalized_id or len(normalized_id) > 160:
+            raise ValueError("invalid trace_id")
+        sent_at = int(request_sent_at)
+        if sent_at <= 0:
+            raise ValueError("request_sent_at must be positive")
+        excerpt = str(query or "").strip()[:2000]
+        digest = hashlib.sha256(str(query or "").encode("utf-8")).hexdigest()
+        expires_at = sent_at + max(300, min(604800, int(trace_ttl_seconds)))
+        with self._lock, self._connection:
+            if request_source_key:
+                source = self._connection.execute(
+                    "SELECT umo FROM messages WHERE source_key = ?",
+                    (request_source_key,),
+                ).fetchone()
+                if source is not None and str(source["umo"]) != umo:
+                    raise ValueError("request source belongs to another group")
+            self._connection.execute(
+                """
+                INSERT INTO interaction_traces(
+                    trace_id, umo, sender_id, request_source_key,
+                    request_sent_at, request_sha256, request_excerpt, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_id,
+                    umo,
+                    sender_id.strip(),
+                    request_source_key.strip(),
+                    sent_at,
+                    digest,
+                    excerpt,
+                    expires_at,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, expires_at
+                ) VALUES (?, ?, 'request', 'request', ?, 1, ?)
+                """,
+                (
+                    normalized_id,
+                    umo,
+                    self._bounded_json(
+                        {
+                            "source_key": request_source_key.strip(),
+                            "sender_id": sender_id.strip(),
+                            "sent_at": sent_at,
+                            "excerpt": excerpt,
+                            "sha256": digest,
+                        }
+                    ),
+                    expires_at,
+                ),
+            )
+        return normalized_id
+
+    def record_trace_node(
+        self,
+        *,
+        trace_id: str,
+        umo: str,
+        node_key: str,
+        node_type: str,
+        content: dict[str, object] | None = None,
+        activation: float = 0.0,
+        utility: float = 0.0,
+        expires_at: int | None = None,
+    ) -> int:
+        self._assert_scope(umo)
+        key = node_key.strip()
+        kind = node_type.strip().lower()
+        if not key or len(key) > 200 or not kind or len(kind) > 80:
+            raise ValueError("invalid trace node identity")
+        with self._lock, self._connection:
+            trace = self._connection.execute(
+                "SELECT umo, expires_at FROM interaction_traces WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()
+            if trace is None or str(trace["umo"]) != umo:
+                raise ValueError("trace does not belong to this group")
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, utility, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                    node_type=excluded.node_type,
+                    content_json=excluded.content_json,
+                    activation=excluded.activation,
+                    utility=excluded.utility
+                """,
+                (
+                    trace_id,
+                    umo,
+                    key,
+                    kind,
+                    self._bounded_json(content or {}, max_chars=8000),
+                    max(0.0, min(1.0, float(activation))),
+                    max(-4.0, min(4.0, float(utility))),
+                    int(expires_at) if expires_at is not None else int(trace["expires_at"]),
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM trace_nodes WHERE trace_id = ? AND node_key = ?",
+                (trace_id, key),
+            ).fetchone()
+        return int(row["id"])
+
+    def record_trace_edge(
+        self,
+        *,
+        trace_id: str,
+        umo: str,
+        source_key: str,
+        target_key: str,
+        relation: str,
+        contribution: float = 0.0,
+        eligibility: float = 0.0,
+    ) -> int:
+        self._assert_scope(umo)
+        normalized_relation = relation.strip().upper()
+        if not normalized_relation or len(normalized_relation) > 80:
+            raise ValueError("invalid trace relation")
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id, node_key, umo FROM trace_nodes
+                WHERE trace_id = ? AND node_key IN (?, ?)
+                """,
+                (trace_id, source_key, target_key),
+            ).fetchall()
+            node_ids = {
+                str(row["node_key"]): int(row["id"])
+                for row in rows
+                if str(row["umo"]) == umo
+            }
+            if source_key not in node_ids or target_key not in node_ids:
+                raise ValueError("trace edge references an unknown node")
+            self._connection.execute(
+                """
+                INSERT INTO trace_edges(
+                    trace_id, umo, source_node_id, target_node_id, relation,
+                    contribution, eligibility
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trace_id, source_node_id, target_node_id, relation)
+                DO UPDATE SET contribution=excluded.contribution,
+                              eligibility=excluded.eligibility
+                """,
+                (
+                    trace_id,
+                    umo,
+                    node_ids[source_key],
+                    node_ids[target_key],
+                    normalized_relation,
+                    max(-1.0, min(1.0, float(contribution))),
+                    max(0.0, min(1.0, float(eligibility))),
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id FROM trace_edges
+                WHERE trace_id = ? AND source_node_id = ?
+                  AND target_node_id = ? AND relation = ?
+                """,
+                (
+                    trace_id,
+                    node_ids[source_key],
+                    node_ids[target_key],
+                    normalized_relation,
+                ),
+            ).fetchone()
+        return int(row["id"])
+
+    def finish_interaction_trace(
+        self,
+        *,
+        trace_id: str,
+        umo: str,
+        response_text: str,
+        response_at: int | None = None,
+    ) -> None:
+        self._assert_scope(umo)
+        raw_response = str(response_text or "")
+        excerpt = raw_response.strip()[:3000]
+        digest = hashlib.sha256(raw_response.encode("utf-8")).hexdigest()
+        finished_at = int(response_at or time.time())
+        with self._lock, self._connection:
+            trace = self._connection.execute(
+                "SELECT umo, request_sent_at, expires_at FROM interaction_traces WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()
+            if trace is None or str(trace["umo"]) != umo:
+                raise ValueError("trace does not belong to this group")
+            finished_at = max(finished_at, int(trace["request_sent_at"]))
+            self._connection.execute(
+                """
+                UPDATE interaction_traces
+                SET response_sha256 = ?, response_excerpt = ?, response_at = ?,
+                    status = 'RESPONDED', updated_at = CURRENT_TIMESTAMP
+                WHERE trace_id = ? AND umo = ?
+                """,
+                (digest, excerpt, finished_at, trace_id, umo),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, expires_at
+                ) VALUES (?, ?, 'response', 'response', ?, 1, ?)
+                ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                    content_json=excluded.content_json, activation=1
+                """,
+                (
+                    trace_id,
+                    umo,
+                    self._bounded_json(
+                        {
+                            "sent_at": finished_at,
+                            "excerpt": excerpt,
+                            "sha256": digest,
+                        }
+                    ),
+                    int(trace["expires_at"]),
+                ),
+            )
+            request_node = self._connection.execute(
+                "SELECT id FROM trace_nodes WHERE trace_id = ? AND node_key = 'request'",
+                (trace_id,),
+            ).fetchone()
+            response_node = self._connection.execute(
+                "SELECT id FROM trace_nodes WHERE trace_id = ? AND node_key = 'response'",
+                (trace_id,),
+            ).fetchone()
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO trace_edges(
+                    trace_id, umo, source_node_id, target_node_id, relation,
+                    contribution, eligibility
+                ) VALUES (?, ?, ?, ?, 'PRODUCES', 1, 1)
+                """,
+                (trace_id, umo, int(request_node["id"]), int(response_node["id"])),
+            )
+            activated = self._connection.execute(
+                """
+                SELECT a.hypothesis_id, a.activation_score, n.id AS node_id
+                FROM hypothesis_activations AS a
+                JOIN trace_nodes AS n
+                  ON n.trace_id = a.trace_id
+                 AND n.node_key = 'hypothesis:' || a.hypothesis_id
+                WHERE a.trace_id = ? AND n.umo = ?
+                """,
+                (trace_id, umo),
+            ).fetchall()
+            for row in activated:
+                score = max(0.0, min(1.0, float(row["activation_score"])))
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO trace_edges(
+                        trace_id, umo, source_node_id, target_node_id, relation,
+                        contribution, eligibility
+                    ) VALUES (?, ?, ?, ?, 'INFLUENCES', ?, ?)
+                    """,
+                    (
+                        trace_id,
+                        umo,
+                        int(row["node_id"]),
+                        int(response_node["id"]),
+                        score,
+                        score,
+                    ),
+                )
+
+    def enqueue_feedback_candidate(
+        self,
+        *,
+        umo: str,
+        feedback_source_key: str,
+        feedback_window_seconds: int = 21600,
+        candidate_limit: int = 3,
+    ) -> int | None:
+        """Queue later text against recent responses; the LLM decides semantics."""
+
+        self._assert_scope(umo)
+        with self._lock, self._connection:
+            feedback = self._connection.execute(
+                """
+                SELECT source_key, sender_id, sent_at, plain_text
+                FROM messages
+                WHERE umo = ? AND source_key = ? AND is_deleted = 0
+                """,
+                (umo, feedback_source_key),
+            ).fetchone()
+            if feedback is None or not str(feedback["plain_text"]).strip():
+                return None
+            sent_at = int(feedback["sent_at"])
+            lower = sent_at - max(60, min(604800, int(feedback_window_seconds)))
+            traces = self._connection.execute(
+                """
+                SELECT trace_id
+                FROM interaction_traces
+                WHERE umo = ? AND status IN ('RESPONDED', 'FEEDBACK')
+                  AND response_at IS NOT NULL
+                  AND response_at < ? AND response_at >= ?
+                  AND request_source_key <> ?
+                ORDER BY (sender_id = ?) DESC, response_at DESC
+                LIMIT ?
+                """,
+                (
+                    umo,
+                    sent_at,
+                    lower,
+                    feedback_source_key,
+                    str(feedback["sender_id"]),
+                    max(1, min(8, int(candidate_limit))),
+                ),
+            ).fetchall()
+            trace_ids = [str(row["trace_id"]) for row in traces]
+            if not trace_ids:
+                return None
+            self._connection.execute(
+                """
+                INSERT INTO feedback_proposals(
+                    umo, feedback_source_key, feedback_sent_at,
+                    candidate_trace_ids_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(umo, feedback_source_key) DO NOTHING
+                """,
+                (
+                    umo,
+                    feedback_source_key,
+                    sent_at,
+                    self._bounded_json(trace_ids, max_chars=2000),
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id FROM feedback_proposals
+                WHERE umo = ? AND feedback_source_key = ?
+                """,
+                (umo, feedback_source_key),
+            ).fetchone()
+        return int(row["id"])
+
+    def pending_feedback_proposals(
+        self, *, umo: str, limit: int = 3
+    ) -> list[dict[str, object]]:
+        self._assert_scope(umo)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, feedback_source_key, feedback_sent_at,
+                       candidate_trace_ids_json, created_at
+                FROM feedback_proposals
+                WHERE umo = ? AND status = 'PENDING'
+                ORDER BY feedback_sent_at, id
+                LIMIT ?
+                """,
+                (umo, max(1, min(20, int(limit)))),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "candidate_trace_ids": json.loads(
+                    str(row["candidate_trace_ids_json"])
+                ),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _component_evidence(content_json: str) -> dict[str, object]:
+        try:
+            content: Any = json.loads(content_json)
+        except (TypeError, json.JSONDecodeError):
+            content = []
+        types: list[str] = []
+        reply_ids: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                kind = value.get("type") or value.get("__class__")
+                if kind:
+                    types.append(str(kind)[:80])
+                for key, item in value.items():
+                    lowered = str(key).casefold()
+                    if lowered in {"reply_id", "message_id", "id"} and (
+                        "reply" in str(kind).casefold() or "reply" in lowered
+                    ):
+                        reply_ids.append(str(item)[:160])
+                    elif isinstance(item, (dict, list)):
+                        walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(content)
+        return {
+            "component_types": list(dict.fromkeys(types))[:20],
+            "reply_ids": list(dict.fromkeys(reply_ids))[:8],
+        }
+
+    def inspect_feedback_proposal(
+        self, *, umo: str, proposal_id: int, context_limit: int = 16
+    ) -> dict[str, object]:
+        """Return bounded evidence for the private agent, with no media URLs/blobs."""
+
+        self._assert_scope(umo)
+        with self._lock:
+            proposal = self._connection.execute(
+                "SELECT * FROM feedback_proposals WHERE id = ? AND umo = ?",
+                (int(proposal_id), umo),
+            ).fetchone()
+            if proposal is None:
+                raise ValueError("unknown feedback proposal")
+            feedback = self._connection.execute(
+                """
+                SELECT source_key, sender_id, sender_name, sent_at, plain_text,
+                       content_json
+                FROM messages
+                WHERE umo = ? AND source_key = ? AND is_deleted = 0
+                """,
+                (umo, str(proposal["feedback_source_key"])),
+            ).fetchone()
+            if feedback is None:
+                raise ValueError("feedback evidence no longer exists")
+            trace_ids = json.loads(str(proposal["candidate_trace_ids_json"]))
+            observable_nodes: list[sqlite3.Row] = []
+            if not trace_ids:
+                traces: list[sqlite3.Row] = []
+            else:
+                placeholders = ",".join("?" for _ in trace_ids)
+                traces = self._connection.execute(
+                    f"""
+                    SELECT trace_id, sender_id, request_source_key,
+                           request_sent_at, request_excerpt, response_at,
+                           response_excerpt, status
+                    FROM interaction_traces
+                    WHERE umo = ? AND trace_id IN ({placeholders})
+                    ORDER BY response_at DESC
+                    """,
+                    (umo, *trace_ids),
+                ).fetchall()
+                observable_nodes = self._connection.execute(
+                    f"""
+                    SELECT trace_id, node_key, node_type, content_json
+                    FROM trace_nodes
+                    WHERE umo = ? AND trace_id IN ({placeholders})
+                      AND node_type IN ('tool_call', 'tool_result', 'artifact')
+                    ORDER BY trace_id, id
+                    LIMIT 64
+                    """,
+                    (umo, *trace_ids),
+                ).fetchall()
+            earliest = min(
+                [int(row["request_sent_at"]) for row in traces]
+                or [int(feedback["sent_at"]) - 300]
+            )
+            context = self._connection.execute(
+                """
+                SELECT source_key, sender_id, sender_name, sent_at, plain_text, role
+                FROM messages
+                WHERE umo = ? AND is_deleted = 0
+                  AND sent_at >= ? AND sent_at <= ?
+                ORDER BY sent_at, id
+                LIMIT ?
+                """,
+                (
+                    umo,
+                    earliest,
+                    int(feedback["sent_at"]),
+                    max(2, min(40, int(context_limit))),
+                ),
+            ).fetchall()
+            activation_rows = self._connection.execute(
+                f"""
+                SELECT a.trace_id, h.id AS hypothesis_id, h.aspect,
+                       h.prospective_cue, a.activation_score, a.contribution
+                FROM hypothesis_activations AS a
+                JOIN feedback_hypotheses AS h ON h.id = a.hypothesis_id
+                WHERE h.umo = ?
+                  AND a.trace_id IN ({','.join('?' for _ in trace_ids) if trace_ids else "''"})
+                ORDER BY a.trace_id, a.activation_score DESC
+                """,
+                (umo, *trace_ids),
+            ).fetchall()
+        feedback_value = {
+            key: feedback[key]
+            for key in ("source_key", "sender_id", "sender_name", "sent_at", "plain_text")
+        }
+        feedback_value.update(self._component_evidence(str(feedback["content_json"])))
+        return {
+            "proposal_id": int(proposal["id"]),
+            "status": str(proposal["status"]),
+            "umo": umo,
+            "feedback": feedback_value,
+            "candidate_traces": [dict(row) for row in traces],
+            "observable_actions": [
+                {
+                    "trace_id": str(row["trace_id"]),
+                    "node_key": str(row["node_key"]),
+                    "node_type": str(row["node_type"]),
+                    "content": json.loads(str(row["content_json"])),
+                }
+                for row in observable_nodes
+            ],
+            "activated_hypotheses": [dict(row) for row in activation_rows],
+            "context": [dict(row) for row in context],
+        }
+
+    def search_feedback_hypotheses(
+        self,
+        *,
+        umo: str,
+        sender_id: str,
+        query: str,
+        at: int | None = None,
+        limit: int = 10,
+        include_inactive: bool = False,
+    ) -> list[dict[str, object]]:
+        self._assert_scope(umo)
+        cutoff = int(at or time.time())
+        status_sql = "" if include_inactive else " AND status = 'ACTIVE'"
+        expiry_sql = (
+            "" if include_inactive else " AND (expires_at IS NULL OR expires_at > ?)"
+        )
+        parameters: tuple[object, ...] = (
+            (umo, cutoff, sender_id)
+            if include_inactive
+            else (umo, cutoff, cutoff, sender_id)
+        )
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT id, umo, scope_type, scope_key, aspect, statement,
+                       prospective_cue, trigger_cues_json, activation_mode,
+                       evidence_confidence, utility, support_count,
+                       contradict_count, activation_count, learned_at,
+                       last_activated_at, status, merged_into
+                FROM feedback_hypotheses
+                WHERE umo = ? AND learned_at < ?
+                  {expiry_sql}
+                  AND (scope_type = 'group'
+                       OR (scope_type = 'sender' AND scope_key = ?))
+                  {status_sql}
+                ORDER BY utility DESC, evidence_confidence DESC, id DESC
+                LIMIT 200
+                """,
+                parameters,
+            ).fetchall()
+        if include_inactive:
+            return [
+                {
+                    **dict(row),
+                    "trigger_cues": json.loads(str(row["trigger_cues_json"])),
+                }
+                for row in rows[: max(1, min(50, int(limit)))]
+            ]
+        return rank_hypotheses(
+            [dict(row) for row in rows],
+            sender_id=sender_id,
+            query=query,
+            limit=limit,
+        )
+
+    def feedback_hypothesis_candidates(
+        self,
+        *,
+        umo: str,
+        sender_id: str,
+        at: int,
+        limit: int = 16,
+    ) -> list[dict[str, object]]:
+        """Bounded active view for semantic selection by the private agent."""
+
+        self._assert_scope(umo)
+        cutoff = int(at)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, scope_type, scope_key, aspect, statement,
+                       prospective_cue, trigger_cues_json, activation_mode,
+                       evidence_confidence, utility, support_count,
+                       contradict_count, learned_at
+                FROM feedback_hypotheses
+                WHERE umo = ? AND status = 'ACTIVE' AND learned_at < ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                  AND (scope_type = 'group'
+                       OR (scope_type = 'sender' AND scope_key = ?))
+                ORDER BY utility DESC, evidence_confidence DESC,
+                         COALESCE(last_activated_at, learned_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (
+                    umo,
+                    cutoff,
+                    cutoff,
+                    sender_id,
+                    max(1, min(50, int(limit))),
+                ),
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "trigger_cues": json.loads(str(row["trigger_cues_json"])),
+            }
+            for row in rows
+        ]
+
+    def activate_feedback_hypotheses(
+        self,
+        *,
+        umo: str,
+        sender_id: str,
+        query: str,
+        at: int,
+        trace_id: str | None = None,
+        limit: int = 6,
+        selected: list[dict[str, object]] | None = None,
+        activation_method: str = "lexical",
+    ) -> list[dict[str, object]]:
+        if selected is None:
+            ranked = self.search_feedback_hypotheses(
+                umo=umo,
+                sender_id=sender_id,
+                query=query,
+                at=at,
+                limit=limit,
+            )
+        else:
+            candidates = {
+                int(row["id"]): row
+                for row in self.feedback_hypothesis_candidates(
+                    umo=umo,
+                    sender_id=sender_id,
+                    at=at,
+                    limit=50,
+                )
+            }
+            ranked = []
+            for item in selected[: max(1, min(20, int(limit)))]:
+                hypothesis_id = int(item.get("id") or 0)
+                row = candidates.get(hypothesis_id)
+                if row is None:
+                    raise ValueError("selected hypothesis is outside the active scope")
+                score = max(
+                    0.0,
+                    min(1.0, float(item.get("activation_score") or 0.0)),
+                )
+                if score <= 0:
+                    continue
+                ranked.append({**row, "activation_score": score})
+        if not ranked:
+            return []
+        method = str(activation_method or "lexical").strip().lower()[:40]
+        with self._lock, self._connection:
+            trace = None
+            if trace_id:
+                trace = self._connection.execute(
+                    "SELECT umo, expires_at FROM interaction_traces WHERE trace_id = ?",
+                    (trace_id,),
+                ).fetchone()
+                if trace is None or str(trace["umo"]) != umo:
+                    raise ValueError("activation trace belongs to another group")
+            for row in ranked:
+                hypothesis_id = int(row["id"])
+                score = max(0.0, min(1.0, float(row["activation_score"])))
+                existing_activation = None
+                if trace_id:
+                    existing_activation = self._connection.execute(
+                        """
+                        SELECT 1 FROM hypothesis_activations
+                        WHERE trace_id = ? AND hypothesis_id = ?
+                        """,
+                        (trace_id, hypothesis_id),
+                    ).fetchone()
+                self._connection.execute(
+                    """
+                    UPDATE feedback_hypotheses
+                    SET activation_count = activation_count + ?,
+                        last_activated_at = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (
+                        0 if existing_activation is not None else 1,
+                        int(at),
+                        hypothesis_id,
+                        umo,
+                    ),
+                )
+                if not trace_id or trace is None:
+                    continue
+                self._connection.execute(
+                    """
+                    INSERT INTO hypothesis_activations(
+                        trace_id, hypothesis_id, activation_score, contribution,
+                        activation_method
+                    ) VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(trace_id, hypothesis_id) DO UPDATE SET
+                        activation_score=max(
+                            hypothesis_activations.activation_score,
+                            excluded.activation_score
+                        ),
+                        activation_method=excluded.activation_method
+                    """,
+                    (trace_id, hypothesis_id, score, method),
+                )
+                node_key = f"hypothesis:{hypothesis_id}"
+                self._connection.execute(
+                    """
+                    INSERT INTO trace_nodes(
+                        trace_id, umo, node_key, node_type, content_json,
+                        activation, utility, expires_at
+                    ) VALUES (?, ?, ?, 'hypothesis', ?, ?, ?, ?)
+                    ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                        content_json=excluded.content_json,
+                        activation=excluded.activation,
+                        utility=excluded.utility
+                    """,
+                    (
+                        trace_id,
+                        umo,
+                        node_key,
+                        self._bounded_json(
+                            {
+                                "hypothesis_id": hypothesis_id,
+                                "aspect": row["aspect"],
+                                "prospective_cue": row["prospective_cue"],
+                                "activation_mode": row["activation_mode"],
+                                "activation_method": method,
+                            }
+                        ),
+                        score,
+                        max(-4.0, min(4.0, float(row["utility"]))),
+                        int(trace["expires_at"]),
+                    ),
+                )
+                request_node = self._connection.execute(
+                    "SELECT id FROM trace_nodes WHERE trace_id = ? AND node_key = 'request'",
+                    (trace_id,),
+                ).fetchone()
+                hypothesis_node = self._connection.execute(
+                    "SELECT id FROM trace_nodes WHERE trace_id = ? AND node_key = ?",
+                    (trace_id, node_key),
+                ).fetchone()
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO trace_edges(
+                        trace_id, umo, source_node_id, target_node_id, relation,
+                        contribution, eligibility
+                    ) VALUES (?, ?, ?, ?, 'ACTIVATES', ?, ?)
+                    """,
+                    (
+                        trace_id,
+                        umo,
+                        int(request_node["id"]),
+                        int(hypothesis_node["id"]),
+                        score,
+                        score,
+                    ),
+                )
+        return ranked
+
+    def apply_feedback_decision(
+        self,
+        *,
+        umo: str,
+        proposal_id: int,
+        decision: FeedbackDecision,
+        hypothesis_ttl_seconds: int = 15552000,
+        min_commit_score: float = 0.65,
+    ) -> dict[str, object]:
+        """Atomically validate evidence, assign credit, and mutate active memory."""
+
+        self._assert_scope(umo)
+        with self._lock, self._connection:
+            proposal = self._connection.execute(
+                "SELECT * FROM feedback_proposals WHERE id = ? AND umo = ?",
+                (int(proposal_id), umo),
+            ).fetchone()
+            if proposal is None or str(proposal["status"]) != "PENDING":
+                raise ValueError("feedback proposal is not pending")
+            feedback = self._connection.execute(
+                """
+                SELECT sender_id, sent_at, plain_text FROM messages
+                WHERE umo = ? AND source_key = ? AND is_deleted = 0
+                """,
+                (umo, str(proposal["feedback_source_key"])),
+            ).fetchone()
+            if feedback is None:
+                raise ValueError("feedback source evidence is missing")
+            if decision.mutation == "ignore":
+                self._connection.execute(
+                    """
+                    UPDATE feedback_proposals
+                    SET status = 'IGNORED', decision_json = ?,
+                        decided_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (
+                        self._bounded_json(decision.as_dict()),
+                        int(proposal_id),
+                        umo,
+                    ),
+                )
+                return {"status": "IGNORED", "proposal_id": int(proposal_id)}
+
+            commit_score = abs(decision.feedback_valence) * decision.confidence
+            threshold = max(0.05, min(1.0, float(min_commit_score)))
+            if decision.scope_type == "group":
+                threshold = max(threshold, 0.8)
+            if commit_score < threshold:
+                raise ValueError(
+                    f"feedback evidence score {commit_score:.3f} is below "
+                    f"the commit threshold {threshold:.3f}"
+                )
+            if decision.activation_mode == "always" and decision.trigger_cues:
+                raise ValueError("always hypotheses must not define trigger cues")
+            if decision.activation_mode == "semantic" and not decision.trigger_cues:
+                raise ValueError("semantic hypotheses require trigger cues")
+
+            candidates = set(json.loads(str(proposal["candidate_trace_ids_json"])))
+            if decision.target_trace_id not in candidates:
+                raise ValueError("target trace was not an eligible candidate")
+            trace = self._connection.execute(
+                "SELECT * FROM interaction_traces WHERE trace_id = ? AND umo = ?",
+                (decision.target_trace_id, umo),
+            ).fetchone()
+            if trace is None:
+                raise ValueError("target trace belongs to another group")
+            response_at = int(trace["response_at"] or trace["request_sent_at"])
+            feedback_sent_at = int(feedback["sent_at"])
+            if feedback_sent_at <= response_at:
+                raise ValueError("feedback must occur after the target response")
+            if decision.scope_type == "sender":
+                allowed_scope_keys = {
+                    str(feedback["sender_id"]),
+                    str(trace["sender_id"]),
+                }
+                if decision.scope_key not in allowed_scope_keys:
+                    raise ValueError("sender scope lacks source evidence")
+            elif decision.scope_key != umo:
+                raise ValueError("group-scoped hypothesis must use the current UMO")
+
+            activation_rows = self._connection.execute(
+                """
+                SELECT a.hypothesis_id, a.activation_score, a.contribution
+                FROM hypothesis_activations AS a
+                JOIN feedback_hypotheses AS h ON h.id = a.hypothesis_id
+                WHERE a.trace_id = ? AND h.umo = ?
+                """,
+                (decision.target_trace_id, umo),
+            ).fetchall()
+            total_credit = 0.0
+            for activation in activation_rows:
+                delta = backward_credit_delta(
+                    feedback_valence=decision.feedback_valence,
+                    feedback_confidence=decision.confidence,
+                    eligibility=float(activation["activation_score"]),
+                    contribution=float(activation["contribution"]),
+                )
+                total_credit += delta
+                self._connection.execute(
+                    """
+                    UPDATE feedback_hypotheses
+                    SET utility = min(4, max(-4, utility + ?)),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (delta, int(activation["hypothesis_id"]), umo),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE hypothesis_activations
+                    SET credit = credit + ?
+                    WHERE trace_id = ? AND hypothesis_id = ?
+                    """,
+                    (
+                        delta,
+                        decision.target_trace_id,
+                        int(activation["hypothesis_id"]),
+                    ),
+                )
+
+            hypothesis_id: int
+            relation: str
+            if decision.mutation == "upsert":
+                fingerprint = hypothesis_fingerprint(
+                    umo=umo,
+                    scope_type=decision.scope_type,
+                    scope_key=decision.scope_key,
+                    aspect=decision.aspect,
+                    prospective_cue=decision.prospective_cue,
+                    trigger_cues=decision.trigger_cues,
+                    activation_mode=decision.activation_mode,
+                )
+                increment = max(0.05, abs(decision.feedback_valence) * decision.confidence)
+                expires_at = feedback_sent_at + max(
+                    86400, min(63072000, int(hypothesis_ttl_seconds))
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO feedback_hypotheses(
+                        umo, fingerprint, scope_type, scope_key, aspect,
+                        statement, prospective_cue, trigger_cues_json,
+                        activation_mode,
+                        evidence_confidence, utility, support_count, learned_at,
+                        last_decay_at, source_trace_id, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    ON CONFLICT(umo, fingerprint) DO UPDATE SET
+                        statement=excluded.statement,
+                        prospective_cue=excluded.prospective_cue,
+                        trigger_cues_json=excluded.trigger_cues_json,
+                        activation_mode=excluded.activation_mode,
+                        evidence_confidence=max(
+                            feedback_hypotheses.evidence_confidence,
+                            excluded.evidence_confidence
+                        ),
+                        utility=min(4, feedback_hypotheses.utility + excluded.utility),
+                        support_count=feedback_hypotheses.support_count + 1,
+                        status='ACTIVE', merged_into=NULL,
+                        merge_previous_status='',
+                        expires_at=max(feedback_hypotheses.expires_at, excluded.expires_at),
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        umo,
+                        fingerprint,
+                        decision.scope_type,
+                        decision.scope_key,
+                        decision.aspect,
+                        decision.statement,
+                        decision.prospective_cue,
+                        self._bounded_json(list(decision.trigger_cues), max_chars=1200),
+                        decision.activation_mode,
+                        decision.confidence,
+                        increment,
+                        feedback_sent_at,
+                        feedback_sent_at,
+                        decision.target_trace_id,
+                        expires_at,
+                    ),
+                )
+                hypothesis = self._connection.execute(
+                    "SELECT id FROM feedback_hypotheses WHERE umo = ? AND fingerprint = ?",
+                    (umo, fingerprint),
+                ).fetchone()
+                hypothesis_id = int(hypothesis["id"])
+                relation = "SUPPORTS_CORRECTION"
+            else:
+                hypothesis_id = int(decision.target_hypothesis_id or 0)
+                hypothesis = self._connection.execute(
+                    """
+                    SELECT id, scope_type, scope_key, learned_at, status
+                    FROM feedback_hypotheses WHERE id = ? AND umo = ?
+                    """,
+                    (hypothesis_id, umo),
+                ).fetchone()
+                if hypothesis is None:
+                    raise ValueError("target hypothesis belongs to another group")
+                if (
+                    str(hypothesis["scope_type"]) != decision.scope_type
+                    or str(hypothesis["scope_key"]) != decision.scope_key
+                ):
+                    raise ValueError("target hypothesis is outside the decision scope")
+                if int(hypothesis["learned_at"]) >= feedback_sent_at:
+                    raise ValueError("target hypothesis was not available at feedback time")
+                if str(hypothesis["status"]) == "MERGED":
+                    raise ValueError("target hypothesis is a merged materialized view")
+                amount = abs(decision.feedback_valence) * decision.confidence
+                if decision.mutation == "reinforce":
+                    self._connection.execute(
+                        """
+                        UPDATE feedback_hypotheses
+                        SET utility=min(4, utility + ?),
+                            evidence_confidence=max(evidence_confidence, ?),
+                            support_count=support_count + 1,
+                            status='ACTIVE', updated_at=CURRENT_TIMESTAMP
+                        WHERE id = ? AND umo = ?
+                        """,
+                        (amount, decision.confidence, hypothesis_id, umo),
+                    )
+                    relation = "SUPPORTS"
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE feedback_hypotheses
+                        SET utility=max(-4, utility - ?),
+                            contradict_count=contradict_count + 1,
+                            status=CASE WHEN utility - ? <= -1 THEN 'DORMANT'
+                                        ELSE status END,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id = ? AND umo = ?
+                        """,
+                        (amount, amount, hypothesis_id, umo),
+                    )
+                    relation = "CONTRADICTS"
+
+            source_key = str(proposal["feedback_source_key"])
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO hypothesis_evidence(
+                    hypothesis_id, feedback_source_key, trace_id, relation,
+                    valence, confidence
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    hypothesis_id,
+                    source_key,
+                    decision.target_trace_id,
+                    relation,
+                    decision.feedback_valence,
+                    decision.confidence,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO feedback_links(
+                    umo, trace_id, feedback_source_key, feedback_sent_at,
+                    link_method, link_confidence, feedback_valence
+                ) VALUES (?, ?, ?, ?, 'maintenance_agent', ?, ?)
+                """,
+                (
+                    umo,
+                    decision.target_trace_id,
+                    source_key,
+                    feedback_sent_at,
+                    decision.confidence,
+                    decision.feedback_valence,
+                ),
+            )
+            expires_at = int(trace["expires_at"])
+            feedback_node_key = f"feedback:{int(proposal_id)}"
+            hypothesis_node_key = f"hypothesis:{hypothesis_id}"
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, utility, expires_at
+                ) VALUES (?, ?, ?, 'feedback', ?, ?, ?, ?)
+                ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                    content_json=excluded.content_json,
+                    activation=excluded.activation,
+                    utility=excluded.utility
+                """,
+                (
+                    decision.target_trace_id,
+                    umo,
+                    feedback_node_key,
+                    self._bounded_json(
+                        {
+                            "source_key": source_key,
+                            "sent_at": feedback_sent_at,
+                            "excerpt": str(feedback["plain_text"])[:1200],
+                            "valence": decision.feedback_valence,
+                            "confidence": decision.confidence,
+                        }
+                    ),
+                    decision.confidence,
+                    decision.feedback_valence,
+                    expires_at,
+                ),
+            )
+            hypothesis_row = self._connection.execute(
+                """
+                SELECT aspect, prospective_cue, activation_mode, utility
+                FROM feedback_hypotheses WHERE id = ?
+                """,
+                (hypothesis_id,),
+            ).fetchone()
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, utility, expires_at
+                ) VALUES (?, ?, ?, 'hypothesis', ?, ?, ?, ?)
+                ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                    content_json=excluded.content_json,
+                    activation=max(trace_nodes.activation, excluded.activation),
+                    utility=excluded.utility
+                """,
+                (
+                    decision.target_trace_id,
+                    umo,
+                    hypothesis_node_key,
+                    self._bounded_json(
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "aspect": hypothesis_row["aspect"],
+                            "prospective_cue": hypothesis_row["prospective_cue"],
+                            "activation_mode": hypothesis_row["activation_mode"],
+                        }
+                    ),
+                    decision.confidence,
+                    float(hypothesis_row["utility"]),
+                    expires_at,
+                ),
+            )
+            nodes = self._connection.execute(
+                """
+                SELECT node_key, id FROM trace_nodes
+                WHERE trace_id = ? AND node_key IN ('response', ?, ?)
+                """,
+                (decision.target_trace_id, feedback_node_key, hypothesis_node_key),
+            ).fetchall()
+            node_ids = {str(row["node_key"]): int(row["id"]) for row in nodes}
+            if "response" in node_ids:
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO trace_edges(
+                        trace_id, umo, source_node_id, target_node_id, relation,
+                        contribution, eligibility
+                    ) VALUES (?, ?, ?, ?, 'RECEIVES_FEEDBACK', ?, 1)
+                    """,
+                    (
+                        decision.target_trace_id,
+                        umo,
+                        node_ids["response"],
+                        node_ids[feedback_node_key],
+                        decision.feedback_valence,
+                    ),
+                )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO trace_edges(
+                    trace_id, umo, source_node_id, target_node_id, relation,
+                    contribution, eligibility
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    decision.target_trace_id,
+                    umo,
+                    node_ids[feedback_node_key],
+                    node_ids[hypothesis_node_key],
+                    relation,
+                    decision.confidence,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE interaction_traces
+                SET status='FEEDBACK', updated_at=CURRENT_TIMESTAMP
+                WHERE trace_id = ? AND umo = ?
+                """,
+                (decision.target_trace_id, umo),
+            )
+            self._connection.execute(
+                """
+                UPDATE feedback_proposals
+                SET status='COMMITTED', decision_json=?,
+                    decided_at=CURRENT_TIMESTAMP
+                WHERE id = ? AND umo = ?
+                """,
+                (
+                    self._bounded_json(decision.as_dict()),
+                    int(proposal_id),
+                    umo,
+                ),
+            )
+        return {
+            "status": "COMMITTED",
+            "proposal_id": int(proposal_id),
+            "trace_id": decision.target_trace_id,
+            "hypothesis_id": hypothesis_id,
+            "backward_credit": round(total_credit, 6),
+        }
+
+    def reject_feedback_proposal(
+        self, *, umo: str, proposal_id: int, error: str
+    ) -> None:
+        self._assert_scope(umo)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE feedback_proposals
+                SET status='REJECTED', error=?, decided_at=CURRENT_TIMESTAMP
+                WHERE id = ? AND umo = ? AND status='PENDING'
+                """,
+                (str(error or "")[:500], int(proposal_id), umo),
+            )
+
+    def feedback_proposal_status(
+        self, *, umo: str, proposal_id: int
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id, status, error, decision_json, decided_at
+                FROM feedback_proposals WHERE id = ? AND umo = ?
+                """,
+                (int(proposal_id), umo),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            **dict(row),
+            "decision": json.loads(str(row["decision_json"])),
+        }
+
+    def merge_feedback_hypotheses(
+        self, *, umo: str, source_id: int, target_id: int
+    ) -> None:
+        """Reversible materialized-view merge; source evidence stays intact."""
+
+        if int(source_id) == int(target_id):
+            raise ValueError("cannot merge a hypothesis into itself")
+        self._assert_scope(umo)
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id, status, merged_into FROM feedback_hypotheses
+                WHERE umo = ? AND id IN (?, ?)
+                """,
+                (umo, int(source_id), int(target_id)),
+            ).fetchall()
+            if {int(row["id"]) for row in rows} != {int(source_id), int(target_id)}:
+                raise ValueError("merge crosses a group boundary or unknown hypothesis")
+            by_id = {int(row["id"]): row for row in rows}
+            source = by_id[int(source_id)]
+            target = by_id[int(target_id)]
+            if str(source["status"]) == "MERGED" or source["merged_into"] is not None:
+                raise ValueError("source hypothesis is already merged")
+            if str(target["status"]) != "ACTIVE" or target["merged_into"] is not None:
+                raise ValueError("merge target must be an active root hypothesis")
+            self._connection.execute(
+                """
+                UPDATE feedback_hypotheses
+                SET merge_previous_status=status, status='MERGED', merged_into=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id = ? AND umo = ?
+                """,
+                (int(target_id), int(source_id), umo),
+            )
+
+    def unmerge_feedback_hypothesis(self, *, umo: str, source_id: int) -> None:
+        self._assert_scope(umo)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE feedback_hypotheses
+                SET status=CASE
+                        WHEN merge_previous_status IN ('ACTIVE', 'DORMANT')
+                        THEN merge_previous_status ELSE 'ACTIVE' END,
+                    merged_into=NULL, merge_previous_status='',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id = ? AND umo = ? AND status='MERGED'
+                """,
+                (int(source_id), umo),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("hypothesis is not a merged member in this group")
+
+    def compact_feedback_memory(
+        self,
+        *,
+        umo: str,
+        now: int | None = None,
+        max_active_hypotheses: int = 200,
+        utility_half_life_days: float = 90.0,
+    ) -> dict[str, int]:
+        """Decay the active view without deleting append-only evidence."""
+
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        half_life = max(1.0, min(3650.0, float(utility_half_life_days)))
+        decayed = 0
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id, utility, last_decay_at
+                FROM feedback_hypotheses
+                WHERE umo = ? AND status IN ('ACTIVE', 'DORMANT')
+                  AND last_decay_at < ?
+                """,
+                (umo, current),
+            ).fetchall()
+            for row in rows:
+                elapsed_days = max(0.0, (current - int(row["last_decay_at"])) / 86400)
+                factor = math.pow(0.5, elapsed_days / half_life)
+                self._connection.execute(
+                    """
+                    UPDATE feedback_hypotheses
+                    SET utility=?, last_decay_at=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (float(row["utility"]) * factor, current, int(row["id"]), umo),
+                )
+                decayed += 1
+            expired_traces = self._connection.execute(
+                """
+                UPDATE interaction_traces
+                SET status='EXPIRED', updated_at=CURRENT_TIMESTAMP
+                WHERE umo = ? AND expires_at <= ?
+                  AND status NOT IN ('EXPIRED', 'COMPACTED')
+                """,
+                (umo, current),
+            ).rowcount
+            self._connection.execute(
+                """
+                UPDATE trace_nodes SET status='EXPIRED'
+                WHERE umo = ? AND expires_at IS NOT NULL AND expires_at <= ?
+                  AND status='ACTIVE'
+                """,
+                (umo, current),
+            )
+            expired_hypotheses = self._connection.execute(
+                """
+                UPDATE feedback_hypotheses
+                SET status='DORMANT', updated_at=CURRENT_TIMESTAMP
+                WHERE umo = ? AND status='ACTIVE'
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (umo, current),
+            ).rowcount
+            keep = max(1, min(5000, int(max_active_hypotheses)))
+            active = self._connection.execute(
+                """
+                SELECT id FROM feedback_hypotheses
+                WHERE umo = ? AND status='ACTIVE'
+                ORDER BY utility DESC, evidence_confidence DESC,
+                         COALESCE(last_activated_at, learned_at) DESC, id DESC
+                """,
+                (umo,),
+            ).fetchall()
+            dormant_by_budget = 0
+            if len(active) > keep:
+                stale_ids = [int(row["id"]) for row in active[keep:]]
+                placeholders = ",".join("?" for _ in stale_ids)
+                dormant_by_budget = self._connection.execute(
+                    f"""
+                    UPDATE feedback_hypotheses
+                    SET status='DORMANT', updated_at=CURRENT_TIMESTAMP
+                    WHERE umo = ? AND id IN ({placeholders})
+                    """,
+                    (umo, *stale_ids),
+                ).rowcount
+            expired_proposals = self._connection.execute(
+                """
+                UPDATE feedback_proposals
+                SET status='EXPIRED', error='maintenance deadline elapsed',
+                    decided_at=CURRENT_TIMESTAMP
+                WHERE umo = ? AND status='PENDING'
+                  AND feedback_sent_at < ?
+                """,
+                (umo, current - 604800),
+            ).rowcount
+        return {
+            "decayed_hypotheses": int(decayed),
+            "expired_traces": int(expired_traces),
+            "expired_hypotheses": int(expired_hypotheses),
+            "dormant_by_budget": int(dormant_by_budget),
+            "expired_proposals": int(expired_proposals),
+        }
+
+    def interaction_trace_graph(
+        self, *, umo: str, trace_id: str
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        with self._lock:
+            trace = self._connection.execute(
+                "SELECT * FROM interaction_traces WHERE trace_id = ? AND umo = ?",
+                (trace_id, umo),
+            ).fetchone()
+            if trace is None:
+                return None
+            nodes = self._connection.execute(
+                """
+                SELECT id, node_key, node_type, content_json, activation,
+                       utility, status, expires_at, created_at
+                FROM trace_nodes WHERE trace_id = ? AND umo = ? ORDER BY id
+                """,
+                (trace_id, umo),
+            ).fetchall()
+            edges = self._connection.execute(
+                """
+                SELECT e.id, s.node_key AS source, t.node_key AS target,
+                       e.relation, e.contribution, e.eligibility, e.credit
+                FROM trace_edges AS e
+                JOIN trace_nodes AS s ON s.id = e.source_node_id
+                JOIN trace_nodes AS t ON t.id = e.target_node_id
+                WHERE e.trace_id = ? AND e.umo = ? ORDER BY e.id
+                """,
+                (trace_id, umo),
+            ).fetchall()
+        return {
+            "trace": dict(trace),
+            "nodes": [
+                {**dict(row), "content": json.loads(str(row["content_json"]))}
+                for row in nodes
+            ],
+            "edges": [dict(row) for row in edges],
+        }
 
     @staticmethod
     def _make_fts_query(query: str) -> str:

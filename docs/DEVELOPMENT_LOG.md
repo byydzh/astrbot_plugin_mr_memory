@@ -102,3 +102,80 @@ response。管理员可在群内执行 `/mrmem usage [limit]` 查看该群最近
 `scripts/export_masked_call.py` 与 `scripts/masked_ab_experiment.py` 的
 `construct`、`materialize`、`fork`、`evaluate --host-evidence-gate` 四阶段命令；Provider
 配置必须来自本地忽略文件，不得写进命令输出或仓库。
+
+## 2026-08-05：后续反馈闭环真实历史 A/B
+
+### 实现对象
+
+0.8.0 为每次主请求持久化不含隐藏思维链的可观察工作图：request、已激活假设、主 Agent
+工具名与参数键/哈希、工具结果哈希、可见 response 和发送组件类型。后续消息进入反馈
+proposal，由独立 `deepseek/deepseek-v4-flash` 维护 Agent 检查有界上下文，再由宿主校验
+proposal 绑定、严格时间顺序、群/发送者 scope、修改阈值和激活模式，最后在一个 SQLite
+事务中写入 Feedback--Hypothesis 边。
+
+负反馈只对实际激活路径做 signed utility credit，不修改事实置信度。前瞻假设分为：
+
+- `always`：跨话题表达偏好，trigger 必须为空，直接走本地快门；
+- `semantic`：任务条件规则，必须有 trigger；字面未命中时交给私有潜意识 Agent 在有界
+  候选内判断语义改写。
+
+完整不变量见 [反馈图闭环](FEEDBACK_LOOP.md)。
+
+### 样本与遮罩协议
+
+从本地只读真实群聊快照选取两条明确的人类纠正及其更晚真实调用：
+
+1. `no_followup`：用户要求不要再用“你要是想”征询是否继续，而应直接给后续内容；
+2. `forced_choice`：用户否定端水回答，要求二选一时只能选一个。
+
+公开记录不写 UMO、数字 ID、昵称或完整上下文。每个 target 只包含其 cutoff 前最近 12 条
+消息；feedback 本身也必须严格早于 target。control 与 memory 使用相同的历史 persona、
+最近上下文和当前线上默认主模型 `openai/gemini-3.5-flash`，每个 arm 运行 3 次并交替顺序。
+维护/激活只执行一次，最终回答复用同一已验证学习结果。主回答上限固定为 1200 token，
+避免 500-token 调试上限被模型内部推理耗尽而产生空串或截断。
+
+确定性评分口径：`no_followup` 要求产生非空回答且不再出现征询是否继续的句式；
+`forced_choice` 要求明确选择西餐或日料之一，并且不出现条件式端水、反问或再次把选择交还
+用户。该口径只检查被反馈指出的行为，不评估答案中额外营养叙述的事实性。
+
+### 最终矩阵
+
+| 样本 | 历史真实回复 | 当前模型 Control | MR Feedback | 负对照误激活 |
+|---|---:|---:|---:|---:|
+| no_followup | FAIL | 3/3 | 3/3 | 0 |
+| forced_choice | FAIL | 0/3 | 3/3 | 0 |
+
+`no_followup` 被学习为 sender-scoped `always` 规则，目标调用经零 token 本地快门激活；另一
+发送者的无关二选一负对照在 scope gate 被直接拒绝。当前 Gemini 已在 control 中自行避免
+旧问题，因此此样本是天花板结果，不能声称记忆带来增益。
+
+`forced_choice` 被学习为 sender-scoped `semantic` 规则。词面 trigger“谁才是/只能选一个”
+没有出现在 target“西餐还是日料”中，私有激活 Agent 仍以 0.85 relevance 建立语义连接；
+同一发送者的无关改名请求返回 `NO_APPLICABLE_FEEDBACK`。Control 三次均重新给出条件式
+两边建议，Memory 三次均直接选择日料，形成该样本上的 0/3 -> 3/3 行为提升。
+
+### Token ledger
+
+| 样本 | 一次性维护 | 目标激活 | 负对照激活 | 3 次 Control | 3 次 Memory |
+|---|---:|---:|---:|---:|---:|
+| no_followup | 5,361 | 0 | 0 | 4,358 | 4,991 |
+| forced_choice | 5,138 | 979 | 832 | 3,459 | 4,187 |
+
+两个样本的一次性反馈维护与激活合计 12,310 token；最终 12 个回答 arm 合计 16,995
+token。这里报告 Provider usage 原值，不用字符数估算。真实运行时每个 feedback proposal
+都可能产生维护成本，因此功能保持默认关闭，并由每次唤醒上限和提交阈值约束。
+
+### 调试发现与边界
+
+- 首轮维护 prompt 没有给出完整 decision schema，Agent 无法可靠提交；已补成精确 JSON
+  schema。
+- Provider 曾返回截断的 tool-call JSON；harness 现在与运行时一样把工具错误回传并允许
+  重试，而不是把失败当实验结果。
+- 1000-token 维护调试上限出现“完成检查但没有提交”；最终维护上限提高到 1800。
+- Agent 曾把跨话题的“不要征询是否继续”误分为 semantic；prompt 现明确要求按未来规则
+  的适用范围分类，而不是按产生反馈时的话题词分类。
+- 两个样本只证明端到端反馈、语义桥接和负门控可以工作，不构成总体效果统计。下一阶段
+  需要更多不同用户/任务的盲评，并单独加入事实一致性与过度服从指标。
+
+本地审计产物为 `.dev/experiments/feedback-ab/bundle.json`、`result.json` 和 `report.md`；
+逐条真实正文、Provider 输出和失败前版本均保持 Git ignored。
