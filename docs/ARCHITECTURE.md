@@ -29,15 +29,42 @@ group's memory.
 - Raw messages are immutable evidence and are stored per group scope.
 - Distillation produces Cue--Tag--Episode, Person--Aspect--Semantic, and
   Topic--Episode units in the same scope.
+- Candidate initialization embeds distilled units and queries inside the plugin
+  with a local FastEmbed/ONNX model; it has no AstrBot provider or remote
+  inference boundary.
 - The private reconstruction loop has seven typed, scoped, read-only tools.
 - The main LLM does not see those low-level tools by default.
 - Empty graph scopes skip the private provider call entirely.
+- Historical experiments pass a strict `before_sent_at` cutoff through candidate
+  search and every traversal tool. They still use an isolated database because a
+  later topic or semantic revision could otherwise overwrite historical state.
+
+## Reconstruction control
+
+The LLM chooses graph paths, but it must not be the only component allowed to stop
+the search. The first real-call ablation showed that the model could retrieve the
+correct source event on its first tool call and still browse until it discarded the
+answer. A deterministic host evidence gate has therefore been validated offline:
+
+1. the event must come from the initial high-score episode candidates;
+2. raw event context must contain source keys;
+3. raw evidence and the query must have salient lexical overlap;
+4. passing the gate means “synthesize now”, never “the claim is true”.
+
+The gate remains a runtime TODO. It should be switchable so later masked experiments
+can compare identical runs with and without host stopping.
 
 ## Storage policy
 
 Keep source messages, graph revisions, provenance, feedback, and administrator
 decisions. Do not permanently keep hidden model reasoning, duplicated prompts,
 or attachment blobs. Only distilled nodes should receive embeddings by default.
+
+Developer observability uses three privacy-minimized tables. Experiment records
+store query hashes, status, and bounded metadata; usage records store token classes
+and latency; reconstruction records store tool arguments, evidence source keys, and
+result hashes. Runtime private-agent usage comes from AstrBot runner aggregate stats,
+so every internal LLM turn is included even though hidden reasoning is not retained.
 
 At the current deployment's observed traffic, the expected steady-state growth
 is roughly 250--500 MB per year with structured traces. This estimate must be

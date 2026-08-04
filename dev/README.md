@@ -12,10 +12,15 @@ Planned shadow runtime:
 - WebChat or a fake adapter only; no NapCat/OneBot configuration.
 - No production provider credentials.
 
-The current scaffold deliberately does not install or start that runtime. The
+The current repository deliberately does not install or start that runtime. The
 framework-independent core and replay tests are the first compatibility gate.
 
 Fixture JSONL uses `NormalizedMessage` fields. Production history exports must
 be one-way, read-only, and pseudonymized before they are added to this folder.
 Real exports and generated databases are ignored by Git; only the synthetic
 sample fixture is tracked.
+
+The private retrieval benchmark is documented in
+`docs/RETRIEVAL_BENCHMARK.md`. Its generated corpus and direct annotations live
+under the repository-level `.dev/benchmarks/` directory, never under this
+tracked fixture directory.

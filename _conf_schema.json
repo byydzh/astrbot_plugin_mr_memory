@@ -17,6 +17,66 @@
     "default": "deepseek/deepseek-v4-flash",
     "hint": "必须是 AstrBot 已配置的聊天模型 Provider ID。"
   },
+  "embedding_enabled": {
+    "description": "启用语义候选初始化",
+    "type": "bool",
+    "default": true,
+    "hint": "在 AstrBot 进程内使用插件自管的本地 ONNX 或 PyTorch 模型，不调用 AstrBot Embedding Provider 或远程推理 API。"
+  },
+  "embedding_backend": {
+    "description": "本地 Embedding 后端",
+    "type": "string",
+    "default": "fastembed",
+    "hint": "可选 fastembed（ONNX）或 sentence_transformers（PyTorch）。Harrier 使用 sentence_transformers。"
+  },
+  "embedding_model_name": {
+    "description": "本地 Embedding 模型",
+    "type": "string",
+    "default": "BAAI/bge-small-zh-v1.5",
+    "hint": "所选后端支持的 Hugging Face 模型名称；首次使用时下载到本插件数据目录。"
+  },
+  "embedding_cpu_threads": {
+    "description": "Embedding CPU 线程数",
+    "type": "int",
+    "default": 1,
+    "hint": "实际范围 1 到 8；2C2G 服务器建议保持 1。"
+  },
+  "embedding_batch_size": {
+    "description": "Embedding 批大小",
+    "type": "int",
+    "default": 16,
+    "hint": "FastEmbed 范围 1 到 128，Sentence Transformers 范围 1 到 32；2GB 内存运行 Harrier 建议 4。"
+  },
+  "embedding_query_prompt_name": {
+    "description": "Embedding 查询 Prompt",
+    "type": "string",
+    "default": "",
+    "hint": "仅用于 Sentence Transformers 查询向量，文档不加 prompt；Harrier 推荐 web_search_query。"
+  },
+  "embedding_max_seq_length": {
+    "description": "Embedding 最大 Token 数",
+    "type": "int",
+    "default": 512,
+    "hint": "Sentence Transformers 实际范围 32 到 4096；限制长文本推理峰值，不改变模型文件。"
+  },
+  "embedding_preload_on_startup": {
+    "description": "启动时预加载 Embedding",
+    "type": "bool",
+    "default": false,
+    "hint": "默认懒加载。仅建议部署验收时开启，以便启动日志记录模型维度和加载耗时。"
+  },
+  "embedding_top_k": {
+    "description": "初始向量候选数量",
+    "type": "int",
+    "default": 12,
+    "hint": "实际范围 1 到 50；候选只负责初始化，最终路径由潜意识主动遍历。"
+  },
+  "distillation_max_messages": {
+    "description": "单次蒸馏最大消息数",
+    "type": "int",
+    "default": 80,
+    "hint": "管理员 /mrmem distill 单次读取的最近消息上限，实际范围 4 到 500。"
+  },
   "wake_on_llm_request": {
     "description": "主 LLM 请求前自动唤醒潜意识",
     "type": "bool",

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.0
+
+- Add strict historical cutoffs to graph search and all seven traversal tools.
+- Add reverse-window masked-call construction and controlled A/B tooling for real
+  retained group calls without future leakage.
+- Add privacy-minimized experiment, token-usage, and reconstruction-step ledgers.
+- Record full private-agent aggregate usage at runtime instead of counting only
+  the final response, and expose recent per-group totals through `/mrmem usage`.
+- Validate a deterministic host evidence gate that stops needless graph browsing
+  once a high-score episode is verified against raw source messages.
+
+## 0.6.0
+
+- Add a plugin-owned Sentence Transformers backend alongside FastEmbed/ONNX.
+- Preserve checkpoint dtype with `dtype=auto` and support query-only named
+  prompts required by asymmetric models such as Harrier.
+- Bound Sentence Transformers batch size and maximum sequence length for
+  low-memory deployments.
+- Add an opt-in startup preload probe for deployment resource verification.
+
+## 0.5.0
+
+- Add an AstrBot-native Plugin Page console under `pages/console`.
+- Add authenticated Web APIs for scope overview, graph inspection, source-message
+  search, episode evidence, and explicit distillation.
+- Visualize Cue--Tag--Episode, Person--Aspect--Semantic, and Topic--Episode links.
+- Persist and verify each physical SQLite database's group-scope identity.
+- Keep console scope selection opaque and server-resolved; raw UMO values are never
+  accepted as API routing inputs.
+
+## 0.4.0
+
+- Reproduce the paper's validated episode, cue/tag, semantic-memory, and topic
+  construction path.
+- Add a plugin-owned local FastEmbed/ONNX backend and a dependency-free hash
+  backend for offline tests; no AstrBot Embedding Provider or remote embedding
+  API is used.
+- Initialize reconstruction from vector-matched cues, episodes, and topics.
+- Add `/mrmem distill` for explicit per-group graph construction.
+- Inject dynamic memory evidence as temporary user content on AstrBot 4.27.
+- Add an end-to-end offline reproduction fixture and regression test.
+
 ## 0.3.0
 
 - Add a plugin-owned provider, defaulting to

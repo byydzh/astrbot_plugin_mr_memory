@@ -1,0 +1,36 @@
+{
+  "episodes": [
+    {
+      "source_keys": [
+        "shadow|shadow:GroupMessage:group-a|1",
+        "shadow|shadow:GroupMessage:group-a|2"
+      ],
+      "started_at": 1785715200,
+      "ended_at": 1785718800,
+      "title": "方案 A 评审",
+      "summary": "群聊先考虑价格较低的方案 A，随后安全审查发现其权限隔离存在问题。",
+      "tag": "方案评审",
+      "cues": ["方案 A", "安全审查", "权限隔离", "价格"]
+    },
+    {
+      "source_keys": [
+        "shadow|shadow:GroupMessage:group-a|3",
+        "shadow|shadow:GroupMessage:group-a|4"
+      ],
+      "started_at": 1785722400,
+      "ended_at": 1785726000,
+      "title": "改用方案 B",
+      "summary": "群聊提议改用已经通过审查的方案 B，并最终决定停止推进方案 A。",
+      "tag": "方案选择",
+      "cues": ["方案 B", "最终决定", "通过审查", "方案 A"]
+    }
+  ],
+  "semantic_memories": [],
+  "topics": [
+    {
+      "name": "项目方案决策",
+      "summary": "项目从方案 A 转向方案 B 的评审和决策过程。",
+      "episode_indices": [0, 1]
+    }
+  ]
+}
