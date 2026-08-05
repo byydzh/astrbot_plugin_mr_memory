@@ -13,6 +13,83 @@ FeedbackScope = Literal["sender", "group"]
 FeedbackActivationMode = Literal["always", "semantic"]
 
 
+_FEEDBACK_SURFACE_MARKERS = (
+    "不对",
+    "错了",
+    "不是",
+    "不好",
+    "不行",
+    "别",
+    "不要",
+    "下次",
+    "应该",
+    "希望",
+    "太密",
+    "太多",
+    "太少",
+    "有点",
+    "更好",
+    "不错",
+    "可以",
+    "喜欢",
+    "讨厌",
+    "谢谢",
+    "改成",
+    "修正",
+    "还是",
+    "让你",
+    "直接",
+    "多点",
+    "少点",
+    "correct",
+    "wrong",
+    "too ",
+    "next time",
+    "prefer",
+)
+
+
+def feedback_surface_score(
+    text: str,
+    *,
+    reply_to_bot: bool,
+    seconds_after_response: int,
+    same_sender: bool,
+) -> tuple[float, tuple[str, ...]]:
+    """Cheap permissive gate; semantic attribution remains the private agent's job."""
+
+    value = str(text or "").strip().casefold()
+    if not value:
+        return 0.0, ()
+    reasons: list[str] = []
+    score = 0.0
+    lexical_signal = any(
+        marker in value for marker in _FEEDBACK_SURFACE_MARKERS
+    )
+    if not reply_to_bot and not lexical_signal:
+        return 0.0, ()
+    if reply_to_bot:
+        score += 0.75
+        reasons.append("reply_to_bot")
+    if lexical_signal:
+        score += 0.45
+        reasons.append("feedback_lexicon")
+    delay = max(0, int(seconds_after_response))
+    if delay <= 300:
+        score += 0.20
+        reasons.append("within_5m")
+    elif delay <= 900:
+        score += 0.10
+        reasons.append("within_15m")
+    if same_sender and delay <= 1800:
+        score += 0.15
+        reasons.append("same_sender")
+    if len(value) <= 80:
+        score += 0.05
+        reasons.append("short_followup")
+    return min(1.0, score), tuple(reasons)
+
+
 @dataclass(frozen=True, slots=True)
 class FeedbackDecision:
     """A bounded mutation proposed by the private maintenance agent.

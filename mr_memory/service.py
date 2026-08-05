@@ -10,7 +10,7 @@ from .distillation import (
 )
 from .embedding import EmbeddingBackend
 from .feedback import FeedbackDecision
-from .models import NormalizedMessage, StoredMessage
+from .models import DistillationWorkItem, NormalizedMessage, StoredMessage
 from .storage import MemoryStorage
 
 
@@ -22,6 +22,53 @@ class MemoryService:
 
     async def ingest(self, message: NormalizedMessage) -> bool:
         return await asyncio.to_thread(self.storage.upsert_message, message)
+
+    async def mark_message_deleted(self, **kwargs: object) -> bool:
+        return await asyncio.to_thread(self.storage.mark_message_deleted, **kwargs)
+
+    async def is_account_forgotten(self, **kwargs: object) -> bool:
+        return await asyncio.to_thread(self.storage.is_account_forgotten, **kwargs)
+
+    async def forget_account(self, **kwargs: object) -> dict[str, int]:
+        return await asyncio.to_thread(self.storage.forget_account, **kwargs)
+
+    async def bind_participant_alias(self, **kwargs: object) -> dict[str, object]:
+        return await asyncio.to_thread(self.storage.bind_participant_alias, **kwargs)
+
+    async def resolve_participants(self, **kwargs: object) -> dict[str, object]:
+        return await asyncio.to_thread(self.storage.resolve_participants, **kwargs)
+
+    async def list_participants(self, **kwargs: object) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.storage.list_participants, **kwargs)
+
+    async def distillation_identity_context(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.distillation_identity_context, **kwargs
+        )
+
+    async def pending_distillation_count(self, *, umo: str) -> int:
+        return await asyncio.to_thread(
+            self.storage.pending_distillation_count, umo=umo
+        )
+
+    async def next_distillation_batch(
+        self, **kwargs: object
+    ) -> DistillationWorkItem | None:
+        return await asyncio.to_thread(
+            self.storage.next_distillation_batch, **kwargs
+        )
+
+    async def finish_distillation_batch(self, **kwargs: object) -> None:
+        await asyncio.to_thread(self.storage.finish_distillation_batch, **kwargs)
+
+    async def record_distillation_ignored_sources(
+        self, **kwargs: object
+    ) -> None:
+        await asyncio.to_thread(
+            self.storage.record_distillation_ignored_sources, **kwargs
+        )
 
     async def search(
         self,
@@ -98,6 +145,13 @@ class MemoryService:
             limit=limit,
         )
 
+    async def private_token_usage_since(self, *, umo: str, since: int) -> int:
+        return await asyncio.to_thread(
+            self.storage.private_token_usage_since,
+            umo=umo,
+            since=since,
+        )
+
     async def apply_distillation(
         self,
         batch: DistillationBatch,
@@ -128,6 +182,7 @@ class MemoryService:
         query: str,
         embedding_backend: EmbeddingBackend,
         limit: int = 12,
+        min_score: float = -1.0,
         before_sent_at: int | None = None,
     ) -> dict[str, list[dict[str, object]]]:
         query_vector = await embedding_backend.embed_query(query)
@@ -137,6 +192,7 @@ class MemoryService:
             model=embedding_backend.model_id,
             query_vector=query_vector,
             limit=limit,
+            min_score=min_score,
             before_sent_at=before_sent_at,
         )
         return await asyncio.to_thread(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -17,13 +18,23 @@ from .embedding import (
 from .feedback import (
     FeedbackDecision,
     backward_credit_delta,
+    feedback_surface_score,
     hypothesis_fingerprint,
     rank_hypotheses,
 )
-from .models import NormalizedMessage, StoredMessage
+from .identity import (
+    attachment_metadata,
+    canonical_participant_key,
+    content_fingerprint,
+    extract_mentions,
+    extract_reply,
+    normalize_alias,
+    sanitize_components,
+)
+from .models import DistillationWorkItem, NormalizedMessage, StoredMessage
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class MemoryStorage:
@@ -42,6 +53,22 @@ class MemoryStorage:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = NORMAL")
         self._migrate()
+        self._restrict_file_permissions()
+
+    def _restrict_file_permissions(self) -> None:
+        """Keep plaintext group stores private to the AstrBot OS account."""
+
+        if os.name == "nt":
+            return
+        try:
+            os.chmod(self.database_path.parent, 0o700)
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(f"{self.database_path}{suffix}")
+                if path.exists():
+                    os.chmod(path, 0o600)
+        except OSError:
+            # Deployment policy may own these modes; storage remains usable.
+            pass
 
     def _migrate(self) -> None:
         with self._lock, self._connection:
@@ -77,6 +104,119 @@ class MemoryStorage:
                     is_deleted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS participants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    platform_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    account_type TEXT NOT NULL DEFAULT 'USER',
+                    current_display_name TEXT NOT NULL DEFAULT '',
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, platform_id, account_id),
+                    UNIQUE (umo, canonical_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_participants_scope_account
+                    ON participants (umo, account_id);
+
+                CREATE TABLE IF NOT EXISTS participant_aliases (
+                    participant_id INTEGER NOT NULL
+                        REFERENCES participants(id) ON DELETE CASCADE,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    observation_count INTEGER NOT NULL DEFAULT 1,
+                    source_kind TEXT NOT NULL DEFAULT 'observed',
+                    confidence REAL NOT NULL DEFAULT 1,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (participant_id, normalized_alias)
+                );
+                CREATE INDEX IF NOT EXISTS idx_participant_alias_lookup
+                    ON participant_aliases (normalized_alias, participant_id);
+
+                CREATE TABLE IF NOT EXISTS forgotten_accounts (
+                    umo TEXT NOT NULL,
+                    platform_id TEXT NOT NULL,
+                    account_hash TEXT NOT NULL,
+                    requested_at INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT 'self_service',
+                    PRIMARY KEY (umo, platform_id, account_hash)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    revision_no INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    plain_text TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    revision_kind TEXT NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (message_id, revision_no)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_processing (
+                    message_id INTEGER PRIMARY KEY REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    content_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    batch_key TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    distilled_at INTEGER,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_processing_pending
+                    ON message_processing (status, message_id);
+
+                CREATE TABLE IF NOT EXISTS message_participants (
+                    message_id INTEGER NOT NULL REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    participant_id INTEGER NOT NULL REFERENCES participants(id),
+                    relation TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    evidence TEXT NOT NULL DEFAULT 'host',
+                    PRIMARY KEY (message_id, participant_id, relation, position)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    source_message_id INTEGER NOT NULL REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    relation TEXT NOT NULL,
+                    target_message_id INTEGER REFERENCES messages(id),
+                    target_source_key TEXT NOT NULL DEFAULT '',
+                    target_platform_message_id TEXT NOT NULL DEFAULT '',
+                    target_participant_id INTEGER REFERENCES participants(id),
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (source_message_id, relation, target_source_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    message_id INTEGER NOT NULL REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    attachment_type TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    reference_sha256 TEXT NOT NULL DEFAULT '',
+                    extraction_status TEXT NOT NULL DEFAULT 'METADATA_ONLY',
+                    descriptor_text TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (message_id, position)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_messages_umo_time
@@ -149,6 +289,28 @@ class MemoryStorage:
                 CREATE INDEX IF NOT EXISTS idx_semantic_person_aspect
                     ON semantic_memories (umo, person_cue, aspect_tag);
 
+                CREATE TABLE IF NOT EXISTS semantic_memory_sources (
+                    semantic_memory_id INTEGER NOT NULL
+                        REFERENCES semantic_memories(id) ON DELETE CASCADE,
+                    message_id INTEGER NOT NULL REFERENCES messages(id),
+                    evidence_role TEXT NOT NULL DEFAULT 'SUPPORT',
+                    source_span TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (semantic_memory_id, message_id, evidence_role)
+                );
+
+                CREATE TABLE IF NOT EXISTS semantic_memory_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    semantic_memory_id INTEGER NOT NULL
+                        REFERENCES semantic_memories(id) ON DELETE CASCADE,
+                    previous_status TEXT NOT NULL,
+                    new_status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    source_message_id INTEGER REFERENCES messages(id),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS topics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     umo TEXT NOT NULL,
@@ -162,6 +324,16 @@ class MemoryStorage:
                     topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
                     episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
                     PRIMARY KEY (topic_id, episode_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_id INTEGER NOT NULL REFERENCES topics(id)
+                        ON DELETE CASCADE,
+                    previous_summary TEXT NOT NULL,
+                    proposed_summary TEXT NOT NULL,
+                    extractor_version TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS entities (
@@ -244,6 +416,28 @@ class MemoryStorage:
                     last_error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS distillation_batches (
+                    batch_key TEXT PRIMARY KEY,
+                    umo TEXT NOT NULL,
+                    target_source_keys_json TEXT NOT NULL,
+                    target_hashes_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'RUNNING',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_distillation_batches_scope
+                    ON distillation_batches (umo, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS distillation_ignored_sources (
+                    batch_key TEXT NOT NULL REFERENCES distillation_batches(batch_key)
+                        ON DELETE CASCADE,
+                    source_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (batch_key, source_key)
                 );
 
                 CREATE TABLE IF NOT EXISTS experiment_runs (
@@ -402,6 +596,8 @@ class MemoryStorage:
                     feedback_source_key TEXT NOT NULL,
                     feedback_sent_at INTEGER NOT NULL,
                     candidate_trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                    surface_score REAL NOT NULL DEFAULT 0,
+                    candidate_reason TEXT NOT NULL DEFAULT '',
                     decision_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'PENDING',
                     error TEXT NOT NULL DEFAULT '',
@@ -438,6 +634,97 @@ class MemoryStorage:
                 );
                 """
             )
+
+            def ensure_column(table: str, name: str, declaration: str) -> None:
+                columns = {
+                    str(row["name"])
+                    for row in self._connection.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+                if name not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
+
+            ensure_column(
+                "messages",
+                "sender_participant_id",
+                "INTEGER REFERENCES participants(id)",
+            )
+            ensure_column("messages", "content_sha256", "TEXT NOT NULL DEFAULT ''")
+            ensure_column("messages", "revision_no", "INTEGER NOT NULL DEFAULT 1")
+            ensure_column("messages", "deleted_at", "INTEGER")
+            ensure_column("episodes", "stable_key", "TEXT NOT NULL DEFAULT ''")
+            ensure_column("episodes", "revision_no", "INTEGER NOT NULL DEFAULT 1")
+            ensure_column(
+                "episodes",
+                "updated_at",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            ensure_column(
+                "semantic_memories",
+                "stable_key",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            ensure_column(
+                "semantic_memories",
+                "subject_participant_id",
+                "INTEGER REFERENCES participants(id)",
+            )
+            ensure_column(
+                "semantic_memories", "subject_text", "TEXT NOT NULL DEFAULT ''"
+            )
+            ensure_column(
+                "semantic_memories", "claim_type", "TEXT NOT NULL DEFAULT 'FACT'"
+            )
+            ensure_column(
+                "semantic_memories",
+                "epistemic_status",
+                "TEXT NOT NULL DEFAULT 'ASSERTED'",
+            )
+            ensure_column(
+                "semantic_memories", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'"
+            )
+            ensure_column(
+                "semantic_memories",
+                "superseded_by",
+                "INTEGER REFERENCES semantic_memories(id)",
+            )
+            ensure_column(
+                "semantic_memories",
+                "updated_at",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._connection.execute(
+                "UPDATE episodes SET updated_at=CURRENT_TIMESTAMP WHERE updated_at=''"
+            )
+            self._connection.execute(
+                """
+                UPDATE semantic_memories SET updated_at=CURRENT_TIMESTAMP
+                WHERE updated_at=''
+                """
+            )
+            ensure_column(
+                "feedback_proposals", "surface_score", "REAL NOT NULL DEFAULT 0"
+            )
+            ensure_column(
+                "feedback_proposals",
+                "candidate_reason",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_stable_key
+                ON episodes (umo, stable_key) WHERE stable_key <> ''
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_semantic_stable_key
+                ON semantic_memories (umo, stable_key, status)
+                """
+            )
             hypothesis_columns = {
                 str(row["name"])
                 for row in self._connection.execute(
@@ -465,6 +752,466 @@ class MemoryStorage:
                 """,
                 (str(SCHEMA_VERSION),),
             )
+            backfill = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='truth_v2_backfill'"
+            ).fetchone()
+            if backfill is None or str(backfill["value"]) != str(SCHEMA_VERSION):
+                self._backfill_truth_v2()
+                self._connection.execute(
+                    """
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('truth_v2_backfill', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (str(SCHEMA_VERSION),),
+                )
+            # A process kill or cancellation can occur after a batch claims rows but
+            # before its normal completion handler runs. Recover those rows on every
+            # open so the oldest-first checkpoint cannot become permanently stuck.
+            self._connection.execute(
+                """
+                UPDATE distillation_batches
+                SET status='FAILED', error='interrupted before completion',
+                    finished_at=CURRENT_TIMESTAMP
+                WHERE status='RUNNING'
+                """
+            )
+            self._connection.execute(
+                """
+                UPDATE message_processing
+                SET status='FAILED', batch_key='',
+                    last_error='interrupted before completion',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE status='PROCESSING'
+                """
+            )
+
+    def _upsert_alias_locked(
+        self,
+        *,
+        participant_id: int,
+        alias: str,
+        seen_at: int,
+        source_kind: str,
+        confidence: float = 1.0,
+    ) -> None:
+        display = str(alias or "").strip()[:300]
+        normalized = normalize_alias(display)
+        if not normalized:
+            return
+        self._connection.execute(
+            """
+            INSERT INTO participant_aliases(
+                participant_id, alias, normalized_alias, first_seen_at,
+                last_seen_at, source_kind, confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(participant_id, normalized_alias) DO UPDATE SET
+                alias=CASE
+                    WHEN excluded.last_seen_at >= participant_aliases.last_seen_at
+                    THEN excluded.alias
+                    ELSE participant_aliases.alias
+                END,
+                last_seen_at=MAX(participant_aliases.last_seen_at,
+                                 excluded.last_seen_at),
+                observation_count=participant_aliases.observation_count + 1,
+                source_kind=CASE
+                    WHEN participant_aliases.source_kind = 'administrator'
+                    THEN participant_aliases.source_kind
+                    ELSE excluded.source_kind
+                END,
+                confidence=MAX(participant_aliases.confidence,
+                               excluded.confidence),
+                is_active=1,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                int(participant_id),
+                display,
+                normalized,
+                int(seen_at),
+                int(seen_at),
+                str(source_kind or "observed"),
+                max(0.0, min(1.0, float(confidence))),
+            ),
+        )
+
+    def _upsert_participant_locked(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+        display_name: str,
+        seen_at: int,
+        account_type: str = "USER",
+        alias_source: str = "observed",
+    ) -> int | None:
+        account = str(account_id or "").strip()
+        platform = str(platform_id or "").strip()
+        if not account or not platform or account.casefold() == "all":
+            return None
+        forgotten_hash = self._forgotten_account_hash(
+            umo=umo,
+            platform_id=platform,
+            account_id=account,
+        )
+        if self._connection.execute(
+            """
+            SELECT 1 FROM forgotten_accounts
+            WHERE umo = ? AND platform_id = ? AND account_hash = ?
+            """,
+            (umo, platform, forgotten_hash),
+        ).fetchone():
+            return None
+        kind = str(account_type or "USER").strip().upper()
+        if kind not in {"USER", "BOT", "UNKNOWN"}:
+            kind = "UNKNOWN"
+        key = canonical_participant_key(platform, account)
+        display = str(display_name or "").strip()[:300]
+        verified_display = display if alias_source == "observed" else ""
+        self._connection.execute(
+            """
+            INSERT INTO participants(
+                umo, platform_id, account_id, canonical_key, account_type,
+                current_display_name, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(umo, platform_id, account_id) DO UPDATE SET
+                account_type=CASE
+                    WHEN participants.account_type = 'BOT' THEN 'BOT'
+                    WHEN excluded.account_type = 'BOT' THEN 'BOT'
+                    WHEN participants.account_type = 'UNKNOWN'
+                    THEN excluded.account_type
+                    ELSE participants.account_type
+                END,
+                current_display_name=CASE
+                    WHEN excluded.current_display_name <> '' AND ? = 1
+                         AND excluded.last_seen_at >= participants.last_seen_at
+                    THEN excluded.current_display_name
+                    WHEN participants.current_display_name = ''
+                         AND excluded.current_display_name <> ''
+                    THEN excluded.current_display_name
+                    ELSE participants.current_display_name
+                END,
+                first_seen_at=MIN(participants.first_seen_at,
+                                  excluded.first_seen_at),
+                last_seen_at=MAX(participants.last_seen_at,
+                                 excluded.last_seen_at),
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                umo,
+                platform,
+                account,
+                key,
+                kind,
+                verified_display,
+                int(seen_at),
+                int(seen_at),
+                1 if alias_source == "observed" else 0,
+            ),
+        )
+        row = self._connection.execute(
+            """
+            SELECT id FROM participants
+            WHERE umo = ? AND platform_id = ? AND account_id = ?
+            """,
+            (umo, platform, account),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("participant upsert did not return an identity")
+        participant_id = int(row["id"])
+        self._upsert_alias_locked(
+            participant_id=participant_id,
+            alias=display,
+            seen_at=seen_at,
+            source_kind=alias_source,
+        )
+        return participant_id
+
+    @staticmethod
+    def _parse_content_json(value: object) -> list[dict[str, object]]:
+        try:
+            parsed = json.loads(str(value or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if isinstance(item, dict)]
+
+    def _refresh_message_links_locked(
+        self,
+        *,
+        message_id: int,
+        umo: str,
+        platform_id: str,
+        source_key: str,
+        platform_message_id: str,
+        sender_participant_id: int | None,
+        sent_at: int,
+        content: list[dict[str, object]],
+    ) -> None:
+        self._connection.execute(
+            "DELETE FROM message_participants WHERE message_id = ?",
+            (int(message_id),),
+        )
+        self._connection.execute(
+            "DELETE FROM message_relations WHERE source_message_id = ?",
+            (int(message_id),),
+        )
+        self._connection.execute(
+            "DELETE FROM message_attachments WHERE message_id = ?",
+            (int(message_id),),
+        )
+        if sender_participant_id is not None:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO message_participants(
+                    message_id, participant_id, relation, position, evidence
+                ) VALUES (?, ?, 'SPEAKER', 0, 'platform_account')
+                """,
+                (int(message_id), int(sender_participant_id)),
+            )
+
+        for position, mention in enumerate(extract_mentions(content), start=1):
+            participant_id = self._upsert_participant_locked(
+                umo=umo,
+                platform_id=platform_id,
+                account_id=mention.account_id,
+                display_name=mention.display_name,
+                seen_at=sent_at,
+                account_type="UNKNOWN",
+                alias_source="mention",
+            )
+            if participant_id is None:
+                continue
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO message_participants(
+                    message_id, participant_id, relation, position, evidence
+                ) VALUES (?, ?, 'MENTIONED', ?, 'platform_mention')
+                """,
+                (int(message_id), int(participant_id), int(position)),
+            )
+
+        reply = extract_reply(content)
+        if reply is not None:
+            target_participant_id = self._upsert_participant_locked(
+                umo=umo,
+                platform_id=platform_id,
+                account_id=reply.sender_id,
+                display_name=reply.sender_name,
+                seen_at=reply.sent_at or sent_at,
+                account_type="UNKNOWN",
+                alias_source="reply",
+            )
+            target = self._connection.execute(
+                """
+                SELECT id, source_key FROM messages
+                WHERE umo = ? AND platform_id = ? AND message_id = ?
+                  AND is_deleted = 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (umo, platform_id, reply.message_id),
+            ).fetchone()
+            if target is None and target_participant_id is not None:
+                parameters: list[object] = [
+                    umo,
+                    int(target_participant_id),
+                    int(reply.sent_at or sent_at),
+                ]
+                text_sql = ""
+                if reply.plain_text:
+                    text_sql = " AND plain_text = ?"
+                    parameters.append(reply.plain_text)
+                target = self._connection.execute(
+                    f"""
+                    SELECT id, source_key FROM messages
+                    WHERE umo = ? AND sender_participant_id = ?
+                      AND ABS(sent_at - ?) <= 180{text_sql}
+                      AND is_deleted = 0
+                    ORDER BY ABS(sent_at - ?), id DESC LIMIT 1
+                    """,
+                    (*parameters, int(reply.sent_at or sent_at)),
+                ).fetchone()
+            target_source_key = (
+                str(target["source_key"])
+                if target is not None
+                else "|".join((platform_id, umo, reply.message_id))
+            )
+            metadata = {
+                "reply_sender_id": reply.sender_id,
+                "reply_sender_name": reply.sender_name,
+                "reply_sent_at": reply.sent_at,
+                "reply_text": reply.plain_text[:2000],
+                "resolved": target is not None,
+            }
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO message_relations(
+                    umo, source_message_id, relation, target_message_id,
+                    target_source_key, target_platform_message_id,
+                    target_participant_id, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    umo,
+                    int(message_id),
+                    reply.relation,
+                    int(target["id"]) if target is not None else None,
+                    target_source_key,
+                    reply.message_id,
+                    target_participant_id,
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            if target_participant_id is not None:
+                self._connection.execute(
+                    """
+                    INSERT OR REPLACE INTO message_participants(
+                        message_id, participant_id, relation, position, evidence
+                    ) VALUES (?, ?, 'REPLY_TARGET', 0, 'platform_reply')
+                    """,
+                    (int(message_id), int(target_participant_id)),
+                )
+
+        for attachment in attachment_metadata(content):
+            self._connection.execute(
+                """
+                INSERT INTO message_attachments(
+                    message_id, position, attachment_type, name,
+                    reference_sha256
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    int(message_id),
+                    int(attachment["position"]),
+                    str(attachment["kind"]),
+                    str(attachment["name"]),
+                    str(attachment["reference_sha256"]),
+                ),
+            )
+
+    def _backfill_truth_v2(self) -> None:
+        rows = self._connection.execute(
+            """
+            SELECT id, source_key, platform_id, umo, message_id, sender_id,
+                   sender_name, sent_at, plain_text, content_json, role,
+                   is_deleted, content_sha256, sender_participant_id
+            FROM messages ORDER BY id
+            """
+        ).fetchall()
+        for row in rows:
+            content = self._scrub_forgotten_references_locked(
+                umo=str(row["umo"]),
+                platform_id=str(row["platform_id"]),
+                content=sanitize_components(
+                    self._parse_content_json(row["content_json"])
+                ),
+            )
+            digest = content_fingerprint(
+                sender_id=str(row["sender_id"]),
+                role=str(row["role"]),
+                plain_text=str(row["plain_text"]),
+                content=content,
+            )
+            participant_id = row["sender_participant_id"]
+            if participant_id is None:
+                participant_id = self._upsert_participant_locked(
+                    umo=str(row["umo"]),
+                    platform_id=str(row["platform_id"]),
+                    account_id=str(row["sender_id"]),
+                    display_name=str(row["sender_name"]),
+                    seen_at=int(row["sent_at"]),
+                    account_type=("BOT" if str(row["role"]) == "BOT" else "USER"),
+                )
+            self._connection.execute(
+                """
+                UPDATE messages
+                SET content_json = ?, content_sha256 = ?,
+                    sender_participant_id = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        content,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    digest,
+                    participant_id,
+                    int(row["id"]),
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO message_processing(
+                    message_id, content_sha256, status
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    content_sha256=excluded.content_sha256,
+                    status=excluded.status, batch_key='', attempts=0,
+                    last_error='', distilled_at=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    int(row["id"]),
+                    digest,
+                    "DELETED" if int(row["is_deleted"]) else "PENDING",
+                ),
+            )
+            self._refresh_message_links_locked(
+                message_id=int(row["id"]),
+                umo=str(row["umo"]),
+                platform_id=str(row["platform_id"]),
+                source_key=str(row["source_key"]),
+                platform_message_id=str(row["message_id"]),
+                sender_participant_id=(
+                    int(participant_id) if participant_id is not None else None
+                ),
+                sent_at=int(row["sent_at"]),
+                content=content,
+            )
+
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO semantic_memory_sources(
+                semantic_memory_id, message_id, evidence_role, confidence
+            )
+            SELECT id, source_message_id, 'SUPPORT', confidence
+            FROM semantic_memories WHERE source_message_id IS NOT NULL
+            """
+        )
+        legacy_semantics = self._connection.execute(
+            """
+            SELECT id, umo, person_cue FROM semantic_memories
+            WHERE subject_participant_id IS NULL
+            """
+        ).fetchall()
+        for semantic in legacy_semantics:
+            aliases = self._connection.execute(
+                """
+                SELECT DISTINCT p.id
+                FROM participant_aliases AS a
+                JOIN participants AS p ON p.id = a.participant_id
+                WHERE p.umo = ? AND a.normalized_alias = ? AND a.is_active = 1
+                """,
+                (str(semantic["umo"]), normalize_alias(semantic["person_cue"])),
+            ).fetchall()
+            if len(aliases) == 1:
+                self._connection.execute(
+                    """
+                    UPDATE semantic_memories
+                    SET subject_participant_id = ?, subject_text = person_cue
+                    WHERE id = ?
+                    """,
+                    (int(aliases[0]["id"]), int(semantic["id"])),
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -544,33 +1291,183 @@ class MemoryStorage:
             "group_id": str(rows[0]["group_id"]),
         }
 
+    def _invalidate_message_derivations_locked(
+        self,
+        *,
+        message_id: int,
+        reason: str,
+    ) -> None:
+        episode_rows = self._connection.execute(
+            "SELECT episode_id FROM episode_messages WHERE message_id = ?",
+            (int(message_id),),
+        ).fetchall()
+        episode_ids = [int(row["episode_id"]) for row in episode_rows]
+        if episode_ids:
+            placeholders = ",".join("?" for _ in episode_ids)
+            self._connection.execute(
+                f"""
+                UPDATE episodes SET status = 'STALE', updated_at=CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders})
+                """,
+                episode_ids,
+            )
+            for episode_id in episode_ids:
+                self._connection.execute(
+                    """
+                    DELETE FROM memory_embeddings
+                    WHERE owner_type = 'episode' AND owner_key = ?
+                    """,
+                    (str(episode_id),),
+                )
+
+        semantic_rows = self._connection.execute(
+            """
+            SELECT DISTINCT semantic_memory_id
+            FROM semantic_memory_sources WHERE message_id = ?
+            """,
+            (int(message_id),),
+        ).fetchall()
+        for row in semantic_rows:
+            semantic_id = int(row["semantic_memory_id"])
+            current = self._connection.execute(
+                "SELECT status FROM semantic_memories WHERE id = ?",
+                (semantic_id,),
+            ).fetchone()
+            if current is None or str(current["status"]) in {
+                "RETRACTED",
+                "SUPERSEDED",
+            }:
+                continue
+            self._connection.execute(
+                """
+                UPDATE semantic_memories
+                SET status = 'STALE', updated_at=CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (semantic_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO semantic_memory_revisions(
+                    semantic_memory_id, previous_status, new_status, reason,
+                    source_message_id
+                ) VALUES (?, ?, 'STALE', ?, ?)
+                """,
+                (
+                    semantic_id,
+                    str(current["status"]),
+                    str(reason)[:500],
+                    int(message_id),
+                ),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM memory_embeddings
+                WHERE owner_type = 'semantic' AND owner_key = ?
+                """,
+                (str(semantic_id),),
+            )
+
     def upsert_message(self, message: NormalizedMessage) -> bool:
         source_key = message.resolved_source_key()
-        content_json = json.dumps(
-            message.content,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         with self._lock, self._connection:
-            existed = self._connection.execute(
-                "SELECT 1 FROM messages WHERE source_key = ?",
+            if self._is_account_forgotten_locked(
+                umo=message.umo,
+                platform_id=message.platform_id,
+                account_id=message.sender_id,
+            ):
+                return False
+            content = self._scrub_forgotten_references_locked(
+                umo=message.umo,
+                platform_id=message.platform_id,
+                content=sanitize_components(message.content),
+            )
+            content_json = json.dumps(
+                content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            digest = content_fingerprint(
+                sender_id=message.sender_id,
+                role=message.role,
+                plain_text=message.plain_text,
+                content=content,
+            )
+            existing = self._connection.execute(
+                """
+                SELECT id, content_sha256, plain_text, content_json, role,
+                       revision_no, is_deleted
+                FROM messages WHERE source_key = ?
+                """,
                 (source_key,),
             ).fetchone()
+            participant_id = self._upsert_participant_locked(
+                umo=message.umo,
+                platform_id=message.platform_id,
+                account_id=message.sender_id,
+                display_name=message.sender_name,
+                seen_at=message.sent_at,
+                account_type=("BOT" if message.role == "BOT" else "USER"),
+            )
+            changed = (
+                existing is not None
+                and (
+                    str(existing["content_sha256"] or "") != digest
+                    or int(existing["is_deleted"] or 0) != 0
+                )
+            )
+            revision_no = 1
+            if existing is not None:
+                revision_no = int(existing["revision_no"] or 1)
+                if changed:
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO message_revisions(
+                            message_id, revision_no, content_sha256, plain_text,
+                            content_json, role, revision_kind, observed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(existing["id"]),
+                            revision_no,
+                            str(existing["content_sha256"] or ""),
+                            str(existing["plain_text"]),
+                            str(existing["content_json"]),
+                            str(existing["role"]),
+                            (
+                                "RESTORED"
+                                if int(existing["is_deleted"] or 0)
+                                else "EDITED"
+                            ),
+                            int(time.time()),
+                        ),
+                    )
+                    revision_no += 1
+                    self._invalidate_message_derivations_locked(
+                        message_id=int(existing["id"]),
+                        reason="source message edited or restored",
+                    )
             self._connection.execute(
                 """
                 INSERT INTO messages(
                     source_key, platform, platform_id, umo, group_id,
-                    message_id, sender_id, sender_name, sent_at,
-                    plain_text, content_json, role
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    message_id, sender_id, sender_name, sender_participant_id,
+                    sent_at, plain_text, content_json, role, content_sha256,
+                    revision_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_key) DO UPDATE SET
                     sender_name=excluded.sender_name,
+                    sender_participant_id=excluded.sender_participant_id,
                     sent_at=excluded.sent_at,
                     plain_text=excluded.plain_text,
                     content_json=excluded.content_json,
                     role=excluded.role,
+                    content_sha256=excluded.content_sha256,
+                    revision_no=excluded.revision_no,
                     is_deleted=0,
+                    deleted_at=NULL,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -582,13 +1479,1332 @@ class MemoryStorage:
                     message.message_id,
                     message.sender_id,
                     message.sender_name,
+                    participant_id,
                     message.sent_at,
                     message.plain_text,
                     content_json,
                     message.role,
+                    digest,
+                    revision_no,
                 ),
             )
-        return existed is None
+            row = self._connection.execute(
+                "SELECT id FROM messages WHERE source_key = ?",
+                (source_key,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("message upsert did not return a row")
+            stored_id = int(row["id"])
+            if existing is None or changed:
+                self._connection.execute(
+                    """
+                    INSERT INTO message_processing(
+                        message_id, content_sha256, status, batch_key,
+                        attempts, last_error, distilled_at
+                    ) VALUES (?, ?, 'PENDING', '', 0, '', NULL)
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        content_sha256=excluded.content_sha256,
+                        status='PENDING', batch_key='', attempts=0,
+                        last_error='', distilled_at=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (stored_id, digest),
+                )
+            self._refresh_message_links_locked(
+                message_id=stored_id,
+                umo=message.umo,
+                platform_id=message.platform_id,
+                source_key=source_key,
+                platform_message_id=message.message_id,
+                sender_participant_id=participant_id,
+                sent_at=message.sent_at,
+                content=content,
+            )
+        return existing is None
+
+    def mark_message_deleted(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        platform_message_id: str,
+        deleted_at: int | None = None,
+        reason: str = "platform_recall",
+    ) -> bool:
+        """Apply a platform recall without destroying the prior revision evidence."""
+
+        when = int(deleted_at or time.time())
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT id, content_sha256, plain_text, content_json, role,
+                       revision_no, is_deleted
+                FROM messages
+                WHERE umo = ? AND platform_id = ? AND message_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (umo, platform_id, str(platform_message_id)),
+            ).fetchone()
+            if row is None or int(row["is_deleted"] or 0):
+                return False
+            message_id = int(row["id"])
+            revision_no = int(row["revision_no"] or 1)
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO message_revisions(
+                    message_id, revision_no, content_sha256, plain_text,
+                    content_json, role, revision_kind, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'DELETED', ?)
+                """,
+                (
+                    message_id,
+                    revision_no,
+                    str(row["content_sha256"] or ""),
+                    str(row["plain_text"]),
+                    str(row["content_json"]),
+                    str(row["role"]),
+                    when,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE messages
+                SET is_deleted = 1, deleted_at = ?, revision_no = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (when, revision_no + 1, message_id),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO message_processing(message_id, content_sha256, status)
+                VALUES (?, ?, 'DELETED')
+                ON CONFLICT(message_id) DO UPDATE SET
+                    status='DELETED', batch_key='', last_error='',
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (message_id, str(row["content_sha256"] or "")),
+            )
+            self._invalidate_message_derivations_locked(
+                message_id=message_id,
+                reason=reason,
+            )
+        return True
+
+    @staticmethod
+    def _forgotten_account_hash(
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+    ) -> str:
+        payload = "\x1f".join((umo, platform_id, account_id)).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def is_account_forgotten(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+    ) -> bool:
+        digest = self._forgotten_account_hash(
+            umo=umo,
+            platform_id=platform_id,
+            account_id=str(account_id),
+        )
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM forgotten_accounts
+                WHERE umo = ? AND platform_id = ? AND account_hash = ?
+                """,
+                (umo, platform_id, digest),
+            ).fetchone()
+        return row is not None
+
+    def _is_account_forgotten_locked(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+    ) -> bool:
+        account = str(account_id or "").strip()
+        if not account:
+            return False
+        digest = self._forgotten_account_hash(
+            umo=umo,
+            platform_id=platform_id,
+            account_id=account,
+        )
+        return self._connection.execute(
+            """
+            SELECT 1 FROM forgotten_accounts
+            WHERE umo = ? AND platform_id = ? AND account_hash = ?
+            """,
+            (umo, platform_id, digest),
+        ).fetchone() is not None
+
+    def _scrub_forgotten_references_locked(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        content: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Remove structured account bindings after a self-erasure request."""
+
+        sanitized: list[dict[str, object]] = []
+        for raw in content:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            kind = str(item.get("type") or "").strip().casefold()
+            if kind in {"mention", "at"}:
+                account = str(
+                    item.get("account_id")
+                    or item.get("qq")
+                    or item.get("user_id")
+                    or ""
+                ).strip()
+                if self._is_account_forgotten_locked(
+                    umo=umo,
+                    platform_id=platform_id,
+                    account_id=account,
+                ):
+                    for key in (
+                        "account_id", "qq", "user_id", "display_name",
+                        "name", "nickname",
+                    ):
+                        item.pop(key, None)
+                    item["erased_participant"] = True
+            elif kind in {"reply", "response_to", "quote"}:
+                account = str(
+                    item.get("sender_id")
+                    or item.get("account_id")
+                    or item.get("qq")
+                    or ""
+                ).strip()
+                if self._is_account_forgotten_locked(
+                    umo=umo,
+                    platform_id=platform_id,
+                    account_id=account,
+                ):
+                    for key in (
+                        "sender_id", "account_id", "qq", "sender_name",
+                        "sender_nickname", "nickname", "plain_text",
+                        "message_str", "text",
+                    ):
+                        item.pop(key, None)
+                    item["erased_participant"] = True
+            sanitized.append(item)
+        return sanitized
+
+    def forget_account(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+        requested_at: int | None = None,
+    ) -> dict[str, int]:
+        """Erase one account's derived and raw content, then suppress recapture."""
+
+        account = str(account_id or "").strip()
+        if not account:
+            raise ValueError("account_id is required")
+        when = int(requested_at or time.time())
+        digest = self._forgotten_account_hash(
+            umo=umo,
+            platform_id=platform_id,
+            account_id=account,
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO forgotten_accounts(
+                    umo, platform_id, account_hash, requested_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (umo, platform_id, digest, when),
+            )
+            participant = self._connection.execute(
+                """
+                SELECT id, canonical_key, current_display_name FROM participants
+                WHERE umo = ? AND platform_id = ? AND account_id = ?
+                """,
+                (umo, platform_id, account),
+            ).fetchone()
+            if participant is None:
+                return {"messages": 0, "episodes": 0, "claims": 0, "traces": 0}
+            participant_id = int(participant["id"])
+            alias_rows = self._connection.execute(
+                """
+                SELECT alias FROM participant_aliases
+                WHERE participant_id = ?
+                """,
+                (participant_id,),
+            ).fetchall()
+            identity_cues = {
+                account,
+                str(participant["canonical_key"] or ""),
+                str(participant["current_display_name"] or ""),
+                *[str(row["alias"] or "") for row in alias_rows],
+            }
+            identity_cues.discard("")
+            speaker_rows = self._connection.execute(
+                """
+                SELECT id, source_key, message_id FROM messages
+                WHERE umo = ? AND sender_participant_id = ?
+                """,
+                (umo, participant_id),
+            ).fetchall()
+            message_ids = {int(row["id"]) for row in speaker_rows}
+            erased_platform_message_ids = {
+                str(row["message_id"]) for row in speaker_rows
+            }
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                dependent = self._connection.execute(
+                    f"""
+                    SELECT source_message_id FROM message_relations
+                    WHERE umo = ? AND target_message_id IN ({placeholders})
+                      AND relation = 'RESPONDS_TO'
+                    """,
+                    (umo, *message_ids),
+                ).fetchall()
+                message_ids.update(int(row["source_message_id"]) for row in dependent)
+                dependent_ids = [int(row["source_message_id"]) for row in dependent]
+                if dependent_ids:
+                    placeholders = ",".join("?" for _ in dependent_ids)
+                    erased_platform_message_ids.update(
+                        str(row["message_id"])
+                        for row in self._connection.execute(
+                            f"SELECT message_id FROM messages WHERE id IN ({placeholders})",
+                            dependent_ids,
+                        ).fetchall()
+                    )
+
+            reference_parameters: list[object] = [umo, participant_id]
+            target_message_sql = ""
+            if message_ids:
+                target_message_sql = (
+                    f" OR mr.target_message_id IN "
+                    f"({','.join('?' for _ in message_ids)})"
+                )
+                reference_parameters.extend(message_ids)
+            reference_rows = self._connection.execute(
+                f"""
+                SELECT DISTINCT m.id, m.source_key, m.platform_id, m.message_id,
+                       m.sender_id, m.sender_participant_id, m.sent_at,
+                       m.plain_text, m.content_json, m.role
+                FROM messages AS m
+                LEFT JOIN message_participants AS mp ON mp.message_id = m.id
+                LEFT JOIN message_relations AS mr ON mr.source_message_id = m.id
+                WHERE m.umo = ? AND m.is_deleted = 0
+                  AND (mp.participant_id = ?
+                       OR mr.target_participant_id = ?{target_message_sql})
+                """,
+                (
+                    reference_parameters[0],
+                    reference_parameters[1],
+                    reference_parameters[1],
+                    *reference_parameters[2:],
+                ),
+            ).fetchall()
+            reference_rows = [
+                row for row in reference_rows if int(row["id"]) not in message_ids
+            ]
+
+            episode_ids: set[int] = set()
+            claim_ids: set[int] = set()
+            source_keys: set[str] = set()
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                source_keys.update(
+                    str(row["source_key"])
+                    for row in self._connection.execute(
+                        f"SELECT source_key FROM messages WHERE id IN ({placeholders})",
+                        tuple(message_ids),
+                    ).fetchall()
+                )
+                episode_ids.update(
+                    int(row["episode_id"])
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT DISTINCT episode_id FROM episode_messages
+                        WHERE message_id IN ({placeholders})
+                        """,
+                        tuple(message_ids),
+                    ).fetchall()
+                )
+                claim_ids.update(
+                    int(row["semantic_memory_id"])
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT DISTINCT semantic_memory_id
+                        FROM semantic_memory_sources
+                        WHERE message_id IN ({placeholders})
+                        """,
+                        tuple(message_ids),
+                    ).fetchall()
+                )
+            claim_ids.update(
+                int(row["id"])
+                for row in self._connection.execute(
+                    """
+                    SELECT id FROM semantic_memories
+                    WHERE umo = ? AND subject_participant_id = ?
+                    """,
+                    (umo, participant_id),
+                ).fetchall()
+            )
+
+            if episode_ids:
+                placeholders = ",".join("?" for _ in episode_ids)
+                remaining = self._connection.execute(
+                    f"""
+                    SELECT DISTINCT em.message_id
+                    FROM episode_messages AS em
+                    JOIN messages AS m ON m.id = em.message_id
+                    WHERE em.episode_id IN ({placeholders})
+                      AND em.message_id NOT IN ({','.join('?' for _ in message_ids)})
+                      AND m.is_deleted = 0
+                    """,
+                    (*episode_ids, *message_ids),
+                ).fetchall() if message_ids else []
+                self._connection.executemany(
+                    """
+                    UPDATE message_processing
+                    SET status='PENDING', batch_key='', last_error='',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE message_id = ?
+                    """,
+                    [(int(row["message_id"]),) for row in remaining],
+                )
+                self._connection.executemany(
+                    """
+                    DELETE FROM memory_embeddings
+                    WHERE owner_type='episode' AND owner_key=?
+                    """,
+                    [(str(item),) for item in episode_ids],
+                )
+                self._connection.execute(
+                    f"DELETE FROM distilled_units WHERE umo=? AND unit_type='episode' "
+                    f"AND unit_id IN ({placeholders})",
+                    (umo, *episode_ids),
+                )
+                self._connection.execute(
+                    f"DELETE FROM episodes WHERE umo=? AND id IN ({placeholders})",
+                    (umo, *episode_ids),
+                )
+            if claim_ids:
+                placeholders = ",".join("?" for _ in claim_ids)
+                dependent_claims = self._connection.execute(
+                    f"""
+                    SELECT id, status FROM semantic_memories
+                    WHERE umo=? AND superseded_by IN ({placeholders})
+                      AND id NOT IN ({placeholders})
+                    """,
+                    (umo, *claim_ids, *claim_ids),
+                ).fetchall()
+                if dependent_claims:
+                    dependent_ids = [int(row["id"]) for row in dependent_claims]
+                    dependent_placeholders = ",".join(
+                        "?" for _ in dependent_ids
+                    )
+                    self._connection.execute(
+                        f"""
+                        UPDATE semantic_memories
+                        SET status='STALE', superseded_by=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE umo=? AND id IN ({dependent_placeholders})
+                        """,
+                        (umo, *dependent_ids),
+                    )
+                    self._connection.executemany(
+                        """
+                        INSERT INTO semantic_memory_revisions(
+                            semantic_memory_id, previous_status, new_status,
+                            reason
+                        ) VALUES (?, ?, 'STALE',
+                                  'superseding claim erased by participant')
+                        """,
+                        [
+                            (int(row["id"]), str(row["status"]))
+                            for row in dependent_claims
+                        ],
+                    )
+                    self._connection.executemany(
+                        """
+                        DELETE FROM memory_embeddings
+                        WHERE owner_type='semantic' AND owner_key=?
+                        """,
+                        [(str(item),) for item in dependent_ids],
+                    )
+                    source_rows = self._connection.execute(
+                        f"""
+                        SELECT DISTINCT message_id
+                        FROM semantic_memory_sources
+                        WHERE semantic_memory_id IN ({dependent_placeholders})
+                        """,
+                        dependent_ids,
+                    ).fetchall()
+                    self._connection.executemany(
+                        """
+                        UPDATE message_processing
+                        SET status='PENDING', batch_key='', attempts=0,
+                            last_error='', distilled_at=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE message_id=?
+                        """,
+                        [(int(row["message_id"]),) for row in source_rows],
+                    )
+                self._connection.executemany(
+                    """
+                    DELETE FROM memory_embeddings
+                    WHERE owner_type='semantic' AND owner_key=?
+                    """,
+                    [(str(item),) for item in claim_ids],
+                )
+                self._connection.execute(
+                    f"DELETE FROM distilled_units WHERE umo=? AND unit_type='semantic' "
+                    f"AND unit_id IN ({placeholders})",
+                    (umo, *claim_ids),
+                )
+                self._connection.execute(
+                    f"DELETE FROM semantic_memories WHERE umo=? AND id IN ({placeholders})",
+                    (umo, *claim_ids),
+                )
+
+            self._connection.execute(
+                """
+                DELETE FROM memory_embeddings
+                WHERE umo=? AND owner_type='participant' AND owner_key=?
+                """,
+                (umo, str(participant_id)),
+            )
+            if identity_cues:
+                placeholders = ",".join("?" for _ in identity_cues)
+                self._connection.execute(
+                    f"""
+                    DELETE FROM memory_embeddings
+                    WHERE umo=? AND owner_type='cue'
+                      AND owner_key IN ({placeholders})
+                    """,
+                    (umo, *sorted(identity_cues)),
+                )
+
+            trace_ids = [
+                str(row["trace_id"])
+                for row in self._connection.execute(
+                    "SELECT trace_id FROM interaction_traces WHERE umo=? AND sender_id=?",
+                    (umo, account),
+                ).fetchall()
+            ]
+            if trace_ids:
+                placeholders = ",".join("?" for _ in trace_ids)
+                self._connection.execute(
+                    f"""
+                    UPDATE trace_nodes SET content_json='{{}}'
+                    WHERE umo=? AND trace_id IN ({placeholders})
+                    """,
+                    (umo, *trace_ids),
+                )
+                self._connection.execute(
+                    f"""
+                    UPDATE interaction_traces
+                    SET sender_id='', request_excerpt='', response_excerpt='',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE umo=? AND trace_id IN ({placeholders})
+                    """,
+                    (umo, *trace_ids),
+                )
+            trace_count = len(trace_ids)
+            if source_keys:
+                placeholders = ",".join("?" for _ in source_keys)
+                affected_hypotheses = [
+                    int(row["hypothesis_id"])
+                    for row in self._connection.execute(
+                        f"""
+                        SELECT DISTINCT hypothesis_id FROM hypothesis_evidence
+                        WHERE feedback_source_key IN ({placeholders})
+                        """,
+                        tuple(source_keys),
+                    ).fetchall()
+                ]
+                if affected_hypotheses:
+                    hypothesis_placeholders = ",".join(
+                        "?" for _ in affected_hypotheses
+                    )
+                    self._connection.execute(
+                        f"""
+                        UPDATE feedback_hypotheses
+                        SET scope_key='', aspect='', statement='',
+                            prospective_cue='', trigger_cues_json='[]',
+                            evidence_confidence=0, utility=0,
+                            status='DORMANT', updated_at=CURRENT_TIMESTAMP
+                        WHERE umo=? AND id IN ({hypothesis_placeholders})
+                        """,
+                        (umo, *affected_hypotheses),
+                    )
+                self._connection.execute(
+                    f"""
+                    DELETE FROM hypothesis_evidence
+                    WHERE feedback_source_key IN ({placeholders})
+                    """,
+                    tuple(source_keys),
+                )
+                self._connection.execute(
+                    f"DELETE FROM feedback_proposals WHERE umo=? "
+                    f"AND feedback_source_key IN ({placeholders})",
+                    (umo, *source_keys),
+                )
+                self._connection.execute(
+                    f"DELETE FROM feedback_links WHERE umo=? "
+                    f"AND feedback_source_key IN ({placeholders})",
+                    (umo, *source_keys),
+                )
+            self._connection.execute(
+                """
+                UPDATE feedback_hypotheses
+                SET scope_key='', statement='', prospective_cue='',
+                    trigger_cues_json='[]', status='DORMANT',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND scope_key=?
+                """,
+                (umo, account),
+            )
+
+            for row in reference_rows:
+                message_id = int(row["id"])
+                content = self._scrub_forgotten_references_locked(
+                    umo=umo,
+                    platform_id=str(row["platform_id"]),
+                    content=self._parse_content_json(row["content_json"]),
+                )
+                for item in content:
+                    kind = str(item.get("type") or "").casefold()
+                    reply_message_id = str(
+                        item.get("message_id") or item.get("id") or ""
+                    )
+                    if (
+                        kind in {"reply", "response_to", "quote"}
+                        and reply_message_id in erased_platform_message_ids
+                    ):
+                        for key in (
+                            "sender_id", "account_id", "qq", "sender_name",
+                            "sender_nickname", "nickname", "plain_text",
+                            "message_str", "text",
+                        ):
+                            item.pop(key, None)
+                        item["erased_participant"] = True
+                content_json = json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                digest = content_fingerprint(
+                    sender_id=str(row["sender_id"]),
+                    role=str(row["role"]),
+                    plain_text=str(row["plain_text"]),
+                    content=content,
+                )
+                self._invalidate_message_derivations_locked(
+                    message_id=message_id,
+                    reason="structured participant reference erased",
+                )
+                self._connection.execute(
+                    "DELETE FROM message_revisions WHERE message_id = ?",
+                    (message_id,),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE messages
+                    SET content_json=?, content_sha256=?,
+                        revision_no=revision_no+1,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (content_json, digest, message_id),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO message_processing(
+                        message_id, content_sha256, status
+                    ) VALUES (?, ?, 'PENDING')
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        content_sha256=excluded.content_sha256,
+                        status='PENDING', batch_key='', attempts=0,
+                        last_error='', distilled_at=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (message_id, digest),
+                )
+                self._refresh_message_links_locked(
+                    message_id=message_id,
+                    umo=umo,
+                    platform_id=str(row["platform_id"]),
+                    source_key=str(row["source_key"]),
+                    platform_message_id=str(row["message_id"]),
+                    sender_participant_id=(
+                        int(row["sender_participant_id"])
+                        if row["sender_participant_id"] is not None
+                        else None
+                    ),
+                    sent_at=int(row["sent_at"]),
+                    content=content,
+                )
+
+            for message_id in message_ids:
+                self._connection.execute(
+                    "DELETE FROM message_revisions WHERE message_id = ?",
+                    (message_id,),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE messages
+                    SET sender_id='', sender_name='', plain_text='',
+                        content_json='[]', content_sha256='', is_deleted=1,
+                        deleted_at=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (when, message_id),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE message_processing
+                    SET status='DELETED', batch_key='', last_error='',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE message_id = ?
+                    """,
+                    (message_id,),
+                )
+                self._connection.execute(
+                    "DELETE FROM message_participants WHERE message_id = ?",
+                    (message_id,),
+                )
+                self._connection.execute(
+                    "DELETE FROM message_relations WHERE source_message_id = ?",
+                    (message_id,),
+                )
+                self._connection.execute(
+                    "DELETE FROM message_attachments WHERE message_id = ?",
+                    (message_id,),
+                )
+            self._connection.execute(
+                "DELETE FROM participant_aliases WHERE participant_id = ?",
+                (participant_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE messages SET sender_participant_id=NULL
+                WHERE sender_participant_id=?
+                """,
+                (participant_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE message_relations SET target_participant_id=NULL,
+                    metadata_json='{}'
+                WHERE target_participant_id=?
+                """,
+                (participant_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM message_participants WHERE participant_id = ?",
+                (participant_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM participants WHERE id = ?",
+                (participant_id,),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM topics WHERE umo = ? AND NOT EXISTS (
+                    SELECT 1 FROM topic_episodes AS te
+                    WHERE te.topic_id = topics.id
+                )
+                """,
+                (umo,),
+            )
+        return {
+            "messages": len(message_ids),
+            "episodes": len(episode_ids),
+            "claims": len(claim_ids),
+            "traces": int(trace_count),
+        }
+
+    def bind_participant_alias(
+        self,
+        *,
+        umo: str,
+        platform_id: str,
+        account_id: str,
+        alias: str,
+        at: int | None = None,
+    ) -> dict[str, object]:
+        """Administrator-authoritative alias binding; account IDs never merge."""
+
+        with self._lock, self._connection:
+            participant_id = self._upsert_participant_locked(
+                umo=umo,
+                platform_id=platform_id,
+                account_id=account_id,
+                display_name="",
+                seen_at=int(at or time.time()),
+                account_type="USER",
+                alias_source="administrator",
+            )
+            if participant_id is None:
+                raise ValueError("account_id is required")
+            self._upsert_alias_locked(
+                participant_id=participant_id,
+                alias=alias,
+                seen_at=int(at or time.time()),
+                source_kind="administrator",
+                confidence=1.0,
+            )
+            row = self._connection.execute(
+                "SELECT * FROM participants WHERE id = ?",
+                (participant_id,),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def resolve_participants(
+        self,
+        *,
+        umo: str,
+        reference: str,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        """Resolve only exact IDs/keys/aliases and report alias ambiguity."""
+
+        query = str(reference or "").strip()
+        normalized = normalize_alias(query)
+        safe_limit = max(1, min(100, int(limit)))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT DISTINCT p.id, p.canonical_key, p.platform_id,
+                       p.account_id, p.account_type, p.current_display_name,
+                       p.first_seen_at, p.last_seen_at
+                FROM participants AS p
+                LEFT JOIN participant_aliases AS a
+                  ON a.participant_id = p.id AND a.is_active = 1
+                WHERE p.umo = ? AND (
+                    p.account_id = ? OR p.canonical_key = ?
+                    OR a.normalized_alias = ?
+                )
+                ORDER BY p.last_seen_at DESC, p.id
+                LIMIT ?
+                """,
+                (umo, query, query, normalized, safe_limit),
+            ).fetchall()
+            result: list[dict[str, object]] = []
+            for row in rows:
+                aliases = self._connection.execute(
+                    """
+                    SELECT alias, first_seen_at, last_seen_at, source_kind,
+                           confidence
+                    FROM participant_aliases
+                    WHERE participant_id = ? AND is_active = 1
+                    ORDER BY last_seen_at DESC, alias
+                    """,
+                    (int(row["id"]),),
+                ).fetchall()
+                result.append(
+                    {
+                        **dict(row),
+                        "aliases": [dict(alias) for alias in aliases],
+                    }
+                )
+        alias_only = bool(query) and all(
+            str(item["account_id"]) != query
+            and str(item["canonical_key"]) != query
+            for item in result
+        )
+        return {
+            "reference": query,
+            "ambiguous": alias_only and len(result) > 1,
+            "participants": result,
+        }
+
+    def list_participants(
+        self,
+        *,
+        umo: str,
+        limit: int = 200,
+    ) -> list[dict[str, object]]:
+        safe_limit = max(1, min(2000, int(limit)))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, canonical_key, platform_id, account_id, account_type,
+                       current_display_name, first_seen_at, last_seen_at
+                FROM participants WHERE umo = ?
+                ORDER BY last_seen_at DESC, id LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            result = []
+            for row in rows:
+                aliases = self._connection.execute(
+                    """
+                    SELECT alias, normalized_alias, first_seen_at, last_seen_at,
+                           observation_count, source_kind, confidence
+                    FROM participant_aliases
+                    WHERE participant_id = ? AND is_active = 1
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (int(row["id"]),),
+                ).fetchall()
+                result.append({**dict(row), "aliases": [dict(a) for a in aliases]})
+        return result
+
+    def participant_embedding_documents(
+        self,
+        *,
+        umo: str,
+    ) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT p.id, p.canonical_key, p.account_id,
+                       p.current_display_name,
+                       GROUP_CONCAT(a.alias, '\n') AS aliases
+                FROM participants AS p
+                LEFT JOIN participant_aliases AS a
+                  ON a.participant_id = p.id AND a.is_active = 1
+                WHERE p.umo = ?
+                GROUP BY p.id ORDER BY p.id
+                """,
+                (umo,),
+            ).fetchall()
+        return [
+            {
+                "owner_key": str(row["id"]),
+                "text": "\n".join(
+                    item
+                    for item in (
+                        str(row["canonical_key"]),
+                        str(row["account_id"]),
+                        str(row["current_display_name"] or ""),
+                        str(row["aliases"] or ""),
+                    )
+                    if item
+                ),
+            }
+            for row in rows
+        ]
+
+    def distillation_identity_context(
+        self,
+        *,
+        umo: str,
+        source_keys: list[str],
+        max_participants: int = 200,
+        max_claims: int = 200,
+    ) -> dict[str, object]:
+        """Build the host-authoritative identity choices exposed to extraction.
+
+        The model may select one of these keys, but it may never invent a new
+        account binding. Text aliases that map to several accounts are explicitly
+        marked ambiguous.
+        """
+
+        if not source_keys:
+            return {"messages": {}, "participants": [], "ambiguous_aliases": {}}
+        placeholders = ",".join("?" for _ in source_keys)
+        safe_participants = max(1, min(1000, int(max_participants)))
+        with self._lock:
+            messages = self._connection.execute(
+                f"""
+                SELECT id, source_key, plain_text, sender_participant_id
+                FROM messages
+                WHERE umo = ? AND source_key IN ({placeholders})
+                  AND is_deleted = 0
+                """,
+                (umo, *source_keys),
+            ).fetchall()
+            participant_ids: set[int] = {
+                int(row["sender_participant_id"])
+                for row in messages
+                if row["sender_participant_id"] is not None
+            }
+            if messages:
+                message_ids = [int(row["id"]) for row in messages]
+                message_placeholders = ",".join("?" for _ in message_ids)
+                linked = self._connection.execute(
+                    f"""
+                    SELECT DISTINCT participant_id FROM message_participants
+                    WHERE message_id IN ({message_placeholders})
+                    """,
+                    message_ids,
+                ).fetchall()
+                participant_ids.update(int(row["participant_id"]) for row in linked)
+
+            # Nicknames used as plain text become candidates, never automatic binds.
+            texts = [str(row["plain_text"]).casefold() for row in messages]
+            alias_rows = self._connection.execute(
+                """
+                SELECT a.normalized_alias, a.participant_id
+                FROM participant_aliases AS a
+                JOIN participants AS p ON p.id = a.participant_id
+                WHERE p.umo = ? AND a.is_active = 1
+                  AND length(a.normalized_alias) >= 2
+                ORDER BY a.last_seen_at DESC LIMIT 5000
+                """,
+                (umo,),
+            ).fetchall()
+            alias_map: dict[str, set[int]] = {}
+            for alias in alias_rows:
+                normalized_alias = str(alias["normalized_alias"])
+                if any(normalized_alias in text for text in texts):
+                    participant_id = int(alias["participant_id"])
+                    participant_ids.add(participant_id)
+                    alias_map.setdefault(normalized_alias, set()).add(participant_id)
+
+            selected_ids = sorted(participant_ids)[:safe_participants]
+            participants: list[dict[str, object]] = []
+            if selected_ids:
+                selected_placeholders = ",".join("?" for _ in selected_ids)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT id, canonical_key, platform_id, account_id,
+                           account_type, current_display_name,
+                           first_seen_at, last_seen_at
+                    FROM participants
+                    WHERE umo = ? AND id IN ({selected_placeholders})
+                    ORDER BY last_seen_at DESC, id
+                    """,
+                    (umo, *selected_ids),
+                ).fetchall()
+                for row in rows:
+                    aliases = self._connection.execute(
+                        """
+                        SELECT alias FROM participant_aliases
+                        WHERE participant_id = ? AND is_active = 1
+                        ORDER BY last_seen_at DESC LIMIT 20
+                        """,
+                        (int(row["id"]),),
+                    ).fetchall()
+                    participants.append(
+                        {
+                            "participant_key": str(row["canonical_key"]),
+                            "account_id": str(row["account_id"]),
+                            "account_type": str(row["account_type"]),
+                            "current_display_name": str(row["current_display_name"]),
+                            "aliases": [str(alias["alias"]) for alias in aliases],
+                        }
+                    )
+
+            message_context: dict[str, object] = {}
+            for message in messages:
+                speaker_key = ""
+                if message["sender_participant_id"] is not None:
+                    speaker = self._connection.execute(
+                        "SELECT canonical_key FROM participants WHERE id = ?",
+                        (int(message["sender_participant_id"]),),
+                    ).fetchone()
+                    if speaker is not None:
+                        speaker_key = str(speaker["canonical_key"])
+                links = self._connection.execute(
+                    """
+                    SELECT mp.relation, p.canonical_key
+                    FROM message_participants AS mp
+                    JOIN participants AS p ON p.id = mp.participant_id
+                    WHERE mp.message_id = ? AND mp.relation <> 'SPEAKER'
+                    ORDER BY mp.position, p.id
+                    """,
+                    (int(message["id"]),),
+                ).fetchall()
+                normalized_text = normalize_alias(message["plain_text"])
+                unique_text_candidates: set[str] = set()
+                ambiguous_text_aliases: dict[str, list[str]] = {}
+                for alias, ids in alias_map.items():
+                    if alias not in normalized_text:
+                        continue
+                    keys = [
+                        self._participant_key_by_id(participant_id)
+                        for participant_id in sorted(ids)
+                    ]
+                    keys = [key for key in keys if key]
+                    if len(keys) == 1:
+                        unique_text_candidates.add(keys[0])
+                    elif keys:
+                        ambiguous_text_aliases[alias] = keys
+                message_context[str(message["source_key"])] = {
+                    "speaker_participant_key": speaker_key,
+                    "linked_participants": [
+                        {
+                            "relation": str(link["relation"]),
+                            "participant_key": str(link["canonical_key"]),
+                        }
+                        for link in links
+                    ],
+                    "unique_text_candidate_participant_keys": sorted(
+                        unique_text_candidates
+                    ),
+                    "ambiguous_text_aliases": ambiguous_text_aliases,
+                }
+
+            claims: list[dict[str, object]] = []
+            if selected_ids:
+                selected_placeholders = ",".join("?" for _ in selected_ids)
+                claim_rows = self._connection.execute(
+                    f"""
+                    SELECT s.id, p.canonical_key AS subject_participant_key,
+                           s.person_cue, s.aspect_tag, s.content, s.claim_type,
+                           s.epistemic_status, s.status, s.confidence
+                    FROM semantic_memories AS s
+                    JOIN participants AS p ON p.id = s.subject_participant_id
+                    WHERE s.umo = ? AND s.subject_participant_id
+                          IN ({selected_placeholders})
+                      AND s.status IN ('ACTIVE', 'CONFLICTED', 'QUARANTINED')
+                    ORDER BY s.confidence DESC, s.id DESC LIMIT ?
+                    """,
+                    (umo, *selected_ids, max(1, min(1000, int(max_claims)))),
+                ).fetchall()
+                claims = [dict(row) for row in claim_rows]
+
+        return {
+            "messages": message_context,
+            "participants": participants,
+            "ambiguous_aliases": {
+                alias: [
+                    next(
+                        (
+                            str(item["participant_key"])
+                            for item in participants
+                            if str(item["participant_key"])
+                            == self._participant_key_by_id(participant_id)
+                        ),
+                        "",
+                    )
+                    for participant_id in sorted(ids)
+                ]
+                for alias, ids in alias_map.items()
+                if len(ids) > 1
+            },
+            "active_claims": claims,
+        }
+
+    def _participant_key_by_id(self, participant_id: int) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT canonical_key FROM participants WHERE id = ?",
+                (int(participant_id),),
+            ).fetchone()
+        return str(row["canonical_key"]) if row is not None else ""
+
+    def pending_distillation_count(self, *, umo: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE m.umo = ? AND m.is_deleted = 0
+                  AND (p.status = 'PENDING'
+                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                """,
+                (umo,),
+            ).fetchone()
+        return int(row[0])
+
+    def next_distillation_batch(
+        self,
+        *,
+        umo: str,
+        limit: int = 80,
+        overlap: int = 12,
+    ) -> DistillationWorkItem | None:
+        safe_limit = max(1, min(500, int(limit)))
+        safe_overlap = max(0, min(100, int(overlap)))
+        with self._lock, self._connection:
+            targets = self._connection.execute(
+                """
+                SELECT m.id, m.source_key, m.content_sha256, m.sent_at
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE m.umo = ? AND m.is_deleted = 0
+                  AND (p.status = 'PENDING'
+                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                ORDER BY m.sent_at, m.id LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            if not targets:
+                return None
+            first = targets[0]
+            context = self._connection.execute(
+                """
+                SELECT m.*
+                FROM messages AS m
+                WHERE m.umo = ? AND m.is_deleted = 0
+                  AND (m.sent_at < ? OR (m.sent_at = ? AND m.id < ?))
+                ORDER BY m.sent_at DESC, m.id DESC LIMIT ?
+                """,
+                (
+                    umo,
+                    int(first["sent_at"]),
+                    int(first["sent_at"]),
+                    int(first["id"]),
+                    safe_overlap,
+                ),
+            ).fetchall()
+            target_ids = [int(row["id"]) for row in targets]
+            placeholders = ",".join("?" for _ in target_ids)
+            target_rows = self._connection.execute(
+                f"SELECT * FROM messages WHERE id IN ({placeholders})",
+                target_ids,
+            ).fetchall()
+            rows = sorted(
+                [*context, *target_rows],
+                key=lambda row: (int(row["sent_at"]), int(row["id"])),
+            )
+            target_hashes = tuple(
+                (str(row["source_key"]), str(row["content_sha256"]))
+                for row in targets
+            )
+            batch_payload = json.dumps(
+                {"umo": umo, "targets": target_hashes},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            batch_key = hashlib.sha256(batch_payload.encode("utf-8")).hexdigest()
+            self._connection.execute(
+                """
+                INSERT INTO distillation_batches(
+                    batch_key, umo, target_source_keys_json,
+                    target_hashes_json, status
+                ) VALUES (?, ?, ?, ?, 'RUNNING')
+                ON CONFLICT(batch_key) DO UPDATE SET
+                    status='RUNNING', error='', finished_at=NULL
+                """,
+                (
+                    batch_key,
+                    umo,
+                    json.dumps([item[0] for item in target_hashes]),
+                    json.dumps(target_hashes),
+                ),
+            )
+            self._connection.executemany(
+                """
+                UPDATE message_processing
+                SET status='PROCESSING', batch_key=?, attempts=attempts+1,
+                    last_error='', updated_at=CURRENT_TIMESTAMP
+                WHERE message_id = ?
+                """,
+                [(batch_key, target_id) for target_id in target_ids],
+            )
+            stored = tuple(self._stored_message_from_row(row) for row in rows)
+        return DistillationWorkItem(
+            batch_key=batch_key,
+            umo=umo,
+            messages=stored,
+            target_source_keys=tuple(item[0] for item in target_hashes),
+            target_hashes=target_hashes,
+        )
+
+    def finish_distillation_batch(
+        self,
+        *,
+        work_item: DistillationWorkItem,
+        error: str = "",
+    ) -> None:
+        success = not str(error).strip()
+        now = int(time.time())
+        expected = dict(work_item.target_hashes)
+        with self._lock, self._connection:
+            for source_key, expected_hash in expected.items():
+                row = self._connection.execute(
+                    """
+                    SELECT m.id, m.content_sha256, m.is_deleted
+                    FROM messages AS m WHERE m.umo = ? AND m.source_key = ?
+                    """,
+                    (work_item.umo, source_key),
+                ).fetchone()
+                if row is None:
+                    continue
+                if int(row["is_deleted"]):
+                    status = "DELETED"
+                elif success and str(row["content_sha256"]) == expected_hash:
+                    status = "DISTILLED"
+                elif success:
+                    status = "PENDING"
+                else:
+                    status = "FAILED"
+                self._connection.execute(
+                    """
+                    UPDATE message_processing
+                    SET status=?, batch_key='', last_error=?, distilled_at=?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE message_id = ?
+                    """,
+                    (
+                        status,
+                        str(error)[:1000],
+                        now if status == "DISTILLED" else None,
+                        int(row["id"]),
+                    ),
+                )
+            self._connection.execute(
+                """
+                UPDATE distillation_batches
+                SET status=?, error=?, finished_at=CURRENT_TIMESTAMP
+                WHERE batch_key = ?
+                """,
+                (
+                    "COMPLETED" if success else "FAILED",
+                    str(error)[:1000],
+                    work_item.batch_key,
+                ),
+            )
+
+    def record_distillation_ignored_sources(
+        self,
+        *,
+        umo: str,
+        batch_key: str,
+        items: list[dict[str, str]],
+    ) -> None:
+        """Persist the extractor's bounded coverage ledger for later audit."""
+
+        with self._lock, self._connection:
+            batch = self._connection.execute(
+                """
+                SELECT target_source_keys_json FROM distillation_batches
+                WHERE batch_key=? AND umo=?
+                """,
+                (batch_key, umo),
+            ).fetchone()
+            if batch is None:
+                raise ValueError("distillation batch is missing or outside scope")
+            allowed = set(json.loads(str(batch["target_source_keys_json"])))
+            self._connection.execute(
+                "DELETE FROM distillation_ignored_sources WHERE batch_key=?",
+                (batch_key,),
+            )
+            for item in items:
+                source_key = str(item.get("source_key") or "")
+                reason = str(item.get("reason") or "").strip()[:300]
+                if source_key not in allowed or not reason:
+                    raise ValueError("invalid ignored-source coverage record")
+                self._connection.execute(
+                    """
+                    INSERT INTO distillation_ignored_sources(
+                        batch_key, source_key, reason
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(batch_key, source_key)
+                    DO UPDATE SET reason=excluded.reason
+                    """,
+                    (batch_key, source_key, reason),
+                )
 
     def count_messages(self, *, umo: str | None = None) -> int:
         with self._lock:
@@ -615,8 +2831,11 @@ class MemoryStorage:
                 row = self._connection.execute(
                     """
                     SELECT
-                        (SELECT COUNT(*) FROM episodes WHERE umo = ?) +
-                        (SELECT COUNT(*) FROM semantic_memories WHERE umo = ?) +
+                        (SELECT COUNT(*) FROM episodes
+                         WHERE umo = ? AND status = 'READY') +
+                        (SELECT COUNT(*) FROM semantic_memories
+                         WHERE umo = ? AND status IN
+                           ('ACTIVE', 'CONFLICTED')) +
                         (SELECT COUNT(*) FROM topics WHERE umo = ?)
                     """,
                     (umo, umo, umo),
@@ -627,17 +2846,25 @@ class MemoryStorage:
                     """
                     SELECT
                         (SELECT COUNT(*) FROM episodes
-                         WHERE umo = ? AND ended_at < ?) +
+                         WHERE umo = ? AND status = 'READY' AND ended_at < ?) +
                         (SELECT COUNT(*)
                          FROM semantic_memories AS s
-                         JOIN messages AS m ON m.id = s.source_message_id
-                         WHERE s.umo = ? AND m.umo = s.umo
-                           AND m.sent_at < ? AND m.is_deleted = 0) +
+                         WHERE s.umo = ?
+                           AND s.status IN
+                             ('ACTIVE', 'CONFLICTED')
+                           AND EXISTS (
+                             SELECT 1 FROM semantic_memory_sources AS ss
+                             JOIN messages AS m ON m.id = ss.message_id
+                             WHERE ss.semantic_memory_id = s.id
+                               AND m.umo = s.umo AND m.sent_at < ?
+                               AND m.is_deleted = 0
+                           )) +
                         (SELECT COUNT(*) FROM topics AS t
                          WHERE t.umo = ? AND EXISTS (
                              SELECT 1 FROM topic_episodes AS te
                              JOIN episodes AS e ON e.id = te.episode_id
                              WHERE te.topic_id = t.id AND e.umo = t.umo
+                               AND e.status = 'READY'
                                AND e.ended_at < ?
                          ))
                     """,
@@ -876,6 +3103,26 @@ class MemoryStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def private_token_usage_since(
+        self,
+        *,
+        umo: str,
+        since: int,
+    ) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COALESCE(SUM(
+                    u.input_other + u.input_cached + u.output
+                ), 0)
+                FROM llm_usage_events AS u
+                JOIN experiment_runs AS r ON r.run_id = u.run_id
+                WHERE r.umo = ? AND unixepoch(u.created_at) >= ?
+                """,
+                (umo, int(since)),
+            ).fetchone()
+        return int(row[0] or 0)
+
     def dashboard_summary(self, *, umo: str) -> dict[str, object]:
         """Return bounded operational metrics for the authenticated plugin page."""
         with self._lock:
@@ -884,9 +3131,21 @@ class MemoryStorage:
                 SELECT
                     (SELECT COUNT(*) FROM messages
                      WHERE umo = ? AND is_deleted = 0) AS messages,
-                    (SELECT COUNT(*) FROM episodes WHERE umo = ?) AS episodes,
-                    (SELECT COUNT(*) FROM semantic_memories WHERE umo = ?)
+                    (SELECT COUNT(*) FROM episodes
+                     WHERE umo = ? AND status = 'READY') AS episodes,
+                    (SELECT COUNT(*) FROM semantic_memories
+                     WHERE umo = ? AND status IN
+                       ('ACTIVE', 'CONFLICTED', 'QUARANTINED'))
                         AS semantic_memories,
+                    (SELECT COUNT(*) FROM participants WHERE umo = ?)
+                        AS participants,
+                    (SELECT COUNT(*) FROM message_processing AS p
+                     JOIN messages AS m ON m.id = p.message_id
+                     WHERE m.umo = ? AND (
+                       p.status = 'PENDING'
+                       OR (p.status = 'FAILED' AND p.attempts < 3)
+                     ))
+                        AS pending_distillation,
                     (SELECT COUNT(*) FROM topics WHERE umo = ?) AS topics,
                     (SELECT COUNT(*) FROM memory_embeddings WHERE umo = ?)
                         AS embeddings,
@@ -900,11 +3159,14 @@ class MemoryStorage:
                     (SELECT COUNT(DISTINCT lower(k.cue))
                      FROM episode_keywords AS k
                      JOIN episodes AS e ON e.id = k.episode_id
-                     WHERE e.umo = ?) AS cues,
+                     WHERE e.umo = ? AND e.status = 'READY') AS cues,
                     (SELECT MAX(sent_at) FROM messages
                      WHERE umo = ? AND is_deleted = 0) AS last_message_at
                 """,
-                (umo, umo, umo, umo, umo, umo, umo, umo, umo, umo),
+                (
+                    umo, umo, umo, umo, umo, umo,
+                    umo, umo, umo, umo, umo, umo,
+                ),
             ).fetchone()
             last_update = self._connection.execute(
                 """
@@ -952,6 +3214,8 @@ class MemoryStorage:
             "messages": int(counts["messages"] or 0),
             "episodes": int(counts["episodes"] or 0),
             "semantic_memories": int(counts["semantic_memories"] or 0),
+            "participants": int(counts["participants"] or 0),
+            "pending_distillation": int(counts["pending_distillation"] or 0),
             "topics": int(counts["topics"] or 0),
             "embeddings": int(counts["embeddings"] or 0),
             "interaction_traces": int(counts["interaction_traces"] or 0),
@@ -985,7 +3249,7 @@ class MemoryStorage:
                        COUNT(em.message_id) AS source_count
                 FROM episodes AS e
                 LEFT JOIN episode_messages AS em ON em.episode_id = e.id
-                WHERE e.umo = ?
+                WHERE e.umo = ? AND e.status = 'READY'
                 GROUP BY e.id
                 ORDER BY e.ended_at DESC, e.id DESC
                 LIMIT ?
@@ -1002,7 +3266,8 @@ class MemoryStorage:
                     SELECT k.episode_id, k.cue, k.tag
                     FROM episode_keywords AS k
                     JOIN episodes AS e ON e.id = k.episode_id
-                    WHERE e.umo = ? AND e.id IN ({placeholders})
+                    WHERE e.umo = ? AND e.status = 'READY'
+                      AND e.id IN ({placeholders})
                     ORDER BY k.episode_id, k.cue, k.tag
                     LIMIT ?
                     """,
@@ -1015,6 +3280,7 @@ class MemoryStorage:
                     JOIN topic_episodes AS te ON te.topic_id = t.id
                     JOIN episodes AS e ON e.id = te.episode_id
                     WHERE t.umo = ? AND e.umo = t.umo
+                      AND e.status = 'READY'
                       AND e.id IN ({placeholders})
                     ORDER BY t.name, te.episode_id
                     LIMIT ?
@@ -1023,14 +3289,31 @@ class MemoryStorage:
                 ).fetchall()
             semantic_rows = self._connection.execute(
                 """
-                SELECT s.id, s.person_cue, s.aspect_tag, s.content,
-                       s.confidence, m.source_key, m.plain_text
+                SELECT s.id, s.person_cue, s.subject_participant_id,
+                       s.aspect_tag, s.content, s.claim_type,
+                       s.epistemic_status, s.status, s.confidence,
+                       m.source_key, m.plain_text
                 FROM semantic_memories AS s
                 LEFT JOIN messages AS m
                   ON m.id = s.source_message_id AND m.umo = s.umo
-                WHERE s.umo = ?
+                WHERE s.umo = ? AND s.status IN
+                  ('ACTIVE', 'CONFLICTED', 'QUARANTINED')
                 ORDER BY s.id DESC
                 LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            participant_rows = self._connection.execute(
+                """
+                SELECT p.id, p.canonical_key, p.account_id, p.account_type,
+                       p.current_display_name, p.first_seen_at, p.last_seen_at,
+                       GROUP_CONCAT(a.alias, ' · ') AS aliases
+                FROM participants AS p
+                LEFT JOIN participant_aliases AS a
+                  ON a.participant_id = p.id AND a.is_active = 1
+                WHERE p.umo = ?
+                GROUP BY p.id
+                ORDER BY p.last_seen_at DESC, p.id LIMIT ?
                 """,
                 (umo, safe_limit),
             ).fetchall()
@@ -1102,6 +3385,24 @@ class MemoryStorage:
             )
             return node_id
 
+        for row in reversed(participant_rows):
+            participant_node_id = f"participant:{int(row['id'])}"
+            label = str(
+                row["current_display_name"] or row["account_id"]
+            )
+            nodes[participant_node_id] = {
+                "id": participant_node_id,
+                "type": "participant",
+                "entity_id": int(row["id"]),
+                "label": label,
+                "detail": str(row["aliases"] or label),
+                "canonical_key": str(row["canonical_key"]),
+                "account_id": str(row["account_id"]),
+                "account_type": str(row["account_type"]),
+                "first_seen_at": int(row["first_seen_at"]),
+                "last_seen_at": int(row["last_seen_at"]),
+            }
+
         for row in reversed(episode_rows):
             node_id = f"episode:{int(row['id'])}"
             nodes[node_id] = {
@@ -1153,14 +3454,20 @@ class MemoryStorage:
                 "entity_id": int(row["id"]),
                 "label": str(row["aspect_tag"]),
                 "detail": str(row["content"]),
+                "claim_type": str(row["claim_type"]),
+                "epistemic_status": str(row["epistemic_status"]),
+                "status": str(row["status"]),
                 "confidence": float(row["confidence"]),
                 "source_key": str(row["source_key"] or ""),
                 "source_text": str(row["plain_text"] or ""),
             }
-            cue_id = ensure_cue(str(row["person_cue"]))
+            if row["subject_participant_id"] is not None:
+                subject_id = f"participant:{int(row['subject_participant_id'])}"
+            else:
+                subject_id = ensure_cue(str(row["person_cue"]))
             edges.append(
                 {
-                    "source": cue_id,
+                    "source": subject_id,
                     "target": semantic_id,
                     "relation": str(row["aspect_tag"]),
                     "type": "cue_semantic",
@@ -1241,8 +3548,9 @@ class MemoryStorage:
                 degree[str(edge["target"])] = degree.get(str(edge["target"]), 0) + 1
 
             ratios = {
-                "episode": 0.25,
-                "cue": 0.20,
+                "episode": 0.20,
+                "cue": 0.15,
+                "participant": 0.10,
                 "semantic": 0.10,
                 "topic": 0.10,
                 "action": 0.10,
@@ -1262,6 +3570,7 @@ class MemoryStorage:
             for node_type in (
                 "episode",
                 "cue",
+                "participant",
                 "semantic",
                 "topic",
                 "action",
@@ -1312,13 +3621,14 @@ class MemoryStorage:
             ]
 
         type_order = {
-            "cue": 0,
-            "episode": 1,
-            "semantic": 2,
-            "topic": 3,
-            "action": 4,
-            "feedback": 5,
-            "hypothesis": 6,
+            "participant": 0,
+            "cue": 1,
+            "episode": 2,
+            "semantic": 3,
+            "topic": 4,
+            "action": 5,
+            "feedback": 6,
+            "hypothesis": 7,
         }
         ordered_nodes = sorted(
             nodes.values(),
@@ -1415,7 +3725,13 @@ class MemoryStorage:
         umo: str,
         model: str,
         query_vector: list[float],
-        owner_types: tuple[str, ...] = ("cue", "episode", "topic", "semantic"),
+        owner_types: tuple[str, ...] = (
+            "participant",
+            "cue",
+            "episode",
+            "topic",
+            "semantic",
+        ),
         limit: int = 12,
         min_score: float = -1.0,
         before_sent_at: int | None = None,
@@ -1459,8 +3775,34 @@ class MemoryStorage:
                     "score": round(score, 6),
                 }
             )
+        safe_limit = max(1, min(100, int(limit)))
         scored.sort(key=lambda item: float(item["score"]), reverse=True)
-        return scored[: max(1, min(100, int(limit)))]
+        grouped: dict[str, list[dict[str, object]]] = {
+            owner_type: [] for owner_type in owner_types
+        }
+        for item in scored:
+            grouped[str(item["owner_type"])].append(item)
+        nonempty = [owner_type for owner_type in owner_types if grouped[owner_type]]
+        if not nonempty:
+            return []
+        quota = max(1, safe_limit // len(nonempty))
+        selected: list[dict[str, object]] = []
+        selected_keys: set[tuple[str, str]] = set()
+        for owner_type in nonempty:
+            for item in grouped[owner_type][:quota]:
+                selected.append(item)
+                selected_keys.add((str(item["owner_type"]), str(item["owner_key"])))
+        if len(selected) < safe_limit:
+            for item in scored:
+                key = (str(item["owner_type"]), str(item["owner_key"]))
+                if key in selected_keys:
+                    continue
+                selected.append(item)
+                selected_keys.add(key)
+                if len(selected) >= safe_limit:
+                    break
+        selected.sort(key=lambda item: float(item["score"]), reverse=True)
+        return selected[:safe_limit]
 
     def _memory_owner_visible(
         self,
@@ -1470,62 +3812,95 @@ class MemoryStorage:
         owner_key: str,
         before_sent_at: int | None,
     ) -> bool:
-        if before_sent_at is None:
-            return True
-        cutoff = int(before_sent_at)
+        cutoff = int(before_sent_at) if before_sent_at is not None else None
         with self._lock:
             if owner_type == "episode" and owner_key.isdigit():
-                row = self._connection.execute(
-                    """
-                    SELECT 1 FROM episodes
-                    WHERE umo = ? AND id = ? AND ended_at < ?
-                    LIMIT 1
-                    """,
-                    (umo, int(owner_key), cutoff),
-                ).fetchone()
+                sql = (
+                    "SELECT 1 FROM episodes WHERE umo=? AND id=? "
+                    "AND status='READY'"
+                    + (" AND ended_at < ?" if cutoff is not None else "")
+                    + " LIMIT 1"
+                )
+                parameters: tuple[object, ...] = (umo, int(owner_key))
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
+                row = self._connection.execute(sql, parameters).fetchone()
             elif owner_type == "semantic" and owner_key.isdigit():
+                cutoff_sql = " AND m.sent_at < ?" if cutoff is not None else ""
+                parameters = (umo, int(owner_key))
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
                 row = self._connection.execute(
-                    """
+                    f"""
                     SELECT 1
                     FROM semantic_memories AS s
-                    JOIN messages AS m ON m.id = s.source_message_id
+                    JOIN semantic_memory_sources AS ss
+                      ON ss.semantic_memory_id = s.id
+                    JOIN messages AS m ON m.id = ss.message_id
                     WHERE s.umo = ? AND s.id = ? AND m.umo = s.umo
-                      AND m.sent_at < ? AND m.is_deleted = 0
+                      AND s.status IN ('ACTIVE', 'CONFLICTED')
+                      AND m.is_deleted = 0{cutoff_sql}
                     LIMIT 1
                     """,
-                    (umo, int(owner_key), cutoff),
+                    parameters,
                 ).fetchone()
             elif owner_type == "topic" and owner_key.isdigit():
+                cutoff_sql = " AND e.ended_at < ?" if cutoff is not None else ""
+                parameters = (umo, int(owner_key))
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
                 row = self._connection.execute(
-                    """
+                    f"""
                     SELECT 1
                     FROM topics AS t
                     JOIN topic_episodes AS te ON te.topic_id = t.id
                     JOIN episodes AS e ON e.id = te.episode_id
                     WHERE t.umo = ? AND t.id = ? AND e.umo = t.umo
-                      AND e.ended_at < ?
+                      AND e.status = 'READY'{cutoff_sql}
                     LIMIT 1
                     """,
-                    (umo, int(owner_key), cutoff),
+                    parameters,
                 ).fetchone()
             elif owner_type == "cue":
+                episode_cutoff = " AND e.ended_at < ?" if cutoff is not None else ""
+                semantic_cutoff = " AND m.sent_at < ?" if cutoff is not None else ""
+                parameters = (umo, owner_key)
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
+                parameters = (*parameters, umo, owner_key)
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
                 row = self._connection.execute(
-                    """
+                    f"""
                     SELECT 1
                     FROM episode_keywords AS k
                     JOIN episodes AS e ON e.id = k.episode_id
                     WHERE e.umo = ? AND lower(k.cue) = lower(?)
-                      AND e.ended_at < ?
+                      AND e.status = 'READY'{episode_cutoff}
                     UNION ALL
                     SELECT 1
                     FROM semantic_memories AS s
-                    JOIN messages AS m ON m.id = s.source_message_id
+                    JOIN semantic_memory_sources AS ss
+                      ON ss.semantic_memory_id = s.id
+                    JOIN messages AS m ON m.id = ss.message_id
                     WHERE s.umo = ? AND lower(s.person_cue) = lower(?)
-                      AND m.umo = s.umo AND m.sent_at < ?
-                      AND m.is_deleted = 0
+                      AND s.status IN ('ACTIVE', 'CONFLICTED')
+                      AND m.umo = s.umo AND m.is_deleted = 0{semantic_cutoff}
                     LIMIT 1
                     """,
-                    (umo, owner_key, cutoff, umo, owner_key, cutoff),
+                    parameters,
+                ).fetchone()
+            elif owner_type == "participant" and owner_key.isdigit():
+                cutoff_sql = " AND first_seen_at < ?" if cutoff is not None else ""
+                parameters = (umo, int(owner_key))
+                if cutoff is not None:
+                    parameters = (*parameters, cutoff)
+                row = self._connection.execute(
+                    f"""
+                    SELECT 1 FROM participants
+                    WHERE umo = ? AND id = ?{cutoff_sql} LIMIT 1
+                    """,
+                    parameters,
                 ).fetchone()
             else:
                 return False
@@ -1552,6 +3927,7 @@ class MemoryStorage:
                 FROM episode_keywords AS k
                 JOIN episodes AS e ON e.id = k.episode_id
                 WHERE e.umo = ? AND lower(k.cue) = lower(?)
+                  AND e.status = 'READY'
                 {cutoff_sql}
                 GROUP BY k.cue, k.tag
                 ORDER BY episode_count DESC, k.tag
@@ -1569,6 +3945,7 @@ class MemoryStorage:
         before_sent_at: int | None = None,
     ) -> dict[str, list[dict[str, object]]]:
         result: dict[str, list[dict[str, object]]] = {
+            "participants": [],
             "cues": [],
             "episodes": [],
             "topics": [],
@@ -1579,7 +3956,32 @@ class MemoryStorage:
                 owner_type = str(match["owner_type"])
                 owner_key = str(match["owner_key"])
                 score = float(match["score"])
-                if owner_type == "cue":
+                if owner_type == "participant" and owner_key.isdigit():
+                    row = self._connection.execute(
+                        """
+                        SELECT id, canonical_key, account_id, account_type,
+                               current_display_name
+                        FROM participants WHERE umo = ? AND id = ?
+                        """,
+                        (umo, int(owner_key)),
+                    ).fetchone()
+                    if row:
+                        aliases = self._connection.execute(
+                            """
+                            SELECT alias FROM participant_aliases
+                            WHERE participant_id = ? AND is_active = 1
+                            ORDER BY last_seen_at DESC LIMIT 20
+                            """,
+                            (int(owner_key),),
+                        ).fetchall()
+                        result["participants"].append(
+                            {
+                                **dict(row),
+                                "aliases": [str(item["alias"]) for item in aliases],
+                                "score": score,
+                            }
+                        )
+                elif owner_type == "cue":
                     tags = self.query_cue_tags(
                         umo=umo,
                         cue=owner_key,
@@ -1602,6 +4004,7 @@ class MemoryStorage:
                                    COUNT(*) AS episode_count
                             FROM semantic_memories
                             WHERE umo = ? AND lower(person_cue) = lower(?)
+                              AND status IN ('ACTIVE', 'CONFLICTED')
                             {cutoff_sql}
                             GROUP BY aspect_tag
                             ORDER BY episode_count DESC, aspect_tag
@@ -1623,6 +4026,7 @@ class MemoryStorage:
                         f"""
                         SELECT id, started_at, ended_at, title, summary
                         FROM episodes WHERE umo = ? AND id = ?
+                          AND status = 'READY'
                         {cutoff_sql}
                         """,
                         parameters,
@@ -1637,6 +4041,7 @@ class MemoryStorage:
                             " AND EXISTS (SELECT 1 FROM topic_episodes AS te "
                             "JOIN episodes AS e ON e.id = te.episode_id "
                             "WHERE te.topic_id = topics.id AND e.umo = topics.umo "
+                            "AND e.status = 'READY' "
                             "AND e.ended_at < ?)"
                         )
                         parameters.append(int(before_sent_at))
@@ -1663,8 +4068,10 @@ class MemoryStorage:
                         parameters.append(int(before_sent_at))
                     row = self._connection.execute(
                         f"""
-                        SELECT id, person_cue, aspect_tag, content, confidence
+                        SELECT id, person_cue, aspect_tag, content, claim_type,
+                               epistemic_status, status, confidence
                         FROM semantic_memories WHERE umo = ? AND id = ?
+                          AND status IN ('ACTIVE', 'CONFLICTED')
                         {cutoff_sql}
                         """,
                         parameters,
@@ -1686,26 +4093,66 @@ class MemoryStorage:
         source_keys: list[str],
         keywords: list[tuple[str, str]],
         extractor_version: str = "",
+        stable_key: str = "",
     ) -> int:
         """Persist one distilled Cue--Tag--Episode unit."""
         with self._lock, self._connection:
-            cursor = self._connection.execute(
-                """
-                INSERT INTO episodes(
-                    umo, started_at, ended_at, title, summary, status,
-                    extractor_version
-                ) VALUES (?, ?, ?, ?, ?, 'READY', ?)
-                """,
-                (
-                    umo,
-                    int(started_at),
-                    int(ended_at),
-                    title,
-                    summary,
-                    extractor_version,
-                ),
-            )
-            episode_id = int(cursor.lastrowid)
+            existing = None
+            if stable_key:
+                existing = self._connection.execute(
+                    """
+                    SELECT id FROM episodes
+                    WHERE umo = ? AND stable_key = ? LIMIT 1
+                    """,
+                    (umo, stable_key),
+                ).fetchone()
+            if existing is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO episodes(
+                        umo, started_at, ended_at, title, summary, status,
+                        extractor_version, stable_key
+                    ) VALUES (?, ?, ?, ?, ?, 'READY', ?, ?)
+                    """,
+                    (
+                        umo,
+                        int(started_at),
+                        int(ended_at),
+                        title,
+                        summary,
+                        extractor_version,
+                        stable_key,
+                    ),
+                )
+                episode_id = int(cursor.lastrowid)
+            else:
+                episode_id = int(existing["id"])
+                self._connection.execute(
+                    """
+                    UPDATE episodes
+                    SET started_at=?, ended_at=?, title=?, summary=?,
+                        status='READY', extractor_version=?,
+                        revision_no=revision_no+1, updated_at=CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (
+                        int(started_at),
+                        int(ended_at),
+                        title,
+                        summary,
+                        extractor_version,
+                        episode_id,
+                        umo,
+                    ),
+                )
+                self._connection.execute(
+                    "DELETE FROM episode_messages WHERE episode_id = ?",
+                    (episode_id,),
+                )
+                self._connection.execute(
+                    "DELETE FROM episode_keywords WHERE episode_id = ?",
+                    (episode_id,),
+                )
             for position, source_key in enumerate(source_keys):
                 row = self._connection.execute(
                     """
@@ -1747,7 +4194,7 @@ class MemoryStorage:
         confidence: float = 0,
         extractor_version: str = "",
     ) -> int:
-        """Persist one distilled Person--Aspect--Semantic unit."""
+        """Persist one distilled Participant--Aspect--Structured Claim unit."""
         with self._lock, self._connection:
             source_message_id = None
             if source_key:
@@ -1779,6 +4226,302 @@ class MemoryStorage:
             )
         return int(cursor.lastrowid)
 
+    def store_semantic_claim(
+        self,
+        *,
+        umo: str,
+        stable_key: str,
+        subject_participant_key: str,
+        subject_text: str,
+        claim_type: str,
+        aspect: str,
+        content: str,
+        epistemic_status: str,
+        operation: str,
+        target_claim_ids: list[int],
+        evidence: list[dict[str, object]],
+        confidence: float,
+        extractor_version: str = "",
+    ) -> int:
+        """Persist a structured, multi-source claim and its revision transition."""
+
+        if not evidence:
+            raise ValueError("semantic claim needs source evidence")
+        with self._lock, self._connection:
+            participant_id = None
+            person_cue = str(subject_text or "").strip()
+            if subject_participant_key:
+                participant = self._connection.execute(
+                    """
+                    SELECT id, current_display_name, account_id
+                    FROM participants WHERE umo = ? AND canonical_key = ?
+                    """,
+                    (umo, subject_participant_key),
+                ).fetchone()
+                if participant is None:
+                    raise ValueError("semantic claim subject is not a bound participant")
+                participant_id = int(participant["id"])
+                person_cue = str(
+                    participant["current_display_name"]
+                    or participant["account_id"]
+                )
+            if not person_cue:
+                raise ValueError("semantic claim subject is empty")
+
+            source_rows: list[tuple[int, str, str, float]] = []
+            independent_user_speakers: set[int] = set()
+            for item in evidence:
+                source_key = str(item.get("source_key") or "")
+                source = self._connection.execute(
+                    """
+                    SELECT id, plain_text, role, sender_participant_id
+                    FROM messages
+                    WHERE umo = ? AND source_key = ? AND is_deleted = 0
+                    """,
+                    (umo, source_key),
+                ).fetchone()
+                if source is None:
+                    raise ValueError("semantic claim source is missing or deleted")
+                span = str(item.get("span") or "")
+                if span and span not in str(source["plain_text"]):
+                    raise ValueError("semantic claim span is not in its source")
+                source_rows.append(
+                    (
+                        int(source["id"]),
+                        str(item.get("role") or "SUPPORT").upper(),
+                        span,
+                        max(0.0, min(1.0, float(item.get("confidence") or 0))),
+                    )
+                )
+                if (
+                    str(source["role"]) == "USER"
+                    and source["sender_participant_id"] is not None
+                ):
+                    independent_user_speakers.add(
+                        int(source["sender_participant_id"])
+                    )
+
+            targets: list[sqlite3.Row] = []
+            if target_claim_ids:
+                placeholders = ",".join("?" for _ in target_claim_ids)
+                targets = self._connection.execute(
+                    f"""
+                    SELECT id, subject_participant_id, subject_text, status
+                    FROM semantic_memories
+                    WHERE umo = ? AND id IN ({placeholders})
+                      AND status IN ('ACTIVE', 'CONFLICTED', 'QUARANTINED')
+                    """,
+                    (umo, *[int(item) for item in target_claim_ids]),
+                ).fetchall()
+                if len(targets) != len(set(target_claim_ids)):
+                    raise ValueError("semantic revision target is not active in scope")
+                for target in targets:
+                    if participant_id is not None and target["subject_participant_id"] != participant_id:
+                        raise ValueError("semantic revision crosses participant subjects")
+                    if participant_id is None and normalize_alias(target["subject_text"]) != normalize_alias(person_cue):
+                        raise ValueError("semantic revision crosses unresolved subjects")
+
+            existing = self._connection.execute(
+                """
+                SELECT id, status, confidence FROM semantic_memories
+                WHERE umo = ? AND stable_key = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (umo, stable_key),
+            ).fetchone()
+            if existing is not None and str(existing["status"]) in {
+                "ACTIVE",
+                "CONFLICTED",
+                "QUARANTINED",
+            }:
+                prior_speakers = self._connection.execute(
+                    """
+                    SELECT DISTINCT m.sender_participant_id
+                    FROM semantic_memory_sources AS ss
+                    JOIN messages AS m ON m.id = ss.message_id
+                    WHERE ss.semantic_memory_id = ? AND m.umo = ?
+                      AND m.is_deleted = 0 AND m.role = 'USER'
+                      AND m.sender_participant_id IS NOT NULL
+                    """,
+                    (int(existing["id"]), umo),
+                ).fetchall()
+                independent_user_speakers.update(
+                    int(row["sender_participant_id"])
+                    for row in prior_speakers
+                )
+
+            initial_status = "ACTIVE"
+            if not subject_participant_key:
+                initial_status = "UNRESOLVED"
+            elif epistemic_status in {"UNCERTAIN", "HEARSAY", "JOKE"}:
+                initial_status = "QUARANTINED"
+            high_risk_text = " ".join(
+                (str(claim_type), str(aspect), str(content))
+            ).casefold()
+            high_risk_markers = (
+                "管理员", "群主", "权限", "真实身份", "admin", "owner",
+            )
+            if (
+                subject_participant_key
+                and (
+                    str(claim_type).upper() == "IDENTITY"
+                    or any(marker in high_risk_text for marker in high_risk_markers)
+                )
+                and len(independent_user_speakers) < 2
+            ):
+                initial_status = "QUARANTINED"
+
+            if existing is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO semantic_memories(
+                        umo, person_cue, aspect_tag, content,
+                        source_message_id, confidence, extractor_version,
+                        stable_key, subject_participant_id, subject_text,
+                        claim_type, epistemic_status, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        umo,
+                        person_cue,
+                        aspect.strip(),
+                        content,
+                        source_rows[0][0],
+                        max(0.0, min(1.0, float(confidence))),
+                        extractor_version,
+                        stable_key,
+                        participant_id,
+                        person_cue,
+                        claim_type,
+                        epistemic_status,
+                        initial_status,
+                    ),
+                )
+                semantic_id = int(cursor.lastrowid)
+            else:
+                semantic_id = int(existing["id"])
+                previous_status = str(existing["status"])
+                self._connection.execute(
+                    """
+                    UPDATE semantic_memories
+                    SET person_cue=?, aspect_tag=?, content=?,
+                        source_message_id=?, confidence=MAX(confidence, ?),
+                        extractor_version=?, subject_participant_id=?,
+                        subject_text=?, claim_type=?, epistemic_status=?,
+                        status=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id = ? AND umo = ?
+                    """,
+                    (
+                        person_cue,
+                        aspect.strip(),
+                        content,
+                        source_rows[0][0],
+                        max(0.0, min(1.0, float(confidence))),
+                        extractor_version,
+                        participant_id,
+                        person_cue,
+                        claim_type,
+                        epistemic_status,
+                        initial_status,
+                        semantic_id,
+                        umo,
+                    ),
+                )
+                if previous_status != initial_status:
+                    self._connection.execute(
+                        """
+                        INSERT INTO semantic_memory_revisions(
+                            semantic_memory_id, previous_status, new_status,
+                            reason, source_message_id
+                        ) VALUES (?, ?, ?, 'new supporting extraction', ?)
+                        """,
+                        (
+                            semantic_id,
+                            previous_status,
+                            initial_status,
+                            source_rows[0][0],
+                        ),
+                    )
+
+            for source_id, role, span, evidence_confidence in source_rows:
+                self._connection.execute(
+                    """
+                    INSERT INTO semantic_memory_sources(
+                        semantic_memory_id, message_id, evidence_role,
+                        source_span, confidence
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(semantic_memory_id, message_id, evidence_role)
+                    DO UPDATE SET source_span=excluded.source_span,
+                                  confidence=MAX(
+                                      semantic_memory_sources.confidence,
+                                      excluded.confidence
+                                  )
+                    """,
+                    (semantic_id, source_id, role, span, evidence_confidence),
+                )
+
+            operation = str(operation or "ASSERT").upper()
+            target_status = "SUPERSEDED" if operation == "SUPERSEDE" else "RETRACTED"
+            if operation in {"SUPERSEDE", "RETRACT"}:
+                for target in targets:
+                    target_id = int(target["id"])
+                    self._connection.execute(
+                        """
+                        UPDATE semantic_memories
+                        SET status=?, superseded_by=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id = ? AND umo = ?
+                        """,
+                        (
+                            target_status,
+                            semantic_id if operation == "SUPERSEDE" else None,
+                            target_id,
+                            umo,
+                        ),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO semantic_memory_revisions(
+                            semantic_memory_id, previous_status, new_status,
+                            reason, source_message_id
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_id,
+                            str(target["status"]),
+                            target_status,
+                            f"{operation.lower()} by claim {semantic_id}",
+                            source_rows[0][0],
+                        ),
+                    )
+            elif initial_status == "ACTIVE":
+                if participant_id is not None:
+                    conflicting = self._connection.execute(
+                        """
+                        SELECT id, status FROM semantic_memories
+                        WHERE umo = ? AND subject_participant_id = ?
+                          AND lower(aspect_tag) = lower(?)
+                          AND id <> ? AND stable_key <> ?
+                          AND status = 'ACTIVE'
+                        """,
+                        (umo, participant_id, aspect, semantic_id, stable_key),
+                    ).fetchall()
+                else:
+                    conflicting = []
+                if any(role == "CONTRADICT" for _, role, _, _ in source_rows):
+                    conflicting = [*conflicting]
+                if conflicting:
+                    conflict_ids = [semantic_id, *[int(row["id"]) for row in conflicting]]
+                    placeholders = ",".join("?" for _ in conflict_ids)
+                    self._connection.execute(
+                        f"""
+                        UPDATE semantic_memories SET status='CONFLICTED',
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE umo = ? AND id IN ({placeholders})
+                        """,
+                        (umo, *conflict_ids),
+                    )
+            return semantic_id
+
     def store_topic(
         self,
         *,
@@ -1790,27 +4533,73 @@ class MemoryStorage:
     ) -> int:
         """Persist one Topic--Episode abstraction."""
         with self._lock, self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO topics(umo, name, summary, extractor_version)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(umo, name) DO UPDATE SET
-                    summary=excluded.summary,
-                    extractor_version=excluded.extractor_version
-                """,
-                (umo, name.strip(), summary, extractor_version),
-            )
             row = self._connection.execute(
                 "SELECT id FROM topics WHERE umo = ? AND name = ?",
                 (umo, name.strip()),
             ).fetchone()
-            topic_id = int(row["id"])
+            if row is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO topics(umo, name, summary, extractor_version)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (umo, name.strip(), summary, extractor_version),
+                )
+                topic_id = int(cursor.lastrowid)
+            else:
+                topic_id = int(row["id"])
+                previous = self._connection.execute(
+                    "SELECT summary FROM topics WHERE id = ?",
+                    (topic_id,),
+                ).fetchone()
+                if previous is not None and str(previous["summary"]) != summary:
+                    self._connection.execute(
+                        """
+                        INSERT INTO topic_revisions(
+                            topic_id, previous_summary, proposed_summary,
+                            extractor_version
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            topic_id,
+                            str(previous["summary"]),
+                            summary,
+                            extractor_version,
+                        ),
+                    )
             self._connection.executemany(
                 """
                 INSERT OR IGNORE INTO topic_episodes(topic_id, episode_id)
                 SELECT ?, id FROM episodes WHERE id = ? AND umo = ?
                 """,
                 [(topic_id, int(event_id), umo) for event_id in event_ids],
+            )
+            episode_rows = self._connection.execute(
+                """
+                SELECT e.summary
+                FROM topic_episodes AS te
+                JOIN episodes AS e ON e.id = te.episode_id
+                WHERE te.topic_id = ? AND e.umo = ? AND e.status = 'READY'
+                ORDER BY e.ended_at DESC, e.id DESC LIMIT 20
+                """,
+                (topic_id, umo),
+            ).fetchall()
+            summaries = list(
+                dict.fromkeys(
+                    str(item["summary"]).strip()
+                    for item in reversed(episode_rows)
+                    if str(item["summary"]).strip()
+                )
+            )
+            aggregate = "；".join(summaries)
+            if len(aggregate) > 4000:
+                aggregate = aggregate[-4000:]
+            self._connection.execute(
+                """
+                UPDATE topics SET summary = ?, extractor_version = ?
+                WHERE id = ? AND umo = ?
+                """,
+                (aggregate or summary, extractor_version, topic_id, umo),
             )
         return topic_id
 
@@ -1887,7 +4676,7 @@ class MemoryStorage:
 
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
-        messages = [self._row_to_message(row) for row in rows]
+        messages = [self._stored_message_from_row(row) for row in rows]
         return sorted(messages, key=lambda item: (item.sent_at, item.id))
 
     def query_tag_events(
@@ -1913,8 +4702,9 @@ class MemoryStorage:
                 FROM episode_keywords AS k
                 JOIN episodes AS e ON e.id = k.episode_id
                 WHERE e.umo = ?
-                  AND instr(lower(k.cue), lower(?)) > 0
-                  AND instr(lower(k.tag), lower(?)) > 0
+                  AND e.status = 'READY'
+                  AND lower(k.cue) = lower(?)
+                  AND lower(k.tag) = lower(?)
                   {cutoff_sql}
                 ORDER BY e.ended_at DESC, e.id DESC
                 LIMIT ?
@@ -1940,7 +4730,7 @@ class MemoryStorage:
                 f"""
                 SELECT id, started_at, ended_at
                 FROM episodes
-                WHERE umo = ? AND id = ?
+                WHERE umo = ? AND id = ? AND status = 'READY'
                 {cutoff_sql}
                 """,
                 parameters,
@@ -1965,7 +4755,7 @@ class MemoryStorage:
                 SELECT k.cue, k.tag
                 FROM episode_keywords AS k
                 JOIN episodes AS e ON e.id = k.episode_id
-                WHERE e.umo = ? AND e.id = ?
+                WHERE e.umo = ? AND e.id = ? AND e.status = 'READY'
                 {cutoff_sql}
                 ORDER BY k.cue, k.tag
                 """,
@@ -1992,13 +4782,13 @@ class MemoryStorage:
         with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
-                       m.role, m.plain_text
+                SELECT m.*
                 FROM episode_messages AS em
                 JOIN episodes AS e ON e.id = em.episode_id
                 JOIN messages AS m ON m.id = em.message_id
                 WHERE e.umo = ?
                   AND e.id = ?
+                  AND e.status = 'READY'
                   AND m.umo = e.umo
                   AND m.is_deleted = 0
                   {cutoff_sql}
@@ -2007,7 +4797,23 @@ class MemoryStorage:
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+            messages = [self._stored_message_from_row(row) for row in rows]
+        return [
+            {
+                "source_key": message.source_key,
+                "sent_at": message.sent_at,
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "sender_participant_key": message.sender_participant_key,
+                "role": message.role,
+                "plain_text": message.plain_text,
+                "reply_to_source_key": message.reply_to_source_key,
+                "mentions": list(message.mentions),
+                "components": message.content,
+                "revision_no": message.revision_no,
+            }
+            for message in messages
+        ]
 
     def query_personal_information(
         self,
@@ -2017,29 +4823,82 @@ class MemoryStorage:
         before_sent_at: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_person->semantic-aspects."""
-        cutoff_sql = ""
-        parameters: list[object] = [umo, person.strip()]
-        if before_sent_at is not None:
-            cutoff_sql = (
-                " AND EXISTS (SELECT 1 FROM messages AS m "
-                "WHERE m.id = semantic_memories.source_message_id "
-                "AND m.umo = semantic_memories.umo "
-                "AND m.sent_at < ? AND m.is_deleted = 0)"
-            )
-            parameters.append(int(before_sent_at))
         with self._lock:
+            resolved = self.resolve_participants(umo=umo, reference=person)
+            participants = resolved["participants"]
+            assert isinstance(participants, list)
+            if resolved["ambiguous"]:
+                return [
+                    {
+                        "identity_ambiguous": True,
+                        "reference": str(resolved["reference"]),
+                        "candidate_participants": [
+                            {
+                                "canonical_key": item["canonical_key"],
+                                "account_id": item["account_id"],
+                                "current_display_name": item[
+                                    "current_display_name"
+                                ],
+                                "aliases": item["aliases"],
+                            }
+                            for item in participants
+                        ],
+                        "notice": (
+                            "昵称对应多个账户；必须改用 account_id 或 "
+                            "canonical_key 后才能读取人物记忆。"
+                        ),
+                    }
+                ]
+            participant_ids = [int(item["id"]) for item in participants]
+            parameters: list[object] = [umo]
+            if participant_ids:
+                placeholders = ",".join("?" for _ in participant_ids)
+                identity_sql = f"s.subject_participant_id IN ({placeholders})"
+                parameters.extend(participant_ids)
+            else:
+                identity_sql = (
+                    "s.subject_participant_id IS NULL "
+                    "AND lower(s.person_cue) = lower(?)"
+                )
+                parameters.append(person.strip())
+            cutoff_sql = ""
+            if before_sent_at is not None:
+                cutoff_sql = (
+                    " AND EXISTS (SELECT 1 "
+                    "FROM semantic_memory_sources AS ss "
+                    "JOIN messages AS m ON m.id = ss.message_id "
+                    "WHERE ss.semantic_memory_id = s.id AND m.umo = s.umo "
+                    "AND m.sent_at < ? AND m.is_deleted = 0)"
+                )
+                parameters.append(int(before_sent_at))
             rows = self._connection.execute(
                 f"""
-                SELECT aspect_tag, COUNT(*) AS evidence_count
-                FROM semantic_memories
-                WHERE umo = ? AND instr(lower(person_cue), lower(?)) > 0
+                SELECT s.subject_participant_id, p.canonical_key,
+                       COALESCE(p.current_display_name, s.subject_text,
+                                s.person_cue) AS subject_display_name,
+                       s.aspect_tag,
+                       COUNT(DISTINCT ss.message_id) AS evidence_count,
+                       GROUP_CONCAT(DISTINCT s.status) AS statuses
+                FROM semantic_memories AS s
+                LEFT JOIN participants AS p ON p.id = s.subject_participant_id
+                LEFT JOIN semantic_memory_sources AS ss
+                  ON ss.semantic_memory_id = s.id
+                WHERE s.umo = ? AND ({identity_sql})
+                  AND s.status IN ('ACTIVE', 'CONFLICTED')
                 {cutoff_sql}
-                GROUP BY aspect_tag
-                ORDER BY evidence_count DESC, aspect_tag
+                GROUP BY s.subject_participant_id, p.canonical_key,
+                         subject_display_name, s.aspect_tag
+                ORDER BY evidence_count DESC, s.aspect_tag
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {
+                **dict(row),
+                "identity_ambiguous": bool(resolved["ambiguous"]),
+            }
+            for row in rows
+        ]
 
     def query_personal_aspect(
         self,
@@ -2052,33 +4911,91 @@ class MemoryStorage:
     ) -> list[dict[str, object]]:
         """Paper mapping phi_(person,aspect)->semantic-content."""
         safe_limit = max(1, min(50, int(limit)))
-        cutoff_sql = ""
-        parameters: list[object] = [umo, person.strip(), aspect.strip()]
-        if before_sent_at is not None:
-            cutoff_sql = (
-                " AND EXISTS (SELECT 1 FROM messages AS m "
-                "WHERE m.id = semantic_memories.source_message_id "
-                "AND m.umo = semantic_memories.umo "
-                "AND m.sent_at < ? AND m.is_deleted = 0)"
-            )
-            parameters.append(int(before_sent_at))
-        parameters.append(safe_limit)
         with self._lock:
+            resolved = self.resolve_participants(umo=umo, reference=person)
+            participants = resolved["participants"]
+            assert isinstance(participants, list)
+            if resolved["ambiguous"]:
+                return [
+                    {
+                        "identity_ambiguous": True,
+                        "reference": str(resolved["reference"]),
+                        "candidate_participants": [
+                            {
+                                "canonical_key": item["canonical_key"],
+                                "account_id": item["account_id"],
+                                "current_display_name": item[
+                                    "current_display_name"
+                                ],
+                                "aliases": item["aliases"],
+                            }
+                            for item in participants
+                        ],
+                        "notice": (
+                            "昵称对应多个账户；必须改用 account_id 或 "
+                            "canonical_key 后才能读取人物记忆。"
+                        ),
+                    }
+                ]
+            participant_ids = [int(item["id"]) for item in participants]
+            parameters: list[object] = [umo]
+            if participant_ids:
+                placeholders = ",".join("?" for _ in participant_ids)
+                identity_sql = f"s.subject_participant_id IN ({placeholders})"
+                parameters.extend(participant_ids)
+            else:
+                identity_sql = (
+                    "s.subject_participant_id IS NULL "
+                    "AND lower(s.person_cue) = lower(?)"
+                )
+                parameters.append(person.strip())
+            parameters.append(aspect.strip())
+            cutoff_sql = ""
+            if before_sent_at is not None:
+                cutoff_sql = (
+                    " AND EXISTS (SELECT 1 "
+                    "FROM semantic_memory_sources AS sx "
+                    "JOIN messages AS mx ON mx.id = sx.message_id "
+                    "WHERE sx.semantic_memory_id = s.id AND mx.umo = s.umo "
+                    "AND mx.sent_at < ? AND mx.is_deleted = 0)"
+                )
+                parameters.append(int(before_sent_at))
+            parameters.append(safe_limit)
             rows = self._connection.execute(
                 f"""
-                SELECT id, person_cue, aspect_tag, content, source_message_id,
-                       confidence
-                FROM semantic_memories
-                WHERE umo = ?
-                  AND instr(lower(person_cue), lower(?)) > 0
-                  AND instr(lower(aspect_tag), lower(?)) > 0
+                SELECT s.id, s.person_cue, p.canonical_key,
+                       s.aspect_tag, s.content, s.claim_type,
+                       s.epistemic_status, s.status, s.confidence,
+                       COUNT(DISTINCT ss.message_id) AS evidence_count,
+                       GROUP_CONCAT(DISTINCT m.source_key) AS source_keys_csv
+                FROM semantic_memories AS s
+                LEFT JOIN participants AS p ON p.id = s.subject_participant_id
+                LEFT JOIN semantic_memory_sources AS ss
+                  ON ss.semantic_memory_id = s.id
+                LEFT JOIN messages AS m
+                  ON m.id = ss.message_id AND m.is_deleted = 0
+                WHERE s.umo = ? AND ({identity_sql})
+                  AND lower(s.aspect_tag) = lower(?)
+                  AND s.status IN ('ACTIVE', 'CONFLICTED')
                   {cutoff_sql}
-                ORDER BY confidence DESC, id DESC
+                GROUP BY s.id
+                ORDER BY s.confidence DESC, s.id DESC
                 LIMIT ?
                 """,
                 parameters,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {
+                **{key: value for key, value in dict(row).items() if key != "source_keys_csv"},
+                "source_keys": [
+                    item
+                    for item in str(row["source_keys_csv"] or "").split(",")
+                    if item
+                ],
+                "identity_ambiguous": bool(resolved["ambiguous"]),
+            }
+            for row in rows
+        ]
 
     def query_topic_events(
         self,
@@ -2105,6 +5022,7 @@ class MemoryStorage:
                 JOIN episodes AS e ON e.id = te.episode_id
                 WHERE t.umo = ?
                   AND e.umo = t.umo
+                  AND e.status = 'READY'
                   AND instr(lower(t.name), lower(?)) > 0
                   {cutoff_sql}
                 ORDER BY e.ended_at DESC, e.id DESC
@@ -2436,7 +5354,7 @@ class MemoryStorage:
         with self._lock, self._connection:
             feedback = self._connection.execute(
                 """
-                SELECT source_key, sender_id, sent_at, plain_text
+                SELECT id, source_key, sender_id, sent_at, plain_text
                 FROM messages
                 WHERE umo = ? AND source_key = ? AND is_deleted = 0
                 """,
@@ -2448,7 +5366,7 @@ class MemoryStorage:
             lower = sent_at - max(60, min(604800, int(feedback_window_seconds)))
             traces = self._connection.execute(
                 """
-                SELECT trace_id
+                SELECT trace_id, sender_id, response_at
                 FROM interaction_traces
                 WHERE umo = ? AND status IN ('RESPONDED', 'FEEDBACK')
                   AND response_at IS NOT NULL
@@ -2469,12 +5387,38 @@ class MemoryStorage:
             trace_ids = [str(row["trace_id"]) for row in traces]
             if not trace_ids:
                 return None
+            reply_to_bot = self._connection.execute(
+                """
+                SELECT 1
+                FROM message_relations AS r
+                LEFT JOIN messages AS target ON target.id = r.target_message_id
+                LEFT JOIN participants AS p ON p.id = r.target_participant_id
+                WHERE r.source_message_id = ?
+                  AND r.relation = 'REPLY_TO'
+                  AND (target.role = 'BOT' OR p.account_type = 'BOT')
+                LIMIT 1
+                """,
+                (int(feedback["id"]),),
+            ).fetchone() is not None
+            closest = traces[0]
+            score, reasons = feedback_surface_score(
+                str(feedback["plain_text"]),
+                reply_to_bot=reply_to_bot,
+                seconds_after_response=(
+                    sent_at - int(closest["response_at"] or sent_at)
+                ),
+                same_sender=(
+                    str(feedback["sender_id"]) == str(closest["sender_id"])
+                ),
+            )
+            if score < 0.25:
+                return None
             self._connection.execute(
                 """
                 INSERT INTO feedback_proposals(
                     umo, feedback_source_key, feedback_sent_at,
-                    candidate_trace_ids_json
-                ) VALUES (?, ?, ?, ?)
+                    candidate_trace_ids_json, surface_score, candidate_reason
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(umo, feedback_source_key) DO NOTHING
                 """,
                 (
@@ -2482,6 +5426,8 @@ class MemoryStorage:
                     feedback_source_key,
                     sent_at,
                     self._bounded_json(trace_ids, max_chars=2000),
+                    score,
+                    ",".join(reasons),
                 ),
             )
             row = self._connection.execute(
@@ -2501,7 +5447,8 @@ class MemoryStorage:
             rows = self._connection.execute(
                 """
                 SELECT id, feedback_source_key, feedback_sent_at,
-                       candidate_trace_ids_json, created_at
+                       candidate_trace_ids_json, surface_score,
+                       candidate_reason, created_at
                 FROM feedback_proposals
                 WHERE umo = ? AND status = 'PENDING'
                 ORDER BY feedback_sent_at, id
@@ -3547,8 +6494,41 @@ class MemoryStorage:
     def _make_fts_query(query: str) -> str:
         return f'"{query.replace(chr(34), chr(34) * 2)}"'
 
-    @staticmethod
-    def _row_to_message(row: sqlite3.Row) -> StoredMessage:
+    def _stored_message_from_row(self, row: sqlite3.Row) -> StoredMessage:
+        sender_participant_id = (
+            int(row["sender_participant_id"])
+            if "sender_participant_id" in row.keys()
+            and row["sender_participant_id"] is not None
+            else None
+        )
+        sender_key = ""
+        if sender_participant_id is not None:
+            participant = self._connection.execute(
+                "SELECT canonical_key FROM participants WHERE id = ?",
+                (sender_participant_id,),
+            ).fetchone()
+            if participant is not None:
+                sender_key = str(participant["canonical_key"])
+        reply = self._connection.execute(
+            """
+            SELECT target_source_key FROM message_relations
+            WHERE source_message_id = ?
+              AND relation IN ('REPLY_TO', 'RESPONDS_TO')
+            ORDER BY id LIMIT 1
+            """,
+            (int(row["id"]),),
+        ).fetchone()
+        mentions = self._connection.execute(
+            """
+            SELECT p.canonical_key, p.account_id,
+                   COALESCE(p.current_display_name, '') AS display_name
+            FROM message_participants AS mp
+            JOIN participants AS p ON p.id = mp.participant_id
+            WHERE mp.message_id = ? AND mp.relation = 'MENTIONED'
+            ORDER BY mp.position, p.id
+            """,
+            (int(row["id"]),),
+        ).fetchall()
         return StoredMessage(
             id=int(row["id"]),
             source_key=str(row["source_key"]),
@@ -3561,6 +6541,29 @@ class MemoryStorage:
             sender_name=str(row["sender_name"]),
             sent_at=int(row["sent_at"]),
             plain_text=str(row["plain_text"]),
-            content=json.loads(row["content_json"]),
+            content=self._parse_content_json(row["content_json"]),
             role=str(row["role"]),  # type: ignore[arg-type]
+            sender_participant_id=sender_participant_id,
+            sender_participant_key=sender_key,
+            revision_no=(
+                int(row["revision_no"] or 1)
+                if "revision_no" in row.keys()
+                else 1
+            ),
+            content_sha256=(
+                str(row["content_sha256"] or "")
+                if "content_sha256" in row.keys()
+                else ""
+            ),
+            reply_to_source_key=(
+                str(reply["target_source_key"]) if reply is not None else ""
+            ),
+            mentions=tuple(
+                {
+                    "participant_key": str(item["canonical_key"]),
+                    "account_id": str(item["account_id"]),
+                    "display_name": str(item["display_name"]),
+                }
+                for item in mentions
+            ),
         )

@@ -14,6 +14,7 @@
   --accent-soft: #dbece4;
   --warning: #a55a20;
   --danger: #a43c38;
+  --participant: #b34d87;
   --cue: #4f7fc2;
   --episode: #2f8b68;
   --semantic: #ad6744;
@@ -46,6 +47,7 @@
   --accent-soft: #203f32;
   --warning: #e3a56a;
   --danger: #e27b76;
+  --participant: #df82b8;
   --cue: #78a7e6;
   --episode: #65bd98;
   --semantic: #df9773;
@@ -182,7 +184,7 @@ select:focus-visible {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -269,6 +271,7 @@ select:focus-visible {
 
 select,
 input[type="search"],
+input[type="text"],
 input[type="number"] {
   min-height: 40px;
   border: 1px solid var(--line-strong);
@@ -441,6 +444,7 @@ input[type="number"] {
 }
 
 .legend i.cue { background: var(--cue); }
+.legend i.participant { background: var(--participant); }
 .legend i.episode { background: var(--episode); }
 .legend i.semantic { background: var(--semantic); }
 .legend i.topic { background: var(--topic); }
@@ -526,6 +530,7 @@ input[type="number"] {
 }
 
 .graph-node[data-type="cue"] circle { fill: var(--cue); }
+.graph-node[data-type="participant"] circle { fill: var(--participant); }
 .graph-node[data-type="episode"] circle { fill: var(--episode); }
 .graph-node[data-type="semantic"] circle { fill: var(--semantic); }
 .graph-node[data-type="topic"] circle { fill: var(--topic); }
@@ -711,8 +716,24 @@ input[type="number"] {
   white-space: pre-wrap;
 }
 
-.messages-panel {
+.messages-panel,
+.identity-panel {
   box-shadow: 0 10px 32px rgba(32, 45, 36, 0.055);
+}
+
+.identity-panel {
+  margin-bottom: 16px;
+}
+
+.panel-note {
+  margin: 5px 0 0;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.identity-panel td:nth-child(3) {
+  min-width: 280px;
+  white-space: normal;
 }
 
 .message-search {

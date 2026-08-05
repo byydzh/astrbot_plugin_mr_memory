@@ -123,13 +123,55 @@
     "description": "单次蒸馏最大消息数",
     "type": "int",
     "default": 80,
-    "hint": "管理员 /mrmem distill 单次读取的最近消息上限，实际范围 4 到 500。"
+    "hint": "每个增量批次的目标消息上限，实际范围 4 到 500；不再重复读取固定的最近窗口。"
+  },
+  "distillation_overlap_messages": {
+    "description": "增量蒸馏重叠上下文数",
+    "type": "int",
+    "default": 12,
+    "hint": "在最早未处理消息前附带的只读上下文，实际范围 0 到 100；只有目标消息会推进 checkpoint。"
+  },
+  "auto_distillation_enabled": {
+    "description": "启用后台增量蒸馏",
+    "type": "bool",
+    "default": true,
+    "hint": "仅在采集开启后生效；模型整理在独立后台队列运行，不阻塞主回复。"
+  },
+  "auto_distillation_min_pending": {
+    "description": "触发后台蒸馏的未处理消息数",
+    "type": "int",
+    "default": 30,
+    "hint": "达到阈值立即排队；未达到时也会在维护周期到达后整理。"
+  },
+  "maintenance_interval_seconds": {
+    "description": "后台维护周期（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "实际范围 30 到 3600；用于低流量群的空闲整理和失败重试。"
   },
   "wake_on_llm_request": {
     "description": "主 LLM 请求前自动唤醒潜意识",
     "type": "bool",
     "default": true,
     "hint": "仅在当前会话已有图记忆时调用潜意识 LLM；无记忆时不会产生模型费用。"
+  },
+  "retrieval_min_score": {
+    "description": "自动唤醒最低向量相似度",
+    "type": "float",
+    "default": 0.48,
+    "hint": "低于此分数的候选不会进入自动潜意识；明确的历史提问和手动 consult 仍可强制检索。"
+  },
+  "runtime_host_evidence_gate": {
+    "description": "启用宿主证据停止门",
+    "type": "bool",
+    "default": true,
+    "hint": "高分 episode 经原始 source key 与词面重叠验证后，宿主强制停止继续浏览并进入结构化综合。"
+  },
+  "private_daily_token_budget": {
+    "description": "每群私有 LLM 24 小时 Token 预算",
+    "type": "int",
+    "default": 120000,
+    "hint": "覆盖蒸馏、反馈维护和重建；达到预算后全部 fail-open。0 表示不限制。"
   },
   "consult_tool_enabled": {
     "description": "向主 LLM 暴露潜意识咨询工具",
