@@ -85,6 +85,75 @@ class MemoryStorageTests(unittest.TestCase):
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
 
+    def test_repeated_images_use_bounded_hash_metadata_not_media_bytes(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        fingerprint = "a" * 64
+        messages = (
+            self.message("before", "这个表情又来了", sent_at=90),
+            NormalizedMessage(
+                platform="aiocqhttp",
+                platform_id="shadow",
+                umo=umo,
+                group_id="group-a",
+                message_id="image-1",
+                sender_id="user-a",
+                sender_name="甲",
+                sent_at=100,
+                plain_text="[图片]",
+                content=[
+                    {
+                        "type": "image",
+                        "name": "meme.jpg",
+                        "reference_sha256": fingerprint,
+                        "url": "https://secret.invalid/signed?token=do-not-store",
+                        "bytes": "do-not-store",
+                    }
+                ],
+            ),
+            NormalizedMessage(
+                platform="aiocqhttp",
+                platform_id="shadow",
+                umo=umo,
+                group_id="group-a",
+                message_id="image-2",
+                sender_id="user-b",
+                sender_name="乙",
+                sent_at=110,
+                plain_text="你又发这个",
+                content=[
+                    {"type": "image", "reference_sha256": fingerprint}
+                ],
+            ),
+        )
+        for message in messages:
+            self.storage.upsert_message(message)
+
+        patterns = self.storage.query_media_patterns(
+            umo=umo,
+            fingerprints=[fingerprint],
+        )
+        self.assertEqual(len(patterns), 1)
+        self.assertEqual(patterns[0]["observation_count"], 2)
+        self.assertEqual(patterns[0]["unique_sender_count"], 2)
+        encoded = str(patterns[0])
+        self.assertNotIn("secret.invalid", encoded)
+        self.assertNotIn("do-not-store", encoded)
+        self.assertIn("这个表情又来了", encoded)
+
+        self.storage.mark_message_deleted(
+            umo=umo,
+            platform_id="shadow",
+            platform_message_id="image-2",
+            deleted_at=120,
+        )
+        self.assertEqual(
+            self.storage.query_media_patterns(
+                umo=umo,
+                fingerprints=[fingerprint],
+            ),
+            [],
+        )
+
     def test_historical_cutoff_is_strict(self) -> None:
         past = self.message("past", "太空采矿玩吐了", sent_at=100)
         future = self.message("future", "后来又买了采矿游戏首发", sent_at=200)

@@ -3,9 +3,9 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.10.0 新增按群隔离的可塑关联图：潜意识 LLM 可以从真实反馈中建立、强化、抑制、
-遗忘或合并局部语义路径，也可以对关系类型做带版本修订；embedding 只生成候选，
-语义相关性与遍历停止由独立潜意识 LLM 判断。
+0.11.0 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
+可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
+或 `CONFIRMED`；embedding 只生成候选，语义状态与遍历停止由独立潜意识 LLM 判断。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -23,7 +23,7 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：记忆推理与主 LLM 分离。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
-- `expose_traversal_tools=false`：主 LLM 默认看不到七个底层遍历工具。
+- `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
 - 数据库固定写入本插件的 `plugin_data` 目录。
 - 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
@@ -68,7 +68,8 @@ private provider tool loop (DeepSeek by default)
 ```
 
 `mr_memory/` 不依赖 AstrBot，可以通过普通 Python 测试和 JSONL 回放独立运行。
-`main.py` 负责把 AstrBot 事件转换为核心模型。论文 Table 4 的七类工具只加入
+`main.py` 负责把 AstrBot 事件转换为核心模型。论文 Table 4 的七类工具和可塑关联、
+重复媒体扩展工具只加入
 插件私有 LLM 的工具循环；主 LLM 默认只能接收有长度上限的证据摘要，或调用
 `mr_consult_subconscious` 请求一次更聚焦的重建。
 
@@ -108,6 +109,7 @@ LLM 必须为每条目标消息提供图证据或显式 ignore reason，不能�
 - 在已认证插件页面绑定管理员确认的“账号 ID → 别名”，不合并账号；
 - 主 Agent Action--Feedback--Prospective Hypothesis 反馈图及激活模式、效用和状态；
 - 动态关系类型、可塑语义边、证据、效用和生命周期状态；
+- 竞争释义的认知状态与未决说明；未决边以虚线显示；
 - 点击 Episode 回溯关键词和原始聊天证据；
 - 按正文或发送者检索当前群的原始消息；
 - 查看待整理 checkpoint，并手动触发下一批增量整理。
@@ -188,14 +190,18 @@ python -m unittest discover -s tests -v
 
 ## 当前边界
 
-- 图片/文件只保留类型、名称和引用 SHA-256；尚未下载、OCR、视觉描述或建立视觉向量。
+- 图片/文件只保留类型、名称和引用 SHA-256；每群最多维护 512 个重复媒体聚合项，
+  只含次数、独立发送者数和最多 8 个 source key。不会下载图片、保存媒体字节、OCR、
+  生成视觉描述、建立视觉向量或默认调用多模态模型；哈希本身不作为图意证据。
 - SQLite 仍是明文；Linux 下数据库与 WAL/SHM 会尽力设为 `0600`，备份加密仍由部署层负责。
 - Participant 只在单群内绑定平台账户；不会猜测跨群、跨平台账号属于同一现实人物。
 - 纯文本出现的新称呼若没有 speaker、结构化 mention/reply、唯一旧别名或管理员绑定，
   会保持 unresolved，不会强行连接。
-- semantic claim 已支持多源 evidence、冲突、quarantine、supersede/retract；反馈 Agent
-  可以修改独立的可塑关联图，但不直接覆写账户身份或结构化事实。`QUARANTINED` 不进入
+- semantic claim 已支持多源 evidence、冲突、quarantine、supersede/retract；增量整理与
+  反馈 Agent 都可以维护独立的可塑关联图，但不直接覆写账户身份或结构化事实。
+  重复 upsert 不会覆盖边的认知状态，必须通过带证据的 `revise_edge` 显式修订。
+  `QUARANTINED` 不进入
   自动事实检索，达到独立来源阈值后才晋升，事实修订仍由构建证据触发。
 - 自动反馈提交已有词面快门、后台队列、阈值与审计；完整管理员
   confirm/edit/reject proposal 控制台仍是后续项。
-- 当前开发版本不自动部署线上；真实历史的首个遮罩 A/B 已完成，线上 canary 尚未开启。
+- 线上采用单群白名单 canary；真实历史遮罩 A/B 与运行时 token ledger 均保留用于复核。

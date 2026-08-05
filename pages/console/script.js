@@ -233,6 +233,8 @@ function renderScopeMeta() {
     `${formatNumber(scope.topics)} topics`,
     `${formatNumber(scope.active_hypotheses)} active hypotheses`,
     `${formatNumber(scope.plastic_edges)} plastic edges`,
+    `${formatNumber(scope.open_semantic_hypotheses)} 未决释义`,
+    `${formatNumber(scope.frequent_media)} 高频图片锚点`,
     `${formatNumber(scope.pending_maintenance)} maintenance jobs`,
     `state r${formatNumber(scope.subconscious_revision)}`,
     `${formatNumber(scope.feedback_links)} feedback links`,
@@ -388,7 +390,13 @@ function renderGraph() {
     const controlY = (source.y + target.y) / 2 + bend;
     const path = svgElement("path", {
       d: `M ${source.x} ${source.y} Q ${controlX} ${controlY} ${target.x} ${target.y}`,
-      class: "graph-edge",
+      class: [
+        "graph-edge",
+        edge.type === "plastic_relation" &&
+          ["HYPOTHESIS", "CONTESTED"].includes(edge.epistemic_state)
+          ? "is-epistemically-open"
+          : "",
+      ].filter(Boolean).join(" "),
       "data-source": edge.source,
       "data-target": edge.target,
     });
@@ -566,6 +574,44 @@ function renderInspector(node) {
     ["账户类型", node.account_type || ""],
     ["认知状态", node.epistemic_status || ""],
   ]);
+  const plasticRelations = connected.filter(
+    (edge) => edge.type === "plastic_relation",
+  );
+  if (plasticRelations.length) {
+    const nodeMap = new Map(
+      (state.graph?.nodes || []).map((item) => [item.id, item]),
+    );
+    const block = document.createElement("section");
+    block.className = "evidence-block";
+    block.append(textElement("h3", "可塑关系与语义疑虑"));
+    plasticRelations.forEach((edge) => {
+      const source = nodeMap.get(edge.source);
+      const target = nodeMap.get(edge.target);
+      const card = document.createElement("article");
+      card.className = "relation-card";
+      card.append(
+        textElement(
+          "strong",
+          `${source?.label || edge.source} —${edge.relation}→ ${target?.label || edge.target}`,
+        ),
+        textElement(
+          "span",
+          `${edge.epistemic_state || "HYPOTHESIS"} · 置信度 ${Math.round(Number(edge.confidence || 0) * 100)}%`,
+          "relation-state",
+        ),
+      );
+      if (edge.statement) {
+        card.append(textElement("p", edge.statement, "inspector-detail"));
+      }
+      if (edge.uncertainty) {
+        card.append(
+          textElement("p", `未决：${edge.uncertainty}`, "relation-uncertainty"),
+        );
+      }
+      block.append(card);
+    });
+    root.append(block);
+  }
   if (node.source_text) {
     const block = document.createElement("section");
     block.className = "evidence-block";

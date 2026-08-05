@@ -1,236 +1,86 @@
 {
   "capture_enabled": {
-    "description": "采集群消息",
+    "description": "采集并整理群聊记忆",
     "type": "bool",
     "default": false,
-    "hint": "开发阶段保持关闭。开启后只写入本插件自己的 SQLite 数据库。"
-  },
-  "feedback_learning_enabled": {
-    "description": "启用反馈学习闭环",
-    "type": "bool",
-    "default": false,
-    "hint": "实验功能，默认关闭。需要同时开启消息采集；潜意识会把后续反馈追溯到主 Agent 的显式行动图并生成前瞻提示。"
-  },
-  "feedback_window_seconds": {
-    "description": "反馈候选时间窗（秒）",
-    "type": "int",
-    "default": 21600,
-    "hint": "后续消息可归因到此前响应的最长时间，实际范围 60 到 604800；最终语义归因由独立潜意识 LLM 决定。"
-  },
-  "feedback_trace_ttl_seconds": {
-    "description": "活动思考图 TTL（秒）",
-    "type": "int",
-    "default": 86400,
-    "hint": "实际范围 300 到 604800；过期后退出活动视图，但证据与结构不会被硬删除。"
-  },
-  "feedback_hypothesis_ttl_days": {
-    "description": "反馈假设 TTL（天）",
-    "type": "int",
-    "default": 180,
-    "hint": "实际范围 1 到 730；到期后转为 dormant，可追溯且可重新激活。"
-  },
-  "feedback_max_pending_per_wake": {
-    "description": "每次唤醒处理反馈数",
-    "type": "int",
-    "default": 2,
-    "hint": "实际范围 1 到 10，用于限制潜意识模型费用和主调用前延迟。"
-  },
-  "feedback_max_active_hypotheses": {
-    "description": "每群活动反馈假设上限",
-    "type": "int",
-    "default": 200,
-    "hint": "实际范围 10 到 5000；超额低效用假设进入 dormant，不删除原始证据。"
-  },
-  "feedback_maintenance_steps": {
-    "description": "反馈维护最大 Agent 步数",
-    "type": "int",
-    "default": 6,
-    "hint": "实际范围 3 到 10；包含检查证据、查找旧假设和提交事务。"
-  },
-  "feedback_min_commit_score": {
-    "description": "自动提交最低证据分",
-    "type": "float",
-    "default": 0.65,
-    "hint": "宿主按 |反馈强度| × 归因置信度校验，实际范围 0.05 到 1.0；群级规则至少需要 0.8。低于阈值的修改会被拒绝并保留审计记录。"
-  },
-  "subconscious_enabled": {
-    "description": "启用独立潜意识记忆 Agent",
-    "type": "bool",
-    "default": true,
-    "hint": "使用插件专属 LLM 进行记忆重建，不占用 AstrBot 当前会话的主 LLM。"
-  },
-  "subconscious_provider_id": {
-    "description": "潜意识 LLM Provider ID",
-    "type": "string",
-    "default": "deepseek/deepseek-v4-flash",
-    "hint": "必须是 AstrBot 已配置的聊天模型 Provider ID。"
-  },
-  "embedding_enabled": {
-    "description": "启用语义候选初始化",
-    "type": "bool",
-    "default": true,
-    "hint": "在 AstrBot 进程内使用插件自管的本地 ONNX 或 PyTorch 模型，不调用 AstrBot Embedding Provider 或远程推理 API。"
-  },
-  "embedding_backend": {
-    "description": "本地 Embedding 后端",
-    "type": "string",
-    "default": "fastembed",
-    "hint": "可选 fastembed（ONNX）或 sentence_transformers（PyTorch）。Harrier 使用 sentence_transformers。"
-  },
-  "embedding_model_name": {
-    "description": "本地 Embedding 模型",
-    "type": "string",
-    "default": "BAAI/bge-small-zh-v1.5",
-    "hint": "所选后端支持的 Hugging Face 模型名称；首次使用时下载到本插件数据目录。"
-  },
-  "embedding_cpu_threads": {
-    "description": "Embedding CPU 线程数",
-    "type": "int",
-    "default": 1,
-    "hint": "实际范围 1 到 8；2C2G 服务器建议保持 1。"
-  },
-  "embedding_batch_size": {
-    "description": "Embedding 批大小",
-    "type": "int",
-    "default": 16,
-    "hint": "FastEmbed 范围 1 到 128，Sentence Transformers 范围 1 到 32；2GB 内存运行 Harrier 建议 4。"
-  },
-  "embedding_query_prompt_name": {
-    "description": "Embedding 查询 Prompt",
-    "type": "string",
-    "default": "",
-    "hint": "仅用于 Sentence Transformers 查询向量，文档不加 prompt；Harrier 推荐 web_search_query。"
-  },
-  "embedding_max_seq_length": {
-    "description": "Embedding 最大 Token 数",
-    "type": "int",
-    "default": 512,
-    "hint": "Sentence Transformers 实际范围 32 到 4096；限制长文本推理峰值，不改变模型文件。"
-  },
-  "embedding_preload_on_startup": {
-    "description": "启动时预加载 Embedding",
-    "type": "bool",
-    "default": false,
-    "hint": "默认懒加载。仅建议部署验收时开启，以便启动日志记录模型维度和加载耗时。"
-  },
-  "embedding_top_k": {
-    "description": "初始向量候选数量",
-    "type": "int",
-    "default": 12,
-    "hint": "实际范围 1 到 50；候选只负责初始化，最终路径由潜意识主动遍历。"
-  },
-  "distillation_max_messages": {
-    "description": "单次蒸馏最大消息数",
-    "type": "int",
-    "default": 80,
-    "hint": "每个增量批次的目标消息上限，实际范围 4 到 500；不再重复读取固定的最近窗口。"
-  },
-  "distillation_overlap_messages": {
-    "description": "增量蒸馏重叠上下文数",
-    "type": "int",
-    "default": 12,
-    "hint": "在最早未处理消息前附带的只读上下文，实际范围 0 到 100；只有目标消息会推进 checkpoint。"
-  },
-  "auto_distillation_enabled": {
-    "description": "启用后台增量蒸馏",
-    "type": "bool",
-    "default": true,
-    "hint": "仅在采集开启后生效；模型整理在独立后台队列运行，不阻塞主回复。"
-  },
-  "auto_distillation_min_pending": {
-    "description": "触发后台蒸馏的未处理消息数",
-    "type": "int",
-    "default": 30,
-    "hint": "达到阈值立即排队；未达到时也会在维护周期到达后整理。"
-  },
-  "maintenance_interval_seconds": {
-    "description": "后台维护周期（秒）",
-    "type": "int",
-    "default": 300,
-    "hint": "实际范围 30 到 3600；用于低流量群的空闲整理和失败重试。"
-  },
-  "wake_on_llm_request": {
-    "description": "主 LLM 请求前自动唤醒潜意识",
-    "type": "bool",
-    "default": true,
-    "hint": "当前群已有任一图记忆时，每次主 LLM 请求都会进行一次短 tick；语义相关性由潜意识 LLM 判断，无记忆时不产生模型费用。"
-  },
-  "candidate_seed_floor": {
-    "description": "向量候选生成下限",
-    "type": "float",
-    "default": -1.0,
-    "hint": "默认 -1 表示不以 embedding 距离裁决相关性；向量只生成候选，潜意识 LLM 才是语义 gate。仅在性能压测后才建议提高。"
-  },
-  "host_gate_min_score": {
-    "description": "宿主提前停止候选分下限",
-    "type": "float",
-    "default": -1.0,
-    "hint": "仅供可选的宿主证据停止优化使用，不决定候选能否进入潜意识。"
-  },
-  "runtime_host_evidence_gate": {
-    "description": "启用宿主证据停止门",
-    "type": "bool",
-    "default": false,
-    "hint": "可选性能优化：episode 经原始 source key 与词面重叠验证后提前停止浏览；默认关闭，由潜意识 LLM 自行决定路径与停止。"
-  },
-  "private_daily_token_budget": {
-    "description": "每群私有 LLM 24 小时 Token 预算",
-    "type": "int",
-    "default": 120000,
-    "hint": "覆盖蒸馏、反馈维护和重建；达到预算后全部 fail-open。0 表示不限制。"
-  },
-  "consult_tool_enabled": {
-    "description": "向主 LLM 暴露潜意识咨询工具",
-    "type": "bool",
-    "default": true,
-    "hint": "主 LLM 只看到一个高层桥接工具，可在自动摘要不足时要求潜意识继续重建。"
-  },
-  "expose_traversal_tools": {
-    "description": "向主 LLM 暴露底层图遍历工具",
-    "type": "bool",
-    "default": false,
-    "hint": "默认关闭。七个底层工具只提供给潜意识 LLM，保持与主 LLM 低耦合。"
-  },
-  "max_loop_steps": {
-    "description": "潜意识单次最大遍历步数",
-    "type": "int",
-    "default": 6,
-    "hint": "实际范围 1 到 12；用于限制延迟和模型费用。"
-  },
-  "subconscious_timeout_seconds": {
-    "description": "潜意识单次超时秒数",
-    "type": "int",
-    "default": 45,
-    "hint": "超时后跳过记忆注入，不阻断主 LLM。"
-  },
-  "max_query_chars": {
-    "description": "传给潜意识的查询字符上限",
-    "type": "int",
-    "default": 4000,
-    "hint": "实际范围 256 到 16000。"
-  },
-  "max_brief_chars": {
-    "description": "注入主 LLM 的记忆摘要字符上限",
-    "type": "int",
-    "default": 3000,
-    "hint": "实际范围 256 到 12000，用于限制主 LLM 输入成本。"
+    "obvious_hint": true,
+    "hint": "总开关。只处理下方白名单群，数据写入插件自己的按群 SQLite。"
   },
   "allowed_umos": {
-    "description": "允许访问记忆的群聊 UMO 白名单",
+    "description": "测试群 UMO 白名单",
     "type": "list",
     "default": [],
-    "hint": "同时约束采集、重建和查询；留空表示允许所有群，生产试运行前建议显式填写。"
+    "obvious_hint": true,
+    "hint": "例如 aiocqhttp:GroupMessage:123456；留空表示所有群，试运行建议只填一个群。"
   },
-  "max_search_results": {
-    "description": "单次检索结果上限",
-    "type": "int",
-    "default": 20,
-    "hint": "实际范围限制为 1 到 50。"
+  "subconscious_enabled": {
+    "description": "启用独立潜意识",
+    "type": "bool",
+    "default": true,
+    "obvious_hint": true,
+    "hint": "使用插件专属 LLM 重建记忆，与当前聊天主模型分离。"
   },
-  "log_message_content": {
-    "description": "在日志中记录消息正文",
+  "subconscious_provider_id": {
+    "description": "潜意识模型",
+    "type": "string",
+    "default": "deepseek/deepseek-v4-flash",
+    "_special": "select_provider",
+    "obvious_hint": true,
+    "condition": {"subconscious_enabled": true},
+    "hint": "选择 AstrBot 已配置的低成本聊天模型 Provider。"
+  },
+  "feedback_learning_enabled": {
+    "description": "从后续反馈修正记忆",
     "type": "bool",
     "default": false,
-    "hint": "默认关闭，防止聊天内容进入运行日志。"
-  }
+    "obvious_hint": true,
+    "condition": {"capture_enabled": true},
+    "hint": "把可归因的人类反馈写回可塑图，并保留未决或竞争释义。"
+  },
+  "embedding_enabled": {
+    "description": "启用本地 Embedding 候选",
+    "type": "bool",
+    "default": true,
+    "condition": {"subconscious_enabled": true},
+    "hint": "仅在本机/服务器运行，不调用 AstrBot Embedding Provider 或远程 Embedding API。"
+  },
+  "private_daily_token_budget": {
+    "description": "每群每日潜意识 Token 上限",
+    "type": "int",
+    "default": 120000,
+    "condition": {"subconscious_enabled": true},
+    "hint": "覆盖整理、反馈维护和重建；达到上限后静默跳过，0 表示不限。"
+  },
+  "feedback_window_seconds": {"type": "int", "default": 21600, "invisible": true},
+  "feedback_trace_ttl_seconds": {"type": "int", "default": 86400, "invisible": true},
+  "feedback_hypothesis_ttl_days": {"type": "int", "default": 180, "invisible": true},
+  "feedback_max_pending_per_wake": {"type": "int", "default": 2, "invisible": true},
+  "feedback_max_active_hypotheses": {"type": "int", "default": 200, "invisible": true},
+  "feedback_maintenance_steps": {"type": "int", "default": 6, "invisible": true},
+  "feedback_min_commit_score": {"type": "float", "default": 0.65, "invisible": true},
+  "embedding_backend": {"type": "string", "default": "fastembed", "invisible": true},
+  "embedding_model_name": {"type": "string", "default": "BAAI/bge-small-zh-v1.5", "invisible": true},
+  "embedding_cpu_threads": {"type": "int", "default": 1, "invisible": true},
+  "embedding_batch_size": {"type": "int", "default": 16, "invisible": true},
+  "embedding_query_prompt_name": {"type": "string", "default": "", "invisible": true},
+  "embedding_max_seq_length": {"type": "int", "default": 512, "invisible": true},
+  "embedding_preload_on_startup": {"type": "bool", "default": false, "invisible": true},
+  "embedding_top_k": {"type": "int", "default": 12, "invisible": true},
+  "distillation_max_messages": {"type": "int", "default": 80, "invisible": true},
+  "distillation_overlap_messages": {"type": "int", "default": 12, "invisible": true},
+  "auto_distillation_enabled": {"type": "bool", "default": true, "invisible": true},
+  "auto_distillation_min_pending": {"type": "int", "default": 30, "invisible": true},
+  "maintenance_interval_seconds": {"type": "int", "default": 300, "invisible": true},
+  "wake_on_llm_request": {"type": "bool", "default": true, "invisible": true},
+  "candidate_seed_floor": {"type": "float", "default": -1.0, "invisible": true},
+  "host_gate_min_score": {"type": "float", "default": -1.0, "invisible": true},
+  "runtime_host_evidence_gate": {"type": "bool", "default": false, "invisible": true},
+  "consult_tool_enabled": {"type": "bool", "default": true, "invisible": true},
+  "expose_traversal_tools": {"type": "bool", "default": false, "invisible": true},
+  "max_loop_steps": {"type": "int", "default": 6, "invisible": true},
+  "subconscious_timeout_seconds": {"type": "int", "default": 45, "invisible": true},
+  "max_query_chars": {"type": "int", "default": 4000, "invisible": true},
+  "max_brief_chars": {"type": "int", "default": 3000, "invisible": true},
+  "max_search_results": {"type": "int", "default": 20, "invisible": true},
+  "log_message_content": {"type": "bool", "default": false, "invisible": true}
 }
