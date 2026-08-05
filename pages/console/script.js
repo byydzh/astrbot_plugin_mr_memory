@@ -6,7 +6,7 @@ const state = {
   selectedNodeId: "",
   visibleTypes: new Set([
     "participant", "cue", "episode", "semantic", "topic",
-    "action", "feedback", "hypothesis",
+    "plastic", "action", "feedback", "hypothesis",
   ]),
   transform: { x: 0, y: 0, scale: 1 },
   virtualSize: { width: 1120, height: 680 },
@@ -69,6 +69,7 @@ const typeNames = {
   action: "行动 ACTION",
   feedback: "反馈 FEEDBACK",
   hypothesis: "前瞻假设 HYPOTHESIS",
+  plastic: "可塑语义 PLASTIC",
 };
 
 function svgElement(name, attributes = {}) {
@@ -231,6 +232,9 @@ function renderScopeMeta() {
     `${formatNumber(scope.pending_distillation)} pending`,
     `${formatNumber(scope.topics)} topics`,
     `${formatNumber(scope.active_hypotheses)} active hypotheses`,
+    `${formatNumber(scope.plastic_edges)} plastic edges`,
+    `${formatNumber(scope.pending_maintenance)} maintenance jobs`,
+    `state r${formatNumber(scope.subconscious_revision)}`,
     `${formatNumber(scope.feedback_links)} feedback links`,
     `最近消息 ${formatTime(scope.last_message_at)}`,
   ].join("  ·  ");
@@ -301,7 +305,7 @@ async function loadGraph() {
 function calculateLayout(nodes) {
   const grouped = {
     participant: [], cue: [], episode: [], semantic: [], topic: [],
-    action: [], feedback: [], hypothesis: [],
+    plastic: [], action: [], feedback: [], hypothesis: [],
   };
   nodes.forEach((node) => grouped[node.type]?.push(node));
   const maxPrimary = Math.max(
@@ -310,7 +314,7 @@ function calculateLayout(nodes) {
     grouped.episode.length,
     8,
   );
-  const rightCount = grouped.semantic.length + grouped.topic.length;
+  const rightCount = grouped.semantic.length + grouped.topic.length + grouped.plastic.length;
   const feedbackCount = Math.max(
     grouped.action.length,
     grouped.feedback.length,
@@ -322,7 +326,7 @@ function calculateLayout(nodes) {
     rightCount * 48 + 140,
     feedbackCount * 58 + 140,
   );
-  const width = 1580;
+  const width = 1760;
   const positions = new Map();
 
   function distribute(items, x, minY, maxY, wobble = 0) {
@@ -349,9 +353,10 @@ function calculateLayout(nodes) {
     height - 90,
     18,
   );
-  distribute(grouped.action, 1040, 90, height - 90, 14);
-  distribute(grouped.feedback, 1260, 100, height - 100, 12);
-  distribute(grouped.hypothesis, 1490, 90, height - 90, 16);
+  distribute(grouped.plastic, 1030, 90, height - 90, 18);
+  distribute(grouped.action, 1240, 90, height - 90, 14);
+  distribute(grouped.feedback, 1460, 100, height - 100, 12);
+  distribute(grouped.hypothesis, 1690, 90, height - 90, 16);
 
   state.virtualSize = { width, height };
   return positions;

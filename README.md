@@ -3,9 +3,9 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.9.0 将原型收口为可增量运行的 truth layer v2：账户主体绑定、Bot 可见输出、
-reply/mention、编辑/撤回、结构化多源 claim、修订状态机、后台整理和宿主停止门均进入
-运行路径。
+0.10.0 新增按群隔离的可塑关联图：潜意识 LLM 可以从真实反馈中建立、强化、抑制、
+遗忘或合并局部语义路径，也可以对关系类型做带版本修订；embedding 只生成候选，
+语义相关性与遍历停止由独立潜意识 LLM 判断。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -19,7 +19,7 @@ reply/mention、编辑/撤回、结构化多源 claim、修订状态机、后台
 
 - `capture_enabled=false`：不采集任何线上消息。
 - `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
-  分数的宿主门禁约束，默认提交阈值为 `0.65`。
+  分数的宿主门禁约束，默认提交阈值为 `0.65`；反馈未先被宿主提交时不能修改可塑图。
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：记忆推理与主 LLM 分离。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
@@ -50,6 +50,7 @@ SQLite truth store + FTS5 + layered memory graph
         +-- Participant--Aspect--Structured Claim
         +-- Topic--Episode
         +-- Action--Feedback--Prospective Hypothesis
+        +-- Plastic Node--Versioned Learned Relation--Plastic Node
         |
         v
 embedding candidate initialization (Cue / Episode / Semantic / Topic)
@@ -62,6 +63,7 @@ private provider tool loop (DeepSeek by default)
         |
         +-- automatic bounded memory brief before main LLM request
         +-- bounded feedback maintenance and prospective activation
+        +-- persistent bounded operational state and resumable maintenance jobs
         +-- one optional consultation tool visible to the main LLM
 ```
 
@@ -72,8 +74,9 @@ private provider tool loop (DeepSeek by default)
 
 插件使用与 AstrBot `Context.tool_loop_agent()` 相同的 `ToolLoopAgentRunner` 调用自己
 配置的 provider，不继承当前会话主 LLM。插件直接持有 runner，以便记录整个多轮循环的
-聚合 token，而不是误把最终 response 当成全部费用。若当前会话还没有图记忆，自动唤醒
-会直接跳过；候选低于相似度门槛且查询没有明确历史意图时也不会调用私有模型。最终
+聚合 token，而不是误把最终 response 当成全部费用。若当前群还没有任何图记忆，自动唤醒
+会直接跳过；一旦有图，每个主 LLM 请求都会运行一个有界潜意识 tick。默认不以固定向量
+相似度裁决相关性，embedding 只提供候选先验；潜意识可以选中、忽略或继续遍历。最终
 claim、conflict 与 unresolved 项都必须引用本轮工具实际访问的 source key，否则整份
 brief 被宿主拒绝，而不是把未验证自由文本交给主 LLM。
 
@@ -104,6 +107,7 @@ LLM 必须为每条目标消息提供图证据或显式 ignore reason，不能�
 - Participant 节点、账号主键、当前群名片、别名历史和重名歧义计数；
 - 在已认证插件页面绑定管理员确认的“账号 ID → 别名”，不合并账号；
 - 主 Agent Action--Feedback--Prospective Hypothesis 反馈图及激活模式、效用和状态；
+- 动态关系类型、可塑语义边、证据、效用和生命周期状态；
 - 点击 Episode 回溯关键词和原始聊天证据；
 - 按正文或发送者检索当前群的原始消息；
 - 查看待整理 checkpoint，并手动触发下一批增量整理。
@@ -167,8 +171,9 @@ python -m scripts.reproduce_fixture `
 阈值和激活模式，并在一个事务中写入反馈边与前瞻假设。下一次请求先走廉价词面门，再由
 私有 Agent 处理真正的语义改写；主 LLM 只接收临时、有限的行为提示。
 
-反馈会反向调整实际激活路径的效用，但不会把情绪反馈伪装成事实置信度。TTL、遗忘和合并
-只改变活动视图，原始证据保持可追溯。完整设计与配置边界见
+反馈会反向调整实际激活路径的效用，但不会把情绪反馈伪装成事实置信度。可塑图修改必须在
+对应反馈 proposal 已通过宿主提交之后发生；负反馈只能抑制确实参与过目标回答的边，不能让
+维护时才发现的正确路径替旧回答背锅。TTL、遗忘和合并只改变活动视图，原始证据保持可追溯。完整设计与配置边界见
 [反馈图闭环](docs/FEEDBACK_LOOP.md)。
 
 ## 测试
@@ -188,9 +193,9 @@ python -m unittest discover -s tests -v
 - Participant 只在单群内绑定平台账户；不会猜测跨群、跨平台账号属于同一现实人物。
 - 纯文本出现的新称呼若没有 speaker、结构化 mention/reply、唯一旧别名或管理员绑定，
   会保持 unresolved，不会强行连接。
-- semantic claim 已支持多源 evidence、冲突、quarantine、supersede/retract，但反馈 Agent
-  暂不直接自动改写事实；`QUARANTINED` 不进入自动事实检索，达到独立来源阈值后才晋升，
-  事实修订由下一次构建证据触发。
+- semantic claim 已支持多源 evidence、冲突、quarantine、supersede/retract；反馈 Agent
+  可以修改独立的可塑关联图，但不直接覆写账户身份或结构化事实。`QUARANTINED` 不进入
+  自动事实检索，达到独立来源阈值后才晋升，事实修订仍由构建证据触发。
 - 自动反馈提交已有词面快门、后台队列、阈值与审计；完整管理员
   confirm/edit/reject proposal 控制台仍是后续项。
 - 当前开发版本不自动部署线上；真实历史的首个遮罩 A/B 已完成，线上 canary 尚未开启。

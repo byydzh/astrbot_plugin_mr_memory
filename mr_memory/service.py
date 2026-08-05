@@ -11,6 +11,7 @@ from .distillation import (
 from .embedding import EmbeddingBackend
 from .feedback import FeedbackDecision
 from .models import DistillationWorkItem, NormalizedMessage, StoredMessage
+from .plasticity import GraphMutation
 from .storage import MemoryStorage
 
 
@@ -326,6 +327,101 @@ class MemoryService:
             topic=topic,
             limit=limit,
             before_sent_at=before_sent_at,
+        )
+
+    async def apply_graph_mutation(
+        self,
+        *,
+        mutation: GraphMutation,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.apply_graph_mutation,
+            mutation=mutation,
+            **kwargs,
+        )
+
+    async def index_plastic_edge(
+        self,
+        *,
+        umo: str,
+        edge_id: int,
+        embedding_backend: EmbeddingBackend,
+    ) -> bool:
+        document = await asyncio.to_thread(
+            self.storage.plastic_edge_embedding_document,
+            umo=umo,
+            edge_id=int(edge_id),
+        )
+        if document is None:
+            return False
+        vectors = await embedding_backend.embed_texts([str(document["text"])])
+        if len(vectors) != 1:
+            raise ValueError("embedding backend returned the wrong vector count")
+        await asyncio.to_thread(
+            self.storage.upsert_memory_embedding,
+            umo=umo,
+            owner_type="plastic_edge",
+            owner_key=str(document["owner_key"]),
+            model=embedding_backend.model_id,
+            vector=vectors[0],
+        )
+        return True
+
+    async def query_plastic_associations(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.query_plastic_associations, **kwargs
+        )
+
+    async def activate_plastic_edges(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.activate_plastic_edges, **kwargs
+        )
+
+    async def compact_plastic_graph(self, **kwargs: object) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.compact_plastic_graph, **kwargs
+        )
+
+    async def subconscious_state(self, *, umo: str) -> dict[str, object]:
+        return await asyncio.to_thread(self.storage.subconscious_state, umo=umo)
+
+    async def update_subconscious_state(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.update_subconscious_state, **kwargs
+        )
+
+    async def enqueue_maintenance_job(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(
+            self.storage.enqueue_maintenance_job, **kwargs
+        )
+
+    async def pending_maintenance_jobs(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.pending_maintenance_jobs, **kwargs
+        )
+
+    async def claim_maintenance_job(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.claim_maintenance_job, **kwargs
+        )
+
+    async def finish_maintenance_job(self, **kwargs: object) -> None:
+        await asyncio.to_thread(self.storage.finish_maintenance_job, **kwargs)
+
+    async def fail_maintenance_job(self, **kwargs: object) -> str:
+        return await asyncio.to_thread(
+            self.storage.fail_maintenance_job, **kwargs
         )
 
     async def start_interaction_trace(self, **kwargs: object) -> str:

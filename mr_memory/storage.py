@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from .embedding import (
     cosine_similarity,
@@ -32,9 +33,15 @@ from .identity import (
     sanitize_components,
 )
 from .models import DistillationWorkItem, NormalizedMessage, StoredMessage
+from .plasticity import (
+    GraphMutation,
+    PlasticNodeProposal,
+    RelationTypeProposal,
+)
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+TRUTH_V2_BACKFILL_VERSION = 8
 
 
 class MemoryStorage:
@@ -632,6 +639,137 @@ class MemoryStorage:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (hypothesis_id, feedback_source_key, relation)
                 );
+
+                CREATE TABLE IF NOT EXISTS plastic_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    node_key TEXT NOT NULL,
+                    node_kind TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    utility REAL NOT NULL DEFAULT 0,
+                    activation_count INTEGER NOT NULL DEFAULT 0,
+                    last_activated_at INTEGER,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    merged_into INTEGER REFERENCES plastic_nodes(id),
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, node_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_plastic_nodes_active
+                    ON plastic_nodes (umo, status, node_kind, utility DESC);
+
+                CREATE TABLE IF NOT EXISTS relation_types (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    relation_key TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    canonical_name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    source_kinds_json TEXT NOT NULL DEFAULT '[]',
+                    target_kinds_json TEXT NOT NULL DEFAULT '[]',
+                    inverse_key TEXT NOT NULL DEFAULT '',
+                    symmetric INTEGER NOT NULL DEFAULT 0,
+                    risk_class TEXT NOT NULL DEFAULT 'normal',
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    predecessor_id INTEGER REFERENCES relation_types(id),
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, relation_key, version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_relation_types_active
+                    ON relation_types (umo, relation_key)
+                    WHERE status = 'ACTIVE';
+
+                CREATE TABLE IF NOT EXISTS plastic_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    source_node_id INTEGER NOT NULL
+                        REFERENCES plastic_nodes(id),
+                    relation_type_id INTEGER NOT NULL
+                        REFERENCES relation_types(id),
+                    target_node_id INTEGER NOT NULL
+                        REFERENCES plastic_nodes(id),
+                    statement TEXT NOT NULL DEFAULT '',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    utility REAL NOT NULL DEFAULT 0,
+                    activation_count INTEGER NOT NULL DEFAULT 0,
+                    support_count INTEGER NOT NULL DEFAULT 0,
+                    contradict_count INTEGER NOT NULL DEFAULT 0,
+                    last_activated_at INTEGER,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    superseded_by INTEGER REFERENCES plastic_edges(id),
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, stable_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_plastic_edges_active
+                    ON plastic_edges (umo, status, utility DESC, id);
+                CREATE INDEX IF NOT EXISTS idx_plastic_edges_source
+                    ON plastic_edges (umo, source_node_id, relation_type_id);
+                CREATE INDEX IF NOT EXISTS idx_plastic_edges_target
+                    ON plastic_edges (umo, target_node_id, relation_type_id);
+
+                CREATE TABLE IF NOT EXISTS plastic_edge_evidence (
+                    edge_id INTEGER NOT NULL REFERENCES plastic_edges(id)
+                        ON DELETE CASCADE,
+                    message_id INTEGER NOT NULL REFERENCES messages(id),
+                    evidence_role TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (edge_id, message_id, evidence_role)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_mutations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    proposal_sha256 TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    target_type TEXT NOT NULL DEFAULT '',
+                    target_id INTEGER,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    evidence_source_keys_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    committed_at TEXT,
+                    UNIQUE (umo, proposal_sha256)
+                );
+                CREATE INDEX IF NOT EXISTS idx_graph_mutations_scope
+                    ON graph_mutations (umo, id DESC);
+
+                CREATE TABLE IF NOT EXISTS subconscious_states (
+                    umo TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    last_query_sha256 TEXT NOT NULL DEFAULT '',
+                    last_tick_at INTEGER,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS maintenance_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at INTEGER NOT NULL,
+                    lease_until INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, job_type, dedupe_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_pending
+                    ON maintenance_jobs (umo, status, available_at, id);
                 """
             )
 
@@ -755,7 +893,10 @@ class MemoryStorage:
             backfill = self._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='truth_v2_backfill'"
             ).fetchone()
-            if backfill is None or str(backfill["value"]) != str(SCHEMA_VERSION):
+            if (
+                backfill is None
+                or str(backfill["value"]) != str(TRUTH_V2_BACKFILL_VERSION)
+            ):
                 self._backfill_truth_v2()
                 self._connection.execute(
                     """
@@ -763,7 +904,7 @@ class MemoryStorage:
                     VALUES ('truth_v2_backfill', ?)
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value
                     """,
-                    (str(SCHEMA_VERSION),),
+                    (str(TRUTH_V2_BACKFILL_VERSION),),
                 )
             # A process kill or cancellation can occur after a batch claims rows but
             # before its normal completion handler runs. Recover those rows on every
@@ -783,6 +924,15 @@ class MemoryStorage:
                     last_error='interrupted before completion',
                     updated_at=CURRENT_TIMESTAMP
                 WHERE status='PROCESSING'
+                """
+            )
+            self._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='PENDING', lease_until=NULL,
+                    last_error='interrupted before completion',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE status='RUNNING'
                 """
             )
 
@@ -2400,6 +2550,47 @@ class MemoryStorage:
             for row in rows
         ]
 
+    def plastic_edge_embedding_document(
+        self, *, umo: str, edge_id: int
+    ) -> dict[str, str] | None:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT e.id, e.statement, src.label AS source_label,
+                       src.description AS source_description,
+                       dst.label AS target_label,
+                       dst.description AS target_description,
+                       r.canonical_name AS relation_name,
+                       r.description AS relation_description
+                FROM plastic_edges AS e
+                JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                JOIN relation_types AS r ON r.id=e.relation_type_id
+                WHERE e.umo=? AND e.id=?
+                  AND e.status IN ('ACTIVE', 'WEAKENED')
+                """,
+                (umo, int(edge_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "owner_key": str(row["id"]),
+            "text": "\n".join(
+                str(row[key])
+                for key in (
+                    "source_label",
+                    "source_description",
+                    "relation_name",
+                    "relation_description",
+                    "target_label",
+                    "target_description",
+                    "statement",
+                )
+                if str(row[key] or "").strip()
+            ),
+        }
+
     def distillation_identity_context(
         self,
         *,
@@ -2836,9 +3027,11 @@ class MemoryStorage:
                         (SELECT COUNT(*) FROM semantic_memories
                          WHERE umo = ? AND status IN
                            ('ACTIVE', 'CONFLICTED')) +
-                        (SELECT COUNT(*) FROM topics WHERE umo = ?)
+                        (SELECT COUNT(*) FROM topics WHERE umo = ?) +
+                        (SELECT COUNT(*) FROM plastic_edges
+                         WHERE umo = ? AND status IN ('ACTIVE', 'WEAKENED'))
                     """,
-                    (umo, umo, umo),
+                    (umo, umo, umo, umo),
                 ).fetchone()
             else:
                 cutoff = int(before_sent_at)
@@ -2866,9 +3059,18 @@ class MemoryStorage:
                              WHERE te.topic_id = t.id AND e.umo = t.umo
                                AND e.status = 'READY'
                                AND e.ended_at < ?
-                         ))
+                         )) +
+                        (SELECT COUNT(*) FROM plastic_edges AS pe
+                         WHERE pe.umo = ?
+                           AND pe.status IN ('ACTIVE', 'WEAKENED')
+                           AND EXISTS (
+                             SELECT 1 FROM plastic_edge_evidence AS pee
+                             JOIN messages AS m ON m.id=pee.message_id
+                             WHERE pee.edge_id=pe.id AND m.umo=pe.umo
+                               AND m.sent_at < ? AND m.is_deleted=0
+                           ))
                     """,
-                    (umo, cutoff, umo, cutoff, umo, cutoff),
+                    (umo, cutoff, umo, cutoff, umo, cutoff, umo, cutoff),
                 ).fetchone()
         return int(row[0])
 
@@ -3156,6 +3358,19 @@ class MemoryStorage:
                         AS active_hypotheses,
                     (SELECT COUNT(*) FROM feedback_links WHERE umo = ?)
                         AS feedback_links,
+                    (SELECT COUNT(*) FROM plastic_nodes
+                     WHERE umo = ? AND status <> 'MERGED') AS plastic_nodes,
+                    (SELECT COUNT(*) FROM plastic_edges
+                     WHERE umo = ? AND status IN
+                       ('ACTIVE', 'WEAKENED', 'DORMANT')) AS plastic_edges,
+                    (SELECT COUNT(*) FROM relation_types
+                     WHERE umo = ? AND status = 'ACTIVE') AS relation_types,
+                    (SELECT COUNT(*) FROM maintenance_jobs
+                     WHERE umo = ? AND status IN ('PENDING', 'RUNNING'))
+                        AS pending_maintenance,
+                    (SELECT COALESCE(MAX(revision), 0)
+                     FROM subconscious_states WHERE umo = ?)
+                        AS subconscious_revision,
                     (SELECT COUNT(DISTINCT lower(k.cue))
                      FROM episode_keywords AS k
                      JOIN episodes AS e ON e.id = k.episode_id
@@ -3165,6 +3380,7 @@ class MemoryStorage:
                 """,
                 (
                     umo, umo, umo, umo, umo, umo,
+                    umo, umo, umo, umo, umo,
                     umo, umo, umo, umo, umo, umo,
                 ),
             ).fetchone()
@@ -3181,9 +3397,12 @@ class MemoryStorage:
                     UNION ALL
                     SELECT MAX(updated_at) AS value
                     FROM feedback_hypotheses WHERE umo = ?
+                    UNION ALL
+                    SELECT MAX(updated_at) AS value
+                    FROM plastic_edges WHERE umo = ?
                 )
                 """,
-                (umo, umo, umo, umo),
+                (umo, umo, umo, umo, umo),
             ).fetchone()
             models = self._connection.execute(
                 """
@@ -3221,6 +3440,13 @@ class MemoryStorage:
             "interaction_traces": int(counts["interaction_traces"] or 0),
             "active_hypotheses": int(counts["active_hypotheses"] or 0),
             "feedback_links": int(counts["feedback_links"] or 0),
+            "plastic_nodes": int(counts["plastic_nodes"] or 0),
+            "plastic_edges": int(counts["plastic_edges"] or 0),
+            "relation_types": int(counts["relation_types"] or 0),
+            "pending_maintenance": int(counts["pending_maintenance"] or 0),
+            "subconscious_revision": int(
+                counts["subconscious_revision"] or 0
+            ),
             "cues": int(counts["cues"] or 0),
             "last_message_at": (
                 int(counts["last_message_at"])
@@ -3344,6 +3570,34 @@ class MemoryStorage:
                  AND he.feedback_source_key = l.feedback_source_key
                 WHERE l.umo = ?
                 ORDER BY l.feedback_sent_at DESC, l.id DESC
+                LIMIT ?
+                """,
+                (umo, safe_limit),
+            ).fetchall()
+            plastic_rows = self._connection.execute(
+                """
+                SELECT e.id, e.statement, e.epistemic_confidence, e.utility,
+                       e.support_count, e.contradict_count, e.status,
+                       src.id AS source_id, src.node_key AS source_key,
+                       src.node_kind AS source_kind, src.label AS source_label,
+                       src.description AS source_description,
+                       dst.id AS target_id, dst.node_key AS target_key,
+                       dst.node_kind AS target_kind, dst.label AS target_label,
+                       dst.description AS target_description,
+                       r.relation_key, r.version AS relation_version,
+                       r.canonical_name AS relation_name,
+                       GROUP_CONCAT(DISTINCT m.source_key) AS evidence_keys
+                FROM plastic_edges AS e
+                JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                JOIN relation_types AS r ON r.id=e.relation_type_id
+                LEFT JOIN plastic_edge_evidence AS pe ON pe.edge_id=e.id
+                LEFT JOIN messages AS m
+                  ON m.id=pe.message_id AND m.umo=e.umo AND m.is_deleted=0
+                WHERE e.umo=? AND e.status IN
+                  ('ACTIVE', 'WEAKENED', 'DORMANT')
+                GROUP BY e.id
+                ORDER BY e.utility DESC, e.id DESC
                 LIMIT ?
                 """,
                 (umo, safe_limit),
@@ -3540,6 +3794,56 @@ class MemoryStorage:
                         }
                     )
 
+        for row in reversed(plastic_rows):
+            source_id = f"plastic_node:{int(row['source_id'])}"
+            target_id = f"plastic_node:{int(row['target_id'])}"
+            nodes.setdefault(
+                source_id,
+                {
+                    "id": source_id,
+                    "type": "plastic",
+                    "entity_id": int(row["source_id"]),
+                    "node_key": str(row["source_key"]),
+                    "node_kind": str(row["source_kind"]),
+                    "label": str(row["source_label"]),
+                    "detail": str(row["source_description"]),
+                },
+            )
+            nodes.setdefault(
+                target_id,
+                {
+                    "id": target_id,
+                    "type": "plastic",
+                    "entity_id": int(row["target_id"]),
+                    "node_key": str(row["target_key"]),
+                    "node_kind": str(row["target_kind"]),
+                    "label": str(row["target_label"]),
+                    "detail": str(row["target_description"]),
+                },
+            )
+            edges.append(
+                {
+                    "id": f"plastic_edge:{int(row['id'])}",
+                    "source": source_id,
+                    "target": target_id,
+                    "relation": str(row["relation_name"]),
+                    "relation_key": str(row["relation_key"]),
+                    "relation_version": int(row["relation_version"]),
+                    "type": "plastic_relation",
+                    "statement": str(row["statement"]),
+                    "confidence": float(row["epistemic_confidence"]),
+                    "utility": float(row["utility"]),
+                    "support_count": int(row["support_count"]),
+                    "contradict_count": int(row["contradict_count"]),
+                    "status": str(row["status"]),
+                    "source_keys": [
+                        key
+                        for key in str(row["evidence_keys"] or "").split(",")
+                        if key
+                    ],
+                }
+            )
+
         original_node_count = len(nodes)
         if original_node_count > safe_limit:
             degree: dict[str, int] = {node_id: 0 for node_id in nodes}
@@ -3548,14 +3852,15 @@ class MemoryStorage:
                 degree[str(edge["target"])] = degree.get(str(edge["target"]), 0) + 1
 
             ratios = {
-                "episode": 0.20,
-                "cue": 0.15,
-                "participant": 0.10,
-                "semantic": 0.10,
-                "topic": 0.10,
+                "episode": 0.16,
+                "cue": 0.10,
+                "participant": 0.08,
+                "semantic": 0.08,
+                "topic": 0.08,
                 "action": 0.10,
                 "feedback": 0.10,
-                "hypothesis": 0.15,
+                "hypothesis": 0.10,
+                "plastic": 0.20,
             }
 
             def node_rank(item: dict[str, object]) -> tuple[object, ...]:
@@ -3576,6 +3881,7 @@ class MemoryStorage:
                 "action",
                 "feedback",
                 "hypothesis",
+                "plastic",
             ):
                 quota = int(safe_limit * ratios[node_type])
                 if quota <= 0 and not selected_ids:
@@ -3629,6 +3935,7 @@ class MemoryStorage:
             "action": 5,
             "feedback": 6,
             "hypothesis": 7,
+            "plastic": 8,
         }
         ordered_nodes = sorted(
             nodes.values(),
@@ -3731,6 +4038,7 @@ class MemoryStorage:
             "episode",
             "topic",
             "semantic",
+            "plastic_edge",
         ),
         limit: int = 12,
         min_score: float = -1.0,
@@ -3902,6 +4210,25 @@ class MemoryStorage:
                     """,
                     parameters,
                 ).fetchone()
+            elif owner_type == "plastic_edge" and owner_key.isdigit():
+                cutoff_sql = ""
+                parameters = (umo, int(owner_key))
+                if cutoff is not None:
+                    cutoff_sql = (
+                        " AND EXISTS (SELECT 1 FROM plastic_edge_evidence AS pe "
+                        "JOIN messages AS m ON m.id=pe.message_id "
+                        "WHERE pe.edge_id=plastic_edges.id AND m.umo=plastic_edges.umo "
+                        "AND m.is_deleted=0 AND m.sent_at < ?)"
+                    )
+                    parameters = (*parameters, cutoff)
+                row = self._connection.execute(
+                    f"""
+                    SELECT 1 FROM plastic_edges
+                    WHERE umo=? AND id=? AND status IN ('ACTIVE', 'WEAKENED')
+                    {cutoff_sql} LIMIT 1
+                    """,
+                    parameters,
+                ).fetchone()
             else:
                 return False
         return row is not None
@@ -3950,6 +4277,7 @@ class MemoryStorage:
             "episodes": [],
             "topics": [],
             "semantic_memories": [],
+            "associations": [],
         }
         with self._lock:
             for match in matches:
@@ -4079,6 +4407,24 @@ class MemoryStorage:
                     if row:
                         result["semantic_memories"].append(
                             {**dict(row), "score": score}
+                        )
+                elif owner_type == "plastic_edge" and owner_key.isdigit():
+                    associations = self.query_plastic_associations(
+                        umo=umo,
+                        limit=100,
+                        before_sent_at=before_sent_at,
+                    )
+                    selected = next(
+                        (
+                            item
+                            for item in associations
+                            if int(item["id"]) == int(owner_key)
+                        ),
+                        None,
+                    )
+                    if selected is not None:
+                        result["associations"].append(
+                            {**selected, "score": score}
                         )
         return result
 
@@ -5050,6 +5396,1201 @@ class MemoryStorage:
         if identity is not None and identity["umo"] != umo:
             raise ValueError("operation crosses the database group boundary")
 
+    @staticmethod
+    def _plastic_edge_stable_key(
+        *, umo: str, source_node_key: str, relation_key: str, target_node_key: str
+    ) -> str:
+        material = "\x1f".join(
+            (umo, source_node_key, relation_key, target_node_key)
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _validate_graph_evidence_locked(
+        self,
+        *,
+        umo: str,
+        source_keys: Iterable[str],
+        allowed_source_keys: set[str] | None = None,
+    ) -> dict[str, int]:
+        keys = tuple(dict.fromkeys(str(key).strip() for key in source_keys if key))
+        if not keys:
+            raise ValueError("a graph mutation requires source-message evidence")
+        if allowed_source_keys is not None and not set(keys).issubset(
+            allowed_source_keys
+        ):
+            raise ValueError("graph mutation cites evidence outside the inspected set")
+        placeholders = ",".join("?" for _ in keys)
+        rows = self._connection.execute(
+            f"""
+            SELECT id, source_key FROM messages
+            WHERE umo = ? AND is_deleted = 0
+              AND source_key IN ({placeholders})
+            """,
+            (umo, *keys),
+        ).fetchall()
+        resolved = {str(row["source_key"]): int(row["id"]) for row in rows}
+        missing = [key for key in keys if key not in resolved]
+        if missing:
+            raise ValueError(
+                "graph mutation evidence is missing or belongs to another group: "
+                + ", ".join(missing[:3])
+            )
+        return resolved
+
+    def _upsert_plastic_node_locked(
+        self,
+        *,
+        umo: str,
+        proposal: PlasticNodeProposal,
+        confidence: float,
+        utility_delta: float,
+        created_by: str,
+    ) -> int:
+        self._connection.execute(
+            """
+            INSERT INTO plastic_nodes(
+                umo, node_key, node_kind, label, description,
+                epistemic_confidence, utility, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(umo, node_key) DO UPDATE SET
+                label=excluded.label,
+                description=CASE WHEN excluded.description <> ''
+                    THEN excluded.description ELSE plastic_nodes.description END,
+                epistemic_confidence=max(
+                    plastic_nodes.epistemic_confidence,
+                    excluded.epistemic_confidence
+                ),
+                utility=min(4, max(-4,
+                    plastic_nodes.utility + excluded.utility
+                )),
+                status=CASE
+                    WHEN plastic_nodes.status = 'MERGED'
+                    THEN plastic_nodes.status
+                    WHEN plastic_nodes.utility + excluded.utility <= -1
+                    THEN 'DORMANT'
+                    WHEN plastic_nodes.utility + excluded.utility < 0
+                    THEN 'WEAKENED'
+                    ELSE 'ACTIVE'
+                END,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                umo,
+                proposal.node_key,
+                proposal.kind,
+                proposal.label,
+                proposal.description,
+                max(0.0, min(1.0, float(confidence))),
+                max(-4.0, min(4.0, float(utility_delta))),
+                str(created_by or "")[:200],
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT id FROM plastic_nodes WHERE umo = ? AND node_key = ?",
+            (umo, proposal.node_key),
+        ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    @staticmethod
+    def _relation_definition(proposal: RelationTypeProposal) -> tuple[object, ...]:
+        return (
+            proposal.name,
+            proposal.description,
+            json.dumps(list(proposal.source_kinds), separators=(",", ":")),
+            json.dumps(list(proposal.target_kinds), separators=(",", ":")),
+            proposal.inverse_key,
+            1 if proposal.symmetric else 0,
+            proposal.risk_class,
+        )
+
+    def _register_relation_type_locked(
+        self,
+        *,
+        umo: str,
+        proposal: RelationTypeProposal,
+        created_by: str,
+        force_revision: bool,
+    ) -> tuple[int, int, bool, int | None]:
+        active = self._connection.execute(
+            """
+            SELECT * FROM relation_types
+            WHERE umo = ? AND relation_key = ? AND status = 'ACTIVE'
+            """,
+            (umo, proposal.key),
+        ).fetchone()
+        definition = self._relation_definition(proposal)
+        if active is not None:
+            stored = (
+                str(active["canonical_name"]),
+                str(active["description"]),
+                str(active["source_kinds_json"]),
+                str(active["target_kinds_json"]),
+                str(active["inverse_key"]),
+                int(active["symmetric"]),
+                str(active["risk_class"]),
+            )
+            if stored == definition:
+                return int(active["id"]), int(active["version"]), False, None
+            if not force_revision:
+                raise ValueError(
+                    "relation definition conflicts with the active version; "
+                    "use revise_relation explicitly"
+                )
+        previous_id = int(active["id"]) if active is not None else None
+        latest = self._connection.execute(
+            """
+            SELECT COALESCE(MAX(version), 0) AS version
+            FROM relation_types WHERE umo = ? AND relation_key = ?
+            """,
+            (umo, proposal.key),
+        ).fetchone()
+        version = int(latest["version"] or 0) + 1
+        if active is not None:
+            self._connection.execute(
+                """
+                UPDATE relation_types
+                SET status='SUPERSEDED', updated_at=CURRENT_TIMESTAMP
+                WHERE id = ? AND umo = ?
+                """,
+                (previous_id, umo),
+            )
+        cursor = self._connection.execute(
+            """
+            INSERT INTO relation_types(
+                umo, relation_key, version, canonical_name, description,
+                source_kinds_json, target_kinds_json, inverse_key, symmetric,
+                risk_class, predecessor_id, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                umo,
+                proposal.key,
+                version,
+                *definition,
+                previous_id,
+                str(created_by or "")[:200],
+            ),
+        )
+        return int(cursor.lastrowid), version, True, previous_id
+
+    def apply_graph_mutation(
+        self,
+        *,
+        umo: str,
+        mutation: GraphMutation,
+        model: str = "",
+        allowed_evidence_keys: Iterable[str] | None = None,
+        allowed_negative_edge_ids: Iterable[int] | None = None,
+        feedback_proposal_id: int | None = None,
+    ) -> dict[str, object]:
+        """Commit one evidence-bound LLM proposal to the plastic graph.
+
+        The LLM proposes semantics; this transaction owns scope validation,
+        relation versioning, immutable provenance, and lifecycle transitions.
+        """
+
+        self._assert_scope(umo)
+        payload = mutation.as_dict()
+        encoded = self._bounded_json(payload, max_chars=16000)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        allowed = (
+            {str(key).strip() for key in allowed_evidence_keys if str(key).strip()}
+            if allowed_evidence_keys is not None
+            else None
+        )
+        negative_edges = (
+            {
+                int(edge_id)
+                for edge_id in allowed_negative_edge_ids
+                if int(edge_id) > 0
+            }
+            if allowed_negative_edge_ids is not None
+            else None
+        )
+        with self._lock, self._connection:
+            if feedback_proposal_id is not None:
+                feedback_proposal = self._connection.execute(
+                    """
+                    SELECT status FROM feedback_proposals
+                    WHERE id=? AND umo=?
+                    """,
+                    (int(feedback_proposal_id), umo),
+                ).fetchone()
+                if (
+                    feedback_proposal is None
+                    or str(feedback_proposal["status"]) != "COMMITTED"
+                ):
+                    raise ValueError(
+                        "plastic graph mutation requires a host-committed "
+                        "feedback proposal"
+                    )
+            evidence = self._validate_graph_evidence_locked(
+                umo=umo,
+                source_keys=mutation.evidence_source_keys,
+                allowed_source_keys=allowed,
+            )
+            if (
+                mutation.operation in {"inhibit_edge", "retire_edge"}
+                and negative_edges is not None
+                and int(mutation.edge_id or 0) not in negative_edges
+            ):
+                raise ValueError(
+                    "negative feedback can only modify a plastic edge that "
+                    "actually influenced an eligible response trace"
+                )
+            existing_mutation = self._connection.execute(
+                """
+                SELECT id, status, target_type, target_id
+                FROM graph_mutations
+                WHERE umo = ? AND proposal_sha256 = ?
+                """,
+                (umo, digest),
+            ).fetchone()
+            if existing_mutation is not None:
+                return {
+                    "mutation_id": int(existing_mutation["id"]),
+                    "status": str(existing_mutation["status"]),
+                    "target_type": str(existing_mutation["target_type"]),
+                    "target_id": existing_mutation["target_id"],
+                    "idempotent": True,
+                }
+            cursor = self._connection.execute(
+                """
+                INSERT INTO graph_mutations(
+                    umo, proposal_sha256, operation, payload_json,
+                    evidence_source_keys_json, status, model
+                ) VALUES (?, ?, ?, ?, ?, 'VALIDATING', ?)
+                """,
+                (
+                    umo,
+                    digest,
+                    mutation.operation,
+                    encoded,
+                    self._bounded_json(list(evidence), max_chars=8000),
+                    str(model or "")[:300],
+                ),
+            )
+            mutation_id = int(cursor.lastrowid)
+            target_type = ""
+            target_id: int | None = None
+            details: dict[str, object] = {}
+
+            if mutation.operation == "upsert_edge":
+                assert mutation.source is not None
+                assert mutation.target is not None
+                assert mutation.relation is not None
+                source_id = self._upsert_plastic_node_locked(
+                    umo=umo,
+                    proposal=mutation.source,
+                    confidence=mutation.confidence,
+                    utility_delta=max(0.0, mutation.utility_delta) / 2,
+                    created_by=f"mutation:{mutation_id}",
+                )
+                target_node_id = self._upsert_plastic_node_locked(
+                    umo=umo,
+                    proposal=mutation.target,
+                    confidence=mutation.confidence,
+                    utility_delta=max(0.0, mutation.utility_delta) / 2,
+                    created_by=f"mutation:{mutation_id}",
+                )
+                relation_id, relation_version, _, _ = (
+                    self._register_relation_type_locked(
+                        umo=umo,
+                        proposal=mutation.relation,
+                        created_by=f"mutation:{mutation_id}",
+                        force_revision=False,
+                    )
+                )
+                stable_key = self._plastic_edge_stable_key(
+                    umo=umo,
+                    source_node_key=mutation.source.node_key,
+                    relation_key=mutation.relation.key,
+                    target_node_key=mutation.target.node_key,
+                )
+                delta = max(-4.0, min(4.0, mutation.utility_delta))
+                self._connection.execute(
+                    """
+                    INSERT INTO plastic_edges(
+                        umo, stable_key, source_node_id, relation_type_id,
+                        target_node_id, statement, epistemic_confidence,
+                        utility, support_count, status, created_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(umo, stable_key) DO UPDATE SET
+                        relation_type_id=excluded.relation_type_id,
+                        statement=CASE WHEN excluded.statement <> ''
+                            THEN excluded.statement ELSE plastic_edges.statement END,
+                        epistemic_confidence=max(
+                            plastic_edges.epistemic_confidence,
+                            excluded.epistemic_confidence
+                        ),
+                        utility=min(4, max(-4,
+                            plastic_edges.utility + excluded.utility
+                        )),
+                        support_count=plastic_edges.support_count + 1,
+                        status=CASE
+                            WHEN plastic_edges.utility + excluded.utility <= -1
+                            THEN 'DORMANT'
+                            WHEN plastic_edges.utility + excluded.utility < 0
+                            THEN 'WEAKENED'
+                            ELSE 'ACTIVE'
+                        END,
+                        superseded_by=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        umo,
+                        stable_key,
+                        source_id,
+                        relation_id,
+                        target_node_id,
+                        mutation.statement,
+                        mutation.confidence,
+                        delta,
+                        "DORMANT" if delta <= -1 else (
+                            "WEAKENED" if delta < 0 else "ACTIVE"
+                        ),
+                        f"mutation:{mutation_id}",
+                    ),
+                )
+                edge = self._connection.execute(
+                    "SELECT id FROM plastic_edges WHERE umo = ? AND stable_key = ?",
+                    (umo, stable_key),
+                ).fetchone()
+                assert edge is not None
+                target_type = "edge"
+                target_id = int(edge["id"])
+                details["relation_version"] = relation_version
+                for source_key, message_id in evidence.items():
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO plastic_edge_evidence(
+                            edge_id, message_id, evidence_role, confidence
+                        ) VALUES (?, ?, 'SUPPORT', ?)
+                        """,
+                        (target_id, message_id, mutation.confidence),
+                    )
+
+            elif mutation.operation == "revise_relation":
+                assert mutation.relation is not None
+                relation_id, version, created, previous_id = (
+                    self._register_relation_type_locked(
+                        umo=umo,
+                        proposal=mutation.relation,
+                        created_by=f"mutation:{mutation_id}",
+                        force_revision=True,
+                    )
+                )
+                if previous_id is not None and created:
+                    self._connection.execute(
+                        """
+                        UPDATE plastic_edges
+                        SET relation_type_id=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE umo=? AND relation_type_id=?
+                          AND status NOT IN ('TOMBSTONED', 'SUPERSEDED')
+                        """,
+                        (relation_id, umo, previous_id),
+                    )
+                target_type = "relation"
+                target_id = relation_id
+                details.update({"version": version, "created": created})
+
+            elif mutation.operation == "deprecate_relation":
+                assert mutation.relation is not None
+                relation = self._connection.execute(
+                    """
+                    SELECT id FROM relation_types
+                    WHERE umo=? AND relation_key=? AND status='ACTIVE'
+                    """,
+                    (umo, mutation.relation.key),
+                ).fetchone()
+                if relation is None:
+                    raise ValueError("active relation type does not exist")
+                target_id = int(relation["id"])
+                target_type = "relation"
+                self._connection.execute(
+                    """
+                    UPDATE relation_types SET status='DEPRECATED',
+                        updated_at=CURRENT_TIMESTAMP WHERE id=? AND umo=?
+                    """,
+                    (target_id, umo),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges SET status='DORMANT',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE umo=? AND relation_type_id=?
+                      AND status IN ('ACTIVE', 'WEAKENED')
+                    """,
+                    (umo, target_id),
+                )
+
+            elif mutation.operation in {
+                "reinforce_edge",
+                "inhibit_edge",
+                "retire_edge",
+            }:
+                edge = self._connection.execute(
+                    "SELECT * FROM plastic_edges WHERE id=? AND umo=?",
+                    (int(mutation.edge_id or 0), umo),
+                ).fetchone()
+                if edge is None:
+                    raise ValueError("plastic edge does not exist in this group")
+                target_type = "edge"
+                target_id = int(edge["id"])
+                delta = float(mutation.utility_delta)
+                new_utility = max(-4.0, min(4.0, float(edge["utility"]) + delta))
+                if mutation.operation == "retire_edge":
+                    status = "TOMBSTONED"
+                elif new_utility <= -1:
+                    status = "DORMANT"
+                elif new_utility < 0:
+                    status = "WEAKENED"
+                else:
+                    status = "ACTIVE"
+                positive = mutation.operation == "reinforce_edge"
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges SET utility=?, status=?,
+                        epistemic_confidence=CASE WHEN ?
+                            THEN max(epistemic_confidence, ?)
+                            ELSE epistemic_confidence END,
+                        support_count=support_count + ?,
+                        contradict_count=contradict_count + ?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND umo=?
+                    """,
+                    (
+                        new_utility,
+                        status,
+                        1 if positive else 0,
+                        mutation.confidence,
+                        1 if positive else 0,
+                        0 if positive else 1,
+                        target_id,
+                        umo,
+                    ),
+                )
+                role = "FEEDBACK_POSITIVE" if positive else (
+                    "RETRACTION"
+                    if mutation.operation == "retire_edge"
+                    else "FEEDBACK_NEGATIVE"
+                )
+                for message_id in evidence.values():
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO plastic_edge_evidence(
+                            edge_id, message_id, evidence_role, confidence
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (target_id, message_id, role, mutation.confidence),
+                    )
+
+            elif mutation.operation == "merge_nodes":
+                source = self._connection.execute(
+                    "SELECT * FROM plastic_nodes WHERE umo=? AND node_key=?",
+                    (umo, mutation.source_node_key),
+                ).fetchone()
+                target = self._connection.execute(
+                    "SELECT * FROM plastic_nodes WHERE umo=? AND node_key=?",
+                    (umo, mutation.target_node_key),
+                ).fetchone()
+                if source is None or target is None:
+                    raise ValueError("both plastic nodes must exist in this group")
+                if str(source["node_kind"]) != str(target["node_kind"]):
+                    raise ValueError("only plastic nodes of the same kind can merge")
+                source_id = int(source["id"])
+                target_id = int(target["id"])
+                incident = self._connection.execute(
+                    """
+                    SELECT e.*, r.relation_key
+                    FROM plastic_edges AS e
+                    JOIN relation_types AS r ON r.id=e.relation_type_id
+                    WHERE e.umo=? AND (e.source_node_id=? OR e.target_node_id=?)
+                      AND e.status <> 'SUPERSEDED'
+                    """,
+                    (umo, source_id, source_id),
+                ).fetchall()
+                for edge in incident:
+                    new_source = (
+                        target_id
+                        if int(edge["source_node_id"]) == source_id
+                        else int(edge["source_node_id"])
+                    )
+                    new_target = (
+                        target_id
+                        if int(edge["target_node_id"]) == source_id
+                        else int(edge["target_node_id"])
+                    )
+                    source_key = (
+                        mutation.target_node_key
+                        if new_source == target_id
+                        else str(
+                            self._connection.execute(
+                                "SELECT node_key FROM plastic_nodes WHERE id=?",
+                                (new_source,),
+                            ).fetchone()["node_key"]
+                        )
+                    )
+                    target_key = (
+                        mutation.target_node_key
+                        if new_target == target_id
+                        else str(
+                            self._connection.execute(
+                                "SELECT node_key FROM plastic_nodes WHERE id=?",
+                                (new_target,),
+                            ).fetchone()["node_key"]
+                        )
+                    )
+                    stable_key = self._plastic_edge_stable_key(
+                        umo=umo,
+                        source_node_key=source_key,
+                        relation_key=str(edge["relation_key"]),
+                        target_node_key=target_key,
+                    )
+                    conflict = self._connection.execute(
+                        """
+                        SELECT id FROM plastic_edges
+                        WHERE umo=? AND stable_key=? AND id<>?
+                        """,
+                        (umo, stable_key, int(edge["id"])),
+                    ).fetchone()
+                    if conflict is None:
+                        self._connection.execute(
+                            """
+                            UPDATE plastic_edges SET source_node_id=?,
+                                target_node_id=?, stable_key=?,
+                                updated_at=CURRENT_TIMESTAMP WHERE id=?
+                            """,
+                            (new_source, new_target, stable_key, int(edge["id"])),
+                        )
+                        continue
+                    winner = int(conflict["id"])
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO plastic_edge_evidence(
+                            edge_id, message_id, evidence_role, confidence
+                        )
+                        SELECT ?, message_id, evidence_role, confidence
+                        FROM plastic_edge_evidence WHERE edge_id=?
+                        """,
+                        (winner, int(edge["id"])),
+                    )
+                    self._connection.execute(
+                        """
+                        UPDATE plastic_edges SET status='SUPERSEDED',
+                            superseded_by=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                        """,
+                        (winner, int(edge["id"])),
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE plastic_nodes SET status='MERGED', merged_into=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=? AND umo=?
+                    """,
+                    (target_id, source_id, umo),
+                )
+                target_type = "node"
+                details["merged_source_id"] = source_id
+
+            self._connection.execute(
+                """
+                UPDATE graph_mutations
+                SET target_type=?, target_id=?, status='COMMITTED',
+                    committed_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=?
+                """,
+                (target_type, target_id, mutation_id, umo),
+            )
+        return {
+            "mutation_id": mutation_id,
+            "status": "COMMITTED",
+            "operation": mutation.operation,
+            "target_type": target_type,
+            "target_id": target_id,
+            "idempotent": False,
+            **details,
+        }
+
+    def query_plastic_associations(
+        self,
+        *,
+        umo: str,
+        query: str = "",
+        node_key: str = "",
+        relation_key: str = "",
+        direction: str = "both",
+        limit: int = 20,
+        include_dormant: bool = False,
+        before_sent_at: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Traverse the learned graph through one generic, versioned relation API."""
+
+        self._assert_scope(umo)
+        normalized_direction = str(direction or "both").strip().casefold()
+        if normalized_direction not in {"out", "in", "both"}:
+            raise ValueError("direction must be out, in, or both")
+        statuses = ("ACTIVE", "WEAKENED", "DORMANT") if include_dormant else (
+            "ACTIVE",
+            "WEAKENED",
+        )
+        status_placeholders = ",".join("?" for _ in statuses)
+        clauses = ["e.umo = ?", f"e.status IN ({status_placeholders})"]
+        parameters: list[object] = [umo, *statuses]
+        if node_key:
+            if normalized_direction == "out":
+                clauses.append("src.node_key = ?")
+                parameters.append(node_key)
+            elif normalized_direction == "in":
+                clauses.append("dst.node_key = ?")
+                parameters.append(node_key)
+            else:
+                clauses.append("(src.node_key = ? OR dst.node_key = ?)")
+                parameters.extend((node_key, node_key))
+        if relation_key:
+            clauses.append("r.relation_key = ?")
+            parameters.append(str(relation_key).strip().casefold())
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            clauses.append(
+                "(instr(lower(src.label), lower(?)) > 0 OR "
+                "instr(lower(src.description), lower(?)) > 0 OR "
+                "instr(lower(dst.label), lower(?)) > 0 OR "
+                "instr(lower(dst.description), lower(?)) > 0 OR "
+                "instr(lower(e.statement), lower(?)) > 0 OR "
+                "instr(lower(r.canonical_name), lower(?)) > 0 OR "
+                "instr(lower(r.description), lower(?)) > 0)"
+            )
+            parameters.extend([normalized_query] * 7)
+        if before_sent_at is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM plastic_edge_evidence AS visible_pe "
+                "JOIN messages AS visible_m ON visible_m.id=visible_pe.message_id "
+                "WHERE visible_pe.edge_id=e.id AND visible_m.umo=e.umo "
+                "AND visible_m.is_deleted=0 AND visible_m.sent_at < ?)"
+            )
+            parameters.append(int(before_sent_at))
+        safe_limit = max(1, min(100, int(limit)))
+        parameters.append(safe_limit)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT e.id, e.stable_key, e.statement,
+                       e.epistemic_confidence, e.utility, e.activation_count,
+                       e.support_count, e.contradict_count, e.status,
+                       src.node_key AS source_key, src.node_kind AS source_kind,
+                       src.label AS source_label,
+                       src.description AS source_description,
+                       dst.node_key AS target_key, dst.node_kind AS target_kind,
+                       dst.label AS target_label,
+                       dst.description AS target_description,
+                       r.relation_key, r.version AS relation_version,
+                       r.canonical_name AS relation_name,
+                       r.description AS relation_description,
+                       r.symmetric, r.risk_class
+                FROM plastic_edges AS e
+                JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                JOIN relation_types AS r ON r.id=e.relation_type_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY e.utility DESC, e.epistemic_confidence DESC,
+                         e.activation_count DESC, e.id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            results: list[dict[str, object]] = []
+            for row in rows:
+                evidence_parameters: list[object] = [int(row["id"]), umo]
+                cutoff = ""
+                if before_sent_at is not None:
+                    cutoff = " AND m.sent_at < ?"
+                    evidence_parameters.append(int(before_sent_at))
+                evidence_rows = self._connection.execute(
+                    f"""
+                    SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
+                           m.plain_text, pe.evidence_role, pe.confidence
+                    FROM plastic_edge_evidence AS pe
+                    JOIN messages AS m ON m.id=pe.message_id
+                    WHERE pe.edge_id=? AND m.umo=? AND m.is_deleted=0{cutoff}
+                    ORDER BY m.sent_at, m.id LIMIT 24
+                    """,
+                    evidence_parameters,
+                ).fetchall()
+                results.append(
+                    {
+                        **dict(row),
+                        "symmetric": bool(row["symmetric"]),
+                        "evidence": [dict(item) for item in evidence_rows],
+                        "source_keys": [
+                            str(item["source_key"]) for item in evidence_rows
+                        ],
+                    }
+                )
+        return results
+
+    def activate_plastic_edges(
+        self,
+        *,
+        umo: str,
+        edge_ids: Iterable[int],
+        at: int,
+        trace_id: str = "",
+        relevance: float = 1.0,
+    ) -> list[dict[str, object]]:
+        """Activate selected paths and make later feedback credit assignable."""
+
+        self._assert_scope(umo)
+        ids = tuple(dict.fromkeys(int(value) for value in edge_ids if int(value) > 0))
+        if not ids:
+            return []
+        score = max(0.0, min(1.0, float(relevance)))
+        if score < 0.05:
+            raise ValueError("relevance is too low to activate")
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                f"""
+                SELECT e.id, e.statement, e.utility, e.status,
+                       src.label AS source_label, dst.label AS target_label,
+                       r.relation_key, r.canonical_name AS relation_name
+                FROM plastic_edges AS e
+                JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                JOIN relation_types AS r ON r.id=e.relation_type_id
+                WHERE e.umo=? AND e.id IN ({placeholders})
+                  AND e.status IN ('ACTIVE', 'WEAKENED')
+                ORDER BY e.utility DESC, e.id
+                """,
+                (umo, *ids),
+            ).fetchall()
+            trace = None
+            if trace_id:
+                trace = self._connection.execute(
+                    "SELECT expires_at FROM interaction_traces WHERE trace_id=? AND umo=?",
+                    (trace_id, umo),
+                ).fetchone()
+                if trace is None:
+                    raise ValueError("interaction trace does not exist in this group")
+            for row in rows:
+                edge_id = int(row["id"])
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges SET activation_count=activation_count+1,
+                        last_activated_at=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND umo=?
+                    """,
+                    (int(at), edge_id, umo),
+                )
+                if trace is None:
+                    continue
+                node_key = f"plastic_edge:{edge_id}"
+                self._connection.execute(
+                    """
+                    INSERT INTO trace_nodes(
+                        trace_id, umo, node_key, node_type, content_json,
+                        activation, utility, expires_at
+                    ) VALUES (?, ?, ?, 'plastic_edge', ?, ?, ?, ?)
+                    ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                        content_json=excluded.content_json,
+                        activation=max(trace_nodes.activation, excluded.activation),
+                        utility=excluded.utility
+                    """,
+                    (
+                        trace_id,
+                        umo,
+                        node_key,
+                        self._bounded_json(
+                            {
+                                "edge_id": edge_id,
+                                "source": str(row["source_label"]),
+                                "relation": str(row["relation_key"]),
+                                "target": str(row["target_label"]),
+                            }
+                        ),
+                        score,
+                        float(row["utility"]),
+                        int(trace["expires_at"]),
+                    ),
+                )
+                request_node = self._connection.execute(
+                    "SELECT id FROM trace_nodes WHERE trace_id=? AND node_key='request'",
+                    (trace_id,),
+                ).fetchone()
+                selected_node = self._connection.execute(
+                    "SELECT id FROM trace_nodes WHERE trace_id=? AND node_key=?",
+                    (trace_id, node_key),
+                ).fetchone()
+                assert request_node is not None and selected_node is not None
+                self._connection.execute(
+                    """
+                    INSERT INTO trace_edges(
+                        trace_id, umo, source_node_id, target_node_id, relation,
+                        contribution, eligibility
+                    ) VALUES (?, ?, ?, ?, 'ACTIVATES', ?, ?)
+                    ON CONFLICT(
+                        trace_id, source_node_id, target_node_id, relation
+                    ) DO UPDATE SET
+                        contribution=max(trace_edges.contribution,
+                                         excluded.contribution),
+                        eligibility=max(trace_edges.eligibility,
+                                        excluded.eligibility)
+                    """,
+                    (
+                        trace_id,
+                        umo,
+                        int(request_node["id"]),
+                        int(selected_node["id"]),
+                        score,
+                        score,
+                    ),
+                )
+        return [dict(row) for row in rows]
+
+    def compact_plastic_graph(
+        self,
+        *,
+        umo: str,
+        now: int | None = None,
+        utility_half_life_days: float = 120.0,
+        max_active_edges: int = 400,
+    ) -> dict[str, int]:
+        """Decay retrieval utility and hide weak paths without deleting evidence."""
+
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        half_life = max(1.0, min(3650.0, float(utility_half_life_days)))
+        decayed = 0
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id, utility, unixepoch(updated_at) AS updated_epoch
+                FROM plastic_edges
+                WHERE umo=? AND status IN ('ACTIVE', 'WEAKENED', 'DORMANT')
+                  AND unixepoch(updated_at) < ?
+                """,
+                (umo, current - 86400),
+            ).fetchall()
+            for row in rows:
+                elapsed_days = max(
+                    0.0, (current - int(row["updated_epoch"] or current)) / 86400
+                )
+                value = float(row["utility"]) * math.pow(
+                    0.5, elapsed_days / half_life
+                )
+                status = "DORMANT" if value <= -1 else (
+                    "WEAKENED" if value < 0 else "ACTIVE"
+                )
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges SET utility=?, status=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=? AND umo=?
+                    """,
+                    (value, status, int(row["id"]), umo),
+                )
+                decayed += 1
+            keep = max(1, min(10000, int(max_active_edges)))
+            active = self._connection.execute(
+                """
+                SELECT id FROM plastic_edges
+                WHERE umo=? AND status IN ('ACTIVE', 'WEAKENED')
+                ORDER BY utility DESC, epistemic_confidence DESC,
+                         COALESCE(last_activated_at, 0) DESC, id DESC
+                """,
+                (umo,),
+            ).fetchall()
+            dormant_by_budget = 0
+            if len(active) > keep:
+                stale = [int(row["id"]) for row in active[keep:]]
+                placeholders = ",".join("?" for _ in stale)
+                dormant_by_budget = self._connection.execute(
+                    f"""
+                    UPDATE plastic_edges SET status='DORMANT',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE umo=? AND id IN ({placeholders})
+                    """,
+                    (umo, *stale),
+                ).rowcount
+            dormant_nodes = self._connection.execute(
+                """
+                UPDATE plastic_nodes SET status='DORMANT',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND status <> 'MERGED' AND NOT EXISTS (
+                    SELECT 1 FROM plastic_edges AS e
+                    WHERE e.umo=plastic_nodes.umo
+                      AND (e.source_node_id=plastic_nodes.id
+                           OR e.target_node_id=plastic_nodes.id)
+                      AND e.status IN ('ACTIVE', 'WEAKENED')
+                )
+                """,
+                (umo,),
+            ).rowcount
+        return {
+            "decayed_edges": int(decayed),
+            "dormant_by_budget": int(dormant_by_budget),
+            "dormant_nodes": int(dormant_nodes),
+        }
+
+    def subconscious_state(self, *, umo: str) -> dict[str, object]:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT revision, state_json, last_query_sha256, last_tick_at,
+                       updated_at FROM subconscious_states WHERE umo=?
+                """,
+                (umo,),
+            ).fetchone()
+        if row is None:
+            return {
+                "revision": 0,
+                "state": {},
+                "last_query_sha256": "",
+                "last_tick_at": None,
+                "updated_at": None,
+            }
+        return {
+            "revision": int(row["revision"]),
+            "state": json.loads(str(row["state_json"])),
+            "last_query_sha256": str(row["last_query_sha256"]),
+            "last_tick_at": (
+                int(row["last_tick_at"])
+                if row["last_tick_at"] is not None
+                else None
+            ),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def update_subconscious_state(
+        self,
+        *,
+        umo: str,
+        state: Mapping[str, object],
+        last_query_sha256: str,
+        at: int | None = None,
+    ) -> dict[str, object]:
+        """Persist bounded operational state, never model chain-of-thought."""
+
+        self._assert_scope(umo)
+        allowed = {
+            "focus",
+            "open_questions",
+            "active_node_keys",
+            "active_edge_ids",
+            "last_decision",
+            "candidate_counts",
+            "visited_source_keys",
+        }
+        unknown = set(state) - allowed
+        if unknown:
+            raise ValueError(
+                "subconscious state contains unsupported fields: "
+                + ", ".join(sorted(unknown))
+            )
+        encoded = self._bounded_json(dict(state), max_chars=8000)
+        digest = str(last_query_sha256 or "").strip()
+        if digest and (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("last_query_sha256 must be a lowercase SHA-256 digest")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO subconscious_states(
+                    umo, revision, state_json, last_query_sha256, last_tick_at
+                ) VALUES (?, 1, ?, ?, ?)
+                ON CONFLICT(umo) DO UPDATE SET
+                    revision=subconscious_states.revision + 1,
+                    state_json=excluded.state_json,
+                    last_query_sha256=excluded.last_query_sha256,
+                    last_tick_at=excluded.last_tick_at,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (umo, encoded, digest, int(at or time.time())),
+            )
+        return self.subconscious_state(umo=umo)
+
+    def enqueue_maintenance_job(
+        self,
+        *,
+        umo: str,
+        job_type: str,
+        dedupe_key: str,
+        payload: Mapping[str, object] | None = None,
+        available_at: int | None = None,
+    ) -> int:
+        self._assert_scope(umo)
+        kind = str(job_type or "").strip().casefold()
+        if kind not in {"distill", "feedback", "plasticity"}:
+            raise ValueError("unsupported maintenance job type")
+        key = str(dedupe_key or "").strip()
+        if not key or len(key) > 240:
+            raise ValueError("invalid maintenance dedupe key")
+        encoded = self._bounded_json(dict(payload or {}), max_chars=8000)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO maintenance_jobs(
+                    umo, job_type, dedupe_key, payload_json, available_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(umo, job_type, dedupe_key) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    available_at=CASE
+                        WHEN maintenance_jobs.status IN
+                            ('DONE', 'CANCELLED')
+                        THEN excluded.available_at
+                        ELSE min(maintenance_jobs.available_at,
+                                 excluded.available_at)
+                    END,
+                    status=CASE
+                        WHEN maintenance_jobs.status IN
+                            ('DONE', 'CANCELLED')
+                        THEN 'PENDING'
+                        ELSE maintenance_jobs.status
+                    END,
+                    attempts=CASE
+                        WHEN maintenance_jobs.status IN
+                            ('DONE', 'CANCELLED')
+                        THEN 0 ELSE maintenance_jobs.attempts END,
+                    last_error=CASE
+                        WHEN maintenance_jobs.status IN
+                            ('DONE', 'CANCELLED')
+                        THEN '' ELSE maintenance_jobs.last_error END,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (umo, kind, key, encoded, int(available_at or time.time())),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id FROM maintenance_jobs
+                WHERE umo=? AND job_type=? AND dedupe_key=?
+                """,
+                (umo, kind, key),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def pending_maintenance_jobs(
+        self,
+        *,
+        umo: str,
+        job_type: str = "",
+        now: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        self._assert_scope(umo)
+        clauses = ["umo=?", "status='PENDING'", "available_at<=?"]
+        parameters: list[object] = [umo, int(now or time.time())]
+        if job_type:
+            clauses.append("job_type=?")
+            parameters.append(str(job_type).strip().casefold())
+        parameters.append(max(1, min(100, int(limit))))
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM maintenance_jobs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY available_at, id LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [
+            {**dict(row), "payload": json.loads(str(row["payload_json"]))}
+            for row in rows
+        ]
+
+    def claim_maintenance_job(
+        self,
+        *,
+        umo: str,
+        job_id: int,
+        now: int | None = None,
+        lease_seconds: int = 300,
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        with self._lock, self._connection:
+            updated = self._connection.execute(
+                """
+                UPDATE maintenance_jobs SET status='RUNNING',
+                    attempts=attempts+1, lease_until=?, last_error='',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=? AND status='PENDING' AND available_at<=?
+                """,
+                (
+                    current + max(30, min(3600, int(lease_seconds))),
+                    int(job_id),
+                    umo,
+                    current,
+                ),
+            ).rowcount
+            if not updated:
+                return None
+            row = self._connection.execute(
+                "SELECT * FROM maintenance_jobs WHERE id=? AND umo=?",
+                (int(job_id), umo),
+            ).fetchone()
+        assert row is not None
+        return {**dict(row), "payload": json.loads(str(row["payload_json"]))}
+
+    def finish_maintenance_job(
+        self, *, umo: str, job_id: int, status: str = "DONE"
+    ) -> None:
+        self._assert_scope(umo)
+        normalized = str(status or "DONE").strip().upper()
+        if normalized not in {"DONE", "CANCELLED"}:
+            raise ValueError("maintenance completion status is invalid")
+        with self._lock, self._connection:
+            updated = self._connection.execute(
+                """
+                UPDATE maintenance_jobs SET status=?, lease_until=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=? AND status='RUNNING'
+                """,
+                (normalized, int(job_id), umo),
+            ).rowcount
+        if not updated:
+            raise ValueError("maintenance job is not running")
+
+    def fail_maintenance_job(
+        self,
+        *,
+        umo: str,
+        job_id: int,
+        error: str,
+        now: int | None = None,
+        max_attempts: int = 3,
+        retry_delay_seconds: int = 60,
+    ) -> str:
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT attempts FROM maintenance_jobs
+                WHERE id=? AND umo=? AND status='RUNNING'
+                """,
+                (int(job_id), umo),
+            ).fetchone()
+            if row is None:
+                raise ValueError("maintenance job is not running")
+            terminal = int(row["attempts"]) >= max(1, int(max_attempts))
+            status = "FAILED" if terminal else "PENDING"
+            self._connection.execute(
+                """
+                UPDATE maintenance_jobs SET status=?, available_at=?,
+                    lease_until=NULL, last_error=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=?
+                """,
+                (
+                    status,
+                    current + max(1, int(retry_delay_seconds)),
+                    str(error or "")[:1000],
+                    int(job_id),
+                    umo,
+                ),
+            )
+        return status
+
     def start_interaction_trace(
         self,
         *,
@@ -5582,6 +7123,31 @@ class MemoryStorage:
                 """,
                 (umo, *trace_ids),
             ).fetchall()
+            plastic_activation_rows = self._connection.execute(
+                f"""
+                SELECT te.trace_id, pe.id AS edge_id, pe.statement,
+                       pe.utility, pe.status, te.contribution, te.eligibility,
+                       src.node_key AS source_key, src.label AS source_label,
+                       dst.node_key AS target_key, dst.label AS target_label,
+                       r.relation_key, r.version AS relation_version,
+                       r.canonical_name AS relation_name
+                FROM trace_edges AS te
+                JOIN trace_nodes AS selected ON selected.id=te.target_node_id
+                JOIN plastic_edges AS pe
+                  ON pe.id=CAST(substr(selected.node_key, 14) AS INTEGER)
+                 AND pe.umo=te.umo
+                JOIN plastic_nodes AS src ON src.id=pe.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=pe.target_node_id
+                JOIN relation_types AS r ON r.id=pe.relation_type_id
+                WHERE te.umo=?
+                  AND te.trace_id IN ({','.join('?' for _ in trace_ids) if trace_ids else "''"})
+                  AND te.relation='ACTIVATES'
+                  AND selected.node_type='plastic_edge'
+                  AND selected.node_key GLOB 'plastic_edge:[0-9]*'
+                ORDER BY te.trace_id, te.eligibility DESC, pe.id
+                """,
+                (umo, *trace_ids),
+            ).fetchall()
         feedback_value = {
             key: feedback[key]
             for key in ("source_key", "sender_id", "sender_name", "sent_at", "plain_text")
@@ -5603,6 +7169,9 @@ class MemoryStorage:
                 for row in observable_nodes
             ],
             "activated_hypotheses": [dict(row) for row in activation_rows],
+            "activated_plastic_edges": [
+                dict(row) for row in plastic_activation_rows
+            ],
             "context": [dict(row) for row in context],
         }
 
@@ -5880,7 +7449,7 @@ class MemoryStorage:
                 raise ValueError("feedback proposal is not pending")
             feedback = self._connection.execute(
                 """
-                SELECT sender_id, sent_at, plain_text FROM messages
+                SELECT id, sender_id, sent_at, plain_text FROM messages
                 WHERE umo = ? AND source_key = ? AND is_deleted = 0
                 """,
                 (umo, str(proposal["feedback_source_key"])),
@@ -5977,6 +7546,74 @@ class MemoryStorage:
                         delta,
                         decision.target_trace_id,
                         int(activation["hypothesis_id"]),
+                    ),
+                )
+
+            plastic_activation_rows = self._connection.execute(
+                """
+                SELECT te.id AS trace_edge_id, te.contribution, te.eligibility,
+                       pe.id AS edge_id, pe.utility
+                FROM trace_edges AS te
+                JOIN trace_nodes AS selected ON selected.id=te.target_node_id
+                JOIN plastic_edges AS pe
+                  ON pe.id=CAST(substr(selected.node_key, 14) AS INTEGER)
+                 AND pe.umo=te.umo
+                WHERE te.trace_id=? AND te.umo=?
+                  AND te.relation='ACTIVATES'
+                  AND selected.node_type='plastic_edge'
+                  AND selected.node_key GLOB 'plastic_edge:[0-9]*'
+                """,
+                (decision.target_trace_id, umo),
+            ).fetchall()
+            plastic_credit = 0.0
+            for activation in plastic_activation_rows:
+                delta = backward_credit_delta(
+                    feedback_valence=decision.feedback_valence,
+                    feedback_confidence=decision.confidence,
+                    eligibility=float(activation["eligibility"]),
+                    contribution=float(activation["contribution"]),
+                )
+                plastic_credit += delta
+                new_utility = max(
+                    -4.0,
+                    min(4.0, float(activation["utility"]) + delta),
+                )
+                status = "DORMANT" if new_utility <= -1 else (
+                    "WEAKENED" if new_utility < 0 else "ACTIVE"
+                )
+                positive = delta >= 0
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges SET utility=?, status=?,
+                        support_count=support_count+?,
+                        contradict_count=contradict_count+?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND umo=?
+                    """,
+                    (
+                        new_utility,
+                        status,
+                        1 if positive else 0,
+                        0 if positive else 1,
+                        int(activation["edge_id"]),
+                        umo,
+                    ),
+                )
+                self._connection.execute(
+                    "UPDATE trace_edges SET credit=credit+? WHERE id=?",
+                    (delta, int(activation["trace_edge_id"])),
+                )
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO plastic_edge_evidence(
+                        edge_id, message_id, evidence_role, confidence
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        int(activation["edge_id"]),
+                        int(feedback["id"]),
+                        "FEEDBACK_POSITIVE" if positive else "FEEDBACK_NEGATIVE",
+                        decision.confidence,
                     ),
                 )
 
@@ -6261,6 +7898,8 @@ class MemoryStorage:
             "trace_id": decision.target_trace_id,
             "hypothesis_id": hypothesis_id,
             "backward_credit": round(total_credit, 6),
+            "plastic_backward_credit": round(plastic_credit, 6),
+            "plastic_edges_credited": len(plastic_activation_rows),
         }
 
     def reject_feedback_proposal(

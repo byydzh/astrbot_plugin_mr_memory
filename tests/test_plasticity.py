@@ -1,0 +1,395 @@
+from __future__ import annotations
+
+import unittest
+import uuid
+from pathlib import Path
+
+from mr_memory.feedback import FeedbackDecision
+from mr_memory.models import NormalizedMessage
+from mr_memory.plasticity import parse_graph_mutation
+from mr_memory.storage import MemoryStorage
+
+
+class PlasticGraphTests(unittest.TestCase):
+    umo = "shadow:GroupMessage:group-a"
+
+    def setUp(self) -> None:
+        test_root = Path.cwd() / ".dev" / "test-tmp"
+        test_root.mkdir(parents=True, exist_ok=True)
+        self.database_path = test_root / f"{uuid.uuid4().hex}.db"
+        self.storage = MemoryStorage(self.database_path)
+        self.storage.bind_scope(
+            umo=self.umo,
+            platform_id="shadow",
+            group_id="group-a",
+        )
+
+    def tearDown(self) -> None:
+        self.storage.close()
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{self.database_path}{suffix}").unlink(missing_ok=True)
+
+    def message(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        sent_at: int,
+        sender_id: str = "user-a",
+    ) -> NormalizedMessage:
+        return NormalizedMessage(
+            platform="aiocqhttp",
+            platform_id="shadow",
+            umo=self.umo,
+            group_id="group-a",
+            message_id=message_id,
+            sender_id=sender_id,
+            sender_name=sender_id,
+            sent_at=sent_at,
+            plain_text=text,
+            content=[{"type": "plain", "text": text}],
+        )
+
+    @staticmethod
+    def edge_payload(source_key: str) -> dict[str, object]:
+        return {
+            "operation": "upsert_edge",
+            "evidence_source_keys": [source_key],
+            "confidence": 0.87,
+            "utility_delta": 0.6,
+            "statement": "‘好女孩’在本群常用作戏谑性的认可标签。",
+            "source": {
+                "kind": "symbol",
+                "label": "好女孩",
+                "description": "群内反复出现的表达",
+            },
+            "relation": {
+                "key": "group_usage",
+                "name": "群内用法",
+                "description": "一个表达在当前群聊中的语用含义",
+                "source_kinds": ["symbol"],
+                "target_kinds": ["concept"],
+            },
+            "target": {
+                "kind": "concept",
+                "label": "戏谑性的认可",
+                "description": "不是性别或品德事实判断",
+            },
+        }
+
+    def test_parser_forbids_identity_nodes(self) -> None:
+        payload = self.edge_payload("source-1")
+        payload["source"] = {"kind": "participant", "label": "某人"}
+        with self.assertRaisesRegex(ValueError, "unsupported plastic node kind"):
+            parse_graph_mutation(payload)
+
+    def test_evidence_bound_edge_and_relation_revision(self) -> None:
+        evidence = self.message("e-1", "鉴定为好女孩", sent_at=100)
+        self.storage.upsert_message(evidence)
+        mutation = parse_graph_mutation(
+            self.edge_payload(evidence.resolved_source_key())
+        )
+        committed = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=mutation,
+            model="test-model",
+            allowed_evidence_keys={evidence.resolved_source_key()},
+        )
+        self.assertEqual(committed["status"], "COMMITTED")
+        self.assertEqual(committed["relation_version"], 1)
+        rows = self.storage.query_plastic_associations(
+            umo=self.umo,
+            query="好女孩",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["relation_key"], "group_usage")
+        self.assertEqual(
+            rows[0]["source_keys"], [evidence.resolved_source_key()]
+        )
+
+        revision = parse_graph_mutation(
+            {
+                "operation": "revise_relation",
+                "evidence_source_keys": [evidence.resolved_source_key()],
+                "confidence": 0.9,
+                "utility_delta": 0,
+                "relation": {
+                    "key": "group_usage",
+                    "name": "本群语用",
+                    "description": "表达在群聊语境中的动态、非字面含义",
+                    "source_kinds": ["symbol"],
+                    "target_kinds": ["concept"],
+                },
+            }
+        )
+        result = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=revision,
+            allowed_evidence_keys={evidence.resolved_source_key()},
+        )
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(
+            self.storage.query_plastic_associations(
+                umo=self.umo, query="好女孩"
+            )[0]["relation_version"],
+            2,
+        )
+
+    def test_cross_group_or_uninspected_evidence_is_rejected(self) -> None:
+        evidence = self.message("e-1", "好女孩", sent_at=100)
+        self.storage.upsert_message(evidence)
+        mutation = parse_graph_mutation(
+            self.edge_payload(evidence.resolved_source_key())
+        )
+        with self.assertRaisesRegex(ValueError, "outside the inspected set"):
+            self.storage.apply_graph_mutation(
+                umo=self.umo,
+                mutation=mutation,
+                allowed_evidence_keys={"not-inspected"},
+            )
+
+    def test_uncommitted_feedback_cannot_mutate_plastic_graph(self) -> None:
+        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
+        request = self.message("q-1", "这是好女孩吗", sent_at=100)
+        feedback = self.message("f-1", "不对，不是这个意思", sent_at=110)
+        self.storage.upsert_message(evidence)
+        self.storage.upsert_message(request)
+        self.storage.start_interaction_trace(
+            trace_id="trace-uncommitted",
+            umo=self.umo,
+            sender_id="user-a",
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=100,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id="trace-uncommitted",
+            umo=self.umo,
+            response_text="这是字面上的夸奖。",
+            response_at=101,
+        )
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        with self.assertRaisesRegex(ValueError, "host-committed"):
+            self.storage.apply_graph_mutation(
+                umo=self.umo,
+                mutation=parse_graph_mutation(
+                    self.edge_payload(evidence.resolved_source_key())
+                ),
+                allowed_evidence_keys={evidence.resolved_source_key()},
+                feedback_proposal_id=int(proposal_id),
+            )
+        self.assertEqual(
+            self.storage.query_plastic_associations(
+                umo=self.umo,
+                query="好女孩",
+            ),
+            [],
+        )
+
+    def test_serialized_state_is_bounded_and_versioned(self) -> None:
+        digest = "a" * 64
+        first = self.storage.update_subconscious_state(
+            umo=self.umo,
+            state={"focus": ["好女孩"], "active_edge_ids": [1]},
+            last_query_sha256=digest,
+            at=100,
+        )
+        second = self.storage.update_subconscious_state(
+            umo=self.umo,
+            state={"last_decision": "NO_RELEVANT_MEMORY"},
+            last_query_sha256=digest,
+            at=200,
+        )
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(second["revision"], 2)
+        with self.assertRaisesRegex(ValueError, "unsupported fields"):
+            self.storage.update_subconscious_state(
+                umo=self.umo,
+                state={"chain_of_thought": "do not persist this"},
+                last_query_sha256=digest,
+            )
+
+    def test_running_maintenance_job_recovers_after_reopen(self) -> None:
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="plasticity",
+            dedupe_key="feedback:e-1",
+            payload={"source_key": "e-1"},
+            available_at=100,
+        )
+        claimed = self.storage.claim_maintenance_job(
+            umo=self.umo,
+            job_id=job_id,
+            now=100,
+        )
+        self.assertIsNotNone(claimed)
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        pending = self.storage.pending_maintenance_jobs(
+            umo=self.umo,
+            now=101,
+        )
+        self.assertEqual([row["id"] for row in pending], [job_id])
+
+    def test_human_feedback_assigns_credit_to_activated_plastic_path(self) -> None:
+        request = self.message("q-1", "这是好女孩吗", sent_at=100)
+        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
+        self.storage.upsert_message(evidence)
+        self.storage.upsert_message(request)
+        edge = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(
+                self.edge_payload(evidence.resolved_source_key())
+            ),
+        )
+        trace_id = "trace-plastic"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=self.umo,
+            sender_id="user-a",
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=100,
+            query=request.plain_text,
+        )
+        self.storage.activate_plastic_edges(
+            umo=self.umo,
+            edge_ids=[int(edge["target_id"])],
+            at=100,
+            trace_id=trace_id,
+            relevance=0.9,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=self.umo,
+            response_text="这是群里的认可梗。",
+            response_at=101,
+        )
+        feedback = self.message("f-1", "对，不错，就是这个意思", sent_at=110)
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        result = self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(proposal_id),
+            decision=FeedbackDecision(
+                target_trace_id=trace_id,
+                mutation="upsert",
+                feedback_valence=1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="group_slang",
+                statement="正确理解了好女孩的群内含义",
+                prospective_cue="遇到好女孩时优先按群内认可梗理解",
+                trigger_cues=("好女孩",),
+                activation_mode="semantic",
+            ),
+        )
+        self.assertEqual(result["plastic_edges_credited"], 1)
+        self.assertGreater(result["plastic_backward_credit"], 0)
+        refreshed = self.storage.query_plastic_associations(
+            umo=self.umo, query="好女孩"
+        )[0]
+        self.assertGreater(float(refreshed["utility"]), 0.6)
+        roles = {item["evidence_role"] for item in refreshed["evidence"]}
+        self.assertIn("FEEDBACK_POSITIVE", roles)
+
+    def test_negative_feedback_cannot_blame_an_unactivated_path(self) -> None:
+        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
+        request = self.message("q-1", "这是好女孩吗", sent_at=100)
+        self.storage.upsert_message(evidence)
+        self.storage.upsert_message(request)
+        first = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(
+                self.edge_payload(evidence.resolved_source_key())
+            ),
+        )
+        other_payload = self.edge_payload(evidence.resolved_source_key())
+        other_payload["source"] = {
+            "kind": "symbol",
+            "label": "好孩子",
+            "description": "另一个未参与回答的群内表达",
+        }
+        second = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(other_payload),
+        )
+        trace_id = "trace-negative-gate"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=self.umo,
+            sender_id="user-a",
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=100,
+            query=request.plain_text,
+        )
+        self.storage.activate_plastic_edges(
+            umo=self.umo,
+            edge_ids=[int(first["target_id"])],
+            at=100,
+            trace_id=trace_id,
+            relevance=0.9,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=self.umo,
+            response_text="误解了这个词。",
+            response_at=101,
+        )
+        feedback = self.message("f-1", "不对，不是这个意思", sent_at=110)
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        inspected = self.storage.inspect_feedback_proposal(
+            umo=self.umo,
+            proposal_id=int(proposal_id),
+        )
+        self.assertEqual(
+            [row["edge_id"] for row in inspected["activated_plastic_edges"]],
+            [first["target_id"]],
+        )
+        unactivated_inhibition = parse_graph_mutation(
+            {
+                "operation": "inhibit_edge",
+                "edge_id": second["target_id"],
+                "evidence_source_keys": [feedback.resolved_source_key()],
+                "confidence": 0.9,
+                "utility_delta": -0.5,
+                "statement": "negative feedback",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "actually influenced"):
+            self.storage.apply_graph_mutation(
+                umo=self.umo,
+                mutation=unactivated_inhibition,
+                allowed_evidence_keys={feedback.resolved_source_key()},
+                allowed_negative_edge_ids={int(first["target_id"])},
+            )
+        activated_inhibition = parse_graph_mutation(
+            {
+                **unactivated_inhibition.as_dict(),
+                "edge_id": first["target_id"],
+            }
+        )
+        result = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=activated_inhibition,
+            allowed_evidence_keys={feedback.resolved_source_key()},
+            allowed_negative_edge_ids={int(first["target_id"])},
+        )
+        self.assertEqual(result["status"], "COMMITTED")
+
+
+if __name__ == "__main__":
+    unittest.main()

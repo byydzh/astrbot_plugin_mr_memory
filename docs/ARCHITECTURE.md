@@ -34,10 +34,14 @@ group's memory.
   enter the same truth layer as user messages.
 - Distillation produces Cue--Tag--Episode, Participant--Aspect--Claim, and
   Topic--Episode units in the same scope.
+- Feedback maintenance may additionally produce a plastic association graph for
+  group-local meanings, symbols, behaviors, preferences, procedures, and traversal
+  paths. Its node kinds cannot represent accounts or privileges.
 - Candidate initialization embeds distilled units and queries inside the plugin
   with a local FastEmbed/ONNX model; it has no AstrBot provider or remote
   inference boundary.
-- The private reconstruction loop has seven typed, scoped, read-only tools.
+- The private reconstruction loop has the paper's seven typed, scoped, read-only
+  tools plus one read-only learned-association traversal tool.
 - The main LLM does not see those low-level tools by default.
 - Empty graph scopes skip the private provider call entirely.
 - Historical experiments pass a strict `before_sent_at` cutoff through candidate
@@ -46,27 +50,32 @@ group's memory.
 
 ## Reconstruction control
 
-The LLM chooses graph paths, but it must not be the only component allowed to stop
-the search. The first real-call ablation showed that the model could retrieve the
-correct source event on its first tool call and still browse until it discarded the
-answer. A deterministic host evidence gate has therefore been validated offline:
+The private LLM is the semantic gate. Embedding distance initializes candidates but
+does not decide relevance, and a request is not skipped merely because every vector
+score is low. Once a group has graph memory, each main-LLM request gets one bounded
+semantic tick; an empty graph still skips the provider entirely.
+
+The first real-call ablation also showed that a model can retrieve the correct source
+event and then browse until it discards the answer. A deterministic host evidence
+gate remains available as an optional latency/cost optimization:
 
 1. the event must come from the initial high-score episode candidates;
 2. raw event context must contain source keys;
 3. raw evidence and the query must have salient lexical overlap;
 4. passing the gate means “synthesize now”, never “the claim is true”.
 
-The same gate now runs inside the online private runner and remains switchable through
-`runtime_host_evidence_gate`, so masked experiments can compare identical runs with
-and without host stopping. Its decision and visited source keys enter the run ledger.
+It is disabled by default and never acts as a semantic truth threshold. When enabled,
+its decision and visited source keys enter the run ledger so masked experiments can
+compare identical runs with and without early stopping.
 
 ## Storage policy
 
 Keep source message revisions, graph revisions, provenance, feedback, and
 administrator decisions. Do not permanently keep hidden model reasoning, duplicated
 prompts, attachment blobs, signed URLs, or local file paths. The storage boundary
-allowlists components and retains only attachment type/name/reference hash. Only
-distilled nodes and Participant alias documents receive embeddings by default.
+allowlists components and retains only attachment type/name/reference hash. Distilled
+nodes, Participant aliases, and learned association documents may receive embeddings;
+the scores remain candidate priors rather than write or truth authority.
 
 Each construction batch is oldest-first and content-hash bound. Read-only overlap
 messages provide continuity but cannot advance the checkpoint. Every target source
@@ -101,10 +110,14 @@ path plus a bounded active view:
 ```text
 request/action/response -> later feedback -> prospective hypothesis
                                       \-> signed credit for activated paths
+                                      \-> versioned plastic association mutation
 ```
 
 The host, not the maintenance LLM, enforces proposal binding, time order, group
-and sender scope, a configurable evidence threshold, and atomic writes. Generic
+and sender scope, a configurable evidence threshold, and evidence-bound writes. A
+plastic mutation is unavailable until the same feedback proposal reaches
+`COMMITTED`; negative mutation is further restricted to plastic edges recorded in
+the eligible response's activation trace. Generic
 style preferences use `activation_mode=always`; task-conditioned behavior uses
 `activation_mode=semantic` with evidence-derived lexical triggers and a bounded
 private-agent semantic gate. Utility and factual confidence are deliberately
@@ -118,26 +131,31 @@ Implemented retention rules:
 - stage write proposals before one host-validated commit transaction;
 - retain evidence IDs through reconstruction so feedback can target the memory
   actually used by the main LLM;
+- reject blame assignment to an alternative path discovered only during later
+  maintenance;
 - decay utility, bound the active view, and make merge/unmerge reversible without
   deleting provenance.
 
 The construction path now has explicit semantic-fact supersede/retract states. The
-feedback loop still changes prospective behavior rather than directly rewriting a
-fact; administrator confirm/edit/reject/defer controls for feedback proposals remain
-planned.
+feedback loop can revise the separate plastic association graph but still cannot
+rewrite deterministic account identity or directly overwrite a structured factual
+claim; administrator confirm/edit/reject/defer controls remain planned.
 
 ## Wake-up policy
 
-Use three complementary triggers:
+Use four complementary triggers:
 
-- a cheap deterministic activation gate before main-LLM requests (implemented);
-- private semantic activation when relevant (implemented, default off with feedback);
+- a bounded private semantic tick before every main-LLM request when graph memory
+  exists (implemented);
+- embedding and lexical candidates as priors, not final relevance gates (implemented);
 - explicit consultation from the main LLM when the injected brief is insufficient
   (implemented);
 - a single bounded background queue after a message threshold or maintenance interval
   (implemented; never runs when capture is disabled).
 
-The persistent component is the scheduler, queue, graph revision, and activation
-state. LLM calls remain bounded and event-driven rather than continuously running.
+The persistent component is the scheduler, maintenance jobs, graph revision, and
+bounded operational state (focus, selected edge IDs, last decision, and evidence
+keys). Hidden reasoning is never serialized. LLM calls remain bounded and
+event-driven rather than continuously running.
 Every group also has a rolling private-token budget; reaching it skips private work
 without blocking the main response.
