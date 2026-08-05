@@ -341,6 +341,52 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.assertEqual([row["id"] for row in pending], [job_id])
 
+    def test_terminal_maintenance_job_only_retries_when_explicit(self) -> None:
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="distill",
+            dedupe_key="distill:pending",
+            available_at=100,
+        )
+        self.assertIsNotNone(
+            self.storage.claim_maintenance_job(
+                umo=self.umo,
+                job_id=job_id,
+                now=100,
+            )
+        )
+        self.assertEqual(
+            self.storage.fail_maintenance_job(
+                umo=self.umo,
+                job_id=job_id,
+                error="old implementation failed",
+                now=101,
+                max_attempts=1,
+            ),
+            "FAILED",
+        )
+        self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="distill",
+            dedupe_key="distill:pending",
+            available_at=102,
+        )
+        self.assertEqual(
+            self.storage.pending_maintenance_jobs(umo=self.umo, now=102),
+            [],
+        )
+        retried_id = self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="distill",
+            dedupe_key="distill:pending",
+            available_at=103,
+            retry_failed=True,
+        )
+        self.assertEqual(retried_id, job_id)
+        pending = self.storage.pending_maintenance_jobs(umo=self.umo, now=103)
+        self.assertEqual([row["id"] for row in pending], [job_id])
+        self.assertEqual(pending[0]["attempts"], 0)
+
     def test_human_feedback_assigns_credit_to_activated_plastic_path(self) -> None:
         request = self.message("q-1", "这是好女孩吗", sent_at=100)
         evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)

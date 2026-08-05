@@ -4,7 +4,76 @@
 `.dev/`，不得提交。插件 ledger 也只保存查询/结果哈希、工具参数、证据 key 和 token，
 不保存模型隐藏推理。
 
-## 2026-08-06：未决语义与重复媒体锚点 / 0.11.0 单群 canary
+## 2026-08-06：全群上线、旧历史迁移与热重载恢复 / 0.12.1
+
+线上 `allowed_umos=[]`，含义始终是处理 OneBot 平台实例当前加入的全部群，不是单群
+白名单。0.11.0 记录中的“单群白名单 canary”是错误判断，本节予以更正。启动时通过
+OneBot `get_group_list` 只读确认平台当前加入 5 个群；控制台把“已建立物理数据库的群数”
+与“平台实际群数”分开显示。
+
+一次性迁移源是 AngelEye 的按需 SQLite 缓存，不是 QQ 全群历史。源库只出现 3 个群，且
+三者 `history_exhausted=false`；另外 2 个已加入群从未被 AngelEye 工具按需缓存。迁移按群
+写入独立数据库，处理 34,642 条、插入 34,642 条、异常跳过 0 条；加上插件上线后已实时
+采集的 2 条，MR 原始证据总数为 34,644。原始迁移不调用 LLM，因此该阶段 token 为 0；
+迁移结束后才按每群预算进入图构建队列。
+
+部署只使用插件热重载，AstrBot PID `2031674` 保持不变，NapCat 未重启。实测发现 AstrBot
+热重载不会再次调用 `on_astrbot_loaded`，导致 0.12.0 的维护 worker 未启动；0.12.1 将运行
+时初始化改成幂等 bootstrap，并在热重载后自动发现 3 个既有 scope、恢复 3 条持久化整理
+队列和读取 5 群 OneBot inventory。后台整理/反馈维护与主请求潜意识使用独立超时；主请求
+仍保持 45 秒，完整思考构图按真实调用时延放宽到 300 秒。
+
+同一 API 的无正文连通探针在 1.447 秒内完成 64-token JSON 请求，reasoning 长度为 0；
+20 条合成构图探针在 4.817 秒内以 746 completion token 完成 20/20 source 覆盖。这证明
+接口和 non-thinking 参数有效，也证明“关闭思考”确实改变了模型运行形态，但不能证明它
+适合生产质量。单批保持 40 条，并限制 episode/semantic/topic/association 数量；覆盖账本
+要求保持不变。
+
+对同一真实批次执行只读探针：52 条上下文、40 条 target、正文 2,106 字符，完整 prompt
+为 41,680 字符 / 16,587 input token；2048 output token 在 12.871 秒结束于 `length`。上线
+后另一个真实 40 条批次在 4096 output token 再次结束于截断。随后对当前失败批次做流式
+实况调用，给出 32768 上限：23.750 秒以 `stop` 自然结束，输入 13,546、输出 3,958 token、
+reasoning 为 0。失败实际是同一 source 同时被引用和 ignored 的结构冲突；宿主移除冲突
+ignored 后严格校验通过。因此生产使用 32768 非瓶颈安全上限，不再拿 4k/8k 调参对抗 API；
+实际成本由自然停止、单批图单元数量和每群每日 token ledger 约束。
+
+随后对完全相同的真实 40 条批次开启 thinking 并流式监控：prompt 33,418 字符，输入
+13,625 token；模型先产生 58,053 字符 reasoning，再输出 15,003 字符 JSON，共计 22,094
+completion token，199.582 秒后以 `stop` 自然完成。150 秒超时和 4k/8k 输出上限都会误杀
+这次正常调用，关闭思考也确实相当于降级模型。严格校验发现一条 claim 缺少 speaker、
+mention、reply 或唯一别名依据；宿主只丢弃该非法 claim 后重跑同一校验并通过。生产策略
+因此改为默认完整思考、流式消费、32768 协议上限、300 秒后台超时，身份门禁不交给 LLM
+自证。该实测总用量为 35,719 token；按每群每日 500,000 token 的线上预算，最坏约允许
+14 个同等批次（约 560 条目标消息），实际值继续由 ledger 记录。
+
+部署后的两次线上完整事务进一步复核了该路径。群 `629280643` 首批模型阶段用时
+157.307 秒，输入 13,625、输出 20,358 token，reasoning 49,600 字符；宿主拒绝 3 个非法
+可选单元后，197.962 秒完成落库：4 episode、1 semantic、4 topic、4 association、63 个
+Harrier 向量。群 `851822508` 首批模型阶段用时 167.259 秒，输入 11,343、输出 19,165
+token，reasoning 52,925 字符；宿主拒绝 2 个非法可选单元后，198.286 秒完成落库：
+3 episode、10 semantic、3 topic、2 association、61 个向量。两批随后自动接续下一批，
+AstrBot PID 保持 `2031674`，6185/6199 监听和 5 群 OneBot inventory 均正常；峰值观察时
+AstrBot RSS 约 1.43 GB，系统仍有约 384 MB available memory 与 1.1 GB 可用 swap。
+进一步检查 AstrBot 4.27.1 `openai_source.py` 发现 `text_chat(**kwargs)`
+虽接收参数，但 `_prepare_chat_payload()` 没有把 `kwargs` 合入 payload，导致插件路径实际
+仍以默认 thinking 和无输出上限运行。插件现通过 companion compatibility bridge 在宿主
+完成 payload 构造后注入参数，再复用同一 Provider client、重试和响应解析；没有修改
+AstrBot core，也没有读取或复制 Provider 密钥。
+
+热重载验证还发现，旧 worker 已把三个群的首批消息耗尽 3 次尝试；仅重试 maintenance job
+会让这些终止态消息永久跳过，小群甚至显示无待处理。现只在显式运行时恢复边界把终止态
+消息重新置为待整理并获得新的 3 次窗口；日常 sweeper 不做该动作，避免无限重试。
+
+兼容桥生效后的 non-thinking 诊断中，DeepSeek 响应 reasoning 长度为 0；20 条小群批次在 12.806 秒
+得到 1,927 output token，随后完成 2 个 episode、3 条语义、1 个 topic、1 条关联及 22 个
+向量文档。两个 40 条批次暴露了可选 topic 结构错误和 4096-token JSON 截断；严格校验不
+放宽：非法 JSON 先追加一次有界修复调用；仍不满足约束的可选单元由宿主逐项拒绝后重新
+执行同一严格校验，因拒绝而失去覆盖的原始消息进入带原因的 ignored 审计项，正文仍保留。
+
+本轮回归 81 项通过，另通过 `compileall`、配置 JSON、控制台脚本语法和 diff whitespace
+检查。
+
+## 2026-08-06：未决语义与重复媒体锚点 / 0.11.0
 
 可塑关系现在持久化 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`、`CONFIRMED`
 四种认知状态及未决说明。增量整理可以直接建立竞争释义，后续证据必须通过带来源审计的
@@ -17,10 +86,10 @@
 
 普通设置页缩减为 7 个运行项；兼容性与实验调参仍保留在 schema 中但默认隐藏。完整回归
 64 项通过，另通过 `compileall`、配置 JSON、浏览器脚本语法和 diff whitespace 检查。
-服务器使用 AstrBot 4.27.1 加载插件 0.11.0，单群白名单 canary 已启用：独立 DeepSeek
-Provider、Harrier 本地 embedding、增量整理、反馈维护、主请求唤醒和高层咨询入口开启，
-底层遍历工具不向主 LLM 暴露。6185/6199 与 OneBot v11 适配器验证正常，NapCat 未重启；
-canary 启动时尚无白名单群新消息，因此没有误建其他群的 scope 数据库。
+服务器使用 AstrBot 4.27.1 加载插件 0.11.0：独立 DeepSeek Provider、Harrier 本地
+embedding、增量整理、反馈维护、主请求唤醒和高层咨询入口开启，底层遍历工具不向主 LLM
+暴露。6185/6199 与 OneBot v11 适配器验证正常，NapCat 未重启。这里曾把空
+`allowed_umos` 错记成单群白名单；实际配置从一开始就是全部群，详见上方 0.12.1 更正。
 
 ## 2026-08-05：truth layer v2 / 0.9.0 收口验证
 

@@ -6,7 +6,12 @@ import unittest
 import uuid
 from pathlib import Path
 
-from mr_memory.distillation import parse_distillation_response
+from mr_memory.distillation import (
+    build_distillation_repair_prompt,
+    distillation_generation_options,
+    parse_distillation_response,
+    parse_distillation_response_resilient,
+)
 from mr_memory.embedding import HashEmbeddingBackend
 from mr_memory.models import NormalizedMessage
 from mr_memory.service import MemoryService
@@ -14,6 +19,43 @@ from mr_memory.storage import MemoryStorage
 
 
 class DistillationPipelineTests(unittest.TestCase):
+    def test_deepseek_v4_structured_extraction_enables_thinking(self) -> None:
+        self.assertEqual(
+            distillation_generation_options(
+                model_name="deepseek-v4-flash",
+                max_tokens=8192,
+            ),
+            {
+                "temperature": 0.0,
+                "thinking": {"type": "enabled"},
+                "response_format": {"type": "json_object"},
+                "max_tokens": 8192,
+            },
+        )
+
+    def test_deepseek_v4_thinking_can_be_explicitly_disabled(self) -> None:
+        options = distillation_generation_options(
+            model_name="deepseek-v4-flash",
+            thinking_mode="disabled",
+        )
+        self.assertEqual(options["thinking"], {"type": "disabled"})
+
+    def test_other_providers_do_not_receive_deepseek_only_options(self) -> None:
+        self.assertEqual(
+            distillation_generation_options(model_name="gpt-5.4-mini"),
+            {"temperature": 0.0},
+        )
+
+    def test_repair_prompt_contains_complete_retry_context(self) -> None:
+        prompt = build_distillation_repair_prompt(
+            original_prompt='{"target_source_keys":["source-1"]}',
+            invalid_output='{"episodes":[]',
+            validation_error="invalid JSON",
+        )
+        self.assertIn("invalid JSON", prompt)
+        self.assertIn('"target_source_keys":["source-1"]', prompt)
+        self.assertIn('{"episodes":[]', prompt)
+
     def setUp(self) -> None:
         test_root = Path.cwd() / ".dev" / "test-tmp"
         test_root.mkdir(parents=True, exist_ok=True)
@@ -181,6 +223,33 @@ class DistillationPipelineTests(unittest.TestCase):
             {item.source_key for item in batch.ignored_sources},
             set(omitted_keys),
         )
+
+    def test_resilient_parser_drops_invalid_units_and_audits_uncovered_raw(self) -> None:
+        value = json.loads(self._response())
+        omitted_keys = list(value["episodes"][1]["source_keys"])
+        value["episodes"][1]["source_keys"] = ["invented"]
+        value["topics"].append(
+            {
+                "name": "空主题",
+                "summary": "模型产生的无效可选主题",
+                "episode_indices": [],
+            }
+        )
+
+        batch, actions = parse_distillation_response_resilient(
+            json.dumps(value, ensure_ascii=False),
+            self._messages(),
+        )
+
+        self.assertEqual(len(batch.episodes), 1)
+        self.assertEqual(len(batch.topics), 0)
+        self.assertEqual(
+            {item.source_key for item in batch.ignored_sources},
+            set(omitted_keys),
+        )
+        self.assertTrue(all("raw evidence retained" in item.reason for item in batch.ignored_sources))
+        self.assertIn("drop:episodes", actions)
+        self.assertIn("host_ignore:uncovered_target", actions)
 
     def test_construction_persists_an_unresolved_competing_association(self) -> None:
         value = json.loads(self._response())

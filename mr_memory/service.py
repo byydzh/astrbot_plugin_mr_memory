@@ -24,6 +24,24 @@ class MemoryService:
     async def ingest(self, message: NormalizedMessage) -> bool:
         return await asyncio.to_thread(self.storage.upsert_message, message)
 
+    async def ingest_many(
+        self,
+        messages: list[NormalizedMessage],
+        *,
+        defer_media_index: bool = False,
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.upsert_messages,
+            messages,
+            defer_media_index=defer_media_index,
+        )
+
+    async def rebuild_media_fingerprints(self, *, umo: str) -> None:
+        await asyncio.to_thread(
+            self.storage.rebuild_media_fingerprints,
+            umo=umo,
+        )
+
     async def mark_message_deleted(self, **kwargs: object) -> bool:
         return await asyncio.to_thread(self.storage.mark_message_deleted, **kwargs)
 
@@ -52,6 +70,12 @@ class MemoryService:
     async def pending_distillation_count(self, *, umo: str) -> int:
         return await asyncio.to_thread(
             self.storage.pending_distillation_count, umo=umo
+        )
+
+    async def retry_terminal_distillation_failures(self, *, umo: str) -> int:
+        return await asyncio.to_thread(
+            self.storage.retry_terminal_distillation_failures,
+            umo=umo,
         )
 
     async def next_distillation_batch(

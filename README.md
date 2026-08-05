@@ -3,7 +3,7 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.11.0 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
+0.12.1 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
 可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
 或 `CONFIRMED`；embedding 只生成候选，语义状态与遍历停止由独立潜意识 LLM 判断。
 
@@ -21,10 +21,16 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 - `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
   分数的宿主门禁约束，默认提交阈值为 `0.65`；反馈未先被宿主提交时不能修改可塑图。
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：记忆推理与主 LLM 分离。
+- `distillation_thinking_mode=enabled`：图构建保留模型完整思考能力；长调用采用流式接收，
+  关闭思考只作为显式诊断选项，不作为省时默认值。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
 - `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
+- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会尝试潜意识重建；
+  可切换为 `manual_only`，仅允许主 Agent 主动咨询。
+- 新消息达到 `auto_distillation_min_pending=30` 时立即整理；不足 30 条时，最迟由
+  `maintenance_interval_minutes=5` 的后台轮询触发。
 - 数据库固定写入本插件的 `plugin_data` 目录。
 - 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
   重名不会自动合并。
@@ -32,8 +38,8 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 - 日志默认不输出聊天正文。
 - 不连接或重启 NapCat，不发送消息。
 
-开发隔离由“只在本地/克隆环境运行、不部署线上”保证，不通过阉割 MRAgent 的
-LLM 工具接口实现。
+线上配置可以用 `allowed_umos` 限定群范围；留空明确表示所有群。UMO 的首段必须是
+平台实例 ID，例如 `byy_official:GroupMessage:123456`，不是 `aiocqhttp` 这样的适配器类型。
 
 ## 当前结构
 
@@ -83,7 +89,9 @@ brief 被宿主拒绝，而不是把未验证自由文本交给主 LLM。
 
 消息按 per-message checkpoint 增量整理：批次只选择最早的 `PENDING/FAILED` 消息，附带
 只读重叠上下文，成功后逐条推进；编辑或撤回会使派生图失效并重新排队。达到消息阈值或
-维护周期后由单一后台 worker 处理，不阻塞主回复。管理员仍可执行 `/mrmem distill`
+维护周期后由有界后台 worker 池处理，不阻塞主回复。后台整理使用独立长超时，主请求的
+潜意识重建仍保留较短超时。DeepSeek V4 整理默认开启完整思考并流式消费响应，32k 只作
+协议安全上限，不把 4k/8k 截断当成成本控制。管理员仍可执行 `/mrmem distill`
 立即处理下一批。进程若在批次中断，下一次打开数据库会把悬挂 checkpoint 恢复为有界重试。
 LLM 必须为每条目标消息提供图证据或显式 ignore reason，不能静默漏掉。
 
@@ -103,6 +111,10 @@ LLM 必须为每条目标消息提供图证据或显式 ignore reason，不能�
 插件安装后，AstrBot 的“插件页面”会自动出现“记忆控制台”。控制台与 AstrBot
 仪表盘共用登录鉴权，无需开放额外端口，提供：
 
+- 检测 AngelEye 按需产生的现有历史缓存，选择 OneBot 平台实例并按群幂等迁移；同时单独
+  显示 OneBot 实际加入群数，不能把缓存群数当成完整平台群数。迁移原始消息本身不调用
+  LLM，完成后才按当前整理阈值与每群 Token 上限构图；
+- 直接显示实际生效范围、潜意识唤醒模式、整理触发条件、反馈窗口和 Embedding 模型；
 - 所有已知群范围的消息量、图记忆量、向量量和数据库占用概览；
 - Cue--Tag--Episode、Participant--Aspect--Structured Claim、Topic--Episode 图谱；
 - Participant 节点、账号主键、当前群名片、别名历史和重名歧义计数；
@@ -204,4 +216,5 @@ python -m unittest discover -s tests -v
   自动事实检索，达到独立来源阈值后才晋升，事实修订仍由构建证据触发。
 - 自动反馈提交已有词面快门、后台队列、阈值与审计；完整管理员
   confirm/edit/reject proposal 控制台仍是后续项。
-- 线上采用单群白名单 canary；真实历史遮罩 A/B 与运行时 token ledger 均保留用于复核。
+- 线上生效范围由 `allowed_umos` 明确控制；真实历史遮罩 A/B 与运行时 token ledger
+  均保留用于复核。
