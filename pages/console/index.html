@@ -44,7 +44,17 @@
         <article class="metric-card">
           <span>语义记忆</span>
           <strong id="metric-semantics">—</strong>
-          <small>人物与属性</small>
+          <small>结构化主张</small>
+        </article>
+        <article class="metric-card">
+          <span>账户主体</span>
+          <strong id="metric-participants">—</strong>
+          <small>账号主键与别名历史</small>
+        </article>
+        <article class="metric-card">
+          <span>待整理</span>
+          <strong id="metric-pending">—</strong>
+          <small>增量 checkpoint 队列</small>
         </article>
         <article class="metric-card">
           <span>向量文档</span>
@@ -66,7 +76,7 @@
             <span aria-hidden="true">↻</span> 刷新
           </button>
           <button id="distill-btn" class="button primary" type="button" disabled>
-            <span aria-hidden="true">✦</span> 整理最近记忆
+            <span aria-hidden="true">✦</span> 整理待处理记忆
           </button>
         </div>
       </section>
@@ -95,6 +105,7 @@
           </div>
 
           <div class="legend" aria-label="节点类型筛选">
+            <label><input type="checkbox" data-node-type="participant" checked /><i class="participant"></i>账户主体</label>
             <label><input type="checkbox" data-node-type="cue" checked /><i class="cue"></i>线索</label>
             <label><input type="checkbox" data-node-type="episode" checked /><i class="episode"></i>Episode</label>
             <label><input type="checkbox" data-node-type="semantic" checked /><i class="semantic"></i>语义</label>
@@ -150,6 +161,46 @@
         </aside>
       </section>
 
+      <section class="panel identity-panel">
+        <div class="panel-heading message-heading">
+          <div>
+            <p class="section-kicker">IDENTITY REGISTRY</p>
+            <h2>账户主体与别名绑定</h2>
+            <p id="participant-status" class="panel-note">
+              平台账户 ID 是不可变主键；同名账户不会自动合并。
+            </p>
+          </div>
+          <form id="alias-bind-form" class="message-search">
+            <label>
+              <span class="sr-only">平台账户 ID</span>
+              <input id="alias-account-id" type="text" maxlength="300" placeholder="平台账户 ID" required />
+            </label>
+            <label>
+              <span class="sr-only">确认别名</span>
+              <input id="alias-value" type="text" maxlength="300" placeholder="管理员确认的别名" required />
+            </label>
+            <button class="button secondary" type="submit">绑定别名</button>
+          </form>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>账户 ID</th>
+                <th>当前群名片</th>
+                <th>别名历史</th>
+                <th>类型</th>
+                <th>最近出现</th>
+                <th>Participant Key</th>
+              </tr>
+            </thead>
+            <tbody id="participant-table-body">
+              <tr><td colspan="6" class="table-empty">选择群范围后显示账户主体。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel messages-panel">
         <div class="panel-heading message-heading">
           <div>
@@ -189,9 +240,9 @@
     <dialog id="distill-dialog" class="dialog">
       <form method="dialog" id="distill-form">
         <div class="dialog-mark">✦</div>
-        <h2>整理最近记忆</h2>
+        <h2>整理待处理记忆</h2>
         <p>
-          将调用插件自己的潜意识 LLM，把当前群最近消息整理成 Episode、语义记忆和 Topic；若已启用本地 Embedding，会同步建立向量索引。
+          将调用插件自己的潜意识 LLM，从 checkpoint 继续整理当前群尚未处理的消息，并带入只读重叠上下文；若已启用本地 Embedding，会同步建立向量索引。
         </p>
         <label class="dialog-field">
           本次消息数

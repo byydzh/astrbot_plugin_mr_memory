@@ -26,8 +26,13 @@ group's memory.
 
 ## Runtime boundaries
 
-- Raw messages are immutable evidence and are stored per group scope.
-- Distillation produces Cue--Tag--Episode, Person--Aspect--Semantic, and
+- Raw message revisions are the truth layer and are stored per group scope. Edits and
+  recalls never leave their old derived graph active.
+- Participants are keyed by host-derived platform account IDs inside one group.
+  Nicknames are aliases, not entity keys; ambiguous aliases are never merged.
+- Visible Bot responses, reply/mention relations, and bounded attachment descriptors
+  enter the same truth layer as user messages.
+- Distillation produces Cue--Tag--Episode, Participant--Aspect--Claim, and
   Topic--Episode units in the same scope.
 - Candidate initialization embeds distilled units and queries inside the plugin
   with a local FastEmbed/ONNX model; it has no AstrBot provider or remote
@@ -51,14 +56,32 @@ answer. A deterministic host evidence gate has therefore been validated offline:
 3. raw evidence and the query must have salient lexical overlap;
 4. passing the gate means “synthesize now”, never “the claim is true”.
 
-The gate remains a runtime TODO. It should be switchable so later masked experiments
-can compare identical runs with and without host stopping.
+The same gate now runs inside the online private runner and remains switchable through
+`runtime_host_evidence_gate`, so masked experiments can compare identical runs with
+and without host stopping. Its decision and visited source keys enter the run ledger.
 
 ## Storage policy
 
-Keep source messages, graph revisions, provenance, feedback, and administrator
-decisions. Do not permanently keep hidden model reasoning, duplicated prompts,
-or attachment blobs. Only distilled nodes should receive embeddings by default.
+Keep source message revisions, graph revisions, provenance, feedback, and
+administrator decisions. Do not permanently keep hidden model reasoning, duplicated
+prompts, attachment blobs, signed URLs, or local file paths. The storage boundary
+allowlists components and retains only attachment type/name/reference hash. Only
+distilled nodes and Participant alias documents receive embeddings by default.
+
+Each construction batch is oldest-first and content-hash bound. Read-only overlap
+messages provide continuity but cannot advance the checkpoint. Every target source
+must either be cited by an episode/claim or appear in the persisted ignored-source
+ledger. An interrupted `PROCESSING` lease is recovered as a bounded retry when the
+database is reopened. Episode identity depends on its evidence set rather than LLM
+wording.
+
+Structured claims separate speaker from subject, keep multiple source rows and exact
+spans, and use `ACTIVE`, `UNRESOLVED`, `QUARANTINED`, `CONFLICTED`, `SUPERSEDED`,
+`RETRACTED`, or `STALE`. Revisions can target only active claims for the same subject.
+Single-source identity or privilege claims are quarantined. See
+[the identity model](IDENTITY_MODEL.md). Quarantined claims remain visible to the
+administrator console and construction audit, but are excluded from automatic
+runtime retrieval until independent evidence promotes them.
 
 Developer observability uses three privacy-minimized tables. Experiment records
 store query hashes, status, and bounded metadata; usage records store token classes
@@ -98,20 +121,23 @@ Implemented retention rules:
 - decay utility, bound the active view, and make merge/unmerge reversible without
   deleting provenance.
 
-Still planned: administrator confirm/edit/reject/defer controls, explicit
-self-correction flows, and semantic-fact supersede/retract states. The current
-loop learns prospective behavior but does not rewrite an old factual claim.
+The construction path now has explicit semantic-fact supersede/retract states. The
+feedback loop still changes prospective behavior rather than directly rewriting a
+fact; administrator confirm/edit/reject/defer controls for feedback proposals remain
+planned.
 
 ## Wake-up policy
 
 Use three complementary triggers:
 
 - a cheap deterministic activation gate before main-LLM requests (implemented);
-- private semantic activation and bounded feedback maintenance on a main request
-  (implemented, default off);
+- private semantic activation when relevant (implemented, default off with feedback);
 - explicit consultation from the main LLM when the injected brief is insufficient
   (implemented);
-- background consolidation after a message threshold or idle interval (TODO).
+- a single bounded background queue after a message threshold or maintenance interval
+  (implemented; never runs when capture is disabled).
 
 The persistent component is the scheduler, queue, graph revision, and activation
 state. LLM calls remain bounded and event-driven rather than continuously running.
+Every group also has a rolling private-token budget; reaching it skips private work
+without blocking the main response.

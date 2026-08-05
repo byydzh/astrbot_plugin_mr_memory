@@ -3,7 +3,9 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.8.0 进一步加入可观察的主 Agent 工作图、后续反馈归因、反向效用更新和前瞻行为假设。
+0.9.0 将原型收口为可增量运行的 truth layer v2：账户主体绑定、Bot 可见输出、
+reply/mention、编辑/撤回、结构化多源 claim、修订状态机、后台整理和宿主停止门均进入
+运行路径。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -24,6 +26,9 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 - `expose_traversal_tools=false`：主 LLM 默认看不到七个底层遍历工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
 - 数据库固定写入本插件的 `plugin_data` 目录。
+- 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
+  重名不会自动合并。
+- 每群私有 LLM 默认有 24 小时 `120000` token 预算，超限 fail-open。
 - 日志默认不输出聊天正文。
 - 不连接或重启 NapCat，不发送消息。
 
@@ -42,7 +47,7 @@ NormalizedMessage
 SQLite truth store + FTS5 + layered memory graph
         |
         +-- Cue--Tag--Episode
-        +-- Person--Aspect--Semantic
+        +-- Participant--Aspect--Structured Claim
         +-- Topic--Episode
         +-- Action--Feedback--Prospective Hypothesis
         |
@@ -68,11 +73,15 @@ private provider tool loop (DeepSeek by default)
 插件使用与 AstrBot `Context.tool_loop_agent()` 相同的 `ToolLoopAgentRunner` 调用自己
 配置的 provider，不继承当前会话主 LLM。插件直接持有 runner，以便记录整个多轮循环的
 聚合 token，而不是误把最终 response 当成全部费用。若当前会话还没有图记忆，自动唤醒
-会直接跳过，不产生模型调用。
+会直接跳过；候选低于相似度门槛且查询没有明确历史意图时也不会调用私有模型。最终
+claim、conflict 与 unresolved 项都必须引用本轮工具实际访问的 source key，否则整份
+brief 被宿主拒绝，而不是把未验证自由文本交给主 LLM。
 
-管理员可在目标群执行 `/mrmem distill`，使用潜意识 Provider 将最近一批原始消息
-构造成 episode、cue/tag、语义记忆和 topic；启用本地 embedding 后会同时建立
-同群向量索引。LLM 返回的 source key 会在落库前校验，不能引用批次外消息。
+消息按 per-message checkpoint 增量整理：批次只选择最早的 `PENDING/FAILED` 消息，附带
+只读重叠上下文，成功后逐条推进；编辑或撤回会使派生图失效并重新排队。达到消息阈值或
+维护周期后由单一后台 worker 处理，不阻塞主回复。管理员仍可执行 `/mrmem distill`
+立即处理下一批。进程若在批次中断，下一次打开数据库会把悬挂 checkpoint 恢复为有界重试。
+LLM 必须为每条目标消息提供图证据或显式 ignore reason，不能静默漏掉。
 
 本地 embedding 由 FastEmbed/ONNX Runtime 执行。默认 `BAAI/bge-small-zh-v1.5`
 模型文件约 90 MB，首次真正构建向量时下载到插件自己的
@@ -91,17 +100,24 @@ private provider tool loop (DeepSeek by default)
 仪表盘共用登录鉴权，无需开放额外端口，提供：
 
 - 所有已知群范围的消息量、图记忆量、向量量和数据库占用概览；
-- Cue--Tag--Episode、Person--Aspect--Semantic、Topic--Episode 图谱；
+- Cue--Tag--Episode、Participant--Aspect--Structured Claim、Topic--Episode 图谱；
+- Participant 节点、账号主键、当前群名片、别名历史和重名歧义计数；
+- 在已认证插件页面绑定管理员确认的“账号 ID → 别名”，不合并账号；
 - 主 Agent Action--Feedback--Prospective Hypothesis 反馈图及激活模式、效用和状态；
 - 点击 Episode 回溯关键词和原始聊天证据；
 - 按正文或发送者检索当前群的原始消息；
-- 明确提示模型费用后，手动触发当前群的最近消息整理。
+- 查看待整理 checkpoint，并手动触发下一批增量整理。
 
 控制台只使用服务端枚举的 64 位不透明 scope ID。后端会再次从对应数据库读取并
 校验 UMO、平台和群号，不接受前端直接指定任意 UMO。
 
 管理员可在群内使用 `/mrmem usage [limit]` 查看该群最近的构建与重建 token ledger。
 记录按群隔离，不保存隐藏推理或完整模型输出。
+
+账户主体的绑定优先级、歧义处理和删除语义见
+[账户主体模型](docs/IDENTITY_MODEL.md)。群内还可使用 `/mrmem participants [账号或别名]`
+检查解析结果，使用 `/mrmem bind_alias <账户ID> <别名>` 添加管理员确认的别名；普通成员
+可使用 `/mrforgetme confirm` 删除并抑制自己在该群的后续采集。
 
 ## 离线回放
 
@@ -167,10 +183,14 @@ python -m unittest discover -s tests -v
 
 ## 当前边界
 
-- 尚未下载或分析图片，仅允许在 `content` 中保留附件元数据。
-- 图构建目前由管理员显式触发；定时/定量后台整理尚未接入。
-- 宿主直接证据门控已在离线消融中验证，尚未接入运行时 runner。
-- semantic memory 聚合多条消息时仍需补齐多源 provenance；0.8.0 的反馈假设已有独立
-  provenance，但尚未直接改写旧 semantic fact。
-- 自动反馈提交已有阈值与审计记录；管理员 confirm/edit/reject 控制台仍是后续项。
+- 图片/文件只保留类型、名称和引用 SHA-256；尚未下载、OCR、视觉描述或建立视觉向量。
+- SQLite 仍是明文；Linux 下数据库与 WAL/SHM 会尽力设为 `0600`，备份加密仍由部署层负责。
+- Participant 只在单群内绑定平台账户；不会猜测跨群、跨平台账号属于同一现实人物。
+- 纯文本出现的新称呼若没有 speaker、结构化 mention/reply、唯一旧别名或管理员绑定，
+  会保持 unresolved，不会强行连接。
+- semantic claim 已支持多源 evidence、冲突、quarantine、supersede/retract，但反馈 Agent
+  暂不直接自动改写事实；`QUARANTINED` 不进入自动事实检索，达到独立来源阈值后才晋升，
+  事实修订由下一次构建证据触发。
+- 自动反馈提交已有词面快门、后台队列、阈值与审计；完整管理员
+  confirm/edit/reject proposal 控制台仍是后续项。
 - 当前开发版本不自动部署线上；真实历史的首个遮罩 A/B 已完成，线上 canary 尚未开启。

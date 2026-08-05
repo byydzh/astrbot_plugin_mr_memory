@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.0
+
+- Add truth-layer Participant identities keyed by group scope, platform, and account
+  ID, with time-bounded alias history, exact ambiguity handling, structured mention
+  and reply relations, and administrator-confirmed aliases without account merging.
+- Capture visible Bot output as ordinary `BOT` evidence linked by `RESPONDS_TO`, and
+  handle platform recalls, edits, revisions, derived-memory invalidation, and
+  self-service account erasure with future-capture suppression.
+- Replace recent-window construction with per-message checkpoints, oldest-first
+  batches, overlap context, retry bounds, content-hash verification, stable
+  evidence-set episode keys, interrupted-batch recovery, and an explicit
+  cited-or-ignored coverage ledger.
+- Replace free-form person memory with structured claims that separate speaker and
+  subject, validate exact evidence spans, support multiple sources, mark epistemic
+  state, quarantine high-risk or uncertain claims, and implement conflict,
+  supersede, retract, stale, and revision states. Quarantined claims remain outside
+  automatic retrieval until independent-source promotion.
+- Compute authoritative episode time from source messages and rebuild topic summaries
+  from their currently linked active episodes.
+- Add owner-type vector quotas, a minimum similarity threshold, a cheap history-intent
+  gate, and the validated host evidence stop gate to the runtime reconstruction loop.
+- Require the private reconstruction agent to return machine-validated
+  claim/source/conflict/unresolved JSON; every item cites visited evidence, and
+  truncation occurs only at complete structural units.
+- Move automatic construction and feedback maintenance to a bounded background queue;
+  add a lexical/reply feedback shutter and a per-group rolling private-token budget.
+- Split optional Sentence Transformers/Harrier dependencies from the default
+  FastEmbed install.
+- Extend the authenticated console with Participant nodes, identity metrics, alias
+  history, ambiguity reporting, pending checkpoints, and administrator alias binding.
+- Add AstrBot 4.27.1 runtime-contract CI and truth-v2 regression coverage.
+
 ## 0.8.0
 
 - Add a persistent, inspectable interaction graph for main-agent requests, tool

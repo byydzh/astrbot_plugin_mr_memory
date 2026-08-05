@@ -27,6 +27,18 @@ class WebConsoleMixin:
             "读取指定群范围的记忆图",
         )
         self._register_memory_web_api(
+            "scopes/<scope_id>/participants",
+            self._api_memory_participants,
+            ["GET"],
+            "读取指定群范围的账户主体与别名历史",
+        )
+        self._register_memory_web_api(
+            "scopes/<scope_id>/participants/bind_alias",
+            self._api_memory_bind_alias,
+            ["POST"],
+            "绑定管理员确认的账户别名",
+        )
+        self._register_memory_web_api(
             "scopes/<scope_id>/messages",
             self._api_memory_messages,
             ["GET"],
@@ -107,6 +119,31 @@ class WebConsoleMixin:
             maximum=500,
         )
         data = await self._web_memory_graph(scope_id=scope_id, limit=limit)
+        return self._memory_web_success(data)
+
+    async def _api_memory_participants(self, scope_id: str):
+        limit = self._bounded_int(
+            request.args.get("limit"),
+            default=200,
+            minimum=1,
+            maximum=2000,
+        )
+        data = await self._web_memory_participants(
+            scope_id=scope_id,
+            reference=str(request.args.get("reference") or ""),
+            limit=limit,
+        )
+        return self._memory_web_success(data)
+
+    async def _api_memory_bind_alias(self, scope_id: str):
+        payload = await request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("请求正文必须是 JSON 对象")
+        data = await self._web_memory_bind_alias(
+            scope_id=scope_id,
+            account_id=str(payload.get("account_id") or ""),
+            alias=str(payload.get("alias") or ""),
+        )
         return self._memory_web_success(data)
 
     async def _api_memory_messages(self, scope_id: str):

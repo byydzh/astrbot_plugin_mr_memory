@@ -88,3 +88,24 @@ class StoredMessage:
     plain_text: str
     content: list[dict[str, Any]]
     role: MessageRole
+    sender_participant_id: int | None = None
+    sender_participant_key: str = ""
+    revision_no: int = 1
+    content_sha256: str = ""
+    reply_to_source_key: str = ""
+    mentions: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DistillationWorkItem:
+    """One stable incremental batch plus read-only overlap context."""
+
+    batch_key: str
+    umo: str
+    messages: tuple[StoredMessage, ...]
+    target_source_keys: tuple[str, ...]
+    target_hashes: tuple[tuple[str, str], ...]
+
+    @property
+    def target_count(self) -> int:
+        return len(self.target_source_keys)

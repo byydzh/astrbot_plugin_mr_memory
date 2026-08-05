@@ -161,6 +161,27 @@ class DistillationPipelineTests(unittest.TestCase):
             )
         self.assertEqual(self.storage.count_graph_units(umo=self.umo), 0)
 
+    def test_requires_explicit_coverage_or_ignore_for_every_target(self) -> None:
+        value = json.loads(self._response())
+        omitted_keys = value["episodes"][1]["source_keys"]
+        value["episodes"] = value["episodes"][:1]
+        value["topics"][0]["episode_indices"] = [0]
+        with self.assertRaisesRegex(ValueError, "omitted target source keys"):
+            parse_distillation_response(
+                json.dumps(value, ensure_ascii=False), self._messages()
+            )
+        value["ignored"] = [
+            {"source_key": key, "reason": "本条不形成额外持久记忆"}
+            for key in omitted_keys
+        ]
+        batch = parse_distillation_response(
+            json.dumps(value, ensure_ascii=False), self._messages()
+        )
+        self.assertEqual(
+            {item.source_key for item in batch.ignored_sources},
+            set(omitted_keys),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

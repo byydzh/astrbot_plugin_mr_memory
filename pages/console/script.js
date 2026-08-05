@@ -2,9 +2,10 @@ const state = {
   overview: null,
   scopeId: "",
   graph: null,
+  participants: [],
   selectedNodeId: "",
   visibleTypes: new Set([
-    "cue", "episode", "semantic", "topic",
+    "participant", "cue", "episode", "semantic", "topic",
     "action", "feedback", "hypothesis",
   ]),
   transform: { x: 0, y: 0, scale: 1 },
@@ -21,6 +22,8 @@ const elements = {
   metricMessages: document.getElementById("metric-messages"),
   metricEpisodes: document.getElementById("metric-episodes"),
   metricSemantics: document.getElementById("metric-semantics"),
+  metricParticipants: document.getElementById("metric-participants"),
+  metricPending: document.getElementById("metric-pending"),
   metricEmbeddings: document.getElementById("metric-embeddings"),
   metricStorage: document.getElementById("metric-storage"),
   scopeSelect: document.getElementById("scope-select"),
@@ -43,6 +46,11 @@ const elements = {
   messageQuery: document.getElementById("message-query"),
   messageSender: document.getElementById("message-sender"),
   messageBody: document.getElementById("message-table-body"),
+  participantStatus: document.getElementById("participant-status"),
+  participantBody: document.getElementById("participant-table-body"),
+  aliasBindForm: document.getElementById("alias-bind-form"),
+  aliasAccountId: document.getElementById("alias-account-id"),
+  aliasValue: document.getElementById("alias-value"),
   distillDialog: document.getElementById("distill-dialog"),
   distillForm: document.getElementById("distill-form"),
   distillLimit: document.getElementById("distill-limit"),
@@ -53,6 +61,7 @@ const elements = {
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const typeNames = {
+  participant: "账户主体 PARTICIPANT",
   cue: "线索 CUE",
   episode: "情节 EPISODE",
   semantic: "语义 SEMANTIC",
@@ -155,6 +164,8 @@ function renderOverview() {
   elements.metricMessages.textContent = formatNumber(totals.messages);
   elements.metricEpisodes.textContent = formatNumber(totals.episodes);
   elements.metricSemantics.textContent = formatNumber(totals.semantic_memories);
+  elements.metricParticipants.textContent = formatNumber(totals.participants);
+  elements.metricPending.textContent = formatNumber(totals.pending_distillation);
   elements.metricEmbeddings.textContent = formatNumber(totals.embeddings);
   elements.metricStorage.textContent = `数据库 ${formatBytes(totals.database_bytes)}`;
   elements.runtimeVersion.textContent = `MR Memory ${overview?.version || ""}`;
@@ -183,6 +194,8 @@ function populateScopes(previousScopeId = "") {
     elements.scopeSelect.disabled = true;
     elements.distillBtn.disabled = true;
     state.scopeId = "";
+    state.participants = [];
+    renderParticipants([]);
     elements.scopeMeta.textContent = "启用采集并收到群消息后，此处会出现独立群范围。";
     showEmptyGraph();
     return;
@@ -214,6 +227,8 @@ function renderScopeMeta() {
   elements.scopeMeta.textContent = [
     `UMO ${scope.umo}`,
     `${formatNumber(scope.cues)} cues`,
+    `${formatNumber(scope.participants)} participants`,
+    `${formatNumber(scope.pending_distillation)} pending`,
     `${formatNumber(scope.topics)} topics`,
     `${formatNumber(scope.active_hypotheses)} active hypotheses`,
     `${formatNumber(scope.feedback_links)} feedback links`,
@@ -264,7 +279,7 @@ async function loadSelectedScope() {
   setGraphLoading(true);
   elements.distillBtn.disabled = true;
   try {
-    await Promise.all([loadGraph(), loadMessages()]);
+    await Promise.all([loadGraph(), loadMessages(), loadParticipants()]);
   } catch (error) {
     showToast(error?.message || "群范围数据加载失败", "error");
   } finally {
@@ -285,11 +300,16 @@ async function loadGraph() {
 
 function calculateLayout(nodes) {
   const grouped = {
-    cue: [], episode: [], semantic: [], topic: [],
+    participant: [], cue: [], episode: [], semantic: [], topic: [],
     action: [], feedback: [], hypothesis: [],
   };
   nodes.forEach((node) => grouped[node.type]?.push(node));
-  const maxPrimary = Math.max(grouped.cue.length, grouped.episode.length, 8);
+  const maxPrimary = Math.max(
+    grouped.participant.length,
+    grouped.cue.length,
+    grouped.episode.length,
+    8,
+  );
   const rightCount = grouped.semantic.length + grouped.topic.length;
   const feedbackCount = Math.max(
     grouped.action.length,
@@ -302,7 +322,7 @@ function calculateLayout(nodes) {
     rightCount * 48 + 140,
     feedbackCount * 58 + 140,
   );
-  const width = 1480;
+  const width = 1580;
   const positions = new Map();
 
   function distribute(items, x, minY, maxY, wobble = 0) {
@@ -317,20 +337,21 @@ function calculateLayout(nodes) {
     });
   }
 
-  distribute(grouped.cue, 100, 80, height - 80, 16);
-  distribute(grouped.episode, 390, 90, height - 90, 22);
+  distribute(grouped.participant, 90, 80, height - 80, 12);
+  distribute(grouped.cue, 285, 80, height - 80, 16);
+  distribute(grouped.episode, 525, 90, height - 90, 22);
   const topicEnd = grouped.topic.length ? Math.min(height * 0.4, 110 + grouped.topic.length * 62) : 90;
-  distribute(grouped.topic, 700, 90, topicEnd, 12);
+  distribute(grouped.topic, 800, 90, topicEnd, 12);
   distribute(
     grouped.semantic,
-    690,
+    800,
     grouped.topic.length ? Math.max(height * 0.48, topicEnd + 70) : 100,
     height - 90,
     18,
   );
-  distribute(grouped.action, 930, 90, height - 90, 14);
-  distribute(grouped.feedback, 1170, 100, height - 100, 12);
-  distribute(grouped.hypothesis, 1400, 90, height - 90, 16);
+  distribute(grouped.action, 1040, 90, height - 90, 14);
+  distribute(grouped.feedback, 1260, 100, height - 100, 12);
+  distribute(grouped.hypothesis, 1490, 90, height - 90, 16);
 
   state.virtualSize = { width, height };
   return positions;
@@ -386,6 +407,8 @@ function renderGraph() {
     if (!position) return;
     const radius = node.type === "episode"
       ? 17
+      : node.type === "participant"
+        ? 16
       : node.type === "cue"
         ? 11
         : node.type === "feedback"
@@ -533,6 +556,10 @@ function renderInspector(node) {
     ["状态", node.status || ""],
     ["学习时间", node.learned_at ? formatTime(node.learned_at) : ""],
     ["Source Key", node.source_key || ""],
+    ["Participant Key", node.canonical_key || ""],
+    ["账户 ID", node.account_id || ""],
+    ["账户类型", node.account_type || ""],
+    ["认知状态", node.epistemic_status || ""],
   ]);
   if (node.source_text) {
     const block = document.createElement("section");
@@ -643,6 +670,62 @@ function renderMessageError(message, isError = true) {
   elements.messageBody.append(row);
 }
 
+async function loadParticipants() {
+  if (!state.scopeId) {
+    state.participants = [];
+    renderParticipants([]);
+    return;
+  }
+  const requestedScopeId = state.scopeId;
+  const data = await apiGet(`scopes/${state.scopeId}/participants`, { limit: 500 });
+  if (state.scopeId !== requestedScopeId || data.scope_id !== requestedScopeId) return;
+  state.participants = data.participants || [];
+  renderParticipants(state.participants);
+}
+
+function renderParticipants(participants) {
+  elements.participantBody.replaceChildren();
+  if (!participants.length) {
+    const row = document.createElement("tr");
+    const cell = textElement("td", "当前群范围还没有账户主体。", "table-empty");
+    cell.colSpan = 6;
+    row.append(cell);
+    elements.participantBody.append(row);
+    elements.participantStatus.textContent = "平台账户 ID 是不可变主键；同名账户不会自动合并。";
+    return;
+  }
+  const aliasOwners = new Map();
+  participants.forEach((participant) => {
+    (participant.aliases || []).forEach((alias) => {
+      const key = String(alias.normalized_alias || alias.alias || "").trim();
+      if (!key) return;
+      if (!aliasOwners.has(key)) aliasOwners.set(key, new Set());
+      aliasOwners.get(key).add(String(participant.account_id));
+    });
+  });
+  const ambiguousAliases = [...aliasOwners.values()].filter((owners) => owners.size > 1).length;
+  elements.participantStatus.textContent = [
+    `${formatNumber(participants.length)} 个账户主体`,
+    `${formatNumber(ambiguousAliases)} 个重名别名保持歧义`,
+    "平台账户 ID 永不因昵称相同而合并",
+  ].join(" · ");
+  participants.forEach((participant) => {
+    const aliases = (participant.aliases || [])
+      .map((alias) => `${alias.alias} (${formatTime(alias.last_seen_at)})`)
+      .join(" · ");
+    const row = document.createElement("tr");
+    row.append(
+      textElement("td", participant.account_id || "—"),
+      textElement("td", participant.current_display_name || "—"),
+      textElement("td", aliases || "—"),
+      textElement("td", participant.account_type || "—"),
+      textElement("td", formatTime(participant.last_seen_at)),
+      textElement("td", participant.canonical_key || "—"),
+    );
+    elements.participantBody.append(row);
+  });
+}
+
 function bindGraphInteractions() {
   elements.graphSvg.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || event.target.closest?.(".graph-node")) return;
@@ -738,6 +821,29 @@ function bindEvents() {
   elements.messageForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     await loadMessages();
+  });
+  elements.aliasBindForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.scopeId) return;
+    const accountId = elements.aliasAccountId.value.trim();
+    const alias = elements.aliasValue.value.trim();
+    if (!accountId || !alias) return;
+    const submit = elements.aliasBindForm.querySelector("button[type='submit']");
+    submit.disabled = true;
+    try {
+      await apiPost(`scopes/${state.scopeId}/participants/bind_alias`, {
+        account_id: accountId,
+        alias,
+      });
+      elements.aliasValue.value = "";
+      showToast(`已将别名“${alias}”绑定到账号 ${accountId}`);
+      await Promise.all([loadParticipants(), loadGraph()]);
+      await refreshOverview({ preserveSelection: true, loadScope: false });
+    } catch (error) {
+      showToast(error?.message || "别名绑定失败", "error");
+    } finally {
+      submit.disabled = false;
+    }
   });
   elements.distillBtn.addEventListener("click", () => {
     elements.distillLimit.value = Math.min(

@@ -4,6 +4,37 @@
 `.dev/`，不得提交。插件 ledger 也只保存查询/结果哈希、工具参数、证据 key 和 token，
 不保存模型隐藏推理。
 
+## 2026-08-05：truth layer v2 / 0.9.0 收口验证
+
+本轮针对研究原型审查中的线上风险统一实现了增量 checkpoint、宿主停止门、账户主体、
+Bot 输出、reply/mention、结构化 claim、多源 provenance、事实修订、后台维护和成本预算。
+身份层采用 `UMO + platform_id + account_id`，昵称只作带时间别名；重名查询必须返回候选
+账号并停止人物记忆读取，不能把两人的 claim 合并后再附一个歧义标记。
+
+确定性身份/修订矩阵：
+
+| 场景 | 宿主行为 | 回归结果 |
+|---|---|---|
+| 同账号换昵称 | 保持一个 Participant，累计别名历史 | PASS |
+| 两账号同昵称 | 保持两个 Participant，昵称查询拒绝合并 claim | PASS |
+| 他人用 mention 说目标偏好 | speaker 与 subject 分离，绑定 mention account ID | PASS |
+| mention/reply 携带玩笑昵称 | 只新增低权别名，不覆盖本人最近实际群名片 | PASS |
+| 旧消息晚于新消息补录 | 保留较新实际群名片，仍补全历史别名 | PASS |
+| 单来源“我是管理员” | 进入 `QUARANTINED` 且不检索；同人重复无效，第二独立来源才晋升 | PASS |
+| 明确更正旧偏好 | 新 claim `ACTIVE`，旧 claim `SUPERSEDED` 且有 revision | PASS |
+| 自助删除后再次 mention/导入 | 擦除结构化引用并由 suppression hash 阻止重建主体 | PASS |
+| 构建进程在 `PROCESSING` 中断 | 下次打开恢复为 `FAILED` 并从相同 source/hash 有界重试 | PASS |
+
+从真实遮罩实验的 v7 图数据库复制件执行 v8 迁移：468 条消息全部建立
+`message_processing`，识别 11 个 Participant，schema 升至 8，原文件未修改。插件源码还在
+服务器 `/tmp` 使用线上 AstrBot 4.27.1 的 Python 3.13 解释器完成导入和 schema 冒烟；
+线上进程 PID 未改变，没有替换插件、修改配置或重启 AstrBot/NapCat。默认依赖和可选
+Harrier 依赖已拆分，CI 新增 AstrBot 4.27.1 import contract。
+
+核心回归目前 53 项，另执行 `compileall`、配置 JSON、浏览器脚本语法和 `git diff --check`。
+这证明迁移与宿主不变量可执行，不等于线上 canary 或新一轮总体效果 A/B；真实效果结论仍
+以以下遮罩实验为限。
+
 ## 2026-08-05：真实调用遮罩实验 #726
 
 ### 目标与样本
