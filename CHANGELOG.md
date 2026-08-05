@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.10.0
+
+- Add a group-scoped plastic association graph for learned meanings, symbols,
+  behaviors, preferences, procedures, and traversal paths while keeping account
+  identity and raw provenance in the deterministic truth layer.
+- Let the private LLM register and version relation types, and propose evidence-bound
+  edge upserts, reinforcement, inhibition, retirement, relation revision, and
+  reversible node merges under host validation.
+- Treat local embedding distance only as a candidate-generation prior. Run a bounded
+  semantic tick for every main-LLM request once the group has graph memory; the
+  private LLM owns relevance and stopping, with the deterministic early-stop gate
+  retained only as an optional optimization.
+- Persist bounded subconscious operational state and maintenance jobs so restarts do
+  not erase focus, active edge IDs, or queued work; hidden reasoning is never stored.
+- Record plastic-edge activation in observable interaction traces and assign feedback
+  credit only to paths that actually influenced the eligible response. A graph
+  mutation is rejected until its feedback proposal is host-committed.
+- Extend the authenticated console, dashboard metrics, runtime ledger, and regression
+  suite for dynamic relation and plastic graph inspection.
+- Add a real-history local-semantics A/B harness with self-contained SVG reports and
+  complete per-call token accounting for the “好女孩” and “阿拉蕾” cases.
+
 ## 0.9.0
 
 - Add truth-layer Participant identities keyed by group scope, platform, and account

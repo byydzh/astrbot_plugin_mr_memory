@@ -39,6 +39,10 @@ from .mr_memory.feedback import (
     render_prospective_brief,
 )
 from .mr_memory.models import NormalizedMessage
+from .mr_memory.plasticity import (
+    PLASTIC_GRAPH_MAINTENANCE_PROMPT,
+    parse_graph_mutation,
+)
 from .mr_memory.scope import GroupMemoryScope, GroupScopeError
 from .mr_memory.service import MemoryService
 from .mr_memory.storage import MemoryStorage
@@ -73,7 +77,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
         query: str = "",
         initial_candidates: dict[str, list[dict[str, object]]] | None = None,
         host_gate_enabled: bool = False,
-        host_gate_min_score: float = 0.48,
+        host_gate_min_score: float = -1.0,
     ):
         self.service = service
         self.run_id = run_id
@@ -83,6 +87,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
         self.host_gate_min_score = float(host_gate_min_score)
         self.step_count = 0
         self.evidence_keys: set[str] = set()
+        self.plastic_edge_ids: set[int] = set()
         self.host_gate_decision: EvidenceGateDecision | None = None
         self._pending: dict[
             tuple[str, str], list[tuple[int, float, dict[str, object]]]
@@ -142,6 +147,37 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
         walk(payload)
         return sorted(found)
 
+    @staticmethod
+    def _plastic_edge_ids(result_text: str) -> list[int]:
+        payload_text = result_text.split("\nnotice=", 1)[0].strip()
+        try:
+            payload: Any = json.loads(payload_text)
+        except (TypeError, ValueError):
+            return []
+        found: set[int] = set()
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                if (
+                    "relation_key" in value
+                    and "source_key" in value
+                    and "target_key" in value
+                ):
+                    try:
+                        edge_id = int(value.get("id") or 0)
+                    except (TypeError, ValueError):
+                        edge_id = 0
+                    if edge_id > 0:
+                        found.add(edge_id)
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(payload)
+        return sorted(found)
+
     async def on_tool_start(
         self,
         run_context: Any,
@@ -189,6 +225,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
         result_text = self._result_text(tool_result)
         evidence_keys = self._evidence_keys(result_text)
         self.evidence_keys.update(evidence_keys)
+        self.plastic_edge_ids.update(self._plastic_edge_ids(result_text))
         await self.service.record_reconstruction_step(
             run_id=self.run_id,
             step_index=step_index,
@@ -245,7 +282,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
     "astrbot_plugin_mr_memory",
     "byydzh",
     "Private subconscious memory agent with grounded graph reconstruction.",
-    "0.9.0",
+    "0.10.0",
 )
 class MrMemoryPlugin(Star, WebConsoleMixin):
     traversal_tool_names = (
@@ -256,12 +293,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         "mr_query_personal_information",
         "mr_query_personal_aspect",
         "mr_query_topic_events",
+        "mr_query_associations",
     )
     consult_tool_name = "mr_consult_subconscious"
     feedback_tool_names = (
         "mr_feedback_inspect_candidate",
         "mr_feedback_find_hypotheses",
+        "mr_query_associations",
         "mr_feedback_commit",
+        "mr_graph_mutate",
     )
     behavior_activation_tool_name = "mr_activate_feedback_hypothesis"
 
@@ -349,12 +389,16 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 int(self.config.get("maintenance_interval_seconds", 300)),
             ),
         )
-        self.retrieval_min_score = max(
+        self.candidate_seed_floor = max(
             -1.0,
-            min(1.0, float(self.config.get("retrieval_min_score", 0.48))),
+            min(1.0, float(self.config.get("candidate_seed_floor", -1.0))),
+        )
+        self.host_gate_min_score = max(
+            -1.0,
+            min(1.0, float(self.config.get("host_gate_min_score", -1.0))),
         )
         self.runtime_host_evidence_gate = bool(
-            self.config.get("runtime_host_evidence_gate", True)
+            self.config.get("runtime_host_evidence_gate", False)
         )
         self.private_daily_token_budget = max(
             0,
@@ -463,10 +507,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._pending_main_tools: dict[tuple[int, str], list[str]] = {}
         self._feedback_candidate_ids: dict[int, set[int]] = {}
         self._active_feedback_proposals: dict[int, tuple[str, int]] = {}
+        self._scope_event_carriers: dict[str, AstrMessageEvent] = {}
         self._maintenance_queue: asyncio.Queue[
-            tuple[str, GroupMemoryScope, AstrMessageEvent | None]
+            tuple[int, str, GroupMemoryScope]
         ] = asyncio.Queue(maxsize=256)
-        self._maintenance_enqueued: set[tuple[str, str]] = set()
+        self._maintenance_enqueued: set[int] = set()
         self._maintenance_tasks: list[asyncio.Task[Any]] = []
         self._register_memory_web_apis()
 
@@ -591,18 +636,28 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 ),
             ]
 
-    def _schedule_maintenance(
+    async def _schedule_maintenance(
         self,
         *,
         kind: str,
         scope: GroupMemoryScope,
         event: AstrMessageEvent | None = None,
+        dedupe_key: str = "",
+        payload: dict[str, object] | None = None,
     ) -> bool:
-        key = (str(kind), scope.key)
-        if key in self._maintenance_enqueued:
+        if event is not None:
+            self._scope_event_carriers[scope.key] = event
+        service = self._service_for_scope(scope)
+        job_id = await service.enqueue_maintenance_job(
+            umo=scope.key,
+            job_type=str(kind),
+            dedupe_key=(dedupe_key or f"{kind}:pending"),
+            payload=payload or {},
+        )
+        if job_id in self._maintenance_enqueued:
             return False
         try:
-            self._maintenance_queue.put_nowait((str(kind), scope, event))
+            self._maintenance_queue.put_nowait((job_id, str(kind), scope))
         except asyncio.QueueFull:
             logger.warning(
                 "MR Memory maintenance queue full | kind=%s | umo=%s",
@@ -610,7 +665,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 scope.key,
             )
             return False
-        self._maintenance_enqueued.add(key)
+        self._maintenance_enqueued.add(job_id)
         return True
 
     async def _private_budget_available(
@@ -637,8 +692,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
 
     async def _maintenance_worker(self) -> None:
         while True:
-            kind, scope, event = await self._maintenance_queue.get()
-            self._maintenance_enqueued.discard((kind, scope.key))
+            job_id, kind, scope = await self._maintenance_queue.get()
+            self._maintenance_enqueued.discard(job_id)
+            claimed = False
             try:
                 service = self._service_for_scope(scope)
                 if not await self._private_budget_available(
@@ -646,46 +702,91 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     service=service,
                 ):
                     continue
+                event = self._scope_event_carriers.get(scope.key)
+                if kind == "feedback" and event is None:
+                    # AstrBot's private runner needs a current event only as its
+                    # execution carrier. The job and evidence remain serialized.
+                    continue
+                if (
+                    kind == "feedback"
+                    and self.context.get_provider_by_id(
+                        self.subconscious_provider_id
+                    )
+                    is None
+                ):
+                    continue
+                job = await service.claim_maintenance_job(
+                    umo=scope.key,
+                    job_id=job_id,
+                    lease_seconds=max(
+                        60, self.subconscious_timeout_seconds * 2
+                    ),
+                )
+                if job is None:
+                    continue
+                claimed = True
                 if kind == "distill":
                     if not self.auto_distillation_enabled:
+                        await service.finish_maintenance_job(
+                            umo=scope.key,
+                            job_id=job_id,
+                            status="CANCELLED",
+                        )
+                        claimed = False
                         continue
                     try:
                         await self._distill_scope(scope=scope)
                     except ValueError as exc:
                         if "没有尚未整理" not in str(exc):
-                            logger.warning(
-                                "MR Memory background distillation skipped | umo=%s | %s",
-                                scope.key,
-                                exc,
-                            )
-                    except Exception:
-                        logger.exception(
-                            "MR Memory background distillation failed | umo=%s",
-                            scope.key,
-                        )
-                    else:
-                        if await service.pending_distillation_count(umo=scope.key):
-                            self._schedule_maintenance(kind="distill", scope=scope)
-                elif kind == "feedback" and event is not None:
+                            raise
+                elif kind == "feedback":
+                    assert event is not None
                     await self._run_feedback_maintenance(
                         event=event,
                         scope=scope,
                         service=service,
                     )
-                    if await service.pending_feedback_proposals(
+                await service.finish_maintenance_job(
+                    umo=scope.key,
+                    job_id=job_id,
+                )
+                claimed = False
+                if (
+                    kind == "distill"
+                    and await service.pending_distillation_count(umo=scope.key)
+                ):
+                    await self._schedule_maintenance(
+                        kind="distill", scope=scope
+                    )
+                elif kind == "feedback" and await service.pending_feedback_proposals(
                         umo=scope.key,
                         limit=1,
                     ):
-                        self._schedule_maintenance(
-                            kind="feedback",
-                            scope=scope,
-                            event=event,
-                        )
+                    await self._schedule_maintenance(
+                        kind="feedback",
+                        scope=scope,
+                        event=event,
+                    )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if claimed:
+                    try:
+                        service = self._service_for_scope(scope)
+                        await service.fail_maintenance_job(
+                            umo=scope.key,
+                            job_id=job_id,
+                            error=type(exc).__name__,
+                            retry_delay_seconds=self.maintenance_interval_seconds,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "MR Memory could not release maintenance job | job=%s",
+                            job_id,
+                        )
                 logger.exception(
-                    "MR Memory maintenance worker failed open | kind=%s | umo=%s",
+                    "MR Memory maintenance worker failed open | job=%s | kind=%s | umo=%s",
+                    job_id,
                     kind,
                     scope.key,
                 )
@@ -708,7 +809,19 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     self.auto_distillation_enabled
                     and await service.pending_distillation_count(umo=umo) > 0
                 ):
-                    self._schedule_maintenance(kind="distill", scope=scope)
+                    await self._schedule_maintenance(
+                        kind="distill", scope=scope
+                    )
+                if await service.pending_feedback_proposals(
+                    umo=umo,
+                    limit=1,
+                ):
+                    await self._schedule_maintenance(
+                        kind="feedback",
+                        scope=scope,
+                        event=self._scope_event_carriers.get(umo),
+                    )
+                await service.compact_plastic_graph(umo=umo)
 
     def _session_allowed(self, umo: str) -> bool:
         return not self.allowed_umos or umo in self.allowed_umos
@@ -912,11 +1025,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "interaction_traces",
                 "active_hypotheses",
                 "feedback_links",
+                "plastic_nodes",
+                "plastic_edges",
+                "relation_types",
+                "pending_maintenance",
                 "database_bytes",
             )
         }
         return {
-            "version": "0.9.0",
+            "version": "0.10.0",
             "runtime": {
                 "capture_enabled": self.capture_enabled,
                 "feedback_learning_enabled": self.feedback_learning_enabled,
@@ -946,7 +1063,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "auto_distillation_min_pending": (
                     self.auto_distillation_min_pending
                 ),
-                "retrieval_min_score": self.retrieval_min_score,
+                "candidate_seed_floor": self.candidate_seed_floor,
+                "host_gate_min_score": self.host_gate_min_score,
                 "runtime_host_evidence_gate": self.runtime_host_evidence_gate,
                 "private_daily_token_budget": self.private_daily_token_budget,
             },
@@ -1236,6 +1354,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             return
         try:
             scope = self._group_scope(event)
+            self._scope_event_carriers[scope.key] = event
             service = self._service_for_scope(scope)
             raw = getattr(event.message_obj, "raw_message", None)
             notice_type = (
@@ -1279,15 +1398,22 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     feedback_window_seconds=self.feedback_window_seconds,
                 )
                 if proposal_id is not None:
-                    self._schedule_maintenance(
+                    await self._schedule_maintenance(
                         kind="feedback",
                         scope=scope,
                         event=event,
+                        dedupe_key=f"feedback:{int(proposal_id)}",
+                        payload={
+                            "proposal_id": int(proposal_id),
+                            "feedback_source_key": message.resolved_source_key(),
+                        },
                     )
             if self.auto_distillation_enabled:
                 pending = await service.pending_distillation_count(umo=scope.key)
                 if pending >= self.auto_distillation_min_pending:
-                    self._schedule_maintenance(kind="distill", scope=scope)
+                    await self._schedule_maintenance(
+                        kind="distill", scope=scope
+                    )
             if self.log_message_content:
                 logger.info(
                     "MR Memory captured | inserted=%s | umo=%s | text=%s",
@@ -1357,7 +1483,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         graph_units = await service.count_graph_units(umo=scope.key)
         summary = await service.dashboard_summary(umo=scope.key)
         yield event.plain_result(
-            "MR Memory 0.9.0\n"
+            "MR Memory 0.10.0\n"
             f"capture_enabled={self.capture_enabled}\n"
             f"feedback_learning_enabled={self.feedback_learning_enabled}\n"
             f"feedback_min_commit_score={self.feedback_min_commit_score}\n"
@@ -1366,6 +1492,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             f"embedding_backend=local-{self.embedding_backend_name}\n"
             f"embedding_model={self.embedding_model_name if self.embedding_enabled else 'disabled'}\n"
             f"embedding_query_prompt={self.embedding_query_prompt_name or 'none'}\n"
+            f"candidate_seed_floor={self.candidate_seed_floor}\n"
             f"wake_on_llm_request={self.wake_on_llm_request}\n"
             f"consult_tool_enabled={self.consult_tool_enabled}\n"
             f"expose_traversal_tools={self.expose_traversal_tools}\n"
@@ -1566,7 +1693,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "source_sent_at_max": max(
                         message.sent_at for message in messages
                     ),
-                    "extractor_version": "mr-memory-0.9.0",
+                    "extractor_version": "mr-memory-0.10.0",
                     "embedding_model": (
                         self.embedding_model_name
                         if self.embedding_enabled
@@ -1610,7 +1737,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 )
                 persisted, indexed = await service.apply_distillation(
                     batch,
-                    extractor_version="mr-memory-0.9.0",
+                    extractor_version="mr-memory-0.10.0",
                     embedding_backend=self._embedding_backend(),
                 )
                 await service.record_distillation_ignored_sources(
@@ -1739,6 +1866,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "mr_activate_feedback_hypothesis with calibrated relevance; do not "
             "activate one merely because it belongs to the same sender. Include "
             "each activated future-facing cue in the final brief. Then "
+            "treat embedding scores only as candidate-generation priors, never "
+            "as a relevance verdict. You are the semantic gate: inspect or prune "
+            "candidates regardless of their numeric distance. When a supplied "
+            "plastic association may matter, call mr_query_associations so the "
+            "host can record that path for later feedback credit. Relation types "
+            "are learned and versioned; interpret their current descriptions, "
+            "not a hard-coded ontology. "
             "actively compose the available graph tools "
             "over multiple steps. Select or prune the next path based on evidence "
             "returned by earlier calls. Prefer source-grounded event context over "
@@ -1802,7 +1936,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         Message(
                             role="user",
                             content=(
-                                "[HOST EVIDENCE GATE] A high-score initial episode "
+                                "[HOST EVIDENCE GATE] A candidate episode "
                                 "has now been verified against raw source messages. "
                                 "Stop browsing and produce the required grounded JSON "
                                 "brief from the evidence already visited."
@@ -1848,27 +1982,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 elapsed_ms=(time.perf_counter() - started) * 1000,
                 usage_source="astrbot_agent_stats_aggregate",
             )
-
-    @staticmethod
-    def _query_explicitly_requests_memory(query: str) -> bool:
-        text = str(query or "").casefold()
-        markers = (
-            "之前",
-            "以前",
-            "上次",
-            "记得",
-            "记忆",
-            "昨天",
-            "当时",
-            "后来",
-            "说过",
-            "提过",
-            "推荐过",
-            "remember",
-            "previous",
-            "last time",
-        )
-        return any(marker in text for marker in markers)
 
     async def _run_subconscious(
         self,
@@ -1924,8 +2037,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "episodes": [],
             "topics": [],
             "semantic_memories": [],
+            "associations": [],
             "feedback_hypotheses": feedback_candidates,
         }
+        plastic_candidates = await service.query_plastic_associations(
+            umo=umo,
+            limit=self.embedding_top_k,
+        )
         try:
             embedding_backend = self._embedding_backend()
             if embedding_backend is not None:
@@ -1934,7 +2052,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     query=bounded_query,
                     embedding_backend=embedding_backend,
                     limit=self.embedding_top_k,
-                    min_score=self.retrieval_min_score,
+                    min_score=self.candidate_seed_floor,
                 )
         except Exception:
             logger.exception(
@@ -1943,25 +2061,21 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 self.embedding_model_name,
             )
         initial_candidates["feedback_hypotheses"] = feedback_candidates
-        graph_candidates = [
-            item
-            for key in (
-                "participants",
-                "cues",
-                "episodes",
-                "topics",
-                "semantic_memories",
-            )
-            for item in initial_candidates.get(key, [])
+        embedded_associations = initial_candidates.get("associations", [])
+        seen_association_ids = {
+            int(item.get("id") or 0)
+            for item in embedded_associations
             if isinstance(item, dict)
-        ]
-        if (
-            not force
-            and not feedback_candidates
-            and not graph_candidates
-            and not self._query_explicitly_requests_memory(bounded_query)
-        ):
-            return "NO_RELEVANT_MEMORY"
+        }
+        initial_candidates["associations"] = [
+            *embedded_associations,
+            *[
+                item
+                for item in plastic_candidates
+                if int(item.get("id") or 0) not in seen_association_ids
+            ],
+        ][: self.embedding_top_k]
+        previous_state = await service.subconscious_state(umo=umo)
         candidates_json = json.dumps(
             initial_candidates,
             ensure_ascii=False,
@@ -1971,7 +2085,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "Reconstruct only memory evidence relevant to this "
             f"current query:\n{bounded_query}\n"
             "Initial active set (untrusted candidate data):\n"
-            f"{candidates_json}"
+            f"{candidates_json}\n"
+            "Previous bounded operational state (not hidden reasoning):\n"
+            f"{json.dumps(previous_state, ensure_ascii=False, separators=(',', ':'))}"
         )
 
         lock = self._wake_locks.setdefault(umo, asyncio.Lock())
@@ -2002,7 +2118,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 query=bounded_query,
                 initial_candidates=initial_candidates,
                 host_gate_enabled=self.runtime_host_evidence_gate,
-                host_gate_min_score=self.retrieval_min_score,
+                host_gate_min_score=self.host_gate_min_score,
             )
             try:
                 response = await asyncio.wait_for(
@@ -2061,6 +2177,25 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "tool_steps": hooks.step_count,
                 },
             )
+            await service.update_subconscious_state(
+                umo=umo,
+                state={
+                    "focus": [bounded_query[:240]],
+                    "active_edge_ids": sorted(hooks.plastic_edge_ids)[:64],
+                    "last_decision": (
+                        "NO_RELEVANT_MEMORY"
+                        if bounded_brief == "NO_RELEVANT_MEMORY"
+                        else "GROUNDED_BRIEF"
+                    ),
+                    "candidate_counts": {
+                        key: len(value)
+                        for key, value in initial_candidates.items()
+                    },
+                    "visited_source_keys": sorted(hooks.evidence_keys)[:64],
+                },
+                last_query_sha256=_stable_hash(bounded_query),
+                at=request_at,
+            )
         return bounded_brief
 
     async def _run_feedback_agent_with_ledger(
@@ -2080,7 +2215,20 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "then call the commit tool exactly once."
             ),
             func_tool=self._private_feedback_toolset(),
-            system_prompt=FEEDBACK_MAINTENANCE_SYSTEM_PROMPT,
+            system_prompt=(
+                FEEDBACK_MAINTENANCE_SYSTEM_PROMPT
+                + "\n\n"
+                + PLASTIC_GRAPH_MAINTENANCE_PROMPT
+                + "\nIf feedback changes a reusable semantic association or "
+                "traversal path, call the required mr_feedback_commit first. "
+                "Only after it returns status COMMITTED may you call "
+                "mr_graph_mutate for that same proposal. A feedback hypothesis controls future "
+                "behavior; a plastic graph edge represents learned group meaning. "
+                "Only inhibit or retire an edge listed under activated_plastic_edges "
+                "for the eligible response: alternatives found afterward did not "
+                "cause that response. Use mr_query_associations to inspect existing "
+                "alternatives before proposing a new edge."
+            ),
         )
         runner = ToolLoopAgentRunner()
         started = time.perf_counter()
@@ -2138,11 +2286,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             return
         provider = self.context.get_provider_by_id(self.subconscious_provider_id)
         if provider is None:
-            logger.warning(
-                "MR Memory skipped feedback maintenance; provider missing: %s",
-                self.subconscious_provider_id,
+            raise RuntimeError(
+                "MR Memory feedback provider is unavailable: "
+                f"{self.subconscious_provider_id}"
             )
-            return
         lock = self._feedback_locks.setdefault(scope.key, asyncio.Lock())
         async with lock:
             proposals = await service.pending_feedback_proposals(
@@ -2213,11 +2360,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         },
                     )
                 except Exception as exc:
-                    await service.reject_feedback_proposal(
-                        umo=scope.key,
-                        proposal_id=proposal_id,
-                        error=type(exc).__name__,
-                    )
                     await service.finish_experiment(
                         run_id=run_id,
                         status="failed",
@@ -2231,6 +2373,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         scope.key,
                         proposal_id,
                     )
+                    raise
             await service.compact_feedback_memory(
                 umo=scope.key,
                 max_active_hypotheses=self.feedback_max_active_hypotheses,
@@ -2297,6 +2440,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             return
         if not self._session_allowed(scope.key):
             return
+        self._scope_event_carriers[scope.key] = event
 
         query = str(req.prompt or event.message_obj.message_str or "").strip()
         if not query:
@@ -2548,6 +2692,91 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         except Exception as exc:
             return f"error: Feedback mutation rejected by host validation: {exc}"
 
+    @filter.llm_tool(name="mr_graph_mutate")
+    async def mr_graph_mutate(
+        self,
+        event: AstrMessageEvent,
+        proposal_id: int,
+        mutation_json: str,
+    ) -> str:
+        """Commit one evidence-bound mutation to the group plastic graph.
+
+        Args:
+            proposal_id(int): Active feedback proposal defining evidence scope.
+            mutation_json(string): One bounded graph mutation JSON object.
+        """
+        if not self.feedback_learning_enabled:
+            return "error: Feedback learning is disabled."
+        try:
+            scope = self._group_scope(event)
+            if self._active_feedback_proposals.get(id(event)) != (
+                scope.key,
+                int(proposal_id),
+            ):
+                return "error: Proposal is outside the active maintenance task."
+            service = self._service_for_scope(scope)
+            proposal_status = await service.feedback_proposal_status(
+                umo=scope.key,
+                proposal_id=int(proposal_id),
+            )
+            if (
+                proposal_status is None
+                or str(proposal_status.get("status") or "") != "COMMITTED"
+            ):
+                return (
+                    "error: Commit feedback first; plastic graph mutation is "
+                    "allowed only after the host accepts this proposal."
+                )
+            inspected = await service.inspect_feedback_proposal(
+                umo=scope.key,
+                proposal_id=int(proposal_id),
+            )
+            allowed_evidence: set[str] = set()
+
+            def collect(value: object) -> None:
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key in {"source_key", "request_source_key"} and isinstance(
+                            item, str
+                        ):
+                            if item:
+                                allowed_evidence.add(item)
+                        else:
+                            collect(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        collect(item)
+
+            collect(inspected)
+            mutation = parse_graph_mutation(mutation_json)
+            allowed_negative_edges = {
+                int(item.get("edge_id") or 0)
+                for item in inspected.get("activated_plastic_edges", [])
+                if isinstance(item, dict) and int(item.get("edge_id") or 0) > 0
+            }
+            provider = self.context.get_provider_by_id(
+                self.subconscious_provider_id
+            )
+            result = await service.apply_graph_mutation(
+                umo=scope.key,
+                mutation=mutation,
+                model=_provider_model_name(provider) if provider else "",
+                allowed_evidence_keys=allowed_evidence,
+                allowed_negative_edge_ids=allowed_negative_edges,
+                feedback_proposal_id=int(proposal_id),
+            )
+            if result.get("target_type") == "edge" and result.get("target_id"):
+                backend = self._embedding_backend()
+                if backend is not None:
+                    await service.index_plastic_edge(
+                        umo=scope.key,
+                        edge_id=int(result["target_id"]),
+                        embedding_backend=backend,
+                    )
+            return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        except Exception as exc:
+            return f"error: Plastic graph mutation rejected by host validation: {exc}"
+
     @filter.llm_tool(name="mr_consult_subconscious")
     async def mr_consult_subconscious(
         self, event: AstrMessageEvent, question: str
@@ -2715,6 +2944,60 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             limit=min(self.max_search_results, max(1, int(limit))),
         )
         return self._render_evidence("topic_events", evidence)
+
+    @filter.llm_tool(name="mr_query_associations")
+    async def mr_query_associations(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        node_key: str = "",
+        relation_key: str = "",
+        direction: str = "both",
+        relevance: float = 0.7,
+        limit: int = 20,
+    ) -> str:
+        """Traverse learned, group-local semantic relations.
+
+        Args:
+            query(string): Semantic cue, symbol, behavior, or target meaning.
+            node_key(string): Optional exact plastic node key from prior results.
+            relation_key(string): Optional learned relation key.
+            direction(string): out, in, or both relative to node_key.
+            relevance(float): Applicability of this selected path, 0.0 to 1.0.
+            limit(int): Maximum associations from 1 to 50.
+        """
+        if error := self._tool_guard(event):
+            return error
+        try:
+            scope = self._group_scope(event)
+            service = self._service_for_scope(scope)
+            rows = await service.query_plastic_associations(
+                umo=scope.key,
+                query=str(query)[: self.max_query_chars],
+                node_key=str(node_key)[:80],
+                relation_key=str(relation_key)[:80],
+                direction=str(direction),
+                limit=min(self.max_search_results, max(1, int(limit))),
+            )
+            active = self._active_interaction_traces.get(id(event))
+            feedback_task = self._active_feedback_proposals.get(id(event))
+            if (
+                rows
+                and feedback_task is None
+                and active is not None
+                and active[0] == scope.key
+            ):
+                message = self._normalize_event(event)
+                await service.activate_plastic_edges(
+                    umo=scope.key,
+                    edge_ids=[int(row["id"]) for row in rows],
+                    at=int(message.sent_at or time.time()),
+                    trace_id=active[1],
+                    relevance=max(0.05, min(1.0, float(relevance))),
+                )
+            return self._render_evidence("plastic_associations", rows)
+        except Exception as exc:
+            return f"error: Cannot traverse plastic associations: {exc}"
 
     @filter.on_using_llm_tool()
     async def trace_main_tool_call(
@@ -2926,7 +3209,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             and await service.pending_distillation_count(umo=scope.key)
             >= self.auto_distillation_min_pending
         ):
-            self._schedule_maintenance(kind="distill", scope=scope)
+            await self._schedule_maintenance(kind="distill", scope=scope)
 
     @filter.after_message_sent()
     async def trace_sent_artifacts(self, event: AstrMessageEvent) -> None:
@@ -3015,6 +3298,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._pending_main_tools.clear()
         self._feedback_candidate_ids.clear()
         self._active_feedback_proposals.clear()
+        self._scope_event_carriers.clear()
         self._maintenance_enqueued.clear()
         self._local_embedding_backend = None
         for service in services:

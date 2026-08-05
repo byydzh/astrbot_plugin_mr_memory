@@ -22,6 +22,7 @@
   --action: #397889;
   --feedback: #c04c5e;
   --hypothesis: #c08b28;
+  --plastic: #7b6fc5;
   --shadow: 0 18px 45px rgba(32, 45, 36, 0.08);
   --radius-xl: 24px;
   --radius-lg: 17px;
@@ -55,6 +56,7 @@
   --action: #65b4c5;
   --feedback: #ed8292;
   --hypothesis: #e3b85e;
+  --plastic: #a99bea;
   --shadow: 0 18px 45px rgba(0, 0, 0, 0.24);
 }
 
@@ -451,6 +453,7 @@ input[type="number"] {
 .legend i.action { background: var(--action); }
 .legend i.feedback { background: var(--feedback); }
 .legend i.hypothesis { background: var(--hypothesis); }
+.legend i.plastic { background: var(--plastic); }
 
 .graph-stage {
   position: relative;
@@ -537,6 +540,7 @@ input[type="number"] {
 .graph-node[data-type="action"] circle { fill: var(--action); }
 .graph-node[data-type="feedback"] circle { fill: var(--feedback); }
 .graph-node[data-type="hypothesis"] circle { fill: var(--hypothesis); }
+.graph-node[data-type="plastic"] circle { fill: var(--plastic); }
 
 .graph-node.is-selected circle {
   stroke: var(--text);
