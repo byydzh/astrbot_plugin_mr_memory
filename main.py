@@ -23,9 +23,12 @@ from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .mr_memory.distillation import (
+    DISTILLATION_REPAIR_SYSTEM_PROMPT,
     DISTILLATION_SYSTEM_PROMPT,
     build_distillation_prompt,
-    parse_distillation_response,
+    build_distillation_repair_prompt,
+    distillation_generation_options,
+    parse_distillation_response_resilient,
 )
 from .mr_memory.backtest import EvidenceGateDecision, direct_evidence_gate
 from .mr_memory.brief import parse_evidence_brief, render_evidence_brief
@@ -38,11 +41,18 @@ from .mr_memory.feedback import (
     parse_feedback_decision,
     render_prospective_brief,
 )
+from .mr_memory.history_import import (
+    AngelEyeGroupSnapshot,
+    AngelEyeHistorySource,
+    angel_eye_scope,
+)
+from .mr_memory.maintenance import scoped_job_key
 from .mr_memory.models import NormalizedMessage
 from .mr_memory.plasticity import (
     PLASTIC_GRAPH_MAINTENANCE_PROMPT,
     parse_graph_mutation,
 )
+from .mr_memory.provider_compat import generate_with_enforced_options
 from .mr_memory.scope import GroupMemoryScope, GroupScopeError
 from .mr_memory.service import MemoryService
 from .mr_memory.storage import MemoryStorage
@@ -282,7 +292,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
     "astrbot_plugin_mr_memory",
     "byydzh",
     "Private subconscious memory agent with grounded graph reconstruction.",
-    "0.11.0",
+    "0.12.1",
 )
 class MrMemoryPlugin(Star, WebConsoleMixin):
     traversal_tool_names = (
@@ -323,6 +333,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "deepseek/deepseek-v4-flash",
             )
         ).strip()
+        self.distillation_thinking_mode = str(
+            self.config.get("distillation_thinking_mode", "enabled")
+        ).strip().casefold()
+        if self.distillation_thinking_mode not in {"enabled", "disabled"}:
+            logger.warning(
+                "Unknown MR Memory distillation thinking mode %r; using enabled.",
+                self.distillation_thinking_mode,
+            )
+            self.distillation_thinking_mode = "enabled"
         self.embedding_enabled = bool(
             self.config.get("embedding_enabled", True)
         )
@@ -355,6 +374,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self.embedding_query_prompt_name = str(
             self.config.get("embedding_query_prompt_name", "")
         ).strip()
+        if self.embedding_query_prompt_name.casefold() == "auto":
+            self.embedding_query_prompt_name = (
+                "web_search_query"
+                if "harrier" in self.embedding_model_name.casefold()
+                else ""
+            )
         self.embedding_max_seq_length = max(
             32,
             min(4096, int(self.config.get("embedding_max_seq_length", 512))),
@@ -368,11 +393,18 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
         self.distillation_max_messages = max(
             4,
-            min(500, int(self.config.get("distillation_max_messages", 80))),
+            min(500, int(self.config.get("distillation_max_messages", 40))),
         )
         self.distillation_overlap_messages = max(
             0,
             min(100, int(self.config.get("distillation_overlap_messages", 12))),
+        )
+        self.distillation_max_output_tokens = max(
+            512,
+            min(
+                32768,
+                int(self.config.get("distillation_max_output_tokens", 32768)),
+            ),
         )
         self.auto_distillation_enabled = bool(
             self.config.get("auto_distillation_enabled", True)
@@ -384,12 +416,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 int(self.config.get("auto_distillation_min_pending", 30)),
             ),
         )
+        if "maintenance_interval_minutes" in self.config:
+            configured_maintenance_interval = int(
+                float(self.config.get("maintenance_interval_minutes", 5)) * 60
+            )
+        else:
+            configured_maintenance_interval = int(
+                self.config.get("maintenance_interval_seconds", 300)
+            )
         self.maintenance_interval_seconds = max(
             30,
-            min(
-                3600,
-                int(self.config.get("maintenance_interval_seconds", 300)),
-            ),
+            min(3600, configured_maintenance_interval),
         )
         self.candidate_seed_floor = max(
             -1.0,
@@ -406,9 +443,19 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             0,
             int(self.config.get("private_daily_token_budget", 120000)),
         )
-        self.wake_on_llm_request = bool(
-            self.config.get("wake_on_llm_request", True)
-        )
+        configured_wake_mode = str(
+            self.config.get("runtime_wake_mode") or ""
+        ).strip().casefold()
+        if not configured_wake_mode:
+            configured_wake_mode = (
+                "every_request"
+                if bool(self.config.get("wake_on_llm_request", True))
+                else "manual_only"
+            )
+        if configured_wake_mode not in {"every_request", "manual_only"}:
+            configured_wake_mode = "every_request"
+        self.runtime_wake_mode = configured_wake_mode
+        self.wake_on_llm_request = configured_wake_mode == "every_request"
         self.consult_tool_enabled = bool(
             self.config.get("consult_tool_enabled", True)
         )
@@ -438,6 +485,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 int(self.config.get("subconscious_timeout_seconds", 45)),
             ),
         )
+        self.maintenance_llm_timeout_seconds = max(
+            self.subconscious_timeout_seconds,
+            min(
+                600,
+                int(self.config.get("maintenance_llm_timeout_seconds", 300)),
+            ),
+        )
         self.max_query_chars = max(
             256,
             min(16000, int(self.config.get("max_query_chars", 4000))),
@@ -446,9 +500,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             256,
             min(12000, int(self.config.get("max_brief_chars", 3000))),
         )
+        if "feedback_window_hours" in self.config:
+            configured_feedback_window = int(
+                float(self.config.get("feedback_window_hours", 6)) * 3600
+            )
+        else:
+            configured_feedback_window = int(
+                self.config.get("feedback_window_seconds", 21600)
+            )
         self.feedback_window_seconds = max(
             60,
-            min(604800, int(self.config.get("feedback_window_seconds", 21600))),
+            min(604800, configured_feedback_window),
         )
         self.feedback_trace_ttl_seconds = max(
             300,
@@ -494,6 +556,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
         self.scope_database_dir = data_dir / "scopes"
         self.scope_database_dir.mkdir(parents=True, exist_ok=True)
+        self.angel_eye_history_path = (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_angel_eye"
+            / "qq_history_cache.db"
+        )
         self.embedding_model_cache_dir = (
             data_dir / "models" / self.embedding_backend_name
         )
@@ -513,8 +581,24 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._maintenance_queue: asyncio.Queue[
             tuple[int, str, GroupMemoryScope]
         ] = asyncio.Queue(maxsize=256)
-        self._maintenance_enqueued: set[int] = set()
+        self._maintenance_enqueued: set[tuple[str, int]] = set()
         self._maintenance_tasks: list[asyncio.Task[Any]] = []
+        self._runtime_bootstrap_task: asyncio.Task[Any] | None = None
+        self._runtime_initialization_lock = asyncio.Lock()
+        self._runtime_initialized = False
+        self._onebot_group_inventory: dict[str, list[dict[str, str]]] = {}
+        self._onebot_group_inventory_refreshed_at = 0.0
+        self._history_import_task: asyncio.Task[Any] | None = None
+        self._history_import_state: dict[str, object] = {
+            "status": "IDLE",
+            "platform_id": "",
+            "processed": 0,
+            "inserted": 0,
+            "skipped": 0,
+            "total": 0,
+            "current_group_id": "",
+            "error": "",
+        }
         self._register_memory_web_apis()
 
         logger.info(
@@ -529,6 +613,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self.wake_on_llm_request,
             self.scope_database_dir,
         )
+        try:
+            self._runtime_bootstrap_task = asyncio.get_running_loop().create_task(
+                self._initialize_runtime(),
+                name="mr-memory-runtime-bootstrap",
+            )
+        except RuntimeError:
+            # Cold startup will invoke the AstrBot-loaded hook once an event loop
+            # exists. Hot reload normally reaches the branch above.
+            self._runtime_bootstrap_task = None
 
     def _tool_manager(self):
         getter = getattr(self.context, "get_llm_tool_manager", None)
@@ -570,6 +663,16 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
+        await self._initialize_runtime()
+
+    async def _initialize_runtime(self) -> None:
+        async with self._runtime_initialization_lock:
+            if self._runtime_initialized:
+                return
+            await self._initialize_runtime_locked()
+            self._runtime_initialized = True
+
+    async def _initialize_runtime_locked(self) -> None:
         self._apply_tool_state()
         if self.feedback_learning_enabled and not self.capture_enabled:
             logger.error(
@@ -637,6 +740,54 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     name="mr-memory-maintenance-sweeper",
                 ),
             ]
+            await self._restore_persistent_distillation()
+        await self._refresh_onebot_group_inventory()
+        logger.info(
+            "MR Memory runtime initialized | maintenance_workers=%s | "
+            "restored_scopes=%s | onebot_groups=%s",
+            len(self._maintenance_tasks),
+            len(self._services),
+            sum(len(groups) for groups in self._onebot_group_inventory.values()),
+        )
+
+    async def _restore_persistent_distillation(self) -> None:
+        summaries = await asyncio.to_thread(
+            self._inspect_scope_databases,
+            {},
+        )
+        restored = 0
+        retried_messages = 0
+        for summary in summaries:
+            scope = GroupMemoryScope(
+                key=str(summary.get("umo") or ""),
+                platform_id=str(summary.get("platform_id") or ""),
+                group_id=str(summary.get("group_id") or ""),
+            )
+            if not scope.key or not self._session_allowed(scope.key):
+                continue
+            service = self._service_for_scope(scope)
+            if self.auto_distillation_enabled:
+                retried_messages += (
+                    await service.retry_terminal_distillation_failures(
+                        umo=scope.key,
+                    )
+                )
+            if self.auto_distillation_enabled and (
+                await service.pending_distillation_count(umo=scope.key) > 0
+            ):
+                await self._schedule_maintenance(
+                    kind="distill",
+                    scope=scope,
+                    retry_failed=True,
+                )
+                restored += 1
+        if restored:
+            logger.info(
+                "MR Memory restored persistent distillation queues | scopes=%s | "
+                "retried_terminal_messages=%s",
+                restored,
+                retried_messages,
+            )
 
     async def _schedule_maintenance(
         self,
@@ -646,6 +797,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         event: AstrMessageEvent | None = None,
         dedupe_key: str = "",
         payload: dict[str, object] | None = None,
+        retry_failed: bool = False,
     ) -> bool:
         if event is not None:
             self._scope_event_carriers[scope.key] = event
@@ -655,8 +807,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             job_type=str(kind),
             dedupe_key=(dedupe_key or f"{kind}:pending"),
             payload=payload or {},
+            retry_failed=retry_failed,
         )
-        if job_id in self._maintenance_enqueued:
+        queue_key = scoped_job_key(umo=scope.key, job_id=job_id)
+        if queue_key in self._maintenance_enqueued:
             return False
         try:
             self._maintenance_queue.put_nowait((job_id, str(kind), scope))
@@ -667,7 +821,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 scope.key,
             )
             return False
-        self._maintenance_enqueued.add(job_id)
+        self._maintenance_enqueued.add(queue_key)
         return True
 
     async def _private_budget_available(
@@ -695,7 +849,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
     async def _maintenance_worker(self) -> None:
         while True:
             job_id, kind, scope = await self._maintenance_queue.get()
-            self._maintenance_enqueued.discard(job_id)
+            self._maintenance_enqueued.discard(
+                scoped_job_key(umo=scope.key, job_id=job_id)
+            )
             claimed = False
             try:
                 service = self._service_for_scope(scope)
@@ -721,7 +877,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     umo=scope.key,
                     job_id=job_id,
                     lease_seconds=max(
-                        60, self.subconscious_timeout_seconds * 2
+                        60, self.maintenance_llm_timeout_seconds * 2
                     ),
                 )
                 if job is None:
@@ -1000,6 +1156,335 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
         return summaries
 
+    def _onebot_platforms(self) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        manager = getattr(self.context, "platform_manager", None)
+        for platform in getattr(manager, "platform_insts", []) or []:
+            try:
+                metadata = platform.meta()
+            except Exception:
+                continue
+            if str(getattr(metadata, "name", "")).casefold() != "aiocqhttp":
+                continue
+            platform_id = str(getattr(metadata, "id", "") or "").strip()
+            if platform_id:
+                result.append(
+                    {
+                        "platform_id": platform_id,
+                        "adapter": "aiocqhttp",
+                    }
+                )
+        return sorted(result, key=lambda item: item["platform_id"])
+
+    async def _refresh_onebot_group_inventory(self) -> None:
+        inventory: dict[str, list[dict[str, str]]] = {}
+        manager = getattr(self.context, "platform_manager", None)
+        for platform in getattr(manager, "platform_insts", []) or []:
+            try:
+                metadata = platform.meta()
+            except Exception:
+                continue
+            if str(getattr(metadata, "name", "")).casefold() != "aiocqhttp":
+                continue
+            platform_id = str(getattr(metadata, "id", "") or "").strip()
+            bot = getattr(platform, "bot", None)
+            call_action = getattr(bot, "call_action", None)
+            if not platform_id or not callable(call_action):
+                continue
+            try:
+                payload = await asyncio.wait_for(
+                    call_action("get_group_list"),
+                    timeout=15,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MR Memory could not read OneBot group inventory | "
+                    "platform=%s | error=%s",
+                    platform_id,
+                    type(exc).__name__,
+                )
+                continue
+            if isinstance(payload, dict):
+                payload = payload.get("data") or payload.get("groups") or []
+            groups: dict[str, dict[str, str]] = {}
+            if isinstance(payload, list):
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    group_id = str(item.get("group_id") or "").strip()
+                    if not group_id:
+                        continue
+                    groups[group_id] = {
+                        "group_id": group_id,
+                        "group_name": str(item.get("group_name") or "").strip(),
+                    }
+            inventory[platform_id] = sorted(
+                groups.values(),
+                key=lambda item: item["group_id"],
+            )
+        self._onebot_group_inventory = inventory
+        self._onebot_group_inventory_refreshed_at = time.monotonic()
+
+    @staticmethod
+    def _count_existing_scope_database(
+        *,
+        database_path: Path,
+        scope: GroupMemoryScope,
+    ) -> int:
+        if not database_path.is_file():
+            return 0
+        storage = MemoryStorage(database_path)
+        try:
+            storage.bind_scope(
+                umo=scope.key,
+                platform_id=scope.platform_id,
+                group_id=scope.group_id,
+            )
+            return storage.count_messages(umo=scope.key)
+        finally:
+            storage.close()
+
+    async def _web_memory_history_import_status(
+        self,
+        *,
+        platform_id: str = "",
+    ) -> dict[str, object]:
+        if time.monotonic() - self._onebot_group_inventory_refreshed_at >= 60:
+            await self._refresh_onebot_group_inventory()
+        platforms = self._onebot_platforms()
+        requested_platform = str(platform_id or "").strip()
+        available_platforms = {
+            item["platform_id"] for item in platforms
+        }
+        if requested_platform and requested_platform not in available_platforms:
+            raise ValueError("未找到指定的 OneBot 平台实例")
+        state_platform = str(
+            self._history_import_state.get("platform_id") or ""
+        )
+        selected_platform = (
+            requested_platform
+            or (
+                state_platform
+                if state_platform in available_platforms
+                else (platforms[0]["platform_id"] if platforms else "")
+            )
+        )
+        if not self.angel_eye_history_path.is_file():
+            platform_groups = self._onebot_group_inventory.get(
+                selected_platform,
+                [],
+            )
+            return {
+                "available": False,
+                "source": "AngelEye QQ history cache",
+                "platforms": platforms,
+                "recommended_platform_id": selected_platform,
+                "groups": [],
+                "source_messages": 0,
+                "target_messages": 0,
+                "platform_group_count": len(platform_groups),
+                "uncached_group_count": len(platform_groups),
+                "state": dict(self._history_import_state),
+            }
+        snapshots = await asyncio.to_thread(
+            AngelEyeHistorySource(self.angel_eye_history_path).inspect
+        )
+        groups: list[dict[str, object]] = []
+        for snapshot in snapshots:
+            scope = (
+                angel_eye_scope(
+                    platform_id=selected_platform,
+                    group_id=snapshot.group_id,
+                )
+                if selected_platform
+                else None
+            )
+            eligible = bool(scope and self._session_allowed(scope.key))
+            target_messages = 0
+            if scope is not None:
+                service = self._services.get(scope.key)
+                if service is not None:
+                    target_messages = await service.count(umo=scope.key)
+                else:
+                    target_messages = await asyncio.to_thread(
+                        self._count_existing_scope_database,
+                        database_path=(
+                            self.scope_database_dir / f"{scope.storage_id}.db"
+                        ),
+                        scope=scope,
+                    )
+            groups.append(
+                {
+                    "group_id": snapshot.group_id,
+                    "umo": scope.key if scope is not None else "",
+                    "storage_id": scope.storage_id if scope is not None else "",
+                    "source_messages": snapshot.messages,
+                    "target_messages": target_messages,
+                    "senders": snapshot.senders,
+                    "oldest_at": snapshot.oldest_at,
+                    "newest_at": snapshot.newest_at,
+                    "history_exhausted": snapshot.history_exhausted,
+                    "eligible": eligible,
+                }
+            )
+        platform_group_ids = {
+            item["group_id"]
+            for item in self._onebot_group_inventory.get(selected_platform, [])
+        }
+        source_group_ids = {
+            str(item["group_id"])
+            for item in groups
+        }
+        return {
+            "available": True,
+            "source": "AngelEye QQ history cache",
+            "platforms": platforms,
+            "recommended_platform_id": selected_platform,
+            "groups": groups,
+            "source_messages": sum(
+                int(item["source_messages"])
+                for item in groups
+                if item["eligible"]
+            ),
+            "target_messages": sum(
+                int(item["target_messages"])
+                for item in groups
+                if item["eligible"]
+            ),
+            "platform_group_count": len(platform_group_ids),
+            "uncached_group_count": len(platform_group_ids - source_group_ids),
+            "state": dict(self._history_import_state),
+        }
+
+    async def _web_memory_history_import_start(
+        self,
+        *,
+        platform_id: str,
+    ) -> dict[str, object]:
+        if self._history_import_task is not None and not self._history_import_task.done():
+            raise ValueError("历史迁移正在进行")
+        platforms = self._onebot_platforms()
+        available_ids = {item["platform_id"] for item in platforms}
+        selected = platform_id.strip()
+        if not selected and len(available_ids) == 1:
+            selected = next(iter(available_ids))
+        if selected not in available_ids:
+            raise ValueError("请选择与 AngelEye 历史对应的 OneBot 平台实例")
+        source = AngelEyeHistorySource(self.angel_eye_history_path)
+        snapshots = await asyncio.to_thread(source.inspect)
+        eligible = [
+            item
+            for item in snapshots
+            if self._session_allowed(
+                angel_eye_scope(
+                    platform_id=selected,
+                    group_id=item.group_id,
+                ).key
+            )
+        ]
+        if not eligible:
+            raise ValueError("当前生效群范围与 AngelEye 历史没有交集")
+        self._history_import_state = {
+            "status": "RUNNING",
+            "platform_id": selected,
+            "processed": 0,
+            "inserted": 0,
+            "skipped": 0,
+            "total": sum(item.messages for item in eligible),
+            "current_group_id": "",
+            "error": "",
+        }
+        self._history_import_task = asyncio.create_task(
+            self._run_angel_eye_history_import(
+                platform_id=selected,
+                snapshots=eligible,
+            ),
+            name="mr-memory-angel-eye-import",
+        )
+        return dict(self._history_import_state)
+
+    async def _run_angel_eye_history_import(
+        self,
+        *,
+        platform_id: str,
+        snapshots: list[AngelEyeGroupSnapshot],
+    ) -> None:
+        source = AngelEyeHistorySource(self.angel_eye_history_path)
+        imported_scopes: list[GroupMemoryScope] = []
+        try:
+            for snapshot in snapshots:
+                scope = angel_eye_scope(
+                    platform_id=platform_id,
+                    group_id=snapshot.group_id,
+                )
+                self._history_import_state["current_group_id"] = scope.group_id
+                service = self._service_for_scope(scope)
+                after_row_id = 0
+                while after_row_id < snapshot.through_row_id:
+                    messages, last_row_id, skipped = await asyncio.to_thread(
+                        source.load_batch,
+                        group_id=scope.group_id,
+                        platform_id=scope.platform_id,
+                        after_row_id=after_row_id,
+                        through_row_id=snapshot.through_row_id,
+                        limit=250,
+                    )
+                    scanned = len(messages) + int(skipped)
+                    if scanned <= 0 or last_row_id <= after_row_id:
+                        break
+                    result = await service.ingest_many(
+                        messages,
+                        defer_media_index=True,
+                    )
+                    after_row_id = last_row_id
+                    self._history_import_state["processed"] = int(
+                        self._history_import_state["processed"]
+                    ) + scanned
+                    self._history_import_state["inserted"] = int(
+                        self._history_import_state["inserted"]
+                    ) + int(result["inserted"])
+                    self._history_import_state["skipped"] = int(
+                        self._history_import_state["skipped"]
+                    ) + int(skipped)
+                    await asyncio.sleep(0)
+                await service.rebuild_media_fingerprints(umo=scope.key)
+                imported_scopes.append(scope)
+            self._history_import_state.update(
+                {
+                    "status": "COMPLETED",
+                    "current_group_id": "",
+                    "completed_at": int(time.time()),
+                }
+            )
+            if self.auto_distillation_enabled:
+                for scope in imported_scopes:
+                    service = self._service_for_scope(scope)
+                    if await service.pending_distillation_count(umo=scope.key):
+                        await self._schedule_maintenance(
+                            kind="distill",
+                            scope=scope,
+                        )
+            logger.info(
+                "MR Memory AngelEye import completed | platform=%s | "
+                "processed=%s | inserted=%s | skipped=%s | groups=%s",
+                platform_id,
+                self._history_import_state["processed"],
+                self._history_import_state["inserted"],
+                self._history_import_state["skipped"],
+                len(imported_scopes),
+            )
+        except asyncio.CancelledError:
+            self._history_import_state["status"] = "CANCELLED"
+            raise
+        except Exception as exc:
+            self._history_import_state.update(
+                {
+                    "status": "FAILED",
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                }
+            )
+            logger.exception("MR Memory AngelEye history import failed")
+
     async def _web_memory_overview(self) -> dict[str, object]:
         active_by_storage_id = {
             GroupMemoryScope(
@@ -1037,13 +1522,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
         }
         return {
-            "version": "0.11.0",
+            "version": "0.12.1",
             "runtime": {
                 "capture_enabled": self.capture_enabled,
                 "feedback_learning_enabled": self.feedback_learning_enabled,
                 "feedback_min_commit_score": self.feedback_min_commit_score,
                 "subconscious_enabled": self.subconscious_enabled,
                 "subconscious_provider_id": self.subconscious_provider_id,
+                "distillation_thinking_mode": self.distillation_thinking_mode,
                 "subconscious_provider_ready": bool(
                     self.context.get_provider_by_id(self.subconscious_provider_id)
                 ),
@@ -1058,6 +1544,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "embedding_model_loaded": bool(
                     embedding_backend and embedding_backend.model_loaded
                 ),
+                "runtime_wake_mode": self.runtime_wake_mode,
                 "wake_on_llm_request": self.wake_on_llm_request,
                 "distillation_max_messages": self.distillation_max_messages,
                 "distillation_overlap_messages": (
@@ -1067,6 +1554,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "auto_distillation_min_pending": (
                     self.auto_distillation_min_pending
                 ),
+                "maintenance_interval_seconds": self.maintenance_interval_seconds,
+                "maintenance_llm_timeout_seconds": (
+                    self.maintenance_llm_timeout_seconds
+                ),
+                "feedback_window_seconds": self.feedback_window_seconds,
+                "allowed_umos": sorted(self.allowed_umos),
                 "candidate_seed_floor": self.candidate_seed_floor,
                 "host_gate_min_score": self.host_gate_min_score,
                 "runtime_host_evidence_gate": self.runtime_host_evidence_gate,
@@ -1487,7 +1980,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         graph_units = await service.count_graph_units(umo=scope.key)
         summary = await service.dashboard_summary(umo=scope.key)
         yield event.plain_result(
-            "MR Memory 0.11.0\n"
+            "MR Memory 0.12.1\n"
             f"capture_enabled={self.capture_enabled}\n"
             f"feedback_learning_enabled={self.feedback_learning_enabled}\n"
             f"feedback_min_commit_score={self.feedback_min_commit_score}\n"
@@ -1497,7 +1990,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             f"embedding_model={self.embedding_model_name if self.embedding_enabled else 'disabled'}\n"
             f"embedding_query_prompt={self.embedding_query_prompt_name or 'none'}\n"
             f"candidate_seed_floor={self.candidate_seed_floor}\n"
-            f"wake_on_llm_request={self.wake_on_llm_request}\n"
+            f"runtime_wake_mode={self.runtime_wake_mode}\n"
+            f"distill_trigger={self.auto_distillation_min_pending}_messages_or_"
+            f"{self.maintenance_interval_seconds}_seconds\n"
+            f"feedback_window_seconds={self.feedback_window_seconds}\n"
             f"consult_tool_enabled={self.consult_tool_enabled}\n"
             f"expose_traversal_tools={self.expose_traversal_tools}\n"
             f"messages_in_session={count}\n"
@@ -1538,6 +2034,28 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        )
+
+    @mrmem.command("import_history")
+    async def import_history_command(
+        self,
+        event: AstrMessageEvent,
+        platform_id: str = "",
+    ):
+        """Start the idempotent AngelEye history import for eligible groups."""
+
+        selected = str(platform_id or event.get_platform_id() or "").strip()
+        try:
+            result = await self._web_memory_history_import_start(
+                platform_id=selected,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            yield event.plain_result(f"MR Memory 历史迁移未启动：{exc}")
+            return
+        yield event.plain_result(
+            "MR Memory 历史迁移已启动\n"
+            f"platform_id={result['platform_id']}\n"
+            f"messages={result['total']}"
         )
 
     @mrmem.command("bind_alias")
@@ -1698,7 +2216,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "source_sent_at_max": max(
                         message.sent_at for message in messages
                     ),
-                    "extractor_version": "mr-memory-0.11.0",
+                    "extractor_version": "mr-memory-0.12.1",
                     "embedding_model": (
                         self.embedding_model_name
                         if self.embedding_enabled
@@ -1707,21 +2225,57 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 },
             )
             started = time.perf_counter()
+            distillation_prompt = build_distillation_prompt(
+                messages,
+                identity_context=identity_context,
+                target_source_keys=work_item.target_source_keys,
+            )
+            generation_options = distillation_generation_options(
+                model_name=_provider_model_name(provider),
+                max_tokens=self.distillation_max_output_tokens,
+                thinking_mode=self.distillation_thinking_mode,
+            )
+            thinking_option = generation_options.get("thinking")
+            thinking_mode = (
+                str(thinking_option.get("type") or "provider-default")
+                if isinstance(thinking_option, dict)
+                else "provider-default"
+            )
+            logger.info(
+                "MR Memory distillation started | umo=%s | messages=%s | "
+                "targets=%s | model=%s | max_output_tokens=%s | thinking=%s",
+                scope.key,
+                len(messages),
+                work_item.target_count,
+                _provider_model_name(provider),
+                generation_options.get("max_tokens", "provider-default"),
+                thinking_mode,
+            )
             try:
                 response = await asyncio.wait_for(
-                    self.context.llm_generate(
+                    generate_with_enforced_options(
+                        provider=provider,
+                        fallback_generate=self.context.llm_generate,
                         chat_provider_id=self.subconscious_provider_id,
-                        prompt=build_distillation_prompt(
-                            messages,
-                            identity_context=identity_context,
-                            target_source_keys=work_item.target_source_keys,
-                        ),
+                        prompt=distillation_prompt,
                         system_prompt=DISTILLATION_SYSTEM_PROMPT,
-                        temperature=0.0,
+                        options=generation_options,
+                        stream=thinking_mode == "enabled",
                     ),
-                    timeout=self.subconscious_timeout_seconds,
+                    timeout=self.maintenance_llm_timeout_seconds,
                 )
                 usage = TokenUsageRecord.from_value(response.usage)
+                logger.info(
+                    "MR Memory distillation response received | umo=%s | "
+                    "text_chars=%s | reasoning_chars=%s | input_tokens=%s | "
+                    "output_tokens=%s | elapsed=%.3fs",
+                    scope.key,
+                    len(response.completion_text or ""),
+                    len(getattr(response, "reasoning_content", "") or ""),
+                    usage.input,
+                    usage.output,
+                    time.perf_counter() - started,
+                )
                 await service.record_llm_usage(
                     run_id=run_id,
                     phase="construction",
@@ -1734,15 +2288,94 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     elapsed_ms=(time.perf_counter() - started) * 1000,
                     usage_source="astrbot_response",
                 )
-                batch = parse_distillation_response(
-                    response.completion_text or "",
-                    messages,
-                    identity_context=identity_context,
-                    target_source_keys=work_item.target_source_keys,
-                )
+                try:
+                    batch, sanitization_actions = (
+                        parse_distillation_response_resilient(
+                            response.completion_text or "",
+                            messages,
+                            identity_context=identity_context,
+                            target_source_keys=work_item.target_source_keys,
+                        )
+                    )
+                except ValueError as validation_error:
+                    logger.warning(
+                        "MR Memory distillation validation failed; requesting "
+                        "one bounded repair | umo=%s | error=%s",
+                        scope.key,
+                        type(validation_error).__name__,
+                    )
+                    repair_started = time.perf_counter()
+                    repair_response = await asyncio.wait_for(
+                        generate_with_enforced_options(
+                            provider=provider,
+                            fallback_generate=self.context.llm_generate,
+                            chat_provider_id=self.subconscious_provider_id,
+                            prompt=build_distillation_repair_prompt(
+                                original_prompt=distillation_prompt,
+                                invalid_output=response.completion_text or "",
+                                validation_error=str(validation_error),
+                            ),
+                            system_prompt=DISTILLATION_REPAIR_SYSTEM_PROMPT,
+                            options=generation_options,
+                            stream=thinking_mode == "enabled",
+                        ),
+                        timeout=self.maintenance_llm_timeout_seconds,
+                    )
+                    repair_usage = TokenUsageRecord.from_value(
+                        repair_response.usage
+                    )
+                    logger.info(
+                        "MR Memory distillation repair received | umo=%s | "
+                        "text_chars=%s | reasoning_chars=%s | "
+                        "input_tokens=%s | output_tokens=%s | elapsed=%.3fs",
+                        scope.key,
+                        len(repair_response.completion_text or ""),
+                        len(
+                            getattr(
+                                repair_response,
+                                "reasoning_content",
+                                "",
+                            )
+                            or ""
+                        ),
+                        repair_usage.input,
+                        repair_usage.output,
+                        time.perf_counter() - repair_started,
+                    )
+                    await service.record_llm_usage(
+                        run_id=run_id,
+                        phase="construction_repair",
+                        call_index=1,
+                        provider_id=self.subconscious_provider_id,
+                        model=_provider_model_name(provider),
+                        input_other=repair_usage.input_other,
+                        input_cached=repair_usage.input_cached,
+                        output=repair_usage.output,
+                        elapsed_ms=(
+                            time.perf_counter() - repair_started
+                        )
+                        * 1000,
+                        usage_source="astrbot_response",
+                    )
+                    response = repair_response
+                    batch, sanitization_actions = (
+                        parse_distillation_response_resilient(
+                            response.completion_text or "",
+                            messages,
+                            identity_context=identity_context,
+                            target_source_keys=work_item.target_source_keys,
+                        )
+                    )
+                if sanitization_actions:
+                    logger.warning(
+                        "MR Memory rejected invalid optional graph units | "
+                        "umo=%s | count=%s",
+                        scope.key,
+                        len(sanitization_actions),
+                    )
                 persisted, indexed = await service.apply_distillation(
                     batch,
-                    extractor_version="mr-memory-0.11.0",
+                    extractor_version="mr-memory-0.12.1",
                     embedding_backend=self._embedding_backend(),
                 )
                 await service.record_distillation_ignored_sources(
@@ -1779,6 +2412,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "plastic_edges": len(persisted.plastic_edge_ids),
                 "embedded_documents": indexed,
                 "ignored_messages": len(batch.ignored_sources),
+                "sanitized_units": len(sanitization_actions),
             }
             await service.finish_experiment(
                 run_id=run_id,
@@ -1789,6 +2423,19 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         response.completion_text or ""
                     ),
                 },
+            )
+            logger.info(
+                "MR Memory distillation completed | umo=%s | messages=%s | "
+                "episodes=%s | semantics=%s | topics=%s | associations=%s | "
+                "embeddings=%s | elapsed=%.3fs",
+                scope.key,
+                len(messages),
+                result["episodes"],
+                result["semantic_memories"],
+                result["topics"],
+                result["plastic_edges"],
+                result["embedded_documents"],
+                time.perf_counter() - started,
             )
         return result
 
@@ -2281,7 +2928,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 request=request,
                 run_context=AgentContextWrapper(
                     context=AstrAgentContext(context=self.context, event=event),
-                    tool_call_timeout=self.subconscious_timeout_seconds,
+                    tool_call_timeout=self.maintenance_llm_timeout_seconds,
                 ),
                 tool_executor=FunctionToolExecutor(),
                 agent_hooks=hooks,
@@ -2368,7 +3015,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             proposal_id=proposal_id,
                             hooks=hooks,
                         ),
-                        timeout=self.subconscious_timeout_seconds,
+                        timeout=self.maintenance_llm_timeout_seconds,
                     )
                     status = await service.feedback_proposal_status(
                         umo=scope.key,
@@ -3356,6 +4003,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
     async def terminate(self) -> None:
         tasks = list(self._maintenance_tasks)
         self._maintenance_tasks.clear()
+        if self._runtime_bootstrap_task is not None:
+            if self._runtime_bootstrap_task is not asyncio.current_task():
+                tasks.append(self._runtime_bootstrap_task)
+            self._runtime_bootstrap_task = None
+        if self._history_import_task is not None:
+            tasks.append(self._history_import_task)
+            self._history_import_task = None
         for task in tasks:
             task.cancel()
         if tasks:
@@ -3372,6 +4026,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._active_feedback_proposals.clear()
         self._scope_event_carriers.clear()
         self._maintenance_enqueued.clear()
+        self._runtime_initialized = False
+        self._onebot_group_inventory.clear()
+        self._onebot_group_inventory_refreshed_at = 0.0
         self._local_embedding_backend = None
         for service in services:
             await service.close()

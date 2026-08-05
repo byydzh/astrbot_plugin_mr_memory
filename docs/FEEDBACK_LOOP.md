@@ -1,6 +1,6 @@
 # 反馈图闭环
 
-0.11.0 延续“可检查工作图而非隐藏思维链”，并把候选筛选与维护移出主请求路径。每次主 Agent
+0.12.1 延续“可检查工作图而非隐藏思维链”，并把候选筛选与维护移出主请求路径。每次主 Agent
 调用会建立一个按群隔离的 `interaction_trace`，只记录可观察状态：请求摘要、已激活的
 前瞻假设、工具名与参数键/哈希、工具结果哈希、最终可见回复和发送组件类型。
 
@@ -54,7 +54,8 @@
 `feedback_learning_enabled` 默认关闭，并且依赖 `capture_enabled=true`。开启后，只有通过
 快门的后续消息进入有界后台队列，由低价私有 Provider 每次最多处理
 `feedback_max_pending_per_wake` 条；维护不再同步阻塞下一次主请求。维护和重建 token 进入
-按群 ledger。本阶段只在隔离实验目录与导入冒烟环境验证，尚未替换线上插件。
+按群 ledger。线上是否自动唤醒由 `runtime_wake_mode` 控制，后续反馈归因范围由
+`feedback_window_hours` 明确显示；两者不再依赖隐藏默认值。
 
 真实历史遮罩 A/B 的样本、评分矩阵和 token 见 [开发记录](DEVELOPMENT_LOG.md)。原始群聊
 正文及逐条结果只保存在 Git ignored 的 `.dev/`。

@@ -349,6 +349,46 @@ class TruthLayerV2Tests(unittest.TestCase):
         self.assertEqual(retry.target_source_keys, claimed.target_source_keys)
         self.storage.finish_distillation_batch(work_item=retry)
 
+    def test_terminal_distillation_messages_retry_only_when_explicit(self) -> None:
+        source = self.message("1", "10001", "甲", "等待修复后重试", 100)
+        self.storage.upsert_message(source)
+        for _ in range(3):
+            work_item = self.storage.next_distillation_batch(
+                umo=self.umo,
+                limit=1,
+                overlap=0,
+            )
+            assert work_item is not None
+            self.storage.finish_distillation_batch(
+                work_item=work_item,
+                error="provider failure",
+            )
+
+        self.assertEqual(self.storage.pending_distillation_count(umo=self.umo), 0)
+        self.assertIsNone(
+            self.storage.next_distillation_batch(
+                umo=self.umo,
+                limit=1,
+                overlap=0,
+            )
+        )
+        self.assertEqual(
+            self.storage.retry_terminal_distillation_failures(umo=self.umo),
+            1,
+        )
+        self.assertEqual(self.storage.pending_distillation_count(umo=self.umo), 1)
+        retried = self.storage.next_distillation_batch(
+            umo=self.umo,
+            limit=1,
+            overlap=0,
+        )
+        assert retried is not None
+        state = self.storage._connection.execute(
+            "SELECT status, attempts FROM message_processing"
+        ).fetchone()
+        self.assertEqual(state["status"], "PROCESSING")
+        self.assertEqual(state["attempts"], 1)
+
     def test_host_time_ignores_model_timestamp(self) -> None:
         source = self.message("1", "10001", "甲", "真实时间", 1234)
         self.storage.upsert_message(source)

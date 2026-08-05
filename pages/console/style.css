@@ -233,6 +233,106 @@ select:focus-visible {
   background: linear-gradient(145deg, var(--accent-soft), var(--surface-solid));
 }
 
+.runtime-policy {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.runtime-policy article {
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
+.runtime-policy span,
+.runtime-policy strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-policy span {
+  margin-bottom: 4px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.runtime-policy strong {
+  font-size: 12px;
+}
+
+.import-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 16px;
+  padding: 18px 20px;
+}
+
+.import-copy {
+  min-width: 0;
+}
+
+.import-copy h2,
+.import-copy p {
+  margin: 0;
+}
+
+.import-copy h2 {
+  margin-bottom: 5px;
+  font-size: 17px;
+}
+
+.import-copy > p:not(.section-kicker) {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.import-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.import-actions label {
+  display: grid;
+  gap: 5px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.import-progress {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 10px;
+}
+
+.import-progress progress {
+  width: min(460px, 70vw);
+  height: 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  accent-color: var(--accent);
+}
+
+.import-progress span {
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .control-bar {
   display: flex;
   align-items: center;
@@ -961,6 +1061,10 @@ td:last-child {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .runtime-policy {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .workspace-grid {
     grid-template-columns: 1fr;
   }
@@ -980,6 +1084,7 @@ td:last-child {
 
   .hero,
   .control-bar,
+  .import-panel,
   .message-heading {
     align-items: stretch;
     flex-direction: column;
@@ -991,6 +1096,21 @@ td:last-child {
 
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .runtime-policy {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .import-actions {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .import-actions .button,
+  .import-actions select {
+    width: 100%;
   }
 
   .metric-card {
@@ -1035,6 +1155,10 @@ td:last-child {
 
 @media (max-width: 440px) {
   .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-policy {
     grid-template-columns: 1fr;
   }
 

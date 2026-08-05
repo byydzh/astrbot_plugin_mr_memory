@@ -27,9 +27,9 @@
 
       <section class="metric-grid" aria-label="运行概览">
         <article class="metric-card metric-primary">
-          <span>群范围</span>
+          <span>已建记忆群</span>
           <strong id="metric-scopes">—</strong>
-          <small>物理隔离数据库</small>
+          <small id="metric-scopes-caption">物理隔离数据库</small>
         </article>
         <article class="metric-card">
           <span>原始消息</span>
@@ -61,6 +61,38 @@
           <strong id="metric-embeddings">—</strong>
           <small id="metric-storage">数据库 —</small>
         </article>
+      </section>
+
+      <section class="runtime-policy" aria-label="实际运行策略">
+        <article><span>生效范围</span><strong id="policy-scope">—</strong></article>
+        <article><span>潜意识唤醒</span><strong id="policy-wake">—</strong></article>
+        <article><span>增量整理</span><strong id="policy-distill">—</strong></article>
+        <article><span>后续反馈</span><strong id="policy-feedback">—</strong></article>
+        <article><span>Embedding</span><strong id="policy-embedding">—</strong></article>
+      </section>
+
+      <section id="history-import-panel" class="panel import-panel" aria-label="历史迁移">
+        <div class="import-copy">
+          <p class="section-kicker">FIRST-RUN DATA</p>
+          <h2>现有群聊历史</h2>
+          <p id="history-import-summary">正在检查可迁移数据…</p>
+          <p id="history-import-detail" class="panel-note"></p>
+          <div id="history-import-progress-wrap" class="import-progress hidden">
+            <progress id="history-import-progress" max="100" value="0"></progress>
+            <span id="history-import-progress-label">0%</span>
+          </div>
+        </div>
+        <div class="import-actions">
+          <label>
+            OneBot 平台实例
+            <select id="history-platform-select" disabled>
+              <option value="">正在检测…</option>
+            </select>
+          </label>
+          <button id="history-import-btn" class="button primary" type="button" disabled>
+            导入已有历史
+          </button>
+        </div>
       </section>
 
       <section class="control-bar" aria-label="群范围控制">
@@ -253,6 +285,23 @@
         <div class="dialog-actions">
           <button id="distill-cancel" class="button ghost" type="button">取消</button>
           <button id="distill-confirm" class="button primary" type="button">开始整理</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="history-import-dialog" class="dialog">
+      <form method="dialog" id="history-import-form">
+        <div class="dialog-mark">↧</div>
+        <h2>导入 AngelEye 群聊历史</h2>
+        <p id="history-import-confirm-copy">
+          历史消息会按群写入独立数据库，重复执行不会产生重复消息。
+        </p>
+        <p class="cost-note">
+          导入原始消息本身不调用 LLM；导入完成后，自动整理会按当前阈值和每群 Token 上限逐批构建图记忆。
+        </p>
+        <div class="dialog-actions">
+          <button id="history-import-cancel" class="button ghost" type="button">取消</button>
+          <button id="history-import-confirm" class="button primary" type="button">开始导入</button>
         </div>
       </form>
     </dialog>

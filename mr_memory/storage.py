@@ -1286,6 +1286,7 @@ class MemoryStorage:
         sender_participant_id: int | None,
         sent_at: int,
         content: list[dict[str, object]],
+        refresh_media_fingerprints: bool = True,
     ) -> None:
         previous_media = {
             (str(row["attachment_type"]), str(row["reference_sha256"]))
@@ -1449,10 +1450,11 @@ class MemoryStorage:
             for item in attachments
             if str(item["reference_sha256"])
         }
-        self._refresh_media_fingerprints_locked(
-            umo=umo,
-            fingerprints=previous_media | current_media,
-        )
+        if refresh_media_fingerprints:
+            self._refresh_media_fingerprints_locked(
+                umo=umo,
+                fingerprints=previous_media | current_media,
+            )
 
     def _backfill_truth_v2(self) -> None:
         rows = self._connection.execute(
@@ -1726,7 +1728,12 @@ class MemoryStorage:
                 (str(semantic_id),),
             )
 
-    def upsert_message(self, message: NormalizedMessage) -> bool:
+    def upsert_message(
+        self,
+        message: NormalizedMessage,
+        *,
+        refresh_media_fingerprints: bool = True,
+    ) -> bool:
         source_key = message.resolved_source_key()
         with self._lock, self._connection:
             if self._is_account_forgotten_locked(
@@ -1877,8 +1884,33 @@ class MemoryStorage:
                 sender_participant_id=participant_id,
                 sent_at=message.sent_at,
                 content=content,
+                refresh_media_fingerprints=refresh_media_fingerprints,
             )
         return existing is None
+
+    def upsert_messages(
+        self,
+        messages: Iterable[NormalizedMessage],
+        *,
+        defer_media_index: bool = False,
+    ) -> dict[str, int]:
+        """Import a bounded batch while preserving normal identity and dedupe rules."""
+
+        processed = 0
+        inserted = 0
+        for message in messages:
+            inserted += int(
+                self.upsert_message(
+                    message,
+                    refresh_media_fingerprints=not defer_media_index,
+                )
+            )
+            processed += 1
+        return {"processed": processed, "inserted": inserted}
+
+    def rebuild_media_fingerprints(self, *, umo: str) -> None:
+        with self._lock, self._connection:
+            self._rebuild_media_fingerprints_locked(umo=umo)
 
     def mark_message_deleted(
         self,
@@ -3080,6 +3112,33 @@ class MemoryStorage:
                 (umo,),
             ).fetchone()
         return int(row[0])
+
+    def retry_terminal_distillation_failures(self, *, umo: str) -> int:
+        """Requeue exhausted messages after an explicit runtime reload.
+
+        Normal maintenance keeps the three-attempt ceiling.  A plugin reload is
+        the explicit recovery boundary after code or provider fixes, so terminal
+        failures may receive a fresh bounded attempt window without turning the
+        periodic sweeper into an infinite retry loop.
+        """
+
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE message_processing
+                SET status='PENDING', attempts=0, batch_key='',
+                    last_error='', updated_at=CURRENT_TIMESTAMP
+                WHERE message_id IN (
+                    SELECT p.message_id
+                    FROM message_processing AS p
+                    JOIN messages AS m ON m.id = p.message_id
+                    WHERE m.umo = ? AND m.is_deleted = 0
+                      AND p.status = 'FAILED' AND p.attempts >= 3
+                )
+                """,
+                (umo,),
+            )
+        return max(0, int(cursor.rowcount))
 
     def next_distillation_batch(
         self,
@@ -6905,6 +6964,7 @@ class MemoryStorage:
         dedupe_key: str,
         payload: Mapping[str, object] | None = None,
         available_at: int | None = None,
+        retry_failed: bool = False,
     ) -> int:
         self._assert_scope(umo)
         kind = str(job_type or "").strip().casefold()
@@ -6914,6 +6974,7 @@ class MemoryStorage:
         if not key or len(key) > 240:
             raise ValueError("invalid maintenance dedupe key")
         encoded = self._bounded_json(dict(payload or {}), max_chars=8000)
+        scheduled_at = int(available_at or time.time())
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -6945,8 +7006,20 @@ class MemoryStorage:
                         THEN '' ELSE maintenance_jobs.last_error END,
                     updated_at=CURRENT_TIMESTAMP
                 """,
-                (umo, kind, key, encoded, int(available_at or time.time())),
+                (umo, kind, key, encoded, scheduled_at),
             )
+            if retry_failed:
+                self._connection.execute(
+                    """
+                    UPDATE maintenance_jobs
+                    SET status='PENDING', attempts=0, available_at=?,
+                        lease_until=NULL, last_error='',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE umo=? AND job_type=? AND dedupe_key=?
+                      AND status='FAILED'
+                    """,
+                    (scheduled_at, umo, kind, key),
+                )
             row = self._connection.execute(
                 """
                 SELECT id FROM maintenance_jobs

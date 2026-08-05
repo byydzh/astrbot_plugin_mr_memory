@@ -3,7 +3,7 @@
 基准为论文 [Memory is Reconstructed, Not Retrieved: Graph Memory for LLM
 Agents](https://arxiv.org/abs/2606.06036) 及其
 [官方实现](https://github.com/Ji-shuo/MRAgent)。本表记录 2026-08-06、插件
-0.11.0 的状态。“结构完成”表示机制已进入核心代码和回归测试，不等于已经复现论文
+0.12.1 的状态。“结构完成”表示机制已进入核心代码和回归测试，不等于已经复现论文
 全部基准分数。
 
 | 论文机制 | 当前状态 | 本项目中的实现证据 | 仍缺什么 |
@@ -20,7 +20,7 @@ Agents](https://arxiv.org/abs/2606.06036) 及其
 | 有证据的最终记忆摘要 | 运行路径完成 | 最终输出为 host-validated claim/source/conflict/unresolved JSON；每个结论和限定项的 source 都必须来自本轮访问；按完整结构单元截断 | 内容蕴含仍依赖模型，不等于形式证明；需扩大人工事实一致性评测 |
 | 构建与重建的 token 观测 | 超出论文原型 | `experiment_runs`、`llm_usage_events`、`reconstruction_steps`；`/mrmem usage` | 运行时多轮重建目前保存 AstrBot runner 聚合值，不拆分每次内部 LLM 调用 |
 | 论文消融与基准 | 部分完成 | CE/CTE/CTC 思路可由 forked run 实验；已完成首个真实调用遮罩 A/B | 尚未复跑论文完整数据集，也没有足够真实样本形成统计结论 |
-| 按群物理隔离 | 工程扩展完成 | 每群独立 SQLite、事件推导 scope、SQL 二次约束、跨群测试、每群预算和自助删除 suppression | 当前单群 canary 仍需验证真实 adapter 撤回与备份策略；SQLite 本身不加密 |
+| 按群物理隔离 | 工程扩展完成 | 每群独立 SQLite、事件推导 scope、SQL 二次约束、跨群测试、每群预算和自助删除 suppression | 已按 `allowed_umos=[]` 对 OneBot 当前全部 5 群实时采集；旧历史只覆盖 AngelEye 曾按需缓存的 3 群，SQLite 本身不加密 |
 | 反馈驱动修订 | 行为与语义闭环完成 | reply/词面快门、持久任务、Action--Feedback--Hypothesis 图、可塑关系修改、实际激活路径归因、阈值、衰减/休眠和可逆合并；未提交反馈不能改图 | 不直接覆写身份或 structured claim；管理员 proposal confirm/edit/reject UI 和更大规模误激活评测仍需完成 |
 
 ## 当前结论
@@ -30,13 +30,13 @@ Agents](https://arxiv.org/abs/2606.06036) 及其
 1. 论文的图结构、构建路径、候选激活、七工具和主动重建已经贯通；
 2. 首个真实历史调用的严格遮罩实验已经端到端跑通；
 3. 身份绑定、在线增量整理、LLM 语义 gate、动态关系、结构化 brief 和反馈归因已贯通；
-   生产化最关键的缺口转为线上 canary、图片语义管线、原论文 active-state 统一与人工复核；
+   生产化最关键的缺口转为长期线上观测、原论文 active-state 统一与人工复核；
 4. 论文完整 benchmark reproduction 仍应作为独立验收项，不能用一个成功案例替代。
 
 ## 下一阶段验收顺序
 
-1. 持续白名单单群 canary，验证 backlog、撤回、Bot 输出和 24 小时成本；
+1. 持续观察全群运行的 backlog、失败重试、撤回、Bot 输出和 24 小时成本；
 2. 压缩可塑图重建的工具上下文和缓存前缀，再把原论文各层 active-state 转移统一到工作图；
-3. 为图片建立独立的下载期限、内容 hash、OCR/视觉描述和删除策略，默认继续关闭原图保留；
+3. 保持图片字节、OCR 与视觉调用关闭，只维护有界 opaque hash 频次锚点；
 4. 把反馈 proposal 的 confirm/edit/reject 接入管理员控制台；
 5. 扩大真实遮罩调用样本与身份/修订测试集，再决定何时引入 ANN 或完整论文基准复现。

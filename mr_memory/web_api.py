@@ -56,6 +56,18 @@ class WebConsoleMixin:
             ["POST"],
             "手动整理指定群范围的最近消息",
         )
+        self._register_memory_web_api(
+            "history-import/status",
+            self._api_memory_history_import_status,
+            ["GET"],
+            "检测可迁移的 AngelEye 群聊历史及进度",
+        )
+        self._register_memory_web_api(
+            "history-import/start",
+            self._api_memory_history_import_start,
+            ["POST"],
+            "启动一次性 AngelEye 群聊历史迁移",
+        )
 
     def _register_memory_web_api(self, route, handler, methods, desc) -> None:
         route_path = f"/{PLUGIN_NAME}/{route.strip('/')}"
@@ -184,4 +196,20 @@ class WebConsoleMixin:
             maximum=500,
         )
         data = await self._web_memory_distill(scope_id=scope_id, limit=limit)
+        return self._memory_web_success(data)
+
+    async def _api_memory_history_import_status(self):
+        return self._memory_web_success(
+            await self._web_memory_history_import_status(
+                platform_id=str(request.args.get("platform_id") or ""),
+            )
+        )
+
+    async def _api_memory_history_import_start(self):
+        payload = await request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("请求正文必须是 JSON 对象")
+        data = await self._web_memory_history_import_start(
+            platform_id=str(payload.get("platform_id") or ""),
+        )
         return self._memory_web_success(data)

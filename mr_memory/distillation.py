@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +12,29 @@ from .identity import sanitize_components
 from .models import StoredMessage
 from .plasticity import GraphMutation, parse_graph_mutation
 from .storage import MemoryStorage
+
+
+def distillation_generation_options(
+    *,
+    model_name: str,
+    max_tokens: int = 32768,
+    thinking_mode: str = "enabled",
+) -> dict[str, Any]:
+    """Provider options for full-capability structured extraction."""
+
+    options: dict[str, Any] = {"temperature": 0.0}
+    if "deepseek-v4" in str(model_name).casefold():
+        normalized_thinking = str(thinking_mode).strip().casefold()
+        if normalized_thinking not in {"enabled", "disabled"}:
+            normalized_thinking = "enabled"
+        options.update(
+            {
+                "thinking": {"type": normalized_thinking},
+                "response_format": {"type": "json_object"},
+                "max_tokens": max(512, min(32768, int(max_tokens))),
+            }
+        )
+    return options
 
 
 DISTILLATION_SYSTEM_PROMPT = """You extract a revision-safe associative memory graph
@@ -100,7 +125,43 @@ has the compact shape {"operation":"revise_edge","edge_id":1,
 "statement":"...","epistemic_state":"HYPOTHESIS|SUPPORTED|CONTESTED|CONFIRMED",
 "uncertainty":"..."}. This coverage ledger prevents silently dropping target
 messages.
+
+Output-budget rules:
+- Prefer one concise graph unit that cites several related messages over one unit per
+  message.
+- Emit at most 8 episodes, 12 semantic_memories, 6 topics, and 8 associations in one
+  batch. Put every remaining target in ignored with a short concrete reason.
+- Keep summaries, statements, labels, descriptions, and ignore reasons concise. Do
+  not spend output tokens narrating the extraction process.
 """
+
+
+DISTILLATION_REPAIR_SYSTEM_PROMPT = DISTILLATION_SYSTEM_PROMPT + """
+
+You are repairing one previously generated object that failed deterministic host
+validation. Return the complete corrected JSON object, not a patch. Re-check every
+source key, exact evidence span, participant binding, episode index, coverage entry,
+and JSON delimiter. Remove an optional graph unit when it cannot be repaired from
+the supplied evidence. Do not weaken, reinterpret, or bypass any validation rule.
+"""
+
+
+def build_distillation_repair_prompt(
+    *,
+    original_prompt: str,
+    invalid_output: str,
+    validation_error: str,
+) -> str:
+    """Build a bounded second-pass request without logging chat contents."""
+
+    return (
+        "Host validation error:\n"
+        + str(validation_error)[:1000]
+        + "\n\nOriginal extraction input:\n"
+        + original_prompt
+        + "\n\nInvalid prior output:\n"
+        + invalid_output
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,6 +790,135 @@ def parse_distillation_response(
         target_source_keys=tuple(target_keys),
         ignored_sources=tuple(ignored_sources),
     )
+
+
+def _validation_error_keys(message: str, prefix: str) -> tuple[str, ...]:
+    if not message.startswith(prefix):
+        return ()
+    try:
+        value = ast.literal_eval(message[len(prefix) :].strip())
+    except (SyntaxError, ValueError):
+        return ()
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    return tuple(str(item) for item in value if str(item))
+
+
+def _sanitize_distillation_validation_error(
+    text: str,
+    error: ValueError,
+) -> tuple[str, str] | None:
+    """Drop only the invalid optional unit identified by strict validation."""
+
+    try:
+        value = _extract_json_object(text)
+    except ValueError:
+        return None
+    message = str(error)
+    indexed = re.match(
+        r"^(episodes|claims|semantic_memories|topics|associations|ignored)"
+        r"\[(\d+)\]",
+        message,
+    )
+    if indexed:
+        field = indexed.group(1)
+        index = int(indexed.group(2))
+        items = value.get(field)
+        if isinstance(items, list) and 0 <= index < len(items):
+            items.pop(index)
+            return (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                f"drop:{field}",
+            )
+
+    overlap_prefix = "target sources cannot be both cited and ignored:"
+    overlap = set(_validation_error_keys(message, overlap_prefix))
+    if overlap:
+        ignored = value.get("ignored")
+        if isinstance(ignored, list):
+            filtered = [
+                item
+                for item in ignored
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get("source_key") or "") in overlap
+                )
+            ]
+            if len(filtered) != len(ignored):
+                value["ignored"] = filtered
+                return (
+                    json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "remove:cited_ignored_overlap",
+                )
+
+    missing_prefix = "distillation omitted target source keys:"
+    missing = _validation_error_keys(message, missing_prefix)
+    if missing:
+        ignored = value.setdefault("ignored", [])
+        if not isinstance(ignored, list):
+            return None
+        existing = {
+            str(item.get("source_key") or "")
+            for item in ignored
+            if isinstance(item, dict)
+        }
+        added = 0
+        for source_key in missing:
+            if source_key in existing:
+                continue
+            ignored.append(
+                {
+                    "source_key": source_key,
+                    "reason": (
+                        "host rejected an invalid optional graph unit; "
+                        "raw evidence retained"
+                    ),
+                }
+            )
+            existing.add(source_key)
+            added += 1
+        if added:
+            return (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                "host_ignore:uncovered_target",
+            )
+    return None
+
+
+def parse_distillation_response_resilient(
+    text: str,
+    messages: list[StoredMessage],
+    *,
+    identity_context: dict[str, Any] | None = None,
+    target_source_keys: tuple[str, ...] | list[str] | None = None,
+    max_sanitizations: int = 128,
+) -> tuple[DistillationBatch, tuple[str, ...]]:
+    """Keep strict validation while discarding isolated invalid model units."""
+
+    current = text
+    actions: list[str] = []
+    for _ in range(max(1, int(max_sanitizations))):
+        try:
+            return (
+                parse_distillation_response(
+                    current,
+                    messages,
+                    identity_context=identity_context,
+                    target_source_keys=target_source_keys,
+                ),
+                tuple(actions),
+            )
+        except ValueError as error:
+            sanitized = _sanitize_distillation_validation_error(current, error)
+            if sanitized is None:
+                raise
+            current, action = sanitized
+            actions.append(action)
+    raise ValueError("distillation exceeded host sanitization limit")
 
 
 def persist_distillation(

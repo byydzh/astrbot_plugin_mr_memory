@@ -1,5 +1,7 @@
 const state = {
   overview: null,
+  historyImport: null,
+  historyImportPollTimer: null,
   scopeId: "",
   graph: null,
   participants: [],
@@ -19,6 +21,7 @@ const elements = {
   connectionLabel: document.getElementById("connection-label"),
   runtimeVersion: document.getElementById("runtime-version"),
   metricScopes: document.getElementById("metric-scopes"),
+  metricScopesCaption: document.getElementById("metric-scopes-caption"),
   metricMessages: document.getElementById("metric-messages"),
   metricEpisodes: document.getElementById("metric-episodes"),
   metricSemantics: document.getElementById("metric-semantics"),
@@ -26,6 +29,19 @@ const elements = {
   metricPending: document.getElementById("metric-pending"),
   metricEmbeddings: document.getElementById("metric-embeddings"),
   metricStorage: document.getElementById("metric-storage"),
+  policyScope: document.getElementById("policy-scope"),
+  policyWake: document.getElementById("policy-wake"),
+  policyDistill: document.getElementById("policy-distill"),
+  policyFeedback: document.getElementById("policy-feedback"),
+  policyEmbedding: document.getElementById("policy-embedding"),
+  historyImportPanel: document.getElementById("history-import-panel"),
+  historyImportSummary: document.getElementById("history-import-summary"),
+  historyImportDetail: document.getElementById("history-import-detail"),
+  historyImportProgressWrap: document.getElementById("history-import-progress-wrap"),
+  historyImportProgress: document.getElementById("history-import-progress"),
+  historyImportProgressLabel: document.getElementById("history-import-progress-label"),
+  historyPlatformSelect: document.getElementById("history-platform-select"),
+  historyImportBtn: document.getElementById("history-import-btn"),
   scopeSelect: document.getElementById("scope-select"),
   scopeMeta: document.getElementById("scope-meta"),
   refreshBtn: document.getElementById("refresh-btn"),
@@ -56,6 +72,11 @@ const elements = {
   distillLimit: document.getElementById("distill-limit"),
   distillCancel: document.getElementById("distill-cancel"),
   distillConfirm: document.getElementById("distill-confirm"),
+  historyImportDialog: document.getElementById("history-import-dialog"),
+  historyImportForm: document.getElementById("history-import-form"),
+  historyImportConfirmCopy: document.getElementById("history-import-confirm-copy"),
+  historyImportCancel: document.getElementById("history-import-cancel"),
+  historyImportConfirm: document.getElementById("history-import-confirm"),
   toastRegion: document.getElementById("toast-region"),
 };
 
@@ -132,6 +153,11 @@ function truncate(value, length = 18) {
   return text.length > length ? `${text.slice(0, length - 1)}…` : text;
 }
 
+function compactModelName(value) {
+  const text = String(value || "");
+  return text.includes("/") ? text.split("/").at(-1) : text || "未配置";
+}
+
 function showToast(message, kind = "success") {
   const toast = textElement("div", String(message), `toast ${kind}`);
   elements.toastRegion.appendChild(toast);
@@ -171,12 +197,31 @@ function renderOverview() {
   elements.metricStorage.textContent = `数据库 ${formatBytes(totals.database_bytes)}`;
   elements.runtimeVersion.textContent = `MR Memory ${overview?.version || ""}`;
 
+  const allowedUmos = runtime.allowed_umos || [];
+  elements.policyScope.textContent = allowedUmos.length
+    ? `${formatNumber(allowedUmos.length)} 个指定 UMO`
+    : "全部群";
+  elements.policyWake.textContent = !runtime.subconscious_enabled
+    ? "关闭"
+    : runtime.runtime_wake_mode === "manual_only"
+      ? "仅主 Agent 咨询"
+      : "每次主 LLM 请求";
+  elements.policyDistill.textContent = runtime.auto_distillation_enabled
+    ? `${formatNumber(runtime.auto_distillation_min_pending)} 条或 ${Math.max(0.5, Number(runtime.maintenance_interval_seconds || 0) / 60)} 分钟 · ${runtime.distillation_thinking_mode === "disabled" ? "思考关闭" : "完整思考"}`
+    : `仅手动 · ${runtime.distillation_thinking_mode === "disabled" ? "思考关闭" : "完整思考"}`;
+  elements.policyFeedback.textContent = runtime.feedback_learning_enabled
+    ? `${Math.max(1 / 60, Number(runtime.feedback_window_seconds || 0) / 3600)} 小时归因窗`
+    : "关闭";
+  elements.policyEmbedding.textContent = runtime.embedding_enabled
+    ? `${compactModelName(runtime.embedding_model_name)} · ${runtime.embedding_model_loaded ? "已加载" : "待加载"}`
+    : "关闭";
+
   const runtimeParts = ["已连接"];
   runtimeParts.push(runtime.capture_enabled ? "采集开启" : "采集关闭");
   runtimeParts.push(runtime.feedback_learning_enabled ? "反馈闭环开启" : "反馈闭环关闭");
   if (runtime.embedding_enabled) {
     if (!runtime.embedding_dependency_ready) {
-      runtimeParts.push("FastEmbed 未安装");
+      runtimeParts.push(`${runtime.embedding_backend || "Embedding"} 依赖缺失`);
     } else if (runtime.embedding_model_loaded) {
       runtimeParts.push("本地 Embedding 已加载");
     } else {
@@ -184,6 +229,110 @@ function renderOverview() {
     }
   }
   setConnection("online", runtimeParts.join(" · "));
+}
+
+function renderHistoryImport() {
+  const payload = state.historyImport || {};
+  const importState = payload.state || {};
+  const groups = (payload.groups || []).filter((group) => group.eligible);
+  const platforms = payload.platforms || [];
+  const previousPlatform = elements.historyPlatformSelect.value;
+  elements.historyPlatformSelect.replaceChildren();
+  platforms.forEach((platform) => {
+    elements.historyPlatformSelect.append(
+      new Option(
+        `${platform.platform_id} · ${platform.adapter}`,
+        platform.platform_id,
+      ),
+    );
+  });
+  const preferred = previousPlatform
+    || payload.recommended_platform_id
+    || platforms[0]?.platform_id
+    || "";
+  elements.historyPlatformSelect.value = preferred;
+  elements.historyPlatformSelect.disabled = platforms.length <= 1;
+  const platformGroupCount = Number(payload.platform_group_count || 0);
+  elements.metricScopesCaption.textContent = platformGroupCount
+    ? `物理隔离数据库 · 平台当前 ${formatNumber(platformGroupCount)} 群`
+    : "物理隔离数据库";
+
+  if (!payload.available) {
+    elements.historyImportSummary.textContent = "未检测到 AngelEye 群聊历史缓存。";
+    elements.historyImportDetail.textContent = payload.platform_group_count
+      ? `平台当前加入 ${formatNumber(payload.platform_group_count)} 个群；新消息仍会按当前采集设置进入 MR Memory。`
+      : "新消息仍会按当前采集设置进入 MR Memory。";
+    elements.historyImportBtn.disabled = true;
+    elements.historyImportProgressWrap.classList.add("hidden");
+    return;
+  }
+
+  const sourceMessages = Number(payload.source_messages || 0);
+  const targetMessages = Number(payload.target_messages || 0);
+  const caughtUp = sourceMessages > 0 && targetMessages >= sourceMessages;
+  const unfinishedSources = groups.filter((group) => !group.history_exhausted).length;
+  const uncachedGroupCount = Number(payload.uncached_group_count || 0);
+  elements.historyImportSummary.textContent =
+    `AngelEye 仅有 ${formatNumber(groups.length)} 个群的按需缓存，共 ${formatNumber(sourceMessages)} 条；MR 当前已有 ${formatNumber(targetMessages)} 条。`;
+  const groupSummary = groups
+    .map((group) => `${group.group_id}: ${formatNumber(group.source_messages)}→${formatNumber(group.target_messages)}`)
+    .join(" · ");
+  elements.historyImportDetail.textContent = [
+    groupSummary,
+    unfinishedSources
+      ? `${formatNumber(unfinishedSources)} 个 AngelEye 缓存仍未标记为完整历史`
+      : "AngelEye 已标记历史覆盖完成",
+    platformGroupCount
+      ? `平台实际加入 ${formatNumber(platformGroupCount)} 个群；另 ${formatNumber(uncachedGroupCount)} 个群没有 AngelEye 旧历史，但新消息仍由 MR 按当前范围实时采集`
+      : "",
+  ].filter(Boolean).join(" · ");
+
+  const running = importState.status === "RUNNING";
+  const total = Number(importState.total || sourceMessages || 0);
+  const processed = Number(importState.processed || 0);
+  const percent = total > 0 ? Math.min(100, (processed / total) * 100) : 0;
+  elements.historyImportProgress.value = percent;
+  elements.historyImportProgressLabel.textContent =
+    `${percent.toFixed(1)}% · ${formatNumber(processed)}/${formatNumber(total)}`;
+  elements.historyImportProgressWrap.classList.toggle(
+    "hidden",
+    !running && !["COMPLETED", "FAILED", "CANCELLED"].includes(importState.status),
+  );
+  elements.historyImportBtn.disabled = running || !preferred || sourceMessages <= 0;
+  elements.historyImportBtn.textContent = running
+    ? `正在导入群 ${importState.current_group_id || "…"}`
+    : importState.status === "COMPLETED"
+      ? "同步新增历史"
+      : caughtUp
+        ? "已导入 · 检查新增"
+        : "导入已有历史";
+  if (importState.status === "FAILED") {
+    elements.historyImportDetail.textContent += ` · 上次失败：${importState.error || "未知错误"}`;
+  } else if (importState.status === "COMPLETED") {
+    elements.historyImportDetail.textContent +=
+      ` · 上次导入新增 ${formatNumber(importState.inserted)} 条，跳过 ${formatNumber(importState.skipped)} 条异常记录`;
+  }
+}
+
+async function refreshHistoryImport({ refreshEverythingOnCompletion = false } = {}) {
+  const previousStatus = state.historyImport?.state?.status || "";
+  state.historyImport = await apiGet("history-import/status");
+  renderHistoryImport();
+  const currentStatus = state.historyImport?.state?.status || "";
+  if (currentStatus === "RUNNING") {
+    window.clearTimeout(state.historyImportPollTimer);
+    state.historyImportPollTimer = window.setTimeout(
+      () => refreshHistoryImport({ refreshEverythingOnCompletion: true }),
+      3000,
+    );
+  } else if (
+    refreshEverythingOnCompletion
+    && previousStatus === "RUNNING"
+    && currentStatus === "COMPLETED"
+  ) {
+    showToast("历史迁移完成，正在刷新群范围与待整理队列。");
+    await refreshOverview({ preserveSelection: true, loadScope: true });
+  }
 }
 
 function populateScopes(previousScopeId = "") {
@@ -197,7 +346,9 @@ function populateScopes(previousScopeId = "") {
     state.scopeId = "";
     state.participants = [];
     renderParticipants([]);
-    elements.scopeMeta.textContent = "启用采集并收到群消息后，此处会出现独立群范围。";
+    elements.scopeMeta.textContent = state.historyImport?.available
+      ? "可先从“现有群聊历史”导入；新群消息也会自动建立独立范围。"
+      : "启用采集并收到群消息后，此处会出现独立群范围。";
     showEmptyGraph();
     return;
   }
@@ -247,8 +398,12 @@ async function refreshOverview({ preserveSelection = true, loadScope = true } = 
   elements.refreshBtn.disabled = true;
   setConnection("loading", "正在同步运行状态");
   try {
-    state.overview = await apiGet("overview");
+    [state.overview, state.historyImport] = await Promise.all([
+      apiGet("overview"),
+      apiGet("history-import/status"),
+    ]);
     renderOverview();
+    renderHistoryImport();
     populateScopes(previousScopeId);
     if (loadScope && state.scopeId) {
       await loadSelectedScope();
@@ -258,6 +413,13 @@ async function refreshOverview({ preserveSelection = true, loadScope = true } = 
     showToast(error?.message || "无法读取 MR Memory 状态", "error");
   } finally {
     elements.refreshBtn.disabled = false;
+  }
+  if (state.historyImport?.state?.status === "RUNNING") {
+    window.clearTimeout(state.historyImportPollTimer);
+    state.historyImportPollTimer = window.setTimeout(
+      () => refreshHistoryImport({ refreshEverythingOnCompletion: true }),
+      3000,
+    );
   }
 }
 
@@ -894,6 +1056,59 @@ function bindEvents() {
       showToast(error?.message || "别名绑定失败", "error");
     } finally {
       submit.disabled = false;
+    }
+  });
+  elements.historyImportBtn.addEventListener("click", () => {
+    const payload = state.historyImport || {};
+    const groups = (payload.groups || []).filter((group) => group.eligible);
+    elements.historyImportConfirmCopy.textContent =
+      `将 ${formatNumber(payload.source_messages)} 条历史消息从 ${formatNumber(groups.length)} 个群导入平台实例 ${elements.historyPlatformSelect.value}。每个群仍使用独立数据库，已有消息按平台消息 ID 幂等去重。`;
+    elements.historyImportDialog.showModal();
+  });
+  elements.historyPlatformSelect.addEventListener("change", async () => {
+    const platformId = elements.historyPlatformSelect.value;
+    try {
+      state.historyImport = await apiGet("history-import/status", {
+        platform_id: platformId,
+      });
+      renderHistoryImport();
+    } catch (error) {
+      showToast(error?.message || "无法读取该平台的历史范围", "error");
+    }
+  });
+  elements.historyImportCancel.addEventListener("click", (event) => {
+    event.preventDefault();
+    elements.historyImportDialog.close();
+  });
+  elements.historyImportForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    elements.historyImportConfirm.click();
+  });
+  elements.historyImportConfirm.addEventListener("click", async (event) => {
+    event.preventDefault();
+    const platformId = elements.historyPlatformSelect.value;
+    if (!platformId) return;
+    elements.historyImportConfirm.disabled = true;
+    elements.historyImportCancel.disabled = true;
+    elements.historyImportConfirm.textContent = "正在启动…";
+    try {
+      const importState = await apiPost("history-import/start", {
+        platform_id: platformId,
+      });
+      state.historyImport = {
+        ...(state.historyImport || {}),
+        state: importState,
+      };
+      elements.historyImportDialog.close();
+      renderHistoryImport();
+      showToast("历史迁移已启动；可关闭页面，任务会在插件后台继续。");
+      await refreshHistoryImport({ refreshEverythingOnCompletion: true });
+    } catch (error) {
+      showToast(error?.message || "历史迁移启动失败", "error");
+    } finally {
+      elements.historyImportConfirm.disabled = false;
+      elements.historyImportCancel.disabled = false;
+      elements.historyImportConfirm.textContent = "开始导入";
     }
   });
   elements.distillBtn.addEventListener("click", () => {

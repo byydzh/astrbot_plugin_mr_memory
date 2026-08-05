@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.12.1
+
+- Initialize tool visibility, maintenance workers, provider checks, and saved
+  distillation queues on both cold startup and zero-restart plugin reload.
+- Discover existing per-group databases after reload so pending historical
+  construction resumes without waiting for a new message in each group.
+- Distinguish the full OneBot group inventory from AngelEye's on-demand cache;
+  the console now labels the number of materialized MR databases separately
+  from the actual joined-group count and reports how many groups have no cached
+  history source.
+- Give background construction and feedback maintenance their own 300-second
+  timeout while keeping the interactive reconstruction timeout at 45 seconds.
+- Keep DeepSeek V4 construction thinking enabled by default and consume its stream
+  so long reasoning calls are not mistaken for a dead non-streaming request. The
+  setting remains explicit for diagnostics instead of silently downgrading the model.
+- Bound construction to 40 source messages and a non-constraining 32768 output-token
+  safety ceiling; concise graph-unit counts and the per-group daily ledger control
+  cost while normal calls stop naturally.
+- Work around AstrBot 4.27.1's dropped OpenAI-provider generation kwargs inside
+  the plugin, without patching AstrBot core or changing the selected Provider.
+- Retry terminal maintenance jobs only on explicit runtime bootstrap, so a
+  fixed deployment recovers old failures without creating an infinite sweep loop.
+- Requeue messages that exhausted their three construction attempts only at that
+  same explicit reload boundary, including small groups with no ordinary pending
+  messages left.
+- Log only response lengths, token counts, and elapsed time for construction so
+  provider-mode failures are diagnosable without exposing group-chat content.
+- Retry deterministic JSON/evidence validation once with a bounded repair request;
+  strict host validation remains unchanged and repeated blind maintenance retries
+  are avoided.
+- Deterministically discard isolated invalid optional graph units, re-run the same
+  strict validator, and audit any newly uncovered raw evidence instead of failing
+  an otherwise useful 40-message batch.
+- Verify the exact 40-message production prompt with thinking enabled: the model
+  stopped naturally after 22,094 completion tokens and about 200 seconds; the host
+  then rejected one unsafe participant binding without weakening identity rules.
+
+## 0.12.0
+
+- Make the local embedding backend and model first-class settings instead of
+  hiding the selected model behind a boolean switch.
+- Expose the actual runtime triggers: automatic wake on every main-LLM request
+  versus tool-only consultation, message-count construction threshold, maximum
+  construction delay, feedback attribution window, and the high-level consult
+  bridge.
+- Correct UMO guidance to use the platform *instance* ID rather than the adapter
+  type. An empty scope list explicitly means all groups.
+- Add a read-only AngelEye history detector and a background, idempotent,
+  group-isolated import flow. The console shows source coverage, target counts,
+  platform mapping, progress, malformed-row skips, and the LLM cost boundary
+  before starting.
+- Show the effective scope, wake, construction, feedback, and embedding policies
+  in the console instead of requiring users to infer them from hidden defaults.
+
 ## 0.11.0
 
 - Persist explicit `HYPOTHESIS`, `SUPPORTED`, `CONTESTED`, and `CONFIRMED`
