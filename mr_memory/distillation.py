@@ -8,6 +8,7 @@ from typing import Any
 from .embedding import EmbeddingBackend
 from .identity import sanitize_components
 from .models import StoredMessage
+from .plasticity import GraphMutation, parse_graph_mutation
 from .storage import MemoryStorage
 
 
@@ -31,6 +32,16 @@ Security and identity rules:
 7. Context messages explain a boundary. Every returned episode and claim must cite at
    least one target_source_key, so overlap context is not reprocessed by itself.
 8. SUPERSEDE or RETRACT may reference only claim IDs supplied in active_claims.
+9. Attachment reference hashes are opaque recurrence anchors. Never infer visual or
+   file contents from a hash, filename, frequency, or nearby text alone.
+10. associations are only for durable group-local meanings, euphemisms, irony,
+   symbols, habits, and reusable paths. Preserve plausible competing readings as
+   separate HYPOTHESIS or CONTESTED edges with an explicit uncertainty note. Do not
+   force one interpretation merely to make the graph tidy. Reuse the exact active
+   relation definition from identity_context.relation_types when its key applies.
+   Use upsert_edge for a new path. To change the epistemic state, statement, or
+   uncertainty of an ID in identity_context.existing_associations, use revise_edge
+   with that edge_id; a repeated upsert deliberately does not rewrite those fields.
 
 Schema:
 {
@@ -65,13 +76,30 @@ Schema:
     "summary": "shared pattern",
     "episode_indices": [0]
   }],
+  "associations": [{
+    "operation": "upsert_edge",
+    "evidence_source_keys": ["exact source_key"],
+    "confidence": 0.0,
+    "utility_delta": 0.0,
+    "statement": "bounded evidence-grounded association",
+    "epistemic_state": "HYPOTHESIS|SUPPORTED|CONTESTED|CONFIRMED",
+    "uncertainty": "what evidence or alternative reading remains unresolved",
+    "source": {"kind": "concept|behavior|symbol|topic|preference|procedure", "label": "...", "description": "..."},
+    "relation": {"key": "stable_ascii_key", "name": "...", "description": "...", "source_kinds": ["symbol"], "target_kinds": ["concept"], "inverse_key": "", "symmetric": false, "risk_class": "normal"},
+    "target": {"kind": "concept|behavior|symbol|topic|preference|procedure", "label": "...", "description": "..."}
+  }],
   "ignored": [{
     "source_key": "an otherwise uncited target_source_key",
     "reason": "brief evidence-grounded reason it creates no durable memory"
   }]
 }
-Every target_source_key must be cited by an episode or claim, or appear exactly once
-in ignored. This coverage ledger prevents silently dropping target messages.
+Every target_source_key must be cited by an episode, claim, or association, or appear
+exactly once in ignored. A revise_edge association
+has the compact shape {"operation":"revise_edge","edge_id":1,
+"evidence_source_keys":["..."],"confidence":0.0,"utility_delta":0.0,
+"statement":"...","epistemic_state":"HYPOTHESIS|SUPPORTED|CONTESTED|CONFIRMED",
+"uncertainty":"..."}. This coverage ledger prevents silently dropping target
+messages.
 """
 
 
@@ -135,6 +163,7 @@ class DistillationBatch:
     episodes: tuple[EpisodeDraft, ...]
     semantic_memories: tuple[SemanticDraft, ...]
     topics: tuple[TopicDraft, ...]
+    associations: tuple[GraphMutation, ...] = ()
     target_source_keys: tuple[str, ...] = ()
     ignored_sources: tuple[IgnoredSourceDraft, ...] = ()
 
@@ -151,6 +180,7 @@ class PersistedDistillation:
     episode_ids: tuple[int, ...]
     semantic_ids: tuple[int, ...]
     topic_ids: tuple[int, ...]
+    plastic_edge_ids: tuple[int, ...]
     index_documents: tuple[IndexDocument, ...]
 
 
@@ -304,6 +334,9 @@ def parse_distillation_response(
         value.get(semantic_field, []), semantic_field, max_items=128
     )
     raw_topics = _list(value.get("topics", []), "topics", max_items=64)
+    raw_associations = _list(
+        value.get("associations", []), "associations", max_items=32
+    )
     raw_ignored = _list(value.get("ignored", []), "ignored", max_items=500)
 
     episodes: list[EpisodeDraft] = []
@@ -609,6 +642,27 @@ def parse_distillation_response(
             )
         )
 
+    associations: list[GraphMutation] = []
+    for index, raw in enumerate(raw_associations):
+        try:
+            mutation = parse_graph_mutation(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"associations[{index}] is invalid: {exc}") from exc
+        if mutation.operation not in {"upsert_edge", "revise_edge"}:
+            raise ValueError(
+                f"associations[{index}] may only use upsert_edge or revise_edge"
+            )
+        unknown = set(mutation.evidence_source_keys) - set(source_map)
+        if unknown:
+            raise ValueError(
+                f"associations[{index}] invented source keys: {sorted(unknown)}"
+            )
+        if target_keys.isdisjoint(mutation.evidence_source_keys):
+            raise ValueError(
+                f"associations[{index}] cites only overlap context, not a target"
+            )
+        associations.append(mutation)
+
     ignored_sources: list[IgnoredSourceDraft] = []
     ignored_keys: set[str] = set()
     for index, raw in enumerate(raw_ignored):
@@ -649,6 +703,12 @@ def parse_distillation_response(
         for evidence in semantic.evidence
         if evidence.source_key in target_keys
     )
+    cited_targets.update(
+        source_key
+        for association in associations
+        for source_key in association.evidence_source_keys
+        if source_key in target_keys
+    )
     overlap = cited_targets & ignored_keys
     if overlap:
         raise ValueError(
@@ -665,6 +725,7 @@ def parse_distillation_response(
         episodes=tuple(episodes),
         semantic_memories=tuple(semantics),
         topics=tuple(topics),
+        associations=tuple(associations),
         target_source_keys=tuple(target_keys),
         ignored_sources=tuple(ignored_sources),
     )
@@ -679,6 +740,7 @@ def persist_distillation(
     episode_ids: list[int] = []
     semantic_ids: list[int] = []
     topic_ids: list[int] = []
+    plastic_edge_ids: list[int] = []
     documents: dict[tuple[str, str], IndexDocument] = {}
 
     for episode in batch.episodes:
@@ -788,10 +850,21 @@ def persist_distillation(
             text=f"{topic.name}\n{topic.summary}",
         )
 
+    for association in batch.associations:
+        result = storage.apply_graph_mutation(
+            umo=batch.umo,
+            mutation=association,
+            model=extractor_version,
+            allowed_evidence_keys=set(association.evidence_source_keys),
+        )
+        if result.get("target_type") == "edge" and result.get("target_id"):
+            plastic_edge_ids.append(int(result["target_id"]))
+
     return PersistedDistillation(
         episode_ids=tuple(episode_ids),
         semantic_ids=tuple(semantic_ids),
         topic_ids=tuple(topic_ids),
+        plastic_edge_ids=tuple(dict.fromkeys(plastic_edge_ids)),
         index_documents=tuple(documents.values()),
     )
 
@@ -804,6 +877,19 @@ async def index_distillation(
     backend: EmbeddingBackend,
 ) -> int:
     documents = list(persisted.index_documents)
+    for edge_id in persisted.plastic_edge_ids:
+        document = storage.plastic_edge_embedding_document(
+            umo=umo,
+            edge_id=edge_id,
+        )
+        if document is not None:
+            documents.append(
+                IndexDocument(
+                    owner_type="plastic_edge",
+                    owner_key=str(document["owner_key"]),
+                    text=str(document["text"]),
+                )
+            )
     documents.extend(
         IndexDocument(
             owner_type="participant",

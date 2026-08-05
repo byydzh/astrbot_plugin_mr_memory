@@ -11,12 +11,20 @@ from typing import Any, Literal, Mapping
 
 GraphMutationOperation = Literal[
     "upsert_edge",
+    "revise_edge",
     "reinforce_edge",
     "inhibit_edge",
     "retire_edge",
     "revise_relation",
     "deprecate_relation",
     "merge_nodes",
+]
+
+PlasticEpistemicState = Literal[
+    "HYPOTHESIS",
+    "SUPPORTED",
+    "CONTESTED",
+    "CONFIRMED",
 ]
 
 PlasticNodeKind = Literal[
@@ -39,6 +47,12 @@ _ALLOWED_NODE_KINDS = {
     "preference",
     "procedure",
 }
+_ALLOWED_EPISTEMIC_STATES = {
+    "HYPOTHESIS",
+    "SUPPORTED",
+    "CONTESTED",
+    "CONFIRMED",
+}
 
 
 PLASTIC_GRAPH_MAINTENANCE_PROMPT = """You maintain a group-scoped plastic
@@ -51,6 +65,15 @@ the existing graph before inventing a relation type. Prefer reinforcing or revis
 an existing relation over creating synonyms. A relation revision creates a new
 version; old meanings remain auditable. Negative feedback should usually inhibit a
 path before retiring it. Never use a model-created edge as evidence for itself.
+
+Epistemic state is explicit and is never derived from an embedding threshold:
+- HYPOTHESIS: one plausible reading with material doubt.
+- SUPPORTED: contextual evidence supports it, but alternatives remain possible.
+- CONTESTED: incompatible readings have live evidence; keep the alternatives.
+- CONFIRMED: direct human clarification or unusually explicit evidence confirms it.
+For slang, euphemism, irony, reclaimed insults, and jokes, preserve uncertainty and
+competing edges instead of collapsing them into one sanitized summary. Use
+revise_edge when later evidence changes the state, statement, or uncertainty note.
 
 Every mutation must cite exact source keys from the current maintenance evidence.
 Factual confidence and retrieval utility are different: usefulness feedback changes
@@ -255,6 +278,8 @@ class GraphMutation:
     confidence: float
     utility_delta: float
     statement: str = ""
+    epistemic_state: PlasticEpistemicState | None = None
+    uncertainty: str = ""
     source: PlasticNodeProposal | None = None
     target: PlasticNodeProposal | None = None
     relation: RelationTypeProposal | None = None
@@ -291,6 +316,8 @@ class GraphMutation:
             "confidence": self.confidence,
             "utility_delta": self.utility_delta,
             "statement": self.statement,
+            "epistemic_state": self.epistemic_state,
+            "uncertainty": self.uncertainty,
             "source": node_value(self.source),
             "target": node_value(self.target),
             "relation": relation_value,
@@ -320,6 +347,7 @@ def parse_graph_mutation(value: str | Mapping[str, Any]) -> GraphMutation:
     ).casefold()
     supported = {
         "upsert_edge",
+        "revise_edge",
         "reinforce_edge",
         "inhibit_edge",
         "retire_edge",
@@ -370,6 +398,9 @@ def parse_graph_mutation(value: str | Mapping[str, Any]) -> GraphMutation:
             raise ValueError("source node kind is outside the relation schema")
         if target.kind not in relation.target_kinds:
             raise ValueError("target node kind is outside the relation schema")
+    elif operation == "revise_edge":
+        if edge_id is None:
+            raise ValueError("revise_edge requires edge_id")
     elif operation == "revise_relation":
         relation = RelationTypeProposal.from_value(raw.get("relation"))
     elif operation == "deprecate_relation":
@@ -407,12 +438,37 @@ def parse_graph_mutation(value: str | Mapping[str, Any]) -> GraphMutation:
         if source_node_key == target_node_key:
             raise ValueError("cannot merge a node into itself")
 
+    raw_epistemic_state = _bounded_text(
+        raw.get("epistemic_state"), "epistemic_state", limit=24
+    ).upper()
+    epistemic_state: PlasticEpistemicState | None = None
+    if raw_epistemic_state:
+        if raw_epistemic_state not in _ALLOWED_EPISTEMIC_STATES:
+            raise ValueError("epistemic_state is invalid")
+        epistemic_state = raw_epistemic_state  # type: ignore[assignment]
+    if operation == "upsert_edge" and epistemic_state is None:
+        epistemic_state = "HYPOTHESIS"
+    if operation == "revise_edge" and epistemic_state is None:
+        raise ValueError("revise_edge requires epistemic_state")
+    uncertainty = _bounded_text(
+        raw.get("uncertainty"), "uncertainty", limit=1200
+    )
+    if epistemic_state in {"HYPOTHESIS", "CONTESTED"} and not uncertainty:
+        if operation == "upsert_edge" and not raw_epistemic_state:
+            uncertainty = "The evidence does not yet settle this association."
+        else:
+            raise ValueError(
+                "uncertain or contested edges require an explicit uncertainty note"
+            )
+
     return GraphMutation(
         operation=operation,  # type: ignore[arg-type]
         evidence_source_keys=evidence,
         confidence=confidence,
         utility_delta=utility_delta,
         statement=_bounded_text(raw.get("statement"), "statement", limit=1200),
+        epistemic_state=epistemic_state,
+        uncertainty=uncertainty,
         source=source,
         target=target,
         relation=relation,

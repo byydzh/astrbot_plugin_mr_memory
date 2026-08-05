@@ -375,6 +375,13 @@ class MemoryService:
             self.storage.query_plastic_associations, **kwargs
         )
 
+    async def query_media_patterns(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.query_media_patterns, **kwargs
+        )
+
     async def activate_plastic_edges(
         self, **kwargs: object
     ) -> list[dict[str, object]]:

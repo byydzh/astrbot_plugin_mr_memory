@@ -135,6 +135,111 @@ class PlasticGraphTests(unittest.TestCase):
             2,
         )
 
+    def test_competing_meanings_keep_doubt_until_evidence_revision(self) -> None:
+        first = self.message("e-1", "鉴定为好女孩", sent_at=100)
+        second = self.message("e-2", "这里的好女孩是不是反话？", sent_at=110)
+        correction = self.message(
+            "e-3", "对，好女孩在这里就是拿臭婊子开玩笑", sent_at=120
+        )
+        for message in (first, second, correction):
+            self.storage.upsert_message(message)
+
+        base = self.edge_payload(first.resolved_source_key())
+        base.update(
+            {
+                "epistemic_state": "HYPOTHESIS",
+                "uncertainty": "可能是反话，也可能只是戏谑性的夸奖。",
+            }
+        )
+        praise = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(base),
+        )
+        euphemism = dict(base)
+        euphemism.update(
+            {
+                "evidence_source_keys": [second.resolved_source_key()],
+                "statement": "‘好女孩’可能是对‘臭婊子’的群内委婉反称。",
+                "relation": {
+                    "key": "possible_euphemism_for",
+                    "name": "可能委婉指代",
+                    "description": "群聊表达可能委婉或反向指代另一表达",
+                    "source_kinds": ["symbol"],
+                    "target_kinds": ["concept"],
+                },
+                "target": {
+                    "kind": "concept",
+                    "label": "臭婊子",
+                    "description": "可能被重新引义的冒犯性原词",
+                },
+            }
+        )
+        candidate = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(euphemism),
+        )
+        rows = self.storage.query_plastic_associations(
+            umo=self.umo, query="好女孩"
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["epistemic_state"] for row in rows}, {"HYPOTHESIS"}
+        )
+        self.assertTrue(all(row["uncertainty"] for row in rows))
+
+        revised = parse_graph_mutation(
+            {
+                "operation": "revise_edge",
+                "edge_id": candidate["target_id"],
+                "evidence_source_keys": [correction.resolved_source_key()],
+                "confidence": 0.94,
+                "utility_delta": 0.2,
+                "statement": "‘好女孩’在该段群聊中是对‘臭婊子’的玩笑式反称。",
+                "epistemic_state": "CONFIRMED",
+                "uncertainty": "",
+            }
+        )
+        result = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=revised,
+        )
+        self.assertEqual(result["epistemic_state"], "CONFIRMED")
+        refreshed = {
+            row["id"]: row
+            for row in self.storage.query_plastic_associations(
+                umo=self.umo, query="好女孩"
+            )
+        }
+        self.assertEqual(
+            refreshed[int(candidate["target_id"])]["epistemic_state"],
+            "CONFIRMED",
+        )
+        self.assertEqual(
+            refreshed[int(praise["target_id"])]["epistemic_state"],
+            "HYPOTHESIS",
+        )
+        repeated = dict(euphemism)
+        repeated["evidence_source_keys"] = [correction.resolved_source_key()]
+        repeated["confidence"] = 0.4
+        repeated["uncertainty"] = "一次较弱的新推测不应覆盖显式修订。"
+        self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(repeated),
+        )
+        still_confirmed = {
+            row["id"]: row
+            for row in self.storage.query_plastic_associations(
+                umo=self.umo, query="好女孩"
+            )
+        }
+        self.assertEqual(
+            still_confirmed[int(candidate["target_id"])]["epistemic_state"],
+            "CONFIRMED",
+        )
+        self.assertEqual(
+            still_confirmed[int(candidate["target_id"])]["uncertainty"], ""
+        )
+
     def test_cross_group_or_uninspected_evidence_is_rejected(self) -> None:
         evidence = self.message("e-1", "好女孩", sent_at=100)
         self.storage.upsert_message(evidence)

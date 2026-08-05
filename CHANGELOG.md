@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.0
+
+- Persist explicit `HYPOTHESIS`, `SUPPORTED`, `CONTESTED`, and `CONFIRMED`
+  states plus an uncertainty note on learned association edges. A repeated upsert
+  cannot silently overwrite the epistemic state; later evidence must use the
+  auditable `revise_edge` operation.
+- Let ordinary incremental construction create new group-local association
+  hypotheses and revise existing ones, so semantic learning is not limited to
+  feedback on a Bot response. Competing interpretations remain separate graph paths.
+- Add a bounded per-group repeated-media index that stores only adapter reference
+  hashes, counts, sender cardinality, and a tiny source-key reservoir. No media bytes,
+  URLs, OCR, captions, or automatic vision calls are retained.
+- Give the private agent a read-only repeated-media context tool and explicitly ban
+  visual inference from opaque hashes. The console renders unresolved association
+  paths as dashed lines and exposes their uncertainty in the inspector.
+- Reduce the normal settings surface to seven operational choices. Low-level tuning
+  remains schema-backed for compatibility but is hidden from the dashboard.
+
 ## 0.10.0
 
 - Add a group-scoped plastic association graph for learned meanings, symbols,

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -40,8 +41,10 @@ from .plasticity import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 TRUTH_V2_BACKFILL_VERSION = 8
+MEDIA_HEAVY_HITTER_LIMIT = 512
+MEDIA_SAMPLE_SOURCE_LIMIT = 8
 
 
 class MemoryStorage:
@@ -225,6 +228,24 @@ class MemoryStorage:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (message_id, position)
                 );
+
+                CREATE TABLE IF NOT EXISTS media_fingerprints (
+                    umo TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    reference_sha256 TEXT NOT NULL,
+                    observation_count INTEGER NOT NULL DEFAULT 0,
+                    unique_sender_count INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    sample_source_keys_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (umo, media_type, reference_sha256)
+                );
+                CREATE INDEX IF NOT EXISTS idx_media_fingerprints_rank
+                    ON media_fingerprints (
+                        umo, observation_count DESC,
+                        unique_sender_count DESC, last_seen_at DESC
+                    );
 
                 CREATE INDEX IF NOT EXISTS idx_messages_umo_time
                     ON messages (umo, sent_at, id);
@@ -696,6 +717,8 @@ class MemoryStorage:
                         REFERENCES plastic_nodes(id),
                     statement TEXT NOT NULL DEFAULT '',
                     epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    epistemic_state TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                    uncertainty TEXT NOT NULL DEFAULT '',
                     utility REAL NOT NULL DEFAULT 0,
                     activation_count INTEGER NOT NULL DEFAULT 0,
                     support_count INTEGER NOT NULL DEFAULT 0,
@@ -851,6 +874,16 @@ class MemoryStorage:
                 "candidate_reason",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            ensure_column(
+                "plastic_edges",
+                "epistemic_state",
+                "TEXT NOT NULL DEFAULT 'HYPOTHESIS'",
+            )
+            ensure_column(
+                "plastic_edges",
+                "uncertainty",
+                "TEXT NOT NULL DEFAULT ''",
+            )
             self._connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_stable_key
@@ -905,6 +938,24 @@ class MemoryStorage:
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value
                     """,
                     (str(TRUTH_V2_BACKFILL_VERSION),),
+                )
+            media_backfill = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='media_index_backfill'"
+            ).fetchone()
+            if media_backfill is None or str(media_backfill["value"]) != "10":
+                scopes = self._connection.execute(
+                    "SELECT DISTINCT umo FROM messages WHERE umo <> ''"
+                ).fetchall()
+                for scope in scopes:
+                    self._rebuild_media_fingerprints_locked(
+                        umo=str(scope["umo"])
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('media_index_backfill', '10')
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """
                 )
             # A process kill or cancellation can occur after a batch claims rows but
             # before its normal completion handler runs. Recover those rows on every
@@ -1088,6 +1139,142 @@ class MemoryStorage:
             return []
         return [item for item in parsed if isinstance(item, dict)]
 
+    def _refresh_media_fingerprints_locked(
+        self,
+        *,
+        umo: str,
+        fingerprints: Iterable[tuple[str, str]],
+    ) -> None:
+        """Maintain a bounded exact-reference heavy-hitter index.
+
+        The source-of-truth attachment rows contain only type/name/reference hashes.
+        This index stores aggregate counts and a tiny source-key reservoir; it never
+        stores media bytes, URLs, local paths, OCR, captions, or model output.
+        """
+
+        pairs = tuple(
+            dict.fromkeys(
+                (
+                    str(media_type or "").strip().casefold(),
+                    str(reference_sha256 or "").strip().casefold(),
+                )
+                for media_type, reference_sha256 in fingerprints
+                if str(media_type or "").strip()
+                and re.fullmatch(
+                    r"[0-9a-fA-F]{64}", str(reference_sha256 or "").strip()
+                )
+            )
+        )
+        for media_type, reference_sha256 in pairs:
+            aggregate = self._connection.execute(
+                """
+                SELECT COUNT(*) AS observations,
+                       COUNT(DISTINCT m.sender_id) AS unique_senders,
+                       MIN(m.sent_at) AS first_seen_at,
+                       MAX(m.sent_at) AS last_seen_at
+                FROM message_attachments AS a
+                JOIN messages AS m ON m.id=a.message_id
+                WHERE m.umo=? AND m.is_deleted=0
+                  AND a.attachment_type=? AND a.reference_sha256=?
+                """,
+                (umo, media_type, reference_sha256),
+            ).fetchone()
+            observations = int(aggregate["observations"] or 0)
+            if observations <= 0:
+                self._connection.execute(
+                    """
+                    DELETE FROM media_fingerprints
+                    WHERE umo=? AND media_type=? AND reference_sha256=?
+                    """,
+                    (umo, media_type, reference_sha256),
+                )
+                continue
+            samples = self._connection.execute(
+                """
+                SELECT DISTINCT m.source_key, m.sent_at, m.id
+                FROM message_attachments AS a
+                JOIN messages AS m ON m.id=a.message_id
+                WHERE m.umo=? AND m.is_deleted=0
+                  AND a.attachment_type=? AND a.reference_sha256=?
+                ORDER BY m.sent_at DESC, m.id DESC LIMIT ?
+                """,
+                (
+                    umo,
+                    media_type,
+                    reference_sha256,
+                    MEDIA_SAMPLE_SOURCE_LIMIT,
+                ),
+            ).fetchall()
+            sample_keys = [str(row["source_key"]) for row in samples]
+            self._connection.execute(
+                """
+                INSERT INTO media_fingerprints(
+                    umo, media_type, reference_sha256, observation_count,
+                    unique_sender_count, first_seen_at, last_seen_at,
+                    sample_source_keys_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(umo, media_type, reference_sha256) DO UPDATE SET
+                    observation_count=excluded.observation_count,
+                    unique_sender_count=excluded.unique_sender_count,
+                    first_seen_at=excluded.first_seen_at,
+                    last_seen_at=excluded.last_seen_at,
+                    sample_source_keys_json=excluded.sample_source_keys_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    umo,
+                    media_type,
+                    reference_sha256,
+                    observations,
+                    int(aggregate["unique_senders"] or 0),
+                    int(aggregate["first_seen_at"] or 0),
+                    int(aggregate["last_seen_at"] or 0),
+                    json.dumps(sample_keys, separators=(",", ":")),
+                ),
+            )
+        self._connection.execute(
+            """
+            DELETE FROM media_fingerprints
+            WHERE rowid IN (
+                SELECT rowid FROM media_fingerprints
+                WHERE umo=?
+                ORDER BY observation_count DESC, unique_sender_count DESC,
+                         last_seen_at DESC, reference_sha256
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (umo, MEDIA_HEAVY_HITTER_LIMIT),
+        )
+
+    def _rebuild_media_fingerprints_locked(self, *, umo: str) -> None:
+        self._connection.execute(
+            "DELETE FROM media_fingerprints WHERE umo=?", (umo,)
+        )
+        rows = self._connection.execute(
+            """
+            SELECT a.attachment_type, a.reference_sha256,
+                   COUNT(*) AS observations,
+                   COUNT(DISTINCT m.sender_id) AS unique_senders,
+                   MAX(m.sent_at) AS last_seen_at
+            FROM message_attachments AS a
+            JOIN messages AS m ON m.id=a.message_id
+            WHERE m.umo=? AND m.is_deleted=0
+              AND a.reference_sha256 <> ''
+            GROUP BY a.attachment_type, a.reference_sha256
+            ORDER BY observations DESC, unique_senders DESC,
+                     last_seen_at DESC, a.reference_sha256
+            LIMIT ?
+            """,
+            (umo, MEDIA_HEAVY_HITTER_LIMIT),
+        ).fetchall()
+        self._refresh_media_fingerprints_locked(
+            umo=umo,
+            fingerprints=(
+                (str(row["attachment_type"]), str(row["reference_sha256"]))
+                for row in rows
+            ),
+        )
+
     def _refresh_message_links_locked(
         self,
         *,
@@ -1100,6 +1287,17 @@ class MemoryStorage:
         sent_at: int,
         content: list[dict[str, object]],
     ) -> None:
+        previous_media = {
+            (str(row["attachment_type"]), str(row["reference_sha256"]))
+            for row in self._connection.execute(
+                """
+                SELECT attachment_type, reference_sha256
+                FROM message_attachments
+                WHERE message_id=? AND reference_sha256 <> ''
+                """,
+                (int(message_id),),
+            ).fetchall()
+        }
         self._connection.execute(
             "DELETE FROM message_participants WHERE message_id = ?",
             (int(message_id),),
@@ -1229,7 +1427,8 @@ class MemoryStorage:
                     (int(message_id), int(target_participant_id)),
                 )
 
-        for attachment in attachment_metadata(content):
+        attachments = attachment_metadata(content)
+        for attachment in attachments:
             self._connection.execute(
                 """
                 INSERT INTO message_attachments(
@@ -1245,6 +1444,15 @@ class MemoryStorage:
                     str(attachment["reference_sha256"]),
                 ),
             )
+        current_media = {
+            (str(item["kind"]), str(item["reference_sha256"]))
+            for item in attachments
+            if str(item["reference_sha256"])
+        }
+        self._refresh_media_fingerprints_locked(
+            umo=umo,
+            fingerprints=previous_media | current_media,
+        )
 
     def _backfill_truth_v2(self) -> None:
         rows = self._connection.execute(
@@ -1698,6 +1906,17 @@ class MemoryStorage:
             if row is None or int(row["is_deleted"] or 0):
                 return False
             message_id = int(row["id"])
+            media_pairs = {
+                (str(item["attachment_type"]), str(item["reference_sha256"]))
+                for item in self._connection.execute(
+                    """
+                    SELECT attachment_type, reference_sha256
+                    FROM message_attachments
+                    WHERE message_id=? AND reference_sha256 <> ''
+                    """,
+                    (message_id,),
+                ).fetchall()
+            }
             revision_no = int(row["revision_no"] or 1)
             self._connection.execute(
                 """
@@ -1738,6 +1957,10 @@ class MemoryStorage:
             self._invalidate_message_derivations_locked(
                 message_id=message_id,
                 reason=reason,
+            )
+            self._refresh_media_fingerprints_locked(
+                umo=umo,
+                fingerprints=media_pairs,
             )
         return True
 
@@ -2380,6 +2603,7 @@ class MemoryStorage:
                 """,
                 (umo,),
             )
+            self._rebuild_media_fingerprints_locked(umo=umo)
         return {
             "messages": len(message_ids),
             "episodes": len(episode_ids),
@@ -2557,7 +2781,8 @@ class MemoryStorage:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT e.id, e.statement, src.label AS source_label,
+                SELECT e.id, e.statement, e.epistemic_state, e.uncertainty,
+                       src.label AS source_label,
                        src.description AS source_description,
                        dst.label AS target_label,
                        dst.description AS target_description,
@@ -2586,6 +2811,8 @@ class MemoryStorage:
                     "target_label",
                     "target_description",
                     "statement",
+                    "epistemic_state",
+                    "uncertainty",
                 )
                 if str(row[key] or "").strip()
             ),
@@ -2761,6 +2988,52 @@ class MemoryStorage:
                 ).fetchall()
                 claims = [dict(row) for row in claim_rows]
 
+            relation_rows = self._connection.execute(
+                """
+                SELECT relation_key AS key, canonical_name AS name,
+                       description, source_kinds_json, target_kinds_json,
+                       inverse_key, symmetric, risk_class, version
+                FROM relation_types
+                WHERE umo=? AND status='ACTIVE'
+                ORDER BY relation_key LIMIT 100
+                """,
+                (umo,),
+            ).fetchall()
+            relation_types = [
+                {
+                    **dict(row),
+                    "source_kinds": json.loads(str(row["source_kinds_json"])),
+                    "target_kinds": json.loads(str(row["target_kinds_json"])),
+                    "symmetric": bool(row["symmetric"]),
+                }
+                for row in relation_rows
+            ]
+            for item in relation_types:
+                item.pop("source_kinds_json", None)
+                item.pop("target_kinds_json", None)
+            association_rows = self._connection.execute(
+                """
+                SELECT e.id, e.statement, e.epistemic_state, e.uncertainty,
+                       e.epistemic_confidence, e.utility,
+                       src.node_key AS source_node_key,
+                       src.node_kind AS source_kind,
+                       src.label AS source_label,
+                       dst.node_key AS target_node_key,
+                       dst.node_kind AS target_kind,
+                       dst.label AS target_label,
+                       r.relation_key
+                FROM plastic_edges AS e
+                JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                JOIN relation_types AS r ON r.id=e.relation_type_id
+                WHERE e.umo=? AND e.status IN ('ACTIVE', 'WEAKENED')
+                ORDER BY e.utility DESC, e.epistemic_confidence DESC, e.id DESC
+                LIMIT 100
+                """,
+                (umo,),
+            ).fetchall()
+            existing_associations = [dict(row) for row in association_rows]
+
         return {
             "messages": message_context,
             "participants": participants,
@@ -2781,6 +3054,8 @@ class MemoryStorage:
                 if len(ids) > 1
             },
             "active_claims": claims,
+            "relation_types": relation_types,
+            "existing_associations": existing_associations,
         }
 
     def _participant_key_by_id(self, participant_id: int) -> str:
@@ -3365,6 +3640,14 @@ class MemoryStorage:
                        ('ACTIVE', 'WEAKENED', 'DORMANT')) AS plastic_edges,
                     (SELECT COUNT(*) FROM relation_types
                      WHERE umo = ? AND status = 'ACTIVE') AS relation_types,
+                    (SELECT COUNT(*) FROM plastic_edges
+                     WHERE umo = ? AND epistemic_state IN
+                       ('HYPOTHESIS', 'CONTESTED') AND status IN
+                       ('ACTIVE', 'WEAKENED', 'DORMANT'))
+                        AS open_semantic_hypotheses,
+                    (SELECT COUNT(*) FROM media_fingerprints
+                     WHERE umo = ? AND media_type = 'image'
+                       AND observation_count >= 2) AS frequent_media,
                     (SELECT COUNT(*) FROM maintenance_jobs
                      WHERE umo = ? AND status IN ('PENDING', 'RUNNING'))
                         AS pending_maintenance,
@@ -3381,7 +3664,7 @@ class MemoryStorage:
                 (
                     umo, umo, umo, umo, umo, umo,
                     umo, umo, umo, umo, umo,
-                    umo, umo, umo, umo, umo, umo,
+                    umo, umo, umo, umo, umo, umo, umo, umo,
                 ),
             ).fetchone()
             last_update = self._connection.execute(
@@ -3443,6 +3726,10 @@ class MemoryStorage:
             "plastic_nodes": int(counts["plastic_nodes"] or 0),
             "plastic_edges": int(counts["plastic_edges"] or 0),
             "relation_types": int(counts["relation_types"] or 0),
+            "open_semantic_hypotheses": int(
+                counts["open_semantic_hypotheses"] or 0
+            ),
+            "frequent_media": int(counts["frequent_media"] or 0),
             "pending_maintenance": int(counts["pending_maintenance"] or 0),
             "subconscious_revision": int(
                 counts["subconscious_revision"] or 0
@@ -3576,7 +3863,8 @@ class MemoryStorage:
             ).fetchall()
             plastic_rows = self._connection.execute(
                 """
-                SELECT e.id, e.statement, e.epistemic_confidence, e.utility,
+                SELECT e.id, e.statement, e.epistemic_confidence,
+                       e.epistemic_state, e.uncertainty, e.utility,
                        e.support_count, e.contradict_count, e.status,
                        src.id AS source_id, src.node_key AS source_key,
                        src.node_kind AS source_kind, src.label AS source_label,
@@ -3832,6 +4120,8 @@ class MemoryStorage:
                     "type": "plastic_relation",
                     "statement": str(row["statement"]),
                     "confidence": float(row["epistemic_confidence"]),
+                    "epistemic_state": str(row["epistemic_state"]),
+                    "uncertainty": str(row["uncertainty"]),
                     "utility": float(row["utility"]),
                     "support_count": int(row["support_count"]),
                     "contradict_count": int(row["contradict_count"]),
@@ -5631,7 +5921,13 @@ class MemoryStorage:
                 allowed_source_keys=allowed,
             )
             if (
-                mutation.operation in {"inhibit_edge", "retire_edge"}
+                (
+                    mutation.operation in {"inhibit_edge", "retire_edge"}
+                    or (
+                        mutation.operation == "revise_edge"
+                        and mutation.utility_delta < 0
+                    )
+                )
                 and negative_edges is not None
                 and int(mutation.edge_id or 0) not in negative_edges
             ):
@@ -5714,8 +6010,9 @@ class MemoryStorage:
                     INSERT INTO plastic_edges(
                         umo, stable_key, source_node_id, relation_type_id,
                         target_node_id, statement, epistemic_confidence,
-                        utility, support_count, status, created_by
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                        epistemic_state, uncertainty, utility, support_count,
+                        status, created_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     ON CONFLICT(umo, stable_key) DO UPDATE SET
                         relation_type_id=excluded.relation_type_id,
                         statement=CASE WHEN excluded.statement <> ''
@@ -5724,6 +6021,8 @@ class MemoryStorage:
                             plastic_edges.epistemic_confidence,
                             excluded.epistemic_confidence
                         ),
+                        epistemic_state=plastic_edges.epistemic_state,
+                        uncertainty=plastic_edges.uncertainty,
                         utility=min(4, max(-4,
                             plastic_edges.utility + excluded.utility
                         )),
@@ -5746,6 +6045,8 @@ class MemoryStorage:
                         target_node_id,
                         mutation.statement,
                         mutation.confidence,
+                        str(mutation.epistemic_state or "HYPOTHESIS"),
+                        mutation.uncertainty,
                         delta,
                         "DORMANT" if delta <= -1 else (
                             "WEAKENED" if delta < 0 else "ACTIVE"
@@ -5754,13 +6055,18 @@ class MemoryStorage:
                     ),
                 )
                 edge = self._connection.execute(
-                    "SELECT id FROM plastic_edges WHERE umo = ? AND stable_key = ?",
+                    """
+                    SELECT id, epistemic_state, uncertainty
+                    FROM plastic_edges WHERE umo = ? AND stable_key = ?
+                    """,
                     (umo, stable_key),
                 ).fetchone()
                 assert edge is not None
                 target_type = "edge"
                 target_id = int(edge["id"])
                 details["relation_version"] = relation_version
+                details["epistemic_state"] = str(edge["epistemic_state"])
+                details["uncertainty"] = str(edge["uncertainty"])
                 for source_key, message_id in evidence.items():
                     self._connection.execute(
                         """
@@ -5824,6 +6130,61 @@ class MemoryStorage:
                     """,
                     (umo, target_id),
                 )
+
+            elif mutation.operation == "revise_edge":
+                edge = self._connection.execute(
+                    "SELECT * FROM plastic_edges WHERE id=? AND umo=?",
+                    (int(mutation.edge_id or 0), umo),
+                ).fetchone()
+                if edge is None:
+                    raise ValueError("plastic edge does not exist in this group")
+                if str(edge["status"]) in {"TOMBSTONED", "SUPERSEDED"}:
+                    raise ValueError("retired or superseded edges cannot be revised")
+                target_type = "edge"
+                target_id = int(edge["id"])
+                new_utility = max(
+                    -4.0,
+                    min(4.0, float(edge["utility"]) + mutation.utility_delta),
+                )
+                status = "DORMANT" if new_utility <= -1 else (
+                    "WEAKENED" if new_utility < 0 else "ACTIVE"
+                )
+                epistemic_state = str(mutation.epistemic_state)
+                self._connection.execute(
+                    """
+                    UPDATE plastic_edges
+                    SET statement=CASE WHEN ? <> '' THEN ? ELSE statement END,
+                        epistemic_confidence=?, epistemic_state=?,
+                        uncertainty=?, utility=?, status=?,
+                        support_count=support_count + ?,
+                        contradict_count=contradict_count + ?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND umo=?
+                    """,
+                    (
+                        mutation.statement,
+                        mutation.statement,
+                        mutation.confidence,
+                        epistemic_state,
+                        mutation.uncertainty,
+                        new_utility,
+                        status,
+                        1 if epistemic_state in {"SUPPORTED", "CONFIRMED"} else 0,
+                        1 if epistemic_state == "CONTESTED" else 0,
+                        target_id,
+                        umo,
+                    ),
+                )
+                for message_id in evidence.values():
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO plastic_edge_evidence(
+                            edge_id, message_id, evidence_role, confidence
+                        ) VALUES (?, ?, 'EPISTEMIC_REVISION', ?)
+                        """,
+                        (target_id, message_id, mutation.confidence),
+                    )
+                details["epistemic_state"] = epistemic_state
 
             elif mutation.operation in {
                 "reinforce_edge",
@@ -6013,6 +6374,129 @@ class MemoryStorage:
             **details,
         }
 
+    def query_media_patterns(
+        self,
+        *,
+        umo: str,
+        fingerprints: Iterable[str] = (),
+        media_type: str = "image",
+        min_observations: int = 2,
+        limit: int = 12,
+    ) -> list[dict[str, object]]:
+        """Return frequent opaque media anchors plus bounded nearby text.
+
+        A reference hash proves repeated use of the same adapter reference only. It
+        says nothing about image contents or meaning, so nearby messages remain the
+        sole semantic evidence exposed to the private agent.
+        """
+
+        self._assert_scope(umo)
+        normalized_type = str(media_type or "image").strip().casefold()[:32]
+        hashes = tuple(
+            dict.fromkeys(
+                str(value or "").strip().casefold()
+                for value in fingerprints
+                if re.fullmatch(
+                    r"[0-9a-fA-F]{64}", str(value or "").strip()
+                )
+            )
+        )
+        clauses = ["umo=?", "media_type=?", "observation_count>=?"]
+        parameters: list[object] = [
+            umo,
+            normalized_type,
+            max(1, int(min_observations)),
+        ]
+        if hashes:
+            placeholders = ",".join("?" for _ in hashes)
+            clauses.append(f"reference_sha256 IN ({placeholders})")
+            parameters.extend(hashes)
+        safe_limit = max(1, min(32, int(limit)))
+        parameters.append(safe_limit)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT media_type, reference_sha256, observation_count,
+                       unique_sender_count, first_seen_at, last_seen_at,
+                       sample_source_keys_json
+                FROM media_fingerprints
+                WHERE {' AND '.join(clauses)}
+                ORDER BY observation_count DESC, unique_sender_count DESC,
+                         last_seen_at DESC, reference_sha256
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            results: list[dict[str, object]] = []
+            for row in rows:
+                direct = self._connection.execute(
+                    """
+                    SELECT DISTINCT m.id, m.source_key, m.sent_at, m.sender_id,
+                           m.sender_name, m.plain_text
+                    FROM message_attachments AS a
+                    JOIN messages AS m ON m.id=a.message_id
+                    WHERE m.umo=? AND m.is_deleted=0
+                      AND a.attachment_type=? AND a.reference_sha256=?
+                    ORDER BY m.sent_at DESC, m.id DESC LIMIT 4
+                    """,
+                    (
+                        umo,
+                        str(row["media_type"]),
+                        str(row["reference_sha256"]),
+                    ),
+                ).fetchall()
+                context_by_id: dict[int, dict[str, object]] = {}
+                for observation in direct[:3]:
+                    context_rows = self._connection.execute(
+                        """
+                        SELECT id, source_key, sent_at, sender_id,
+                               sender_name, plain_text, role
+                        FROM messages
+                        WHERE umo=? AND is_deleted=0
+                          AND sent_at BETWEEN ? AND ?
+                        ORDER BY sent_at, id LIMIT 12
+                        """,
+                        (
+                            umo,
+                            int(observation["sent_at"]) - 120,
+                            int(observation["sent_at"]) + 120,
+                        ),
+                    ).fetchall()
+                    for context in context_rows:
+                        if len(context_by_id) >= 24:
+                            break
+                        context_by_id[int(context["id"])] = dict(context)
+                results.append(
+                    {
+                        "media_key": (
+                            f"{str(row['media_type'])}:"
+                            f"{str(row['reference_sha256'])}"
+                        ),
+                        "media_type": str(row["media_type"]),
+                        "reference_sha256": str(row["reference_sha256"]),
+                        "observation_count": int(row["observation_count"]),
+                        "unique_sender_count": int(
+                            row["unique_sender_count"]
+                        ),
+                        "first_seen_at": int(row["first_seen_at"]),
+                        "last_seen_at": int(row["last_seen_at"]),
+                        "sample_source_keys": json.loads(
+                            str(row["sample_source_keys_json"])
+                        ),
+                        "observations": [dict(item) for item in direct],
+                        "nearby_messages": sorted(
+                            context_by_id.values(),
+                            key=lambda item: (
+                                int(item["sent_at"]), int(item["id"])
+                            ),
+                        ),
+                        "semantic_notice": (
+                            "opaque repeated-media anchor; infer no visual content"
+                        ),
+                    }
+                )
+        return results
+
     def query_plastic_associations(
         self,
         *,
@@ -6077,7 +6561,8 @@ class MemoryStorage:
             rows = self._connection.execute(
                 f"""
                 SELECT e.id, e.stable_key, e.statement,
-                       e.epistemic_confidence, e.utility, e.activation_count,
+                       e.epistemic_confidence, e.epistemic_state,
+                       e.uncertainty, e.utility, e.activation_count,
                        e.support_count, e.contradict_count, e.status,
                        src.node_key AS source_key, src.node_kind AS source_kind,
                        src.label AS source_label,
@@ -6152,7 +6637,8 @@ class MemoryStorage:
         with self._lock, self._connection:
             rows = self._connection.execute(
                 f"""
-                SELECT e.id, e.statement, e.utility, e.status,
+                SELECT e.id, e.statement, e.epistemic_state, e.uncertainty,
+                       e.utility, e.status,
                        src.label AS source_label, dst.label AS target_label,
                        r.relation_key, r.canonical_name AS relation_name
                 FROM plastic_edges AS e
@@ -6207,6 +6693,8 @@ class MemoryStorage:
                                 "source": str(row["source_label"]),
                                 "relation": str(row["relation_key"]),
                                 "target": str(row["target_label"]),
+                                "epistemic_state": str(row["epistemic_state"]),
+                                "uncertainty": str(row["uncertainty"]),
                             }
                         ),
                         score,

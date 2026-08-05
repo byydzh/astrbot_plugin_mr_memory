@@ -182,6 +182,56 @@ class DistillationPipelineTests(unittest.TestCase):
             set(omitted_keys),
         )
 
+    def test_construction_persists_an_unresolved_competing_association(self) -> None:
+        value = json.loads(self._response())
+        source_key = value["episodes"][0]["source_keys"][0]
+        value["associations"] = [
+            {
+                "operation": "upsert_edge",
+                "evidence_source_keys": [source_key],
+                "confidence": 0.58,
+                "utility_delta": 0.1,
+                "statement": "方案 A 可能是群内对低价但高风险选择的代称。",
+                "epistemic_state": "HYPOTHESIS",
+                "uncertainty": "当前证据也可能只是在讨论这一次具体方案。",
+                "source": {
+                    "kind": "symbol",
+                    "label": "方案 A",
+                    "description": "群聊中出现的方案称呼",
+                },
+                "relation": {
+                    "key": "possible_local_shorthand_for",
+                    "name": "可能是本群代称",
+                    "description": "表达可能在本群形成可复用的局部语义",
+                    "source_kinds": ["symbol"],
+                    "target_kinds": ["concept"],
+                },
+                "target": {
+                    "kind": "concept",
+                    "label": "低价但高风险的选择",
+                    "description": "尚未被后续群聊确认的候选含义",
+                },
+            }
+        ]
+        batch = parse_distillation_response(
+            json.dumps(value, ensure_ascii=False), self._messages()
+        )
+        persisted, indexed = asyncio.run(
+            self.service.apply_distillation(
+                batch,
+                extractor_version="test-uncertainty",
+                embedding_backend=HashEmbeddingBackend(dimensions=64),
+            )
+        )
+        self.assertEqual(len(persisted.plastic_edge_ids), 1)
+        self.assertGreater(indexed, 0)
+        rows = self.storage.query_plastic_associations(
+            umo=self.umo,
+            query="方案 A",
+        )
+        self.assertEqual(rows[0]["epistemic_state"], "HYPOTHESIS")
+        self.assertIn("具体方案", rows[0]["uncertainty"])
+
 
 if __name__ == "__main__":
     unittest.main()
