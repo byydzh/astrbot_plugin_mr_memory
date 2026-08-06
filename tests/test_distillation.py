@@ -18,7 +18,7 @@ from mr_memory.distillation import (
 from mr_memory.embedding import HashEmbeddingBackend
 from mr_memory.models import NormalizedMessage
 from mr_memory.service import MemoryService
-from mr_memory.storage import MemoryStorage
+from mr_memory.storage import DistillationSnapshotChanged, MemoryStorage
 
 
 class DistillationPipelineTests(unittest.TestCase):
@@ -137,6 +137,116 @@ class DistillationPipelineTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
+
+    def test_atomic_commit_discards_graph_when_source_changes(self) -> None:
+        work_item = self.storage.next_distillation_batch(
+            umo=self.umo,
+            limit=4,
+            overlap=0,
+        )
+        assert work_item is not None
+        batch = parse_distillation_response(
+            self._response(),
+            work_item.messages,
+            target_source_keys=work_item.target_source_keys,
+        )
+        self.storage.upsert_message(
+            NormalizedMessage(
+                platform="aiocqhttp",
+                platform_id="shadow",
+                umo=self.umo,
+                group_id="group-a",
+                message_id="1",
+                sender_id="甲",
+                sender_name="甲",
+                sent_at=100,
+                plain_text="方案 A 的价格信息已更正。",
+                content=[{"type": "plain", "text": "方案 A 的价格信息已更正。"}],
+            )
+        )
+        with self.assertRaises(DistillationSnapshotChanged):
+            asyncio.run(
+                self.service.commit_distillation_batch(
+                    batch,
+                    work_item=work_item,
+                    extractor_version="atomic-test",
+                )
+            )
+        self.storage.finish_distillation_batch(
+            work_item=work_item,
+            error="snapshot changed",
+            snapshot_changed=True,
+        )
+        self.assertEqual(self.storage.count_graph_units(umo=self.umo), 0)
+        statuses = {
+            str(row["status"])
+            for row in self.storage._connection.execute(
+                "SELECT status FROM message_processing"
+            ).fetchall()
+        }
+        self.assertEqual(statuses, {"PENDING"})
+
+    def test_atomic_commit_rolls_back_partial_graph_writes(self) -> None:
+        work_item = self.storage.next_distillation_batch(
+            umo=self.umo,
+            limit=4,
+            overlap=0,
+        )
+        assert work_item is not None
+        batch = parse_distillation_response(
+            self._response(),
+            work_item.messages,
+            target_source_keys=work_item.target_source_keys,
+        )
+        with mock.patch.object(
+            self.storage,
+            "store_topic",
+            side_effect=RuntimeError("forced mid-transaction failure"),
+        ), self.assertRaisesRegex(RuntimeError, "forced mid-transaction"):
+            asyncio.run(
+                self.service.commit_distillation_batch(
+                    batch,
+                    work_item=work_item,
+                    extractor_version="atomic-test",
+                )
+            )
+        self.assertEqual(self.storage.count_graph_units(umo=self.umo), 0)
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM distilled_units"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_atomic_commit_checkpoints_before_embedding_refresh(self) -> None:
+        work_item = self.storage.next_distillation_batch(
+            umo=self.umo,
+            limit=4,
+            overlap=0,
+        )
+        assert work_item is not None
+        batch = parse_distillation_response(
+            self._response(),
+            work_item.messages,
+            target_source_keys=work_item.target_source_keys,
+        )
+        persisted, indexed, index_error = asyncio.run(
+            self.service.commit_distillation_batch(
+                batch,
+                work_item=work_item,
+                extractor_version="atomic-test",
+            )
+        )
+        self.assertEqual(len(persisted.episode_ids), 2)
+        self.assertEqual(indexed, 0)
+        self.assertEqual(index_error, "")
+        statuses = {
+            str(row["status"])
+            for row in self.storage._connection.execute(
+                "SELECT status FROM message_processing"
+            ).fetchall()
+        }
+        self.assertEqual(statuses, {"DISTILLED"})
 
     def test_reproduces_construction_embedding_seed_and_graph_traversal(self) -> None:
         messages = self._messages()
@@ -351,7 +461,9 @@ class DistillationPipelineTests(unittest.TestCase):
             set(omitted_keys),
         )
 
-    def test_resilient_parser_drops_invalid_units_and_audits_uncovered_raw(self) -> None:
+    def test_resilient_parser_drops_invalid_units_and_audits_uncovered_raw(
+        self,
+    ) -> None:
         value = json.loads(self._response())
         omitted_keys = list(value["episodes"][1]["source_keys"])
         value["episodes"][1]["source_keys"] = ["invented"]
@@ -374,7 +486,11 @@ class DistillationPipelineTests(unittest.TestCase):
             {item.source_key for item in batch.ignored_sources},
             set(omitted_keys),
         )
-        self.assertTrue(all("raw evidence retained" in item.reason for item in batch.ignored_sources))
+        self.assertTrue(
+            all(
+                "raw evidence retained" in item.reason for item in batch.ignored_sources
+            )
+        )
         self.assertIn("drop:episodes", actions)
         self.assertIn("host_ignore:uncovered_target", actions)
 

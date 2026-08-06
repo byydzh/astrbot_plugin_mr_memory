@@ -5,6 +5,7 @@ import asyncio
 from .distillation import (
     DistillationBatch,
     PersistedDistillation,
+    commit_distillation_batch,
     index_distillation,
     persist_distillation,
 )
@@ -90,6 +91,18 @@ class MemoryService:
     ) -> int:
         return await asyncio.to_thread(
             self.storage.pending_distillation_count,
+            umo=umo,
+            processing_class=processing_class,
+        )
+
+    async def oldest_pending_distillation_at(
+        self,
+        *,
+        umo: str,
+        processing_class: str = "LIVE",
+    ) -> int | None:
+        return await asyncio.to_thread(
+            self.storage.oldest_pending_distillation_at,
             umo=umo,
             processing_class=processing_class,
         )
@@ -279,6 +292,35 @@ class MemoryService:
                 backend=embedding_backend,
             )
         return persisted, indexed
+
+    async def commit_distillation_batch(
+        self,
+        batch: DistillationBatch,
+        *,
+        work_item: DistillationWorkItem,
+        extractor_version: str,
+        embedding_backend: EmbeddingBackend | None = None,
+    ) -> tuple[PersistedDistillation, int, str]:
+        persisted = await asyncio.to_thread(
+            commit_distillation_batch,
+            self.storage,
+            batch,
+            work_item=work_item,
+            extractor_version=extractor_version,
+        )
+        indexed = 0
+        index_error = ""
+        if embedding_backend is not None:
+            try:
+                indexed = await index_distillation(
+                    self.storage,
+                    umo=batch.umo,
+                    persisted=persisted,
+                    backend=embedding_backend,
+                )
+            except Exception as exc:
+                index_error = f"{type(exc).__name__}: {exc}"[:1000]
+        return persisted, indexed, index_error
 
     async def initialize_candidates(
         self,

@@ -9,9 +9,10 @@ import sqlite3
 import threading
 import time
 from collections import Counter, deque
+from contextlib import contextmanager
 from heapq import heappop, heappush
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterator, Iterable, Mapping
 
 from .embedding import (
     cosine_similarity,
@@ -42,7 +43,7 @@ from .plasticity import (
     RelationTypeProposal,
 )
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 TRUTH_V2_BACKFILL_VERSION = 8
 MEDIA_HEAVY_HITTER_LIMIT = 512
 MEDIA_SAMPLE_SOURCE_LIMIT = 8
@@ -71,6 +72,10 @@ GRAPH_NODE_TYPES = {
     "hypothesis",
     "plastic",
 }
+
+
+class DistillationSnapshotChanged(RuntimeError):
+    """The authoritative source changed after an LLM batch was selected."""
 
 
 def _graph_structure(
@@ -343,6 +348,7 @@ class MemoryStorage:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._write_transaction_depth = 0
         self._connection = sqlite3.connect(
             self.database_path,
             check_same_thread=False,
@@ -353,6 +359,27 @@ class MemoryStorage:
         self._connection.execute("PRAGMA synchronous = NORMAL")
         self._migrate()
         self._restrict_file_permissions()
+
+    @contextmanager
+    def _write_transaction(self, *, immediate: bool = False) -> Iterator[None]:
+        """One re-entrant SQLite transaction for multi-method graph commits."""
+
+        with self._lock:
+            outermost = self._write_transaction_depth == 0
+            if outermost:
+                self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            self._write_transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                self._write_transaction_depth -= 1
+                if outermost:
+                    self._connection.rollback()
+                raise
+            else:
+                self._write_transaction_depth -= 1
+                if outermost:
+                    self._connection.commit()
 
     def _restrict_file_permissions(self) -> None:
         """Keep plaintext group stores private to the AstrBot OS account."""
@@ -1117,6 +1144,11 @@ class MemoryStorage:
             ensure_column("messages", "revision_no", "INTEGER NOT NULL DEFAULT 1")
             ensure_column("messages", "deleted_at", "INTEGER")
             ensure_column(
+                "message_revisions",
+                "sent_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            ensure_column(
                 "message_processing",
                 "processing_class",
                 "TEXT NOT NULL DEFAULT 'LIVE'",
@@ -1825,6 +1857,7 @@ class MemoryStorage:
                 role=str(row["role"]),
                 plain_text=str(row["plain_text"]),
                 content=content,
+                sent_at=int(row["sent_at"]),
             )
             participant_id = row["sender_participant_id"]
             if participant_id is None:
@@ -2114,11 +2147,12 @@ class MemoryStorage:
                 role=message.role,
                 plain_text=message.plain_text,
                 content=content,
+                sent_at=message.sent_at,
             )
             existing = self._connection.execute(
                 """
-                SELECT id, content_sha256, plain_text, content_json, role,
-                       revision_no, is_deleted
+                SELECT id, sender_id, sent_at, content_sha256, plain_text,
+                       content_json, role, revision_no, is_deleted
                 FROM messages WHERE source_key = ?
                 """,
                 (source_key,),
@@ -2131,8 +2165,18 @@ class MemoryStorage:
                 seen_at=message.sent_at,
                 account_type=("BOT" if message.role == "BOT" else "USER"),
             )
+            payload_changed = existing is not None and (
+                str(existing["sender_id"] or "") != message.sender_id
+                or str(existing["plain_text"] or "") != message.plain_text
+                or str(existing["content_json"] or "") != content_json
+                or str(existing["role"] or "") != message.role
+            )
+            timestamp_changed = existing is not None and (
+                int(existing["sent_at"] or 0) != int(message.sent_at)
+            )
             changed = existing is not None and (
-                str(existing["content_sha256"] or "") != digest
+                payload_changed
+                or timestamp_changed
                 or int(existing["is_deleted"] or 0) != 0
             )
             revision_no = 1
@@ -2143,8 +2187,8 @@ class MemoryStorage:
                         """
                         INSERT OR IGNORE INTO message_revisions(
                             message_id, revision_no, content_sha256, plain_text,
-                            content_json, role, revision_kind, observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            content_json, role, revision_kind, observed_at, sent_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             int(existing["id"]),
@@ -2156,15 +2200,24 @@ class MemoryStorage:
                             (
                                 "RESTORED"
                                 if int(existing["is_deleted"] or 0)
-                                else "EDITED"
+                                else (
+                                    "TIMESTAMP_CORRECTED"
+                                    if timestamp_changed and not payload_changed
+                                    else "EDITED"
+                                )
                             ),
                             int(time.time()),
+                            int(existing["sent_at"] or 0),
                         ),
                     )
                     revision_no += 1
                     self._invalidate_message_derivations_locked(
                         message_id=int(existing["id"]),
-                        reason="source message edited or restored",
+                        reason=(
+                            "source message timestamp corrected"
+                            if timestamp_changed and not payload_changed
+                            else "source message edited or restored"
+                        ),
                     )
             self._connection.execute(
                 """
@@ -2243,7 +2296,20 @@ class MemoryStorage:
                         normalized_ingestion_source,
                     ),
                 )
-            elif normalized_processing_class == "LIVE":
+            elif str(existing["content_sha256"] or "") != digest:
+                self._connection.execute(
+                    """
+                    UPDATE message_processing SET content_sha256=?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE message_id=?
+                    """,
+                    (digest, stored_id),
+                )
+            if (
+                existing is not None
+                and not changed
+                and normalized_processing_class == "LIVE"
+            ):
                 # A live adapter observation wins over a later idempotent history
                 # sync, so current traffic can never be moved behind backfill.
                 self._connection.execute(
@@ -2312,7 +2378,7 @@ class MemoryStorage:
             row = self._connection.execute(
                 """
                 SELECT id, content_sha256, plain_text, content_json, role,
-                       revision_no, is_deleted
+                       revision_no, is_deleted, sent_at
                 FROM messages
                 WHERE umo = ? AND platform_id = ? AND message_id = ?
                 ORDER BY id DESC LIMIT 1
@@ -2338,8 +2404,8 @@ class MemoryStorage:
                 """
                 INSERT OR IGNORE INTO message_revisions(
                     message_id, revision_no, content_sha256, plain_text,
-                    content_json, role, revision_kind, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'DELETED', ?)
+                    content_json, role, revision_kind, observed_at, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'DELETED', ?, ?)
                 """,
                 (
                     message_id,
@@ -2349,6 +2415,7 @@ class MemoryStorage:
                     str(row["content_json"]),
                     str(row["role"]),
                     when,
+                    int(row["sent_at"] or 0),
                 ),
             )
             self._connection.execute(
@@ -2919,6 +2986,7 @@ class MemoryStorage:
                     role=str(row["role"]),
                     plain_text=str(row["plain_text"]),
                     content=content,
+                    sent_at=int(row["sent_at"]),
                 )
                 self._invalidate_message_derivations_locked(
                     message_id=message_id,
@@ -3571,6 +3639,32 @@ class MemoryStorage:
             ).fetchone()
         return int(row[0])
 
+    def oldest_pending_distillation_at(
+        self,
+        *,
+        umo: str,
+        processing_class: str = "LIVE",
+    ) -> int | None:
+        normalized_class = str(processing_class).strip().upper()
+        if normalized_class not in {"LIVE", "BACKFILL"}:
+            raise ValueError("processing_class must be LIVE or BACKFILL")
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT MIN(m.sent_at) AS oldest_at
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id=p.message_id
+                WHERE m.umo=? AND m.is_deleted=0
+                  AND p.processing_class=?
+                  AND (p.status='PENDING'
+                       OR (p.status='FAILED' AND p.attempts<3))
+                """,
+                (umo, normalized_class),
+            ).fetchone()
+        if row is None or row["oldest_at"] is None:
+            return None
+        return int(row["oldest_at"])
+
     def next_distillation_processing_class(self, *, umo: str) -> str | None:
         """Prefer online messages without mixing them into history batches."""
 
@@ -3759,11 +3853,12 @@ class MemoryStorage:
         *,
         work_item: DistillationWorkItem,
         error: str = "",
+        snapshot_changed: bool = False,
     ) -> None:
-        success = not str(error).strip()
+        success = not str(error).strip() and not snapshot_changed
         now = int(time.time())
         expected = dict(work_item.target_hashes)
-        with self._lock, self._connection:
+        with self._write_transaction():
             for source_key, expected_hash in expected.items():
                 row = self._connection.execute(
                     """
@@ -3776,6 +3871,8 @@ class MemoryStorage:
                     continue
                 if int(row["is_deleted"]):
                     status = "DELETED"
+                elif snapshot_changed:
+                    status = "PENDING"
                 elif success and str(row["content_sha256"]) == expected_hash:
                     status = "DISTILLED"
                 elif success:
@@ -3803,11 +3900,43 @@ class MemoryStorage:
                 WHERE batch_key = ?
                 """,
                 (
-                    "COMPLETED" if success else "FAILED",
+                    (
+                        "COMPLETED"
+                        if success
+                        else ("STALE" if snapshot_changed else "FAILED")
+                    ),
                     str(error)[:1000],
                     work_item.batch_key,
                 ),
             )
+
+    @contextmanager
+    def distillation_write(
+        self,
+        *,
+        work_item: DistillationWorkItem,
+    ) -> Iterator[None]:
+        """Verify the selected source snapshot and atomically commit its graph."""
+
+        with self._write_transaction(immediate=True):
+            for source_key, expected_hash in work_item.target_hashes:
+                row = self._connection.execute(
+                    """
+                    SELECT content_sha256, is_deleted
+                    FROM messages
+                    WHERE umo=? AND source_key=?
+                    """,
+                    (work_item.umo, source_key),
+                ).fetchone()
+                if (
+                    row is None
+                    or int(row["is_deleted"] or 0) != 0
+                    or str(row["content_sha256"] or "") != expected_hash
+                ):
+                    raise DistillationSnapshotChanged(
+                        f"distillation source changed: {source_key}"
+                    )
+            yield
 
     def record_distillation_ignored_sources(
         self,
@@ -3818,7 +3947,7 @@ class MemoryStorage:
     ) -> None:
         """Persist the extractor's bounded coverage ledger for later audit."""
 
-        with self._lock, self._connection:
+        with self._write_transaction():
             batch = self._connection.execute(
                 """
                 SELECT target_source_keys_json FROM distillation_batches
@@ -5644,7 +5773,7 @@ class MemoryStorage:
         fingerprint: str,
         unit_id: int,
     ) -> None:
-        with self._lock, self._connection:
+        with self._write_transaction():
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO distilled_units(
@@ -6425,7 +6554,7 @@ class MemoryStorage:
         stable_key: str = "",
     ) -> int:
         """Persist one distilled Cue--Tag--Episode unit."""
-        with self._lock, self._connection:
+        with self._write_transaction():
             existing = None
             if stable_key:
                 existing = self._connection.execute(
@@ -6576,7 +6705,7 @@ class MemoryStorage:
 
         if not evidence:
             raise ValueError("semantic claim needs source evidence")
-        with self._lock, self._connection:
+        with self._write_transaction():
             participant_id = None
             person_cue = str(subject_text or "").strip()
             if subject_participant_key:
@@ -6876,7 +7005,7 @@ class MemoryStorage:
         extractor_version: str = "",
     ) -> int:
         """Persist one Topic--Episode abstraction."""
-        with self._lock, self._connection:
+        with self._write_transaction():
             row = self._connection.execute(
                 "SELECT id FROM topics WHERE umo = ? AND name = ?",
                 (umo, name.strip()),
@@ -7600,7 +7729,7 @@ class MemoryStorage:
             if allowed_negative_edge_ids is not None
             else None
         )
-        with self._lock, self._connection:
+        with self._write_transaction():
             if feedback_proposal_id is not None:
                 feedback_proposal = self._connection.execute(
                     """
@@ -8751,10 +8880,19 @@ class MemoryStorage:
         job_type: str = "",
         now: int | None = None,
         limit: int = 20,
+        include_future: bool = False,
+        include_budget_wait: bool = False,
     ) -> list[dict[str, object]]:
         self._assert_scope(umo)
-        clauses = ["umo=?", "status='PENDING'", "available_at<=?"]
-        parameters: list[object] = [umo, int(now or time.time())]
+        statuses = ["PENDING"]
+        if include_budget_wait:
+            statuses.append("BUDGET_WAIT")
+        placeholders = ",".join("?" for _ in statuses)
+        clauses = ["umo=?", f"status IN ({placeholders})"]
+        parameters: list[object] = [umo, *statuses]
+        if not include_future:
+            clauses.append("available_at<=?")
+            parameters.append(int(now or time.time()))
         if job_type:
             clauses.append("job_type=?")
             parameters.append(str(job_type).strip().casefold())

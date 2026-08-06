@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.16.2
+
+- Atomically validate distillation source snapshots, graph writes, coverage
+  records, and processing checkpoints so edits or recalls cannot commit stale
+  memory.
+- Fail open instead of queueing concurrent automatic wakes for one group, and
+  keep token-budget checks inside that serialization boundary.
+- Derive reconstruction and feedback allowlists from the bounded JSON actually
+  delivered to the private model; non-brief decisions cannot activate paths.
+- Persist low-traffic distillation deadlines across hot reloads and record
+  timestamp-only source corrections as first-class revisions.
+- Use one shared version constant across AstrBot registration, runtime status,
+  extractor metadata, and package metadata.
+
 ## 0.16.1
 
 - Keep graph-neighbor inspection local so selecting a connected entry no longer

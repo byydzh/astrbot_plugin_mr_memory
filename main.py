@@ -30,6 +30,7 @@ from .mr_memory.distillation import (
     build_distillation_prompt,
     build_distillation_prompt_aliases,
     build_distillation_repair_prompt,
+    PersistedDistillation,
     distillation_generation_options,
     parse_distillation_response_resilient,
 )
@@ -55,14 +56,18 @@ from .mr_memory.runtime import (
     FAST_RECONSTRUCTION_SYSTEM_PROMPT,
     FEEDBACK_ATTRIBUTION_SYSTEM_PROMPT,
     FEEDBACK_BATCH_SYSTEM_PROMPT,
+    feedback_packet_edge_ids,
+    feedback_packet_evidence,
     parse_feedback_attribution_plan,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
+    reconstruction_packet_allowlist,
 )
 from .mr_memory.scope import GroupMemoryScope, GroupScopeError
 from .mr_memory.service import MemoryService
-from .mr_memory.storage import MemoryStorage
+from .mr_memory.storage import DistillationSnapshotChanged, MemoryStorage
 from .mr_memory.usage import TokenUsageRecord
+from .mr_memory.version import EXTRACTOR_VERSION, PLUGIN_VERSION
 from .mr_memory.web_api import WebConsoleMixin
 
 
@@ -561,7 +566,7 @@ class _ReconstructionTraceHooks(BaseAgentRunHooks):
     "astrbot_plugin_mr_memory",
     "byydzh",
     "Private subconscious memory agent with grounded graph reconstruction.",
-    "0.14.0",
+    PLUGIN_VERSION,
 )
 class MrMemoryPlugin(Star, WebConsoleMixin):
     traversal_tool_names = (
@@ -838,6 +843,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._services: dict[str, MemoryService] = {}
         self._service_scopes: dict[str, GroupMemoryScope] = {}
         self._wake_locks: dict[str, asyncio.Lock] = {}
+        self._wake_execution_locks: dict[str, asyncio.Lock] = {}
         self._distill_locks: dict[str, asyncio.Lock] = {}
         self._feedback_locks: dict[str, asyncio.Lock] = {}
         self._active_interaction_traces: dict[int, tuple[str, str, str]] = {}
@@ -853,7 +859,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             tuple[int, str, GroupMemoryScope]
         ] = asyncio.Queue(maxsize=256)
         self._maintenance_enqueued: set[tuple[str, int]] = set()
-        self._maintenance_wakeup_tasks: set[asyncio.Task[Any]] = set()
+        self._maintenance_wakeup_tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
+        self._maintenance_wakeup_specs: dict[tuple[str, int], tuple[int, bool]] = {}
         self._feedback_debounce_tasks: dict[str, asyncio.Task[Any]] = {}
         self._maintenance_tasks: list[asyncio.Task[Any]] = []
         self._runtime_bootstrap_task: asyncio.Task[Any] | None = None
@@ -1049,14 +1056,32 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     umo=scope.key,
                     job_type="distill",
                     limit=20,
+                    include_future=True,
+                    include_budget_wait=True,
                 )
                 for job in distill_jobs:
-                    if await self._queue_existing_maintenance(
-                        kind="distill",
-                        scope=scope,
-                        job_id=int(job["id"]),
+                    job_id = int(job["id"])
+                    available_at = int(job["available_at"])
+                    if (
+                        str(job["status"]) == "PENDING"
+                        and available_at <= int(time.time())
+                        and await self._queue_existing_maintenance(
+                            kind="distill",
+                            scope=scope,
+                            job_id=job_id,
+                        )
                     ):
                         restored += 1
+                    else:
+                        self._schedule_maintenance_wakeup(
+                            kind="distill",
+                            scope=scope,
+                            job_id=job_id,
+                            available_at=available_at,
+                            resume_budget_wait=(str(job["status"]) == "BUDGET_WAIT"),
+                        )
+            if self.auto_distillation_enabled:
+                await self._ensure_distillation_deadline(scope=scope)
             if (
                 self.feedback_learning_enabled
                 and await service.pending_feedback_proposals(
@@ -1083,6 +1108,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         dedupe_key: str = "",
         payload: dict[str, object] | None = None,
         retry_failed: bool = False,
+        available_at: int | None = None,
     ) -> bool:
         if event is not None:
             self._scope_event_carriers[scope.key] = event
@@ -1093,11 +1119,52 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             dedupe_key=(dedupe_key or f"{kind}:pending"),
             payload=payload or {},
             retry_failed=retry_failed,
+            available_at=available_at,
         )
-        return await self._queue_existing_maintenance(
+        queued = await self._queue_existing_maintenance(
             kind=str(kind),
             scope=scope,
             job_id=job_id,
+        )
+        if not queued and available_at is not None and available_at > int(time.time()):
+            self._schedule_maintenance_wakeup(
+                kind=str(kind),
+                scope=scope,
+                job_id=job_id,
+                available_at=available_at,
+            )
+        return queued
+
+    async def _ensure_distillation_deadline(
+        self,
+        *,
+        scope: GroupMemoryScope,
+        event: AstrMessageEvent | None = None,
+    ) -> bool:
+        service = self._service_for_scope(scope)
+        pending = await service.pending_distillation_count(
+            umo=scope.key,
+            processing_class="LIVE",
+        )
+        if pending <= 0:
+            return False
+        oldest_at = await service.oldest_pending_distillation_at(
+            umo=scope.key,
+            processing_class="LIVE",
+        )
+        available_at = int(time.time())
+        if pending < self.auto_distillation_min_pending and oldest_at is not None:
+            oldest_at = min(int(oldest_at), available_at)
+            available_at = max(
+                available_at,
+                oldest_at + self.maintenance_interval_seconds,
+            )
+        return await self._schedule_maintenance(
+            kind="distill",
+            scope=scope,
+            event=event,
+            available_at=available_at,
+            retry_failed=True,
         )
 
     async def _queue_existing_maintenance(
@@ -1131,6 +1198,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
             return False
         self._maintenance_enqueued.add(queue_key)
+        wake_task = self._maintenance_wakeup_tasks.get(queue_key)
+        if wake_task is not None and wake_task is not asyncio.current_task():
+            self._maintenance_wakeup_tasks.pop(queue_key, None)
+            self._maintenance_wakeup_specs.pop(queue_key, None)
+            wake_task.cancel()
         return True
 
     def _schedule_maintenance_wakeup(
@@ -1142,6 +1214,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         available_at: int,
         resume_budget_wait: bool = False,
     ) -> None:
+        wake_key = (scope.key, int(job_id))
+        requested_spec = (int(available_at), bool(resume_budget_wait))
+        existing = self._maintenance_wakeup_tasks.get(wake_key)
+        existing_spec = self._maintenance_wakeup_specs.get(wake_key)
+        if existing is not None and not existing.done() and existing_spec is not None:
+            earlier_or_equal = existing_spec[0] <= requested_spec[0]
+            sufficient_resume = existing_spec[1] or not requested_spec[1]
+            if earlier_or_equal and sufficient_resume:
+                return
+            existing.cancel()
+
         async def wake() -> None:
             delay = max(0.0, float(available_at) - time.time())
             if delay:
@@ -1159,8 +1242,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             wake(),
             name=f"mr-memory-{kind}-wakeup-{scope.storage_id[:8]}-{job_id}",
         )
-        self._maintenance_wakeup_tasks.add(task)
-        task.add_done_callback(self._maintenance_wakeup_tasks.discard)
+        self._maintenance_wakeup_tasks[wake_key] = task
+        self._maintenance_wakeup_specs[wake_key] = requested_spec
+
+        def done(completed: asyncio.Task[Any]) -> None:
+            if self._maintenance_wakeup_tasks.get(wake_key) is completed:
+                self._maintenance_wakeup_tasks.pop(wake_key, None)
+                self._maintenance_wakeup_specs.pop(wake_key, None)
+
+        task.add_done_callback(done)
 
     async def _private_budget_available(
         self,
@@ -1311,15 +1401,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     job_id=job_id,
                 )
                 claimed = False
-                if (
-                    kind == "distill"
-                    and await service.pending_distillation_count(
-                        umo=scope.key,
-                        processing_class="LIVE",
-                    )
-                    >= self.auto_distillation_min_pending
-                ):
-                    await self._schedule_maintenance(kind="distill", scope=scope)
+                if kind == "distill":
+                    await self._ensure_distillation_deadline(scope=scope)
                 elif kind == "feedback" and await service.pending_feedback_proposals(
                     umo=scope.key,
                     limit=1,
@@ -1431,15 +1514,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 if scope is None:
                     continue
                 await service.resume_due_budget_jobs(umo=umo)
-                if (
-                    self.auto_distillation_enabled
-                    and await service.pending_distillation_count(
-                        umo=umo,
-                        processing_class="LIVE",
-                    )
-                    > 0
-                ):
-                    await self._schedule_maintenance(kind="distill", scope=scope)
+                if self.auto_distillation_enabled:
+                    await self._ensure_distillation_deadline(scope=scope)
                 if await service.pending_feedback_proposals(
                     umo=umo,
                     limit=1,
@@ -1714,7 +1790,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             for scope in scopes
         )
         return {
-            "version": "0.16.1",
+            "version": PLUGIN_VERSION,
             "runtime": {
                 "capture_enabled": self.capture_enabled,
                 "feedback_learning_enabled": self.feedback_learning_enabled,
@@ -2145,12 +2221,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         event=event,
                     )
             if self.auto_distillation_enabled:
-                pending = await service.pending_distillation_count(
-                    umo=scope.key,
-                    processing_class="LIVE",
+                await self._ensure_distillation_deadline(
+                    scope=scope,
+                    event=event,
                 )
-                if pending >= self.auto_distillation_min_pending:
-                    await self._schedule_maintenance(kind="distill", scope=scope)
             if self.log_message_content:
                 logger.info(
                     "MR Memory captured | inserted=%s | umo=%s | text=%s",
@@ -2220,7 +2294,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         graph_units = await service.count_graph_units(umo=scope.key)
         summary = await service.dashboard_summary(umo=scope.key)
         yield event.plain_result(
-            "MR Memory 0.14.0\n"
+            f"MR Memory {PLUGIN_VERSION}\n"
             f"capture_enabled={self.capture_enabled}\n"
             f"feedback_learning_enabled={self.feedback_learning_enabled}\n"
             f"feedback_min_commit_score={self.feedback_min_commit_score}\n"
@@ -2456,7 +2530,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "processing_class": work_item.processing_class,
                     "source_sent_at_min": min(message.sent_at for message in messages),
                     "source_sent_at_max": max(message.sent_at for message in messages),
-                    "extractor_version": "mr-memory-0.14.0",
+                    "extractor_version": EXTRACTOR_VERSION,
                     "embedding_model": (
                         self.embedding_model_name if self.embedding_enabled else ""
                     ),
@@ -2498,6 +2572,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
             validation_error_detail = ""
             llm_total_tokens = 0
+            snapshot_changed = False
+            index_error = ""
             last_stream_progress_log = started
 
             def log_stream_progress(chunk_count, chunk_response) -> None:
@@ -2684,21 +2760,37 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         scope.key,
                         len(sanitization_actions),
                     )
-                persisted, indexed = await service.apply_distillation(
-                    batch,
-                    extractor_version="mr-memory-0.14.0",
-                    embedding_backend=self._embedding_backend(),
+                persisted, indexed, index_error = (
+                    await service.commit_distillation_batch(
+                        batch,
+                        work_item=work_item,
+                        extractor_version=EXTRACTOR_VERSION,
+                        embedding_backend=self._embedding_backend(),
+                    )
                 )
-                await service.record_distillation_ignored_sources(
-                    umo=scope.key,
-                    batch_key=work_item.batch_key,
-                    items=[
-                        {
-                            "source_key": item.source_key,
-                            "reason": item.reason,
-                        }
-                        for item in batch.ignored_sources
-                    ],
+                if index_error:
+                    logger.warning(
+                        "MR Memory graph committed but embedding refresh failed | "
+                        "umo=%s | batch=%s | error=%s",
+                        scope.key,
+                        work_item.batch_key,
+                        index_error,
+                    )
+            except DistillationSnapshotChanged as exc:
+                snapshot_changed = True
+                error_detail = f"{type(exc).__name__}: {exc}"[:1000]
+                await service.finish_distillation_batch(
+                    work_item=work_item,
+                    error=error_detail,
+                    snapshot_changed=True,
+                )
+                persisted = PersistedDistillation((), (), (), (), ())
+                indexed = 0
+                logger.info(
+                    "MR Memory discarded stale distillation result | umo=%s | "
+                    "batch=%s",
+                    scope.key,
+                    work_item.batch_key,
                 )
             except Exception as exc:
                 error_detail = f"{type(exc).__name__}: {exc}"[:1000]
@@ -2716,7 +2808,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     },
                 )
                 raise
-            await service.finish_distillation_batch(work_item=work_item)
             result = {
                 "scope_id": scope.storage_id,
                 "message_count": len(messages),
@@ -2728,7 +2819,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "topics": len(persisted.topic_ids),
                 "plastic_edges": len(persisted.plastic_edge_ids),
                 "embedded_documents": indexed,
-                "ignored_messages": len(batch.ignored_sources),
+                "ignored_messages": (
+                    0 if snapshot_changed else len(batch.ignored_sources)
+                ),
                 "sanitized_units": len(sanitization_actions),
                 "prompt_chars": len(distillation_prompt),
                 "llm_total_tokens": llm_total_tokens,
@@ -2737,10 +2830,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     2,
                 ),
                 "prompt_protocol": "compact-v1",
+                "snapshot_changed": snapshot_changed,
+                "embedding_index_error": index_error,
             }
             await service.finish_experiment(
                 run_id=run_id,
-                status="completed",
+                status=("superseded" if snapshot_changed else "completed"),
                 result={
                     **result,
                     "initial_validation_error": validation_error_detail,
@@ -3038,6 +3133,40 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         *,
         force: bool = False,
     ) -> str:
+        """Serialize one group's private wake without delaying the main reply."""
+
+        if not self.subconscious_enabled:
+            return "error: MR Memory subconscious agent is disabled."
+        if not self.subconscious_provider_id:
+            return "error: No subconscious provider is configured."
+        if error := self._tool_guard(event):
+            return error
+        scope = self._group_scope(event)
+        lock = self._wake_locks.setdefault(scope.key, asyncio.Lock())
+        if not force and lock.locked():
+            logger.info(
+                "MR Memory automatic reconstruction skipped; previous wake still "
+                "running | umo=%s",
+                scope.key,
+            )
+            return "NO_RELEVANT_MEMORY"
+        await lock.acquire()
+        try:
+            return await self._run_subconscious_locked(
+                event,
+                query,
+                force=force,
+            )
+        finally:
+            lock.release()
+
+    async def _run_subconscious_locked(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        *,
+        force: bool = False,
+    ) -> str:
         if not self.subconscious_enabled:
             return "error: MR Memory subconscious agent is disabled."
         if not self.subconscious_provider_id:
@@ -3161,7 +3290,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             f"{json.dumps(previous_state, ensure_ascii=False, separators=(',', ':'))}"
         )
 
-        lock = self._wake_locks.setdefault(umo, asyncio.Lock())
+        lock = self._wake_execution_locks.setdefault(umo, asyncio.Lock())
         async with lock:
             run_id = _runtime_run_id("reconstruction")
             initial_path = "deep_forced" if force else "fast"
@@ -3200,11 +3329,16 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         messages_per_episode=12,
                     )
                     prefetch_ms = (time.perf_counter() - prefetch_started) * 1000
-                    visited_source_keys = _collect_source_keys(evidence_packet)
                     packet_json, packet_truncated = _bounded_json_text(
                         evidence_packet,
                         max_chars=60000,
                     )
+                    delivered_packet = json.loads(packet_json)
+                    (
+                        visited_source_keys,
+                        allowed_hypothesis_ids,
+                        allowed_edge_ids,
+                    ) = reconstruction_packet_allowlist(delivered_packet)
                     await service.record_reconstruction_step(
                         run_id=run_id,
                         step_index=0,
@@ -3265,14 +3399,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     fast_plan = parse_reconstruction_plan(
                         response.completion_text or "",
                         allowed_source_keys=visited_source_keys,
-                        allowed_hypothesis_ids={
-                            int(item["id"]) for item in feedback_candidates
-                        },
-                        allowed_edge_ids={
-                            int(item.get("id") or 0)
-                            for item in initial_candidates.get("associations", [])
-                            if int(item.get("id") or 0) > 0
-                        },
+                        allowed_hypothesis_ids=allowed_hypothesis_ids,
+                        allowed_edge_ids=allowed_edge_ids,
                     )
                     active_trace = self._active_interaction_traces.get(id(event))
                     trace_id = (
@@ -3788,10 +3916,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 learning_response = None
                 learning_packet_chars = 0
                 learning_packet_truncated = False
+                learning_edge_ids: dict[int, set[int]] = {}
                 plans = ()
                 if learning_attributions:
                     learning_packets: list[dict[str, object]] = []
-                    learning_evidence: dict[int, set[str]] = {}
                     for attribution in learning_attributions:
                         active_proposal_id = attribution.proposal_id
                         inspected = inspected_by_id[active_proposal_id]
@@ -3881,15 +4009,23 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             _compact_plastic_association(item) for item in associations
                         ]
                         learning_packets.append(learning_packet)
-                        learning_evidence[active_proposal_id] = _collect_source_keys(
-                            learning_packet
-                        )
                     learning_packet_json, learning_packet_truncated = (
                         _bounded_json_text(
                             {"items": learning_packets},
                             max_chars=24000,
                         )
                     )
+                    delivered_learning_packet = json.loads(learning_packet_json)
+                    learning_evidence = feedback_packet_evidence(
+                        delivered_learning_packet
+                    )
+                    learning_edge_ids = feedback_packet_edge_ids(
+                        delivered_learning_packet
+                    )
+                    if not learning_evidence:
+                        raise ValueError(
+                            "bounded feedback packet omitted all attributable evidence"
+                        )
                     learning_packet_chars = len(learning_packet_json)
                     learning_prompt = (
                         f"Current group UMO: {scope.key}\n"
@@ -3941,6 +4077,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     plans = parse_feedback_batch_plan(
                         learning_response.completion_text or "",
                         proposal_evidence=learning_evidence,
+                        proposal_edge_ids=learning_edge_ids,
                     )
 
                 for plan in plans:
@@ -3954,13 +4091,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     mutation_results: list[dict[str, object]] = []
                     mutation_errors: list[str] = []
                     if result.get("status") == "COMMITTED":
-                        inspected = inspected_by_id[plan.proposal_id]
-                        allowed_negative_edges = {
-                            int(item.get("edge_id") or 0)
-                            for item in inspected.get("activated_plastic_edges", [])
-                            if isinstance(item, dict)
-                            and int(item.get("edge_id") or 0) > 0
-                        }
+                        allowed_negative_edges = learning_edge_ids.get(
+                            plan.proposal_id,
+                            set(),
+                        )
                         for mutation in plan.graph_mutations:
                             try:
                                 mutation_result = await service.apply_graph_mutation(
@@ -4909,15 +5043,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 role="BOT",
             )
         )
-        if (
-            self.auto_distillation_enabled
-            and await service.pending_distillation_count(
-                umo=scope.key,
-                processing_class="LIVE",
+        if self.auto_distillation_enabled:
+            await self._ensure_distillation_deadline(
+                scope=scope,
+                event=event,
             )
-            >= self.auto_distillation_min_pending
-        ):
-            await self._schedule_maintenance(kind="distill", scope=scope)
 
     @filter.after_message_sent()
     async def trace_sent_artifacts(self, event: AstrMessageEvent) -> None:
@@ -4992,8 +5122,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
     async def terminate(self) -> None:
         tasks = list(self._maintenance_tasks)
         self._maintenance_tasks.clear()
-        tasks.extend(self._maintenance_wakeup_tasks)
+        tasks.extend(self._maintenance_wakeup_tasks.values())
         self._maintenance_wakeup_tasks.clear()
+        self._maintenance_wakeup_specs.clear()
         tasks.extend(
             task
             for task in self._feedback_debounce_tasks.values()
@@ -5012,6 +5143,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._services.clear()
         self._service_scopes.clear()
         self._wake_locks.clear()
+        self._wake_execution_locks.clear()
         self._distill_locks.clear()
         self._feedback_locks.clear()
         self._active_interaction_traces.clear()

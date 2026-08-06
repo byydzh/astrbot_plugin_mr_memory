@@ -4,9 +4,12 @@ import json
 import unittest
 
 from mr_memory.runtime import (
+    feedback_packet_edge_ids,
+    feedback_packet_evidence,
     parse_feedback_attribution_plan,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
+    reconstruction_packet_allowlist,
 )
 
 
@@ -60,6 +63,43 @@ class RuntimePlanTests(unittest.TestCase):
                 },
                 allowed_source_keys={"source-1"},
             )
+
+    def test_non_brief_reconstruction_cannot_activate_memory_paths(self) -> None:
+        for decision, extra in (
+            ("none", {}),
+            ("escalate", {"escalation_question": "需要沿哪条边继续检索？"}),
+        ):
+            with self.subTest(decision=decision), self.assertRaises(ValueError):
+                parse_reconstruction_plan(
+                    {
+                        "decision": decision,
+                        "memory_brief": {
+                            "claims": [],
+                            "conflicts": [],
+                            "unresolved": [],
+                        },
+                        "activate_hypotheses": [{"id": 7, "relevance": 0.8}],
+                        "activate_edges": [],
+                        **extra,
+                    },
+                    allowed_source_keys=set(),
+                    allowed_hypothesis_ids={7},
+                )
+
+        plan = parse_reconstruction_plan(
+            {
+                "decision": "none",
+                "memory_brief": {
+                    "claims": [],
+                    "conflicts": [],
+                    "unresolved": [],
+                },
+                "activate_hypotheses": [],
+                "activate_edges": [],
+            },
+            allowed_source_keys=set(),
+        )
+        self.assertEqual(plan.decision, "none")
 
     def test_feedback_batch_requires_one_plan_per_proposal(self) -> None:
         value = {
@@ -155,6 +195,45 @@ class RuntimePlanTests(unittest.TestCase):
                 },
                 eligible_trace_ids={1: {"trace-1"}},
             )
+
+    def test_allowlists_follow_only_the_delivered_packet(self) -> None:
+        sources, hypotheses, edges = reconstruction_packet_allowlist(
+            {
+                "candidates": {
+                    "feedback_hypotheses": [{"id": 7, "source_key": "s-1"}],
+                    "associations": [{"id": 9, "source_keys": ["s-2"]}],
+                },
+                "expanded_episodes": [{"source_key": "s-3"}],
+            }
+        )
+        self.assertEqual(sources, {"s-1", "s-2", "s-3"})
+        self.assertEqual(hypotheses, {7})
+        self.assertEqual(edges, {9})
+
+        evidence = feedback_packet_evidence(
+            {
+                "items": [
+                    {"proposal_id": 4, "evidence": {"source_key": "f-1"}},
+                    {"proposal_id": 5, "evidence": {"source_keys": ["f-2"]}},
+                ]
+            }
+        )
+        self.assertEqual(evidence, {4: {"f-1"}, 5: {"f-2"}})
+        edge_ids = feedback_packet_edge_ids(
+            {
+                "items": [
+                    {
+                        "proposal_id": 4,
+                        "evidence": {
+                            "activated_plastic_edges": [
+                                {"edge_id": 12, "relation": "means"}
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+        self.assertEqual(edge_ids, {4: {12}})
 
 
 if __name__ == "__main__":

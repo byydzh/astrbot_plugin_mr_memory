@@ -38,6 +38,11 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertNotIn("history_backfill_daily_token_budget", self.schema)
         self.assertNotIn("history_budget_reserve_tokens", self.schema)
 
+    def test_online_distillation_defaults_to_150_messages_or_daily(self) -> None:
+        self.assertEqual(self.schema["auto_distillation_min_pending"]["default"], 150)
+        self.assertEqual(self.schema["maintenance_interval_minutes"]["default"], 1440)
+        self.assertEqual(self.schema["maintenance_interval_seconds"]["default"], 86400)
+
     def test_umo_guidance_uses_platform_instance_id(self) -> None:
         hint = str(self.schema["allowed_umos"]["hint"])
         self.assertIn("平台实例 ID", hint)

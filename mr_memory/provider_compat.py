@@ -1,7 +1,37 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
+
+
+def _supports_private_call(
+    value: object,
+    *,
+    positional: int = 0,
+    keywords: tuple[str, ...] = (),
+) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = tuple(inspect.signature(value).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    has_var_positional = any(
+        item.kind is inspect.Parameter.VAR_POSITIONAL for item in parameters
+    )
+    positional_capacity = sum(
+        item.kind
+        in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        for item in parameters
+    )
+    if not has_var_positional and positional_capacity < positional:
+        return False
+    names = {item.name for item in parameters}
+    has_var_keyword = any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters
+    )
+    return has_var_keyword or all(name in names for name in keywords)
 
 
 async def generate_with_enforced_options(
@@ -27,13 +57,27 @@ async def generate_with_enforced_options(
     prepare = getattr(provider, "_prepare_chat_payload", None)
     query = getattr(provider, "_query", None)
     query_stream = getattr(provider, "_query_stream", None)
-    if callable(prepare) and callable(query):
+    private_api_compatible = _supports_private_call(
+        prepare,
+        keywords=("prompt", "system_prompt"),
+    ) and _supports_private_call(
+        query,
+        positional=2,
+        keywords=("request_max_retries",),
+    )
+    if stream:
+        private_api_compatible = private_api_compatible and _supports_private_call(
+            query_stream,
+            positional=2,
+            keywords=("request_max_retries",),
+        )
+    if private_api_compatible:
         payload, _ = await prepare(
             prompt=prompt,
             system_prompt=system_prompt,
         )
         payload.update(dict(options))
-        if stream and callable(query_stream):
+        if stream:
             final_response = None
             chunk_count = 0
             async for response in query_stream(
