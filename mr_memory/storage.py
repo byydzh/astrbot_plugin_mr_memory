@@ -8,6 +8,8 @@ import re
 import sqlite3
 import threading
 import time
+from collections import Counter, deque
+from heapq import heappop, heappush
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -40,11 +42,298 @@ from .plasticity import (
     RelationTypeProposal,
 )
 
-
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 TRUTH_V2_BACKFILL_VERSION = 8
 MEDIA_HEAVY_HITTER_LIMIT = 512
 MEDIA_SAMPLE_SOURCE_LIMIT = 8
+TOKEN_BUDGET_PHASES = {
+    "online": (
+        "construction",
+        "construction_repair",
+        "reconstruction",
+        "reconstruction_deep",
+    ),
+    "feedback": ("feedback_maintenance",),
+    "backfill": (
+        "history_construction",
+        "history_construction_repair",
+    ),
+}
+
+GRAPH_NODE_TYPES = {
+    "participant",
+    "cue",
+    "episode",
+    "semantic",
+    "topic",
+    "action",
+    "feedback",
+    "hypothesis",
+    "plastic",
+}
+
+
+def _graph_structure(
+    nodes: Mapping[str, Mapping[str, object]],
+    edges: Iterable[Mapping[str, object]],
+) -> dict[str, object]:
+    """Calculate deterministic complex-network measures on an undirected projection."""
+    node_ids = set(nodes)
+    adjacency: dict[str, set[str]] = {node_id: set() for node_id in node_ids}
+    in_degree: Counter[str] = Counter()
+    out_degree: Counter[str] = Counter()
+    directed_pairs: set[tuple[str, str]] = set()
+    relation_counts: Counter[str] = Counter()
+    edge_count = 0
+    for edge in edges:
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source not in node_ids or target not in node_ids:
+            continue
+        edge_count += 1
+        out_degree[source] += 1
+        in_degree[target] += 1
+        relation_counts[str(edge.get("relation") or "未命名关系")] += 1
+        if source == target:
+            continue
+        adjacency[source].add(target)
+        adjacency[target].add(source)
+        directed_pairs.add((source, target))
+
+    degrees = {node_id: len(neighbors) for node_id, neighbors in adjacency.items()}
+    components: list[set[str]] = []
+    unseen = set(node_ids)
+    while unseen:
+        start = min(unseen)
+        queue = deque([start])
+        unseen.remove(start)
+        component = {start}
+        while queue:
+            current = queue.popleft()
+            for neighbor in adjacency[current]:
+                if neighbor not in unseen:
+                    continue
+                unseen.remove(neighbor)
+                component.add(neighbor)
+                queue.append(neighbor)
+        components.append(component)
+    components.sort(key=lambda item: (-len(item), min(item) if item else ""))
+    component_ids: dict[str, int] = {}
+    component_sizes: dict[str, int] = {}
+    for index, component in enumerate(components, start=1):
+        for node_id in component:
+            component_ids[node_id] = index
+            component_sizes[node_id] = len(component)
+
+    mutable_degree = dict(degrees)
+    active = set(node_ids)
+    heap: list[tuple[int, str]] = []
+    for node_id, degree in mutable_degree.items():
+        heappush(heap, (degree, node_id))
+    core_numbers: dict[str, int] = {}
+    while heap:
+        degree, node_id = heappop(heap)
+        if node_id not in active or degree != mutable_degree[node_id]:
+            continue
+        active.remove(node_id)
+        core_numbers[node_id] = degree
+        for neighbor in adjacency[node_id]:
+            if neighbor not in active or mutable_degree[neighbor] <= degree:
+                continue
+            mutable_degree[neighbor] -= 1
+            heappush(heap, (mutable_degree[neighbor], neighbor))
+
+    clustering_sum = 0.0
+    for node_id, neighbors in adjacency.items():
+        degree = len(neighbors)
+        if degree < 2:
+            continue
+        links = (
+            sum(
+                len(adjacency[neighbor].intersection(neighbors))
+                for neighbor in neighbors
+            )
+            / 2.0
+        )
+        clustering_sum += links / (degree * (degree - 1) / 2.0)
+
+    unique_undirected_edges = sum(degrees.values()) // 2
+    node_count = len(node_ids)
+    density = (
+        (2.0 * unique_undirected_edges) / (node_count * (node_count - 1))
+        if node_count > 1
+        else 0.0
+    )
+    reciprocal_pairs = sum(
+        1 for source, target in directed_pairs if (target, source) in directed_pairs
+    )
+    reciprocity = reciprocal_pairs / len(directed_pairs) if directed_pairs else 0.0
+
+    average_path_length = 0.0
+    diameter = 0
+    path_sample_size = 0
+    if components and len(components[0]) > 1:
+        giant = components[0]
+        ranked = sorted(giant, key=lambda item: (-degrees[item], item))
+        sample_count = min(24, len(ranked))
+        if sample_count:
+            sample_indexes = {
+                round(index * (len(ranked) - 1) / max(1, sample_count - 1))
+                for index in range(sample_count)
+            }
+            sample_nodes = [ranked[index] for index in sorted(sample_indexes)]
+            distance_sum = 0
+            distance_count = 0
+            for start in sample_nodes:
+                distances = {start: 0}
+                queue = deque([start])
+                while queue:
+                    current = queue.popleft()
+                    for neighbor in adjacency[current]:
+                        if neighbor in distances:
+                            continue
+                        distances[neighbor] = distances[current] + 1
+                        queue.append(neighbor)
+                reachable = [
+                    value for node, value in distances.items() if node != start
+                ]
+                if reachable:
+                    distance_sum += sum(reachable)
+                    distance_count += len(reachable)
+                    diameter = max(diameter, max(reachable))
+            path_sample_size = len(sample_nodes)
+            if distance_count:
+                average_path_length = distance_sum / distance_count
+
+    histogram_buckets = (
+        ("0", 0, 0),
+        ("1", 1, 1),
+        ("2", 2, 2),
+        ("3–4", 3, 4),
+        ("5–9", 5, 9),
+        ("10–19", 10, 19),
+        ("20+", 20, 2**31 - 1),
+    )
+    degree_histogram = [
+        {
+            "label": label,
+            "count": sum(1 for degree in degrees.values() if low <= degree <= high),
+        }
+        for label, low, high in histogram_buckets
+    ]
+    top_node_ids = sorted(
+        node_ids,
+        key=lambda item: (
+            -degrees[item],
+            -core_numbers.get(item, 0),
+            str(nodes[item].get("label") or "").casefold(),
+            item,
+        ),
+    )[:12]
+    top_nodes = [
+        {
+            "id": node_id,
+            "type": str(nodes[node_id].get("type") or ""),
+            "label": str(nodes[node_id].get("label") or node_id),
+            "degree": degrees[node_id],
+            "core": core_numbers.get(node_id, 0),
+            "component_id": component_ids.get(node_id, 0),
+        }
+        for node_id in top_node_ids
+    ]
+    return {
+        "adjacency": adjacency,
+        "degrees": degrees,
+        "in_degree": dict(in_degree),
+        "out_degree": dict(out_degree),
+        "core_numbers": core_numbers,
+        "component_ids": component_ids,
+        "component_sizes": component_sizes,
+        "metrics": {
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "unique_edge_count": unique_undirected_edges,
+            "density": density,
+            "average_degree": (
+                (2.0 * unique_undirected_edges) / node_count if node_count else 0.0
+            ),
+            "connected_components": len(components),
+            "giant_component_size": len(components[0]) if components else 0,
+            "giant_component_ratio": (
+                len(components[0]) / node_count if components and node_count else 0.0
+            ),
+            "isolated_nodes": sum(1 for degree in degrees.values() if degree == 0),
+            "average_clustering": (clustering_sum / node_count if node_count else 0.0),
+            "reciprocity": reciprocity,
+            "max_core": max(core_numbers.values(), default=0),
+            "average_path_length_estimate": average_path_length,
+            "diameter_estimate": diameter,
+            "path_sample_size": path_sample_size,
+        },
+        "degree_histogram": degree_histogram,
+        "top_nodes": top_nodes,
+        "relation_counts": [
+            {"relation": relation, "count": count}
+            for relation, count in sorted(
+                relation_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:30]
+        ],
+    }
+
+
+def _graph_search_score(node: Mapping[str, object], query: str) -> int:
+    terms = [term for term in query.casefold().split() if term]
+    if not terms:
+        return 0
+    label = str(node.get("label") or "").casefold()
+    primary = " ".join(
+        str(node.get(key) or "").casefold()
+        for key in ("label", "detail", "statement", "node_key", "account_id")
+    )
+    secondary = " ".join(
+        str(node.get(key) or "").casefold()
+        for key in ("source_key", "source_text", "canonical_key")
+    )
+    if not all(term in primary or term in secondary for term in terms):
+        return 0
+    normalized = " ".join(terms)
+    score = 20
+    if label == normalized:
+        score += 120
+    elif label.startswith(normalized):
+        score += 90
+    elif normalized in label:
+        score += 65
+    score += sum(18 for term in terms if term in label)
+    score += sum(7 for term in terms if term in primary)
+    score += sum(2 for term in terms if term in secondary)
+    return score
+
+
+def _shortest_graph_path(
+    adjacency: Mapping[str, set[str]], source: str, target: str
+) -> list[str]:
+    if source not in adjacency or target not in adjacency:
+        return []
+    if source == target:
+        return [source]
+    parents: dict[str, str | None] = {source: None}
+    queue = deque([source])
+    while queue:
+        current = queue.popleft()
+        for neighbor in sorted(adjacency[current]):
+            if neighbor in parents:
+                continue
+            parents[neighbor] = current
+            if neighbor == target:
+                path = [target]
+                cursor = target
+                while parents[cursor] is not None:
+                    cursor = str(parents[cursor])
+                    path.append(cursor)
+                return list(reversed(path))
+            queue.append(neighbor)
+    return []
 
 
 class MemoryStorage:
@@ -82,8 +371,7 @@ class MemoryStorage:
 
     def _migrate(self) -> None:
         with self._lock, self._connection:
-            self._connection.executescript(
-                """
+            self._connection.executescript("""
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -180,6 +468,7 @@ class MemoryStorage:
                     message_id INTEGER PRIMARY KEY REFERENCES messages(id)
                         ON DELETE CASCADE,
                     content_sha256 TEXT NOT NULL,
+                    processing_class TEXT NOT NULL DEFAULT 'LIVE',
                     status TEXT NOT NULL DEFAULT 'PENDING',
                     batch_key TEXT NOT NULL DEFAULT '',
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -502,6 +791,18 @@ class MemoryStorage:
                 CREATE INDEX IF NOT EXISTS idx_llm_usage_run_phase
                     ON llm_usage_events (run_id, phase, arm, call_index);
 
+                CREATE TABLE IF NOT EXISTS token_budget_resets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    budget_class TEXT NOT NULL,
+                    reset_at INTEGER NOT NULL,
+                    usage_event_id INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT 'operator',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_token_budget_resets_scope
+                    ON token_budget_resets (umo, budget_class, reset_at DESC);
+
                 CREATE TABLE IF NOT EXISTS reconstruction_steps (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT NOT NULL REFERENCES experiment_runs(run_id)
@@ -793,8 +1094,7 @@ class MemoryStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_pending
                     ON maintenance_jobs (umo, status, available_at, id);
-                """
-            )
+                """)
 
             def ensure_column(table: str, name: str, declaration: str) -> None:
                 columns = {
@@ -816,6 +1116,25 @@ class MemoryStorage:
             ensure_column("messages", "content_sha256", "TEXT NOT NULL DEFAULT ''")
             ensure_column("messages", "revision_no", "INTEGER NOT NULL DEFAULT 1")
             ensure_column("messages", "deleted_at", "INTEGER")
+            ensure_column(
+                "message_processing",
+                "processing_class",
+                "TEXT NOT NULL DEFAULT 'LIVE'",
+            )
+            ensure_column(
+                "message_processing",
+                "ingestion_source",
+                "TEXT NOT NULL DEFAULT 'adapter_live'",
+            )
+            ensure_column(
+                "token_budget_resets",
+                "usage_event_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_message_processing_class_pending
+                ON message_processing (processing_class, status, message_id)
+                """)
             ensure_column("episodes", "stable_key", "TEXT NOT NULL DEFAULT ''")
             ensure_column("episodes", "revision_no", "INTEGER NOT NULL DEFAULT 1")
             ensure_column(
@@ -860,12 +1179,10 @@ class MemoryStorage:
             self._connection.execute(
                 "UPDATE episodes SET updated_at=CURRENT_TIMESTAMP WHERE updated_at=''"
             )
-            self._connection.execute(
-                """
+            self._connection.execute("""
                 UPDATE semantic_memories SET updated_at=CURRENT_TIMESTAMP
                 WHERE updated_at=''
-                """
-            )
+                """)
             ensure_column(
                 "feedback_proposals", "surface_score", "REAL NOT NULL DEFAULT 0"
             )
@@ -884,18 +1201,14 @@ class MemoryStorage:
                 "uncertainty",
                 "TEXT NOT NULL DEFAULT ''",
             )
-            self._connection.execute(
-                """
+            self._connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_stable_key
                 ON episodes (umo, stable_key) WHERE stable_key <> ''
-                """
-            )
-            self._connection.execute(
-                """
+                """)
+            self._connection.execute("""
                 CREATE INDEX IF NOT EXISTS idx_semantic_stable_key
                 ON semantic_memories (umo, stable_key, status)
-                """
-            )
+                """)
             hypothesis_columns = {
                 str(row["name"])
                 for row in self._connection.execute(
@@ -903,19 +1216,46 @@ class MemoryStorage:
                 ).fetchall()
             }
             if "activation_mode" not in hypothesis_columns:
-                self._connection.execute(
-                    """
+                self._connection.execute("""
                     ALTER TABLE feedback_hypotheses
                     ADD COLUMN activation_mode TEXT NOT NULL DEFAULT 'semantic'
-                    """
-                )
+                    """)
             if "merge_previous_status" not in hypothesis_columns:
-                self._connection.execute(
-                    """
+                self._connection.execute("""
                     ALTER TABLE feedback_hypotheses
                     ADD COLUMN merge_previous_status TEXT NOT NULL DEFAULT ''
-                    """
-                )
+                    """)
+            ingestion_source_migration = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='ingestion_source_v12'"
+            ).fetchone()
+            if ingestion_source_migration is None:
+                self._connection.execute("""
+                    UPDATE message_processing
+                    SET ingestion_source=CASE processing_class
+                        WHEN 'BACKFILL' THEN 'external_backfill'
+                        ELSE 'adapter_live' END
+                    """)
+                self._connection.execute("""
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('ingestion_source_v12', 'completed')
+                    """)
+            feedback_budget_migration = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='feedback_budget_v13'"
+            ).fetchone()
+            if feedback_budget_migration is None:
+                self._connection.execute("""
+                    UPDATE maintenance_jobs
+                    SET status='CANCELLED', available_at=unixepoch(),
+                        lease_until=NULL,
+                        last_error='superseded_by_feedback_batch_v13',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE job_type='feedback' AND status='BUDGET_WAIT'
+                      AND last_error='budget_wait:online'
+                    """)
+                self._connection.execute("""
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('feedback_budget_v13', 'completed')
+                    """)
             self._connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)
@@ -926,9 +1266,8 @@ class MemoryStorage:
             backfill = self._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='truth_v2_backfill'"
             ).fetchone()
-            if (
-                backfill is None
-                or str(backfill["value"]) != str(TRUTH_V2_BACKFILL_VERSION)
+            if backfill is None or str(backfill["value"]) != str(
+                TRUTH_V2_BACKFILL_VERSION
             ):
                 self._backfill_truth_v2()
                 self._connection.execute(
@@ -947,44 +1286,56 @@ class MemoryStorage:
                     "SELECT DISTINCT umo FROM messages WHERE umo <> ''"
                 ).fetchall()
                 for scope in scopes:
-                    self._rebuild_media_fingerprints_locked(
-                        umo=str(scope["umo"])
-                    )
-                self._connection.execute(
-                    """
+                    self._rebuild_media_fingerprints_locked(umo=str(scope["umo"]))
+                self._connection.execute("""
                     INSERT INTO schema_meta(key, value)
                     VALUES ('media_index_backfill', '10')
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """
-                )
+                    """)
             # A process kill or cancellation can occur after a batch claims rows but
             # before its normal completion handler runs. Recover those rows on every
             # open so the oldest-first checkpoint cannot become permanently stuck.
-            self._connection.execute(
-                """
+            self._connection.execute("""
                 UPDATE distillation_batches
                 SET status='FAILED', error='interrupted before completion',
                     finished_at=CURRENT_TIMESTAMP
                 WHERE status='RUNNING'
-                """
-            )
-            self._connection.execute(
-                """
+                """)
+            self._connection.execute("""
                 UPDATE message_processing
                 SET status='FAILED', batch_key='',
                     last_error='interrupted before completion',
                     updated_at=CURRENT_TIMESTAMP
                 WHERE status='PROCESSING'
-                """
-            )
-            self._connection.execute(
-                """
+                """)
+            self._connection.execute("""
                 UPDATE maintenance_jobs
                 SET status='PENDING', lease_until=NULL,
                     last_error='interrupted before completion',
                     updated_at=CURRENT_TIMESTAMP
                 WHERE status='RUNNING'
+                  AND (
+                    lease_until IS NULL
+                    OR lease_until <= CAST(strftime('%s', 'now') AS INTEGER)
+                  )
+                """)
+            self._connection.execute(
                 """
+                UPDATE experiment_runs
+                SET status='FAILED',
+                    result_json=?,
+                    finished_at=CURRENT_TIMESTAMP
+                WHERE status='RUNNING'
+                """,
+                (
+                    json.dumps(
+                        {
+                            "error_type": "InterruptedError",
+                            "error_detail": ("runtime interrupted before completion"),
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
             )
 
     def _upsert_alias_locked(
@@ -1247,9 +1598,7 @@ class MemoryStorage:
         )
 
     def _rebuild_media_fingerprints_locked(self, *, umo: str) -> None:
-        self._connection.execute(
-            "DELETE FROM media_fingerprints WHERE umo=?", (umo,)
-        )
+        self._connection.execute("DELETE FROM media_fingerprints WHERE umo=?", (umo,))
         rows = self._connection.execute(
             """
             SELECT a.attachment_type, a.reference_sha256,
@@ -1457,14 +1806,12 @@ class MemoryStorage:
             )
 
     def _backfill_truth_v2(self) -> None:
-        rows = self._connection.execute(
-            """
+        rows = self._connection.execute("""
             SELECT id, source_key, platform_id, umo, message_id, sender_id,
                    sender_name, sent_at, plain_text, content_json, role,
                    is_deleted, content_sha256, sender_participant_id
             FROM messages ORDER BY id
-            """
-        ).fetchall()
+            """).fetchall()
         for row in rows:
             content = self._scrub_forgotten_references_locked(
                 umo=str(row["umo"]),
@@ -1538,21 +1885,17 @@ class MemoryStorage:
                 content=content,
             )
 
-        self._connection.execute(
-            """
+        self._connection.execute("""
             INSERT OR IGNORE INTO semantic_memory_sources(
                 semantic_memory_id, message_id, evidence_role, confidence
             )
             SELECT id, source_message_id, 'SUPPORT', confidence
             FROM semantic_memories WHERE source_message_id IS NOT NULL
-            """
-        )
-        legacy_semantics = self._connection.execute(
-            """
+            """)
+        legacy_semantics = self._connection.execute("""
             SELECT id, umo, person_cue FROM semantic_memories
             WHERE subject_participant_id IS NULL
-            """
-        ).fetchall()
+            """).fetchall()
         for semantic in legacy_semantics:
             aliases = self._connection.execute(
                 """
@@ -1635,14 +1978,12 @@ class MemoryStorage:
                     "platform_id": str(row["platform_id"]),
                     "group_id": str(row["group_id"]),
                 }
-            rows = self._connection.execute(
-                """
+            rows = self._connection.execute("""
                 SELECT DISTINCT umo, platform_id, group_id
                 FROM messages
                 WHERE is_deleted = 0
                 LIMIT 2
-                """
-            ).fetchall()
+                """).fetchall()
         if len(rows) != 1:
             return None
         return {
@@ -1733,7 +2074,21 @@ class MemoryStorage:
         message: NormalizedMessage,
         *,
         refresh_media_fingerprints: bool = True,
+        processing_class: str = "LIVE",
+        ingestion_source: str = "",
     ) -> bool:
+        normalized_processing_class = str(processing_class).strip().upper()
+        if normalized_processing_class not in {"LIVE", "BACKFILL"}:
+            raise ValueError("processing_class must be LIVE or BACKFILL")
+        normalized_ingestion_source = str(ingestion_source or "").strip()
+        if not normalized_ingestion_source:
+            normalized_ingestion_source = (
+                "adapter_live"
+                if normalized_processing_class == "LIVE"
+                else "external_backfill"
+            )
+        if not re.fullmatch(r"[a-z0-9_.-]{1,80}", normalized_ingestion_source):
+            raise ValueError("ingestion_source must be a bounded ASCII key")
         source_key = message.resolved_source_key()
         with self._lock, self._connection:
             if self._is_account_forgotten_locked(
@@ -1776,12 +2131,9 @@ class MemoryStorage:
                 seen_at=message.sent_at,
                 account_type=("BOT" if message.role == "BOT" else "USER"),
             )
-            changed = (
-                existing is not None
-                and (
-                    str(existing["content_sha256"] or "") != digest
-                    or int(existing["is_deleted"] or 0) != 0
-                )
+            changed = existing is not None and (
+                str(existing["content_sha256"] or "") != digest
+                or int(existing["is_deleted"] or 0) != 0
             )
             revision_no = 1
             if existing is not None:
@@ -1864,16 +2216,44 @@ class MemoryStorage:
                 self._connection.execute(
                     """
                     INSERT INTO message_processing(
-                        message_id, content_sha256, status, batch_key,
+                        message_id, content_sha256, processing_class,
+                        ingestion_source,
+                        status, batch_key,
                         attempts, last_error, distilled_at
-                    ) VALUES (?, ?, 'PENDING', '', 0, '', NULL)
+                    ) VALUES (?, ?, ?, ?, 'PENDING', '', 0, '', NULL)
                     ON CONFLICT(message_id) DO UPDATE SET
                         content_sha256=excluded.content_sha256,
+                        processing_class=CASE
+                            WHEN message_processing.processing_class='LIVE'
+                              OR excluded.processing_class='LIVE'
+                            THEN 'LIVE' ELSE 'BACKFILL' END,
+                        ingestion_source=CASE
+                            WHEN message_processing.processing_class='LIVE'
+                              AND excluded.processing_class<>'LIVE'
+                            THEN message_processing.ingestion_source
+                            ELSE excluded.ingestion_source END,
                         status='PENDING', batch_key='', attempts=0,
                         last_error='', distilled_at=NULL,
                         updated_at=CURRENT_TIMESTAMP
                     """,
-                    (stored_id, digest),
+                    (
+                        stored_id,
+                        digest,
+                        normalized_processing_class,
+                        normalized_ingestion_source,
+                    ),
+                )
+            elif normalized_processing_class == "LIVE":
+                # A live adapter observation wins over a later idempotent history
+                # sync, so current traffic can never be moved behind backfill.
+                self._connection.execute(
+                    """
+                    UPDATE message_processing SET processing_class='LIVE',
+                        ingestion_source=?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE message_id=? AND processing_class<>'LIVE'
+                    """,
+                    (normalized_ingestion_source, stored_id),
                 )
             self._refresh_message_links_locked(
                 message_id=stored_id,
@@ -1893,6 +2273,8 @@ class MemoryStorage:
         messages: Iterable[NormalizedMessage],
         *,
         defer_media_index: bool = False,
+        processing_class: str = "LIVE",
+        ingestion_source: str = "",
     ) -> dict[str, int]:
         """Import a bounded batch while preserving normal identity and dedupe rules."""
 
@@ -1903,6 +2285,8 @@ class MemoryStorage:
                 self.upsert_message(
                     message,
                     refresh_media_fingerprints=not defer_media_index,
+                    processing_class=processing_class,
+                    ingestion_source=ingestion_source,
                 )
             )
             processed += 1
@@ -2043,13 +2427,16 @@ class MemoryStorage:
             platform_id=platform_id,
             account_id=account,
         )
-        return self._connection.execute(
-            """
+        return (
+            self._connection.execute(
+                """
             SELECT 1 FROM forgotten_accounts
             WHERE umo = ? AND platform_id = ? AND account_hash = ?
             """,
-            (umo, platform_id, digest),
-        ).fetchone() is not None
+                (umo, platform_id, digest),
+            ).fetchone()
+            is not None
+        )
 
     def _scrub_forgotten_references_locked(
         self,
@@ -2079,8 +2466,12 @@ class MemoryStorage:
                     account_id=account,
                 ):
                     for key in (
-                        "account_id", "qq", "user_id", "display_name",
-                        "name", "nickname",
+                        "account_id",
+                        "qq",
+                        "user_id",
+                        "display_name",
+                        "name",
+                        "nickname",
                     ):
                         item.pop(key, None)
                     item["erased_participant"] = True
@@ -2097,9 +2488,15 @@ class MemoryStorage:
                     account_id=account,
                 ):
                     for key in (
-                        "sender_id", "account_id", "qq", "sender_name",
-                        "sender_nickname", "nickname", "plain_text",
-                        "message_str", "text",
+                        "sender_id",
+                        "account_id",
+                        "qq",
+                        "sender_name",
+                        "sender_nickname",
+                        "nickname",
+                        "plain_text",
+                        "message_str",
+                        "text",
                     ):
                         item.pop(key, None)
                     item["erased_participant"] = True
@@ -2268,8 +2665,9 @@ class MemoryStorage:
 
             if episode_ids:
                 placeholders = ",".join("?" for _ in episode_ids)
-                remaining = self._connection.execute(
-                    f"""
+                remaining = (
+                    self._connection.execute(
+                        f"""
                     SELECT DISTINCT em.message_id
                     FROM episode_messages AS em
                     JOIN messages AS m ON m.id = em.message_id
@@ -2277,8 +2675,11 @@ class MemoryStorage:
                       AND em.message_id NOT IN ({','.join('?' for _ in message_ids)})
                       AND m.is_deleted = 0
                     """,
-                    (*episode_ids, *message_ids),
-                ).fetchall() if message_ids else []
+                        (*episode_ids, *message_ids),
+                    ).fetchall()
+                    if message_ids
+                    else []
+                )
                 self._connection.executemany(
                     """
                     UPDATE message_processing
@@ -2316,9 +2717,7 @@ class MemoryStorage:
                 ).fetchall()
                 if dependent_claims:
                     dependent_ids = [int(row["id"]) for row in dependent_claims]
-                    dependent_placeholders = ",".join(
-                        "?" for _ in dependent_ids
-                    )
+                    dependent_placeholders = ",".join("?" for _ in dependent_ids)
                     self._connection.execute(
                         f"""
                         UPDATE semantic_memories
@@ -2440,9 +2839,7 @@ class MemoryStorage:
                     ).fetchall()
                 ]
                 if affected_hypotheses:
-                    hypothesis_placeholders = ",".join(
-                        "?" for _ in affected_hypotheses
-                    )
+                    hypothesis_placeholders = ",".join("?" for _ in affected_hypotheses)
                     self._connection.execute(
                         f"""
                         UPDATE feedback_hypotheses
@@ -2499,9 +2896,15 @@ class MemoryStorage:
                         and reply_message_id in erased_platform_message_ids
                     ):
                         for key in (
-                            "sender_id", "account_id", "qq", "sender_name",
-                            "sender_nickname", "nickname", "plain_text",
-                            "message_str", "text",
+                            "sender_id",
+                            "account_id",
+                            "qq",
+                            "sender_name",
+                            "sender_nickname",
+                            "nickname",
+                            "plain_text",
+                            "message_str",
+                            "text",
                         ):
                             item.pop(key, None)
                         item["erased_participant"] = True
@@ -2728,8 +3131,7 @@ class MemoryStorage:
                     }
                 )
         alias_only = bool(query) and all(
-            str(item["account_id"]) != query
-            and str(item["canonical_key"]) != query
+            str(item["account_id"]) != query and str(item["canonical_key"]) != query
             for item in result
         )
         return {
@@ -2856,7 +3258,8 @@ class MemoryStorage:
         umo: str,
         source_keys: list[str],
         max_participants: int = 200,
-        max_claims: int = 200,
+        max_claims: int = 60,
+        max_associations: int = 40,
     ) -> dict[str, object]:
         """Build the host-authoritative identity choices exposed to extraction.
 
@@ -3001,12 +3404,23 @@ class MemoryStorage:
                     "ambiguous_text_aliases": ambiguous_text_aliases,
                 }
 
+            search_text = "\n".join(texts)
+
+            def appears_in_batch(*values: object) -> bool:
+                for value in values:
+                    normalized = " ".join(str(value or "").casefold().split())
+                    if len(normalized) >= 2 and normalized in search_text:
+                        return True
+                return False
+
             claims: list[dict[str, object]] = []
             if selected_ids:
+                safe_claims = max(1, min(200, int(max_claims)))
                 selected_placeholders = ",".join("?" for _ in selected_ids)
                 claim_rows = self._connection.execute(
                     f"""
-                    SELECT s.id, p.canonical_key AS subject_participant_key,
+                    SELECT s.id, s.subject_participant_id,
+                           p.canonical_key AS subject_participant_key,
                            s.person_cue, s.aspect_tag, s.content, s.claim_type,
                            s.epistemic_status, s.status, s.confidence
                     FROM semantic_memories AS s
@@ -3016,9 +3430,24 @@ class MemoryStorage:
                       AND s.status IN ('ACTIVE', 'CONFLICTED', 'QUARANTINED')
                     ORDER BY s.confidence DESC, s.id DESC LIMIT ?
                     """,
-                    (umo, *selected_ids, max(1, min(1000, int(max_claims)))),
+                    (umo, *selected_ids, min(1000, safe_claims * 4)),
                 ).fetchall()
-                claims = [dict(row) for row in claim_rows]
+                claim_values = [dict(row) for row in claim_rows]
+                relevant_claims = [
+                    item
+                    for item in claim_values
+                    if appears_in_batch(
+                        item.get("person_cue"),
+                        item.get("aspect_tag"),
+                        item.get("content"),
+                    )
+                ]
+                remaining_claims = [
+                    item for item in claim_values if item not in relevant_claims
+                ]
+                claims = (relevant_claims + remaining_claims)[:safe_claims]
+                for item in claims:
+                    item.pop("subject_participant_id", None)
 
             relation_rows = self._connection.execute(
                 """
@@ -3027,7 +3456,7 @@ class MemoryStorage:
                        inverse_key, symmetric, risk_class, version
                 FROM relation_types
                 WHERE umo=? AND status='ACTIVE'
-                ORDER BY relation_key LIMIT 100
+                ORDER BY relation_key LIMIT 50
                 """,
                 (umo,),
             ).fetchall()
@@ -3060,11 +3489,27 @@ class MemoryStorage:
                 JOIN relation_types AS r ON r.id=e.relation_type_id
                 WHERE e.umo=? AND e.status IN ('ACTIVE', 'WEAKENED')
                 ORDER BY e.utility DESC, e.epistemic_confidence DESC, e.id DESC
-                LIMIT 100
+                LIMIT 200
                 """,
                 (umo,),
             ).fetchall()
-            existing_associations = [dict(row) for row in association_rows]
+            association_values = [dict(row) for row in association_rows]
+            relevant_associations = [
+                item
+                for item in association_values
+                if appears_in_batch(
+                    item.get("source_label"),
+                    item.get("target_label"),
+                )
+            ]
+            remaining_associations = [
+                item for item in association_values if item not in relevant_associations
+            ]
+            safe_associations = max(1, min(100, int(max_associations)))
+            fallback_count = max(8, safe_associations // 4)
+            existing_associations = (
+                relevant_associations + remaining_associations[:fallback_count]
+            )[:safe_associations]
 
         return {
             "messages": message_context,
@@ -3098,22 +3543,61 @@ class MemoryStorage:
             ).fetchone()
         return str(row["canonical_key"]) if row is not None else ""
 
-    def pending_distillation_count(self, *, umo: str) -> int:
+    def pending_distillation_count(
+        self,
+        *,
+        umo: str,
+        processing_class: str = "",
+    ) -> int:
+        normalized_class = str(processing_class).strip().upper()
+        if normalized_class and normalized_class not in {"LIVE", "BACKFILL"}:
+            raise ValueError("processing_class must be LIVE or BACKFILL")
+        class_clause = " AND p.processing_class = ?" if normalized_class else ""
+        parameters: tuple[object, ...] = (
+            (umo, normalized_class) if normalized_class else (umo,)
+        )
         with self._lock:
             row = self._connection.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM message_processing AS p
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE m.umo = ? AND m.is_deleted = 0
                   AND (p.status = 'PENDING'
                        OR (p.status = 'FAILED' AND p.attempts < 3))
+                  {class_clause}
                 """,
-                (umo,),
+                parameters,
             ).fetchone()
         return int(row[0])
 
-    def retry_terminal_distillation_failures(self, *, umo: str) -> int:
+    def next_distillation_processing_class(self, *, umo: str) -> str | None:
+        """Prefer online messages without mixing them into history batches."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT p.processing_class
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE m.umo = ? AND m.is_deleted = 0
+                  AND (p.status = 'PENDING'
+                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                ORDER BY CASE p.processing_class
+                    WHEN 'LIVE' THEN 0 ELSE 1 END,
+                    m.sent_at, m.id
+                LIMIT 1
+                """,
+                (umo,),
+            ).fetchone()
+        return str(row["processing_class"]) if row is not None else None
+
+    def retry_terminal_distillation_failures(
+        self,
+        *,
+        umo: str,
+        processing_class: str = "",
+    ) -> int:
         """Requeue exhausted messages after an explicit runtime reload.
 
         Normal maintenance keeps the three-attempt ceiling.  A plugin reload is
@@ -3122,9 +3606,16 @@ class MemoryStorage:
         periodic sweeper into an infinite retry loop.
         """
 
+        normalized_class = str(processing_class).strip().upper()
+        if normalized_class and normalized_class not in {"LIVE", "BACKFILL"}:
+            raise ValueError("processing_class must be LIVE or BACKFILL")
+        class_clause = " AND p.processing_class = ?" if normalized_class else ""
+        parameters: tuple[object, ...] = (
+            (umo, normalized_class) if normalized_class else (umo,)
+        )
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                """
+                f"""
                 UPDATE message_processing
                 SET status='PENDING', attempts=0, batch_key='',
                     last_error='', updated_at=CURRENT_TIMESTAMP
@@ -3134,9 +3625,10 @@ class MemoryStorage:
                     JOIN messages AS m ON m.id = p.message_id
                     WHERE m.umo = ? AND m.is_deleted = 0
                       AND p.status = 'FAILED' AND p.attempts >= 3
+                      {class_clause}
                 )
                 """,
-                (umo,),
+                parameters,
             )
         return max(0, int(cursor.rowcount))
 
@@ -3146,21 +3638,47 @@ class MemoryStorage:
         umo: str,
         limit: int = 80,
         overlap: int = 12,
+        processing_class: str = "",
     ) -> DistillationWorkItem | None:
         safe_limit = max(1, min(500, int(limit)))
         safe_overlap = max(0, min(100, int(overlap)))
+        requested_class = str(processing_class).strip().upper()
+        if requested_class and requested_class not in {"LIVE", "BACKFILL"}:
+            raise ValueError("processing_class must be LIVE or BACKFILL")
         with self._lock, self._connection:
+            if requested_class:
+                selected_class = requested_class
+            else:
+                class_row = self._connection.execute(
+                    """
+                    SELECT p.processing_class
+                    FROM message_processing AS p
+                    JOIN messages AS m ON m.id = p.message_id
+                    WHERE m.umo = ? AND m.is_deleted = 0
+                      AND (p.status = 'PENDING'
+                           OR (p.status = 'FAILED' AND p.attempts < 3))
+                    ORDER BY CASE p.processing_class
+                        WHEN 'LIVE' THEN 0 ELSE 1 END,
+                        m.sent_at, m.id
+                    LIMIT 1
+                    """,
+                    (umo,),
+                ).fetchone()
+                if class_row is None:
+                    return None
+                selected_class = str(class_row["processing_class"])
             targets = self._connection.execute(
                 """
                 SELECT m.id, m.source_key, m.content_sha256, m.sent_at
                 FROM message_processing AS p
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE m.umo = ? AND m.is_deleted = 0
+                  AND p.processing_class = ?
                   AND (p.status = 'PENDING'
                        OR (p.status = 'FAILED' AND p.attempts < 3))
                 ORDER BY m.sent_at, m.id LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, selected_class, safe_limit),
             ).fetchall()
             if not targets:
                 return None
@@ -3192,8 +3710,7 @@ class MemoryStorage:
                 key=lambda row: (int(row["sent_at"]), int(row["id"])),
             )
             target_hashes = tuple(
-                (str(row["source_key"]), str(row["content_sha256"]))
-                for row in targets
+                (str(row["source_key"]), str(row["content_sha256"])) for row in targets
             )
             batch_payload = json.dumps(
                 {"umo": umo, "targets": target_hashes},
@@ -3231,6 +3748,7 @@ class MemoryStorage:
         return DistillationWorkItem(
             batch_key=batch_key,
             umo=umo,
+            processing_class=selected_class,  # type: ignore[arg-type]
             messages=stored,
             target_source_keys=tuple(item[0] for item in target_hashes),
             target_hashes=target_hashes,
@@ -3549,9 +4067,11 @@ class MemoryStorage:
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
-                    hashlib.sha256(result_text.encode("utf-8")).hexdigest()
-                    if result_text
-                    else "",
+                    (
+                        hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+                        if result_text
+                        else ""
+                    ),
                     max(0.0, float(elapsed_ms)),
                 ),
             )
@@ -3639,25 +4159,423 @@ class MemoryStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def runtime_health_summary(
+        self,
+        *,
+        umo: str,
+        since: int | None = None,
+        recent_limit: int = 12,
+    ) -> dict[str, object]:
+        """Return privacy-safe realtime latency, cost and outcome metrics."""
+
+        self._assert_scope(umo)
+        cutoff = int(since or (time.time() - 86400))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT r.run_id, r.experiment_type, r.status, r.started_at,
+                       r.finished_at, r.result_json, r.metadata_json,
+                       COALESCE(SUM(u.input_other), 0) AS input_other,
+                       COALESCE(SUM(u.input_cached), 0) AS input_cached,
+                       COALESCE(SUM(u.output), 0) AS output,
+                       COALESCE(SUM(
+                           u.input_other + u.input_cached + u.output
+                       ), 0) AS total,
+                       COALESCE(SUM(u.elapsed_ms), 0) AS elapsed_ms
+                FROM experiment_runs AS r
+                LEFT JOIN llm_usage_events AS u ON u.run_id=r.run_id
+                WHERE r.umo=? AND unixepoch(r.started_at)>=?
+                  AND r.experiment_type IN (
+                    'runtime_reconstruction',
+                    'runtime_feedback_maintenance'
+                  )
+                GROUP BY r.run_id
+                ORDER BY r.started_at DESC, r.run_id DESC
+                LIMIT 500
+                """,
+                (umo, cutoff),
+            ).fetchall()
+            proposal_rows = self._connection.execute(
+                """
+                SELECT status, COUNT(*) AS count,
+                       MIN(feedback_sent_at) AS oldest_at
+                FROM feedback_proposals WHERE umo=? GROUP BY status
+                """,
+                (umo,),
+            ).fetchall()
+            hypothesis_rows = self._connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM feedback_hypotheses WHERE umo=? GROUP BY status
+                """,
+                (umo,),
+            ).fetchall()
+            feedback_jobs = self._connection.execute(
+                """
+                SELECT status, COUNT(*) AS count, MIN(available_at) AS oldest_at
+                FROM maintenance_jobs
+                WHERE umo=? AND job_type='feedback'
+                  AND status IN ('PENDING', 'RUNNING', 'BUDGET_WAIT', 'FAILED')
+                GROUP BY status
+                """,
+                (umo,),
+            ).fetchall()
+
+        phases: dict[str, dict[str, object]] = {
+            "reconstruction": {
+                "calls": 0,
+                "completed": 0,
+                "failed": 0,
+                "timeouts": 0,
+                "useful": 0,
+                "none": 0,
+                "escalated": 0,
+                "tokens": 0,
+                "elapsed_values": [],
+            },
+            "feedback": {
+                "calls": 0,
+                "completed": 0,
+                "failed": 0,
+                "timeouts": 0,
+                "committed": 0,
+                "provisional": 0,
+                "ignored": 0,
+                "rejected": 0,
+                "tokens": 0,
+                "elapsed_values": [],
+            },
+        }
+        recent: list[dict[str, object]] = []
+        for row in rows:
+            experiment_type = str(row["experiment_type"])
+            phase = (
+                "feedback"
+                if experiment_type == "runtime_feedback_maintenance"
+                else "reconstruction"
+            )
+            aggregate = phases[phase]
+            aggregate["calls"] = int(aggregate["calls"]) + 1
+            status = str(row["status"])
+            if status == "completed":
+                aggregate["completed"] = int(aggregate["completed"]) + 1
+            else:
+                aggregate["failed"] = int(aggregate["failed"]) + 1
+            result = json.loads(str(row["result_json"] or "{}"))
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+            if str(result.get("error_type") or "") in {
+                "TimeoutError",
+                "TimeoutErrorException",
+            }:
+                aggregate["timeouts"] = int(aggregate["timeouts"]) + 1
+            total = int(row["total"] or 0)
+            elapsed = float(row["elapsed_ms"] or 0.0)
+            aggregate["tokens"] = int(aggregate["tokens"]) + total
+            elapsed_values = aggregate["elapsed_values"]
+            assert isinstance(elapsed_values, list)
+            if elapsed > 0:
+                elapsed_values.append(elapsed)
+
+            outcome = "failed" if status != "completed" else "completed"
+            if phase == "reconstruction" and status == "completed":
+                path = str(result.get("path") or metadata.get("path") or "legacy")
+                if path == "deep_escalation":
+                    aggregate["escalated"] = int(aggregate["escalated"]) + 1
+                if bool(result.get("no_relevant_memory")):
+                    aggregate["none"] = int(aggregate["none"]) + 1
+                    outcome = "none"
+                else:
+                    aggregate["useful"] = int(aggregate["useful"]) + 1
+                    outcome = "useful"
+            elif phase == "feedback" and status == "completed":
+                outcomes = result.get("outcomes")
+                if not isinstance(outcomes, list):
+                    outcomes = [
+                        {
+                            "proposal_status": result.get("proposal_status"),
+                            "hypothesis_status": result.get("hypothesis_status"),
+                        }
+                    ]
+                labels: list[str] = []
+                for item in outcomes:
+                    if not isinstance(item, dict):
+                        continue
+                    proposal_status = str(
+                        item.get("proposal_status") or item.get("status") or ""
+                    ).upper()
+                    hypothesis_status = str(item.get("hypothesis_status") or "").upper()
+                    if proposal_status == "IGNORED":
+                        aggregate["ignored"] = int(aggregate["ignored"]) + 1
+                        labels.append("ignored")
+                    elif proposal_status == "REJECTED":
+                        aggregate["rejected"] = int(aggregate["rejected"]) + 1
+                        labels.append("rejected")
+                    elif hypothesis_status == "PROVISIONAL":
+                        aggregate["provisional"] = int(aggregate["provisional"]) + 1
+                        labels.append("provisional")
+                    elif proposal_status == "COMMITTED":
+                        aggregate["committed"] = int(aggregate["committed"]) + 1
+                        labels.append("committed")
+                outcome = ",".join(labels) or "completed"
+            if len(recent) < max(1, min(50, int(recent_limit))):
+                recent.append(
+                    {
+                        "run_id": str(row["run_id"]),
+                        "phase": phase,
+                        "status": status,
+                        "started_at": str(row["started_at"]),
+                        "finished_at": str(row["finished_at"] or ""),
+                        "input_other": int(row["input_other"] or 0),
+                        "input_cached": int(row["input_cached"] or 0),
+                        "output": int(row["output"] or 0),
+                        "tokens": total,
+                        "elapsed_ms": round(elapsed, 3),
+                        "outcome": outcome,
+                        "path": str(
+                            result.get("path") or metadata.get("path") or "legacy"
+                        ),
+                        "first_chunk_ms": round(
+                            float(result.get("first_chunk_ms") or 0.0), 3
+                        ),
+                    }
+                )
+
+        def finalize(value: dict[str, object]) -> dict[str, object]:
+            elapsed_values = sorted(
+                float(item) for item in value.pop("elapsed_values", [])
+            )
+            calls = int(value["calls"])
+            tokens = int(value["tokens"])
+            if elapsed_values:
+                median_index = (len(elapsed_values) - 1) // 2
+                p95_index = max(
+                    0,
+                    min(
+                        len(elapsed_values) - 1,
+                        math.ceil(len(elapsed_values) * 0.95) - 1,
+                    ),
+                )
+                average_ms = sum(elapsed_values) / len(elapsed_values)
+                p50_ms = elapsed_values[median_index]
+                p95_ms = elapsed_values[p95_index]
+            else:
+                average_ms = p50_ms = p95_ms = 0.0
+            return {
+                **value,
+                "avg_tokens": round(tokens / calls, 3) if calls else 0.0,
+                "avg_elapsed_ms": round(average_ms, 3),
+                "p50_elapsed_ms": round(p50_ms, 3),
+                "p95_elapsed_ms": round(p95_ms, 3),
+            }
+
+        proposal_status = {
+            str(row["status"]).casefold(): int(row["count"] or 0)
+            for row in proposal_rows
+        }
+        pending_row = next(
+            (row for row in proposal_rows if str(row["status"]) == "PENDING"),
+            None,
+        )
+        oldest_pending_at = int(pending_row["oldest_at"] or 0) if pending_row else 0
+        return {
+            "window_seconds": max(0, int(time.time()) - cutoff),
+            "reconstruction": finalize(phases["reconstruction"]),
+            "feedback": finalize(phases["feedback"]),
+            "recent": recent,
+            "feedback_queue": {
+                "proposal_status": proposal_status,
+                "hypothesis_status": {
+                    str(row["status"]).casefold(): int(row["count"] or 0)
+                    for row in hypothesis_rows
+                },
+                "job_status": {
+                    str(row["status"]).casefold(): int(row["count"] or 0)
+                    for row in feedback_jobs
+                },
+                "oldest_pending_age_seconds": (
+                    max(0, int(time.time()) - oldest_pending_at)
+                    if oldest_pending_at
+                    else 0
+                ),
+            },
+        }
+
     def private_token_usage_since(
         self,
         *,
         umo: str,
         since: int,
+        budget_class: str = "all",
+        apply_resets: bool = True,
     ) -> int:
+        normalized_class = str(budget_class or "all").strip().casefold()
+        if normalized_class not in {"all", *TOKEN_BUDGET_PHASES}:
+            raise ValueError("budget_class must be online, feedback, backfill, or all")
+        effective_since = int(since)
+        minimum_usage_id = 0
+        if apply_resets and normalized_class != "all":
+            with self._lock:
+                reset = self._connection.execute(
+                    """
+                    SELECT reset_at, usage_event_id FROM token_budget_resets
+                    WHERE umo=? AND budget_class=?
+                    ORDER BY reset_at DESC, id DESC LIMIT 1
+                    """,
+                    (umo, normalized_class),
+                ).fetchone()
+            if reset is not None:
+                effective_since = max(effective_since, int(reset["reset_at"]))
+                minimum_usage_id = int(reset["usage_event_id"] or 0)
+        phases = TOKEN_BUDGET_PHASES.get(normalized_class, ())
+        phase_clause = ""
+        parameters: list[object] = [umo, effective_since, minimum_usage_id]
+        if phases:
+            placeholders = ",".join("?" for _ in phases)
+            phase_clause = f" AND u.phase IN ({placeholders})"
+            parameters.extend(phases)
         with self._lock:
             row = self._connection.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(
                     u.input_other + u.input_cached + u.output
                 ), 0)
                 FROM llm_usage_events AS u
                 JOIN experiment_runs AS r ON r.run_id = u.run_id
                 WHERE r.umo = ? AND unixepoch(u.created_at) >= ?
+                  AND u.id > ?
+                  {phase_clause}
                 """,
-                (umo, int(since)),
+                parameters,
             ).fetchone()
         return int(row[0] or 0)
+
+    def reset_token_budget(
+        self,
+        *,
+        umo: str,
+        budget_class: str = "online",
+        at: int | None = None,
+        reason: str = "operator",
+    ) -> dict[str, object]:
+        self._assert_scope(umo)
+        normalized_class = str(budget_class).strip().casefold()
+        if normalized_class not in TOKEN_BUDGET_PHASES:
+            raise ValueError("budget_class must be online, feedback, or backfill")
+        reset_at = int(at or time.time())
+        phases = TOKEN_BUDGET_PHASES[normalized_class]
+        placeholders = ",".join("?" for _ in phases)
+        with self._lock, self._connection:
+            watermark = self._connection.execute(
+                f"""
+                SELECT COALESCE(MAX(u.id), 0)
+                FROM llm_usage_events AS u
+                JOIN experiment_runs AS r ON r.run_id=u.run_id
+                WHERE r.umo=? AND u.phase IN ({placeholders})
+                """,
+                (umo, *phases),
+            ).fetchone()
+            usage_event_id = int(watermark[0] or 0)
+            cursor = self._connection.execute(
+                """
+                INSERT INTO token_budget_resets(
+                    umo, budget_class, reset_at, usage_event_id, reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    umo,
+                    normalized_class,
+                    reset_at,
+                    usage_event_id,
+                    str(reason or "operator")[:200],
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='PENDING', available_at=?, lease_until=NULL,
+                    last_error='', updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND status='BUDGET_WAIT'
+                  AND last_error=?
+                """,
+                (reset_at, umo, f"budget_wait:{normalized_class}"),
+            )
+        return {
+            "id": int(cursor.lastrowid),
+            "umo": umo,
+            "budget_class": normalized_class,
+            "reset_at": reset_at,
+            "usage_event_id": usage_event_id,
+        }
+
+    def latest_token_budget_resets(self, *, umo: str) -> dict[str, int]:
+        self._assert_scope(umo)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT budget_class, MAX(reset_at) AS reset_at
+                FROM token_budget_resets WHERE umo=? GROUP BY budget_class
+                """,
+                (umo,),
+            ).fetchall()
+        return {str(row["budget_class"]): int(row["reset_at"]) for row in rows}
+
+    def private_budget_retry_at(
+        self,
+        *,
+        umo: str,
+        budget_class: str,
+        budget: int,
+        reserve: int,
+        now: int | None = None,
+    ) -> int:
+        """Return the first ledger-expiry time that can admit one reserved call."""
+
+        self._assert_scope(umo)
+        normalized_class = str(budget_class).strip().casefold()
+        if normalized_class not in TOKEN_BUDGET_PHASES:
+            raise ValueError("budget_class must be online, feedback, or backfill")
+        current = int(now or time.time())
+        if int(budget) <= 0:
+            return current
+        since = current - 86400
+        with self._lock:
+            reset = self._connection.execute(
+                """
+                SELECT reset_at, usage_event_id FROM token_budget_resets
+                WHERE umo=? AND budget_class=?
+                ORDER BY reset_at DESC, id DESC LIMIT 1
+                """,
+                (umo, normalized_class),
+            ).fetchone()
+        minimum_usage_id = 0
+        if reset is not None:
+            since = max(since, int(reset["reset_at"]))
+            minimum_usage_id = int(reset["usage_event_id"] or 0)
+        phases = TOKEN_BUDGET_PHASES[normalized_class]
+        placeholders = ",".join("?" for _ in phases)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT unixepoch(u.created_at) AS created_at,
+                       (u.input_other + u.input_cached + u.output) AS tokens
+                FROM llm_usage_events AS u
+                JOIN experiment_runs AS r ON r.run_id=u.run_id
+                WHERE r.umo=? AND unixepoch(u.created_at)>=?
+                  AND u.id>?
+                  AND u.phase IN ({placeholders})
+                ORDER BY u.created_at, u.id
+                """,
+                [umo, since, minimum_usage_id, *phases],
+            ).fetchall()
+        remaining = sum(int(row["tokens"] or 0) for row in rows)
+        if remaining + max(0, int(reserve)) <= int(budget):
+            return current
+        for row in rows:
+            remaining -= int(row["tokens"] or 0)
+            retry_at = int(row["created_at"] or current) + 86401
+            if remaining + max(0, int(reserve)) <= int(budget):
+                return max(current + 1, retry_at)
+        return current + 86400
 
     def dashboard_summary(self, *, umo: str) -> dict[str, object]:
         """Return bounded operational metrics for the authenticated plugin page."""
@@ -3708,7 +4626,8 @@ class MemoryStorage:
                      WHERE umo = ? AND media_type = 'image'
                        AND observation_count >= 2) AS frequent_media,
                     (SELECT COUNT(*) FROM maintenance_jobs
-                     WHERE umo = ? AND status IN ('PENDING', 'RUNNING'))
+                     WHERE umo = ? AND status IN
+                       ('PENDING', 'RUNNING', 'BUDGET_WAIT'))
                         AS pending_maintenance,
                     (SELECT COALESCE(MAX(revision), 0)
                      FROM subconscious_states WHERE umo = ?)
@@ -3721,9 +4640,25 @@ class MemoryStorage:
                      WHERE umo = ? AND is_deleted = 0) AS last_message_at
                 """,
                 (
-                    umo, umo, umo, umo, umo, umo,
-                    umo, umo, umo, umo, umo,
-                    umo, umo, umo, umo, umo, umo, umo, umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
+                    umo,
                 ),
             ).fetchone()
             last_update = self._connection.execute(
@@ -3756,6 +4691,51 @@ class MemoryStorage:
                 """,
                 (umo,),
             ).fetchall()
+            processing_rows = self._connection.execute(
+                """
+                SELECT processing_class, status, COUNT(*) AS count
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id=p.message_id
+                WHERE m.umo=?
+                GROUP BY processing_class, status
+                ORDER BY processing_class, status
+                """,
+                (umo,),
+            ).fetchall()
+            ingestion_rows = self._connection.execute(
+                """
+                SELECT ingestion_source, processing_class, COUNT(*) AS count
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id=p.message_id
+                WHERE m.umo=?
+                GROUP BY ingestion_source, processing_class
+                ORDER BY count DESC, ingestion_source
+                """,
+                (umo,),
+            ).fetchall()
+            processing_errors = self._connection.execute(
+                """
+                SELECT p.processing_class, p.status, p.attempts,
+                       p.last_error, p.updated_at, m.sent_at
+                FROM message_processing AS p
+                JOIN messages AS m ON m.id=p.message_id
+                WHERE m.umo=? AND p.last_error<>''
+                ORDER BY p.updated_at DESC, p.message_id DESC
+                LIMIT 5
+                """,
+                (umo,),
+            ).fetchall()
+            maintenance_errors = self._connection.execute(
+                """
+                SELECT job_type, status, attempts, last_error, updated_at,
+                       available_at
+                FROM maintenance_jobs
+                WHERE umo=? AND last_error<>''
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 5
+                """,
+                (umo,),
+            ).fetchall()
 
         database_bytes = 0
         for suffix in ("", "-wal", "-shm"):
@@ -3769,6 +4749,41 @@ class MemoryStorage:
             "platform_id": "",
             "group_id": "",
         }
+        since = int(time.time()) - 86400
+        token_usage_24h = {
+            budget_class: self.private_token_usage_since(
+                umo=umo,
+                since=since,
+                budget_class=budget_class,
+            )
+            for budget_class in ("online", "feedback", "backfill")
+        }
+        token_ledger_24h = {
+            budget_class: self.private_token_usage_since(
+                umo=umo,
+                since=since,
+                budget_class=budget_class,
+                apply_resets=False,
+            )
+            for budget_class in ("online", "feedback", "backfill")
+        }
+        token_ledger_total = {
+            budget_class: self.private_token_usage_since(
+                umo=umo,
+                since=0,
+                budget_class=budget_class,
+                apply_resets=False,
+            )
+            for budget_class in ("online", "feedback", "backfill")
+        }
+        pending_by_class = {
+            processing_class.casefold(): self.pending_distillation_count(
+                umo=umo,
+                processing_class=processing_class,
+            )
+            for processing_class in ("LIVE", "BACKFILL")
+        }
+        runtime_health = self.runtime_health_summary(umo=umo)
         return {
             **identity,
             "storage_id": hashlib.sha256(umo.encode("utf-8")).hexdigest(),
@@ -3777,6 +4792,16 @@ class MemoryStorage:
             "semantic_memories": int(counts["semantic_memories"] or 0),
             "participants": int(counts["participants"] or 0),
             "pending_distillation": int(counts["pending_distillation"] or 0),
+            "pending_distillation_by_class": pending_by_class,
+            "token_usage_24h": token_usage_24h,
+            "token_ledger_24h": token_ledger_24h,
+            "token_ledger_total": token_ledger_total,
+            "token_budget_resets": self.latest_token_budget_resets(umo=umo),
+            "runtime_health": runtime_health,
+            "processing_status": [dict(row) for row in processing_rows],
+            "ingestion_sources": [dict(row) for row in ingestion_rows],
+            "recent_processing_errors": [dict(row) for row in processing_errors],
+            "recent_maintenance_errors": [dict(row) for row in maintenance_errors],
             "topics": int(counts["topics"] or 0),
             "embeddings": int(counts["embeddings"] or 0),
             "interaction_traces": int(counts["interaction_traces"] or 0),
@@ -3785,14 +4810,10 @@ class MemoryStorage:
             "plastic_nodes": int(counts["plastic_nodes"] or 0),
             "plastic_edges": int(counts["plastic_edges"] or 0),
             "relation_types": int(counts["relation_types"] or 0),
-            "open_semantic_hypotheses": int(
-                counts["open_semantic_hypotheses"] or 0
-            ),
+            "open_semantic_hypotheses": int(counts["open_semantic_hypotheses"] or 0),
             "frequent_media": int(counts["frequent_media"] or 0),
             "pending_maintenance": int(counts["pending_maintenance"] or 0),
-            "subconscious_revision": int(
-                counts["subconscious_revision"] or 0
-            ),
+            "subconscious_revision": int(counts["subconscious_revision"] or 0),
             "cues": int(counts["cues"] or 0),
             "last_message_at": (
                 int(counts["last_message_at"])
@@ -3811,9 +4832,44 @@ class MemoryStorage:
         *,
         umo: str,
         limit: int = 200,
+        query: str = "",
+        focus_node_id: str = "",
+        depth: int = 1,
+        node_types: Iterable[str] | None = None,
+        epistemic_states: Iterable[str] | None = None,
+        relation: str = "",
+        min_degree: int = 0,
+        min_core: int = 0,
+        structure_scope: str = "all",
+        path_source: str = "",
+        path_target: str = "",
     ) -> dict[str, object]:
-        """Build a compact knowledge plus observable feedback-loop graph."""
+        """Build a searchable, structurally annotated memory graph view."""
         safe_limit = max(1, min(500, int(limit)))
+        scan_limit = 10_000
+        safe_depth = max(1, min(3, int(depth)))
+        normalized_query = query.strip()[:300]
+        normalized_focus = focus_node_id.strip()[:300]
+        normalized_path_source = path_source.strip()[:300]
+        normalized_path_target = path_target.strip()[:300]
+        allowed_types = {
+            str(item).strip()
+            for item in (node_types or ())
+            if str(item).strip() in GRAPH_NODE_TYPES
+        }
+        allowed_epistemic_states = {
+            str(item).strip().upper()
+            for item in (epistemic_states or ())
+            if str(item).strip()
+        }
+        normalized_relation = relation.strip().casefold()[:160]
+        safe_min_degree = max(0, min(1000, int(min_degree)))
+        safe_min_core = max(0, min(100, int(min_core)))
+        normalized_structure_scope = (
+            structure_scope
+            if structure_scope in {"all", "connected", "giant"}
+            else "all"
+        )
         with self._lock:
             episode_rows = self._connection.execute(
                 """
@@ -3826,7 +4882,7 @@ class MemoryStorage:
                 ORDER BY e.ended_at DESC, e.id DESC
                 LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             episode_ids = [int(row["id"]) for row in episode_rows]
             keyword_rows: list[sqlite3.Row] = []
@@ -3843,7 +4899,7 @@ class MemoryStorage:
                     ORDER BY k.episode_id, k.cue, k.tag
                     LIMIT ?
                     """,
-                    (umo, *episode_ids, safe_limit * 4),
+                    (umo, *episode_ids, scan_limit * 4),
                 ).fetchall()
                 topic_rows = self._connection.execute(
                     f"""
@@ -3857,7 +4913,7 @@ class MemoryStorage:
                     ORDER BY t.name, te.episode_id
                     LIMIT ?
                     """,
-                    (umo, *episode_ids, safe_limit * 2),
+                    (umo, *episode_ids, scan_limit * 2),
                 ).fetchall()
             semantic_rows = self._connection.execute(
                 """
@@ -3873,7 +4929,7 @@ class MemoryStorage:
                 ORDER BY s.id DESC
                 LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             participant_rows = self._connection.execute(
                 """
@@ -3887,7 +4943,7 @@ class MemoryStorage:
                 GROUP BY p.id
                 ORDER BY p.last_seen_at DESC, p.id LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             hypothesis_rows = self._connection.execute(
                 """
@@ -3900,7 +4956,7 @@ class MemoryStorage:
                 ORDER BY learned_at DESC, id DESC
                 LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             feedback_rows = self._connection.execute(
                 """
@@ -3918,7 +4974,7 @@ class MemoryStorage:
                 ORDER BY l.feedback_sent_at DESC, l.id DESC
                 LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             plastic_rows = self._connection.execute(
                 """
@@ -3947,7 +5003,7 @@ class MemoryStorage:
                 ORDER BY e.utility DESC, e.id DESC
                 LIMIT ?
                 """,
-                (umo, safe_limit),
+                (umo, scan_limit),
             ).fetchall()
             feedback_trace_ids = list(
                 dict.fromkeys(str(row["trace_id"]) for row in feedback_rows)
@@ -3988,9 +5044,7 @@ class MemoryStorage:
 
         for row in reversed(participant_rows):
             participant_node_id = f"participant:{int(row['id'])}"
-            label = str(
-                row["current_display_name"] or row["account_id"]
-            )
+            label = str(row["current_display_name"] or row["account_id"])
             nodes[participant_node_id] = {
                 "id": participant_node_id,
                 "type": "participant",
@@ -4186,20 +5240,201 @@ class MemoryStorage:
                     "contradict_count": int(row["contradict_count"]),
                     "status": str(row["status"]),
                     "source_keys": [
-                        key
-                        for key in str(row["evidence_keys"] or "").split(",")
-                        if key
+                        key for key in str(row["evidence_keys"] or "").split(",") if key
                     ],
                 }
             )
 
-        original_node_count = len(nodes)
-        if original_node_count > safe_limit:
-            degree: dict[str, int] = {node_id: 0 for node_id in nodes}
-            for edge in edges:
-                degree[str(edge["source"])] = degree.get(str(edge["source"]), 0) + 1
-                degree[str(edge["target"])] = degree.get(str(edge["target"]), 0) + 1
+        summary = self.dashboard_summary(umo=umo)
+        scan_truncated = int(summary["episodes"]) > len(episode_rows)
 
+        if allowed_types:
+            nodes = {
+                node_id: node
+                for node_id, node in nodes.items()
+                if str(node.get("type") or "") in allowed_types
+            }
+        edges = [
+            edge
+            for edge in edges
+            if str(edge["source"]) in nodes and str(edge["target"]) in nodes
+        ]
+        if allowed_epistemic_states:
+            edges = [
+                edge
+                for edge in edges
+                if edge.get("type") != "plastic_relation"
+                or str(edge.get("epistemic_state") or "").upper()
+                in allowed_epistemic_states
+            ]
+        if normalized_relation:
+            edges = [
+                edge
+                for edge in edges
+                if normalized_relation
+                in {
+                    str(edge.get("relation") or "").casefold(),
+                    str(edge.get("relation_key") or "").casefold(),
+                }
+            ]
+            incident_ids = {
+                str(edge[endpoint])
+                for edge in edges
+                for endpoint in ("source", "target")
+            }
+            nodes = {
+                node_id: node
+                for node_id, node in nodes.items()
+                if node_id in incident_ids
+            }
+
+        structure = _graph_structure(nodes, edges)
+        degree = structure["degrees"]
+        core_numbers = structure["core_numbers"]
+        component_ids = structure["component_ids"]
+        required_ids = {
+            node_id
+            for node_id in (
+                normalized_focus,
+                normalized_path_source,
+                normalized_path_target,
+            )
+            if node_id in nodes
+        }
+        structurally_visible = {
+            node_id
+            for node_id in nodes
+            if (
+                int(degree.get(node_id, 0)) >= safe_min_degree
+                and int(core_numbers.get(node_id, 0)) >= safe_min_core
+                and (
+                    normalized_structure_scope == "all"
+                    or (
+                        normalized_structure_scope == "connected"
+                        and int(degree.get(node_id, 0)) > 0
+                    )
+                    or (
+                        normalized_structure_scope == "giant"
+                        and int(component_ids.get(node_id, 0)) == 1
+                    )
+                )
+            )
+        }
+        structurally_visible.update(required_ids)
+        if structurally_visible != set(nodes):
+            nodes = {
+                node_id: node
+                for node_id, node in nodes.items()
+                if node_id in structurally_visible
+            }
+            edges = [
+                edge
+                for edge in edges
+                if str(edge["source"]) in nodes and str(edge["target"]) in nodes
+            ]
+            structure = _graph_structure(nodes, edges)
+            degree = structure["degrees"]
+            core_numbers = structure["core_numbers"]
+            component_ids = structure["component_ids"]
+
+        for node_id, node in nodes.items():
+            node["degree"] = int(degree.get(node_id, 0))
+            node["in_degree"] = int(structure["in_degree"].get(node_id, 0))
+            node["out_degree"] = int(structure["out_degree"].get(node_id, 0))
+            node["core"] = int(core_numbers.get(node_id, 0))
+            node["component_id"] = int(component_ids.get(node_id, 0))
+            node["component_size"] = int(structure["component_sizes"].get(node_id, 1))
+
+        search_matches: list[dict[str, object]] = []
+        if normalized_query:
+            ranked_matches = sorted(
+                (
+                    (_graph_search_score(node, normalized_query), node_id, node)
+                    for node_id, node in nodes.items()
+                ),
+                key=lambda item: (
+                    -item[0],
+                    -int(degree.get(item[1], 0)),
+                    str(item[2].get("label") or "").casefold(),
+                    item[1],
+                ),
+            )
+            for score, node_id, node in ranked_matches:
+                if score <= 0:
+                    break
+                search_matches.append(
+                    {
+                        "id": node_id,
+                        "type": str(node.get("type") or ""),
+                        "label": str(node.get("label") or node_id),
+                        "detail": str(
+                            node.get("detail") or node.get("statement") or ""
+                        )[:240],
+                        "score": score,
+                        "degree": int(degree.get(node_id, 0)),
+                        "core": int(core_numbers.get(node_id, 0)),
+                    }
+                )
+                if len(search_matches) >= 30:
+                    break
+
+        effective_focus = normalized_focus
+        if not effective_focus and search_matches:
+            effective_focus = str(search_matches[0]["id"])
+        path: list[str] = []
+        mode = "overview"
+        selected_ids: set[str] = set()
+        distances: dict[str, int] = {}
+        view_truncated = False
+        adjacency = structure["adjacency"]
+        if normalized_path_source and normalized_path_target:
+            mode = "path"
+            path = _shortest_graph_path(
+                adjacency,
+                normalized_path_source,
+                normalized_path_target,
+            )
+            selected_ids.update(path)
+            view_truncated = len(path) > safe_limit
+            if not path:
+                selected_ids.update(required_ids)
+        elif effective_focus:
+            mode = "neighborhood"
+            if effective_focus in nodes:
+                distances = {effective_focus: 0}
+                queue = deque([effective_focus])
+                while queue:
+                    current = queue.popleft()
+                    if distances[current] >= safe_depth:
+                        continue
+                    neighbors = sorted(
+                        adjacency[current],
+                        key=lambda item: (
+                            -int(degree.get(item, 0)),
+                            str(nodes[item].get("label") or "").casefold(),
+                            item,
+                        ),
+                    )
+                    for neighbor in neighbors:
+                        if neighbor in distances:
+                            continue
+                        distances[neighbor] = distances[current] + 1
+                        queue.append(neighbor)
+                ranked_neighborhood = sorted(
+                    distances,
+                    key=lambda item: (
+                        distances[item],
+                        -int(degree.get(item, 0)),
+                        -int(core_numbers.get(item, 0)),
+                        str(nodes[item].get("label") or "").casefold(),
+                        item,
+                    ),
+                )
+                selected_ids.update(ranked_neighborhood[:safe_limit])
+                view_truncated = len(ranked_neighborhood) > safe_limit
+        elif normalized_query:
+            mode = "search"
+        else:
             ratios = {
                 "episode": 0.16,
                 "cue": 0.10,
@@ -4212,15 +5447,25 @@ class MemoryStorage:
                 "plastic": 0.20,
             }
 
-            def node_rank(item: dict[str, object]) -> tuple[object, ...]:
+            def node_rank(item: Mapping[str, object]) -> tuple[object, ...]:
+                node_id = str(item["id"])
                 node_type = str(item["type"])
-                if node_type == "episode":
-                    return (-int(item.get("ended_at") or 0), str(item["id"]))
-                if node_type == "semantic":
-                    return (-int(item.get("entity_id") or 0), str(item["id"]))
-                return (-degree.get(str(item["id"]), 0), str(item["label"]).casefold())
+                recency = int(
+                    item.get("ended_at")
+                    or item.get("learned_at")
+                    or item.get("sent_at")
+                    or item.get("last_seen_at")
+                    or item.get("entity_id")
+                    or 0
+                )
+                return (
+                    -int(degree.get(node_id, 0)),
+                    -int(core_numbers.get(node_id, 0)),
+                    -recency if node_type in {"episode", "semantic", "feedback"} else 0,
+                    str(item.get("label") or "").casefold(),
+                    node_id,
+                )
 
-            selected_ids: set[str] = set()
             for node_type in (
                 "episode",
                 "cue",
@@ -4232,48 +5477,57 @@ class MemoryStorage:
                 "hypothesis",
                 "plastic",
             ):
-                quota = int(safe_limit * ratios[node_type])
-                if quota <= 0 and not selected_ids:
-                    quota = 1
+                quota = max(1, int(safe_limit * ratios[node_type]))
                 candidates = sorted(
-                    (
-                        item
-                        for item in nodes.values()
-                        if item["type"] == node_type
-                    ),
+                    (item for item in nodes.values() if item["type"] == node_type),
                     key=node_rank,
                 )
-                for item in candidates[:quota]:
-                    if len(selected_ids) >= safe_limit:
-                        break
-                    selected_ids.add(str(item["id"]))
-
+                selected_ids.update(str(item["id"]) for item in candidates[:quota])
+                if len(selected_ids) >= safe_limit:
+                    break
             remaining = sorted(
                 (
                     item
                     for item in nodes.values()
                     if str(item["id"]) not in selected_ids
                 ),
-                key=lambda item: (
-                    -degree.get(str(item["id"]), 0),
-                    node_rank(item),
-                ),
+                key=node_rank,
             )
             for item in remaining:
                 if len(selected_ids) >= safe_limit:
                     break
                 selected_ids.add(str(item["id"]))
-            nodes = {
-                node_id: node
-                for node_id, node in nodes.items()
-                if node_id in selected_ids
-            }
-            edges = [
-                edge
-                for edge in edges
-                if str(edge["source"]) in selected_ids
-                and str(edge["target"]) in selected_ids
-            ]
+            view_truncated = len(nodes) > len(selected_ids)
+
+        selected_ids = set(
+            sorted(
+                selected_ids,
+                key=lambda item: (
+                    distances.get(item, 0),
+                    -int(degree.get(item, 0)),
+                    item,
+                ),
+            )[:safe_limit]
+        )
+        display_nodes = {
+            node_id: dict(node)
+            for node_id, node in nodes.items()
+            if node_id in selected_ids
+        }
+        for node_id, distance in distances.items():
+            if node_id in display_nodes:
+                display_nodes[node_id]["distance"] = distance
+        if path:
+            for index, node_id in enumerate(path):
+                if node_id in display_nodes:
+                    display_nodes[node_id]["path_index"] = index
+        display_edges = [
+            edge
+            for edge in edges
+            if str(edge["source"]) in selected_ids
+            and str(edge["target"]) in selected_ids
+        ]
+        display_structure = _graph_structure(display_nodes, display_edges)
 
         type_order = {
             "participant": 0,
@@ -4287,22 +5541,47 @@ class MemoryStorage:
             "plastic": 8,
         }
         ordered_nodes = sorted(
-            nodes.values(),
+            display_nodes.values(),
             key=lambda item: (
+                int(item.get("distance") or 0),
+                int(item.get("path_index") or 0),
                 type_order.get(str(item["type"]), 99),
+                -int(item.get("degree") or 0),
                 str(item["label"]).casefold(),
             ),
         )
-        summary = self.dashboard_summary(umo=umo)
         return {
             "scope": summary,
             "nodes": ordered_nodes,
-            "edges": edges,
+            "edges": display_edges,
             "limit": safe_limit,
-            "truncated": (
-                int(summary["episodes"]) > len(episode_rows)
-                or original_node_count > len(ordered_nodes)
-            ),
+            "mode": mode,
+            "query": normalized_query,
+            "focus_node_id": effective_focus,
+            "depth": safe_depth,
+            "matches": search_matches,
+            "metrics": structure["metrics"],
+            "view_metrics": display_structure["metrics"],
+            "degree_histogram": structure["degree_histogram"],
+            "top_nodes": structure["top_nodes"],
+            "relation_counts": structure["relation_counts"],
+            "filters": {
+                "node_types": sorted(allowed_types),
+                "epistemic_states": sorted(allowed_epistemic_states),
+                "relation": relation.strip()[:160],
+                "min_degree": safe_min_degree,
+                "min_core": safe_min_core,
+                "structure_scope": normalized_structure_scope,
+            },
+            "path": {
+                "source": normalized_path_source,
+                "target": normalized_path_target,
+                "found": bool(path),
+                "length": max(0, len(path) - 1),
+                "node_ids": path,
+            },
+            "scan_truncated": scan_truncated,
+            "truncated": view_truncated,
         }
 
     def upsert_memory_embedding(
@@ -4407,16 +5686,17 @@ class MemoryStorage:
                 """,
                 (umo, model, *owner_types),
             ).fetchall()
+            visible_keys = self._visible_memory_owner_keys_locked(
+                umo=umo,
+                owner_types=owner_types,
+                before_sent_at=before_sent_at,
+            )
         scored: list[dict[str, object]] = []
         for row in rows:
             owner_type = str(row["owner_type"])
             owner_key = str(row["owner_key"])
-            if not self._memory_owner_visible(
-                umo=umo,
-                owner_type=owner_type,
-                owner_key=owner_key,
-                before_sent_at=before_sent_at,
-            ):
+            lookup_key = owner_key.casefold() if owner_type == "cue" else owner_key
+            if lookup_key not in visible_keys.get(owner_type, set()):
                 continue
             dimensions = int(row["dimensions"])
             if dimensions != len(normalized_query):
@@ -4460,6 +5740,143 @@ class MemoryStorage:
                     break
         selected.sort(key=lambda item: float(item["score"]), reverse=True)
         return selected[:safe_limit]
+
+    def _visible_memory_owner_keys_locked(
+        self,
+        *,
+        umo: str,
+        owner_types: tuple[str, ...],
+        before_sent_at: int | None,
+    ) -> dict[str, set[str]]:
+        """Resolve embedding visibility in bounded bulk queries.
+
+        The former implementation issued one SQLite query for every embedding.
+        A live group with roughly ten thousand vectors therefore held and
+        reacquired the shared connection lock thousands of times, starving
+        message capture and WebUI graph reads.  Keep the exact visibility rules,
+        but materialize each requested owner class once while the caller owns
+        ``self._lock``.
+        """
+
+        requested = set(owner_types)
+        cutoff = int(before_sent_at) if before_sent_at is not None else None
+        visible: dict[str, set[str]] = {owner_type: set() for owner_type in requested}
+
+        def collect(owner_type: str, sql: str, parameters: tuple[object, ...]) -> None:
+            if owner_type not in requested:
+                return
+            visible[owner_type] = {
+                (
+                    str(row["owner_key"]).casefold()
+                    if owner_type == "cue"
+                    else str(row["owner_key"])
+                )
+                for row in self._connection.execute(sql, parameters).fetchall()
+            }
+
+        episode_cutoff = " AND ended_at < ?" if cutoff is not None else ""
+        episode_params: tuple[object, ...] = (umo,)
+        if cutoff is not None:
+            episode_params = (*episode_params, cutoff)
+        collect(
+            "episode",
+            "SELECT CAST(id AS TEXT) AS owner_key FROM episodes "
+            "WHERE umo=? AND status='READY'" + episode_cutoff,
+            episode_params,
+        )
+
+        semantic_cutoff = " AND m.sent_at < ?" if cutoff is not None else ""
+        semantic_params: tuple[object, ...] = (umo,)
+        if cutoff is not None:
+            semantic_params = (*semantic_params, cutoff)
+        collect(
+            "semantic",
+            """
+            SELECT DISTINCT CAST(s.id AS TEXT) AS owner_key
+            FROM semantic_memories AS s
+            JOIN semantic_memory_sources AS ss ON ss.semantic_memory_id=s.id
+            JOIN messages AS m ON m.id=ss.message_id
+            WHERE s.umo=? AND s.status IN ('ACTIVE', 'CONFLICTED')
+              AND m.umo=s.umo AND m.is_deleted=0
+            """ + semantic_cutoff,
+            semantic_params,
+        )
+
+        topic_cutoff = " AND e.ended_at < ?" if cutoff is not None else ""
+        topic_params: tuple[object, ...] = (umo,)
+        if cutoff is not None:
+            topic_params = (*topic_params, cutoff)
+        collect(
+            "topic",
+            """
+            SELECT DISTINCT CAST(t.id AS TEXT) AS owner_key
+            FROM topics AS t
+            JOIN topic_episodes AS te ON te.topic_id=t.id
+            JOIN episodes AS e ON e.id=te.episode_id
+            WHERE t.umo=? AND e.umo=t.umo AND e.status='READY'
+            """ + topic_cutoff,
+            topic_params,
+        )
+
+        if "cue" in requested:
+            cue_episode_cutoff = " AND e.ended_at < ?" if cutoff is not None else ""
+            cue_semantic_cutoff = " AND m.sent_at < ?" if cutoff is not None else ""
+            cue_params: tuple[object, ...] = (umo,)
+            if cutoff is not None:
+                cue_params = (*cue_params, cutoff)
+            cue_params = (*cue_params, umo)
+            if cutoff is not None:
+                cue_params = (*cue_params, cutoff)
+            collect(
+                "cue",
+                """
+                SELECT lower(k.cue) AS owner_key
+                FROM episode_keywords AS k
+                JOIN episodes AS e ON e.id=k.episode_id
+                WHERE e.umo=? AND e.status='READY'
+                """
+                + cue_episode_cutoff
+                + """
+                UNION
+                SELECT lower(s.person_cue) AS owner_key
+                FROM semantic_memories AS s
+                JOIN semantic_memory_sources AS ss ON ss.semantic_memory_id=s.id
+                JOIN messages AS m ON m.id=ss.message_id
+                WHERE s.umo=? AND s.status IN ('ACTIVE', 'CONFLICTED')
+                  AND m.umo=s.umo AND m.is_deleted=0
+                """
+                + cue_semantic_cutoff,
+                cue_params,
+            )
+
+        participant_cutoff = " AND first_seen_at < ?" if cutoff is not None else ""
+        participant_params: tuple[object, ...] = (umo,)
+        if cutoff is not None:
+            participant_params = (*participant_params, cutoff)
+        collect(
+            "participant",
+            "SELECT CAST(id AS TEXT) AS owner_key FROM participants WHERE umo=?"
+            + participant_cutoff,
+            participant_params,
+        )
+
+        plastic_cutoff = ""
+        plastic_params: tuple[object, ...] = (umo,)
+        if cutoff is not None:
+            plastic_cutoff = (
+                " AND EXISTS (SELECT 1 FROM plastic_edge_evidence AS pe "
+                "JOIN messages AS m ON m.id=pe.message_id "
+                "WHERE pe.edge_id=plastic_edges.id AND m.umo=plastic_edges.umo "
+                "AND m.is_deleted=0 AND m.sent_at < ?)"
+            )
+            plastic_params = (*plastic_params, cutoff)
+        collect(
+            "plastic_edge",
+            "SELECT CAST(id AS TEXT) AS owner_key FROM plastic_edges "
+            "WHERE umo=? AND status IN ('ACTIVE', 'WEAKENED')" + plastic_cutoff,
+            plastic_params,
+        )
+        return visible
 
     def _memory_owner_visible(
         self,
@@ -4772,10 +6189,227 @@ class MemoryStorage:
                         None,
                     )
                     if selected is not None:
-                        result["associations"].append(
-                            {**selected, "score": score}
-                        )
+                        result["associations"].append({**selected, "score": score})
         return result
+
+    def reconstruction_evidence_packet(
+        self,
+        *,
+        umo: str,
+        candidates: Mapping[str, Iterable[Mapping[str, object]]],
+        max_episodes: int = 8,
+        max_messages: int = 48,
+        messages_per_episode: int = 12,
+    ) -> dict[str, object]:
+        """Deterministically expand retrieval seeds to bounded raw evidence.
+
+        This is the host-side fast path: SQLite does the cheap graph expansion once,
+        then the model performs one semantic decision over the resulting packet.
+        """
+
+        self._assert_scope(umo)
+        episode_cap = max(1, min(24, int(max_episodes)))
+        message_cap = max(1, min(160, int(max_messages)))
+        per_episode = max(1, min(40, int(messages_per_episode)))
+
+        def rows(name: str) -> list[Mapping[str, object]]:
+            return [
+                item for item in candidates.get(name, []) if isinstance(item, Mapping)
+            ]
+
+        episode_ids: list[int] = []
+
+        def add_episode(value: object) -> None:
+            try:
+                episode_id = int(value or 0)
+            except (TypeError, ValueError):
+                return
+            if episode_id > 0 and episode_id not in episode_ids:
+                episode_ids.append(episode_id)
+
+        for item in rows("episodes"):
+            add_episode(item.get("id"))
+
+        with self._lock:
+            for topic in rows("topics"):
+                topic_id = int(topic.get("id") or 0)
+                if topic_id <= 0:
+                    continue
+                related = self._connection.execute(
+                    """
+                    SELECT e.id FROM topic_episodes AS te
+                    JOIN episodes AS e ON e.id=te.episode_id
+                    WHERE te.topic_id=? AND e.umo=? AND e.status='READY'
+                    ORDER BY e.ended_at DESC, e.id DESC LIMIT 3
+                    """,
+                    (topic_id, umo),
+                ).fetchall()
+                for row in related:
+                    add_episode(row["id"])
+
+            for cue in rows("cues"):
+                cue_text = str(cue.get("cue") or "").strip()
+                if not cue_text:
+                    continue
+                tag_values = cue.get("tags")
+                tags = (
+                    [item for item in tag_values if isinstance(item, Mapping)]
+                    if isinstance(tag_values, list)
+                    else []
+                )
+                for tag in tags[:2]:
+                    tag_text = str(tag.get("tag") or "").strip()
+                    if not tag_text:
+                        continue
+                    related = self._connection.execute(
+                        """
+                        SELECT DISTINCT e.id
+                        FROM episode_keywords AS k
+                        JOIN episodes AS e ON e.id=k.episode_id
+                        WHERE e.umo=? AND e.status='READY'
+                          AND lower(k.cue)=lower(?)
+                          AND lower(k.tag)=lower(?)
+                        ORDER BY e.ended_at DESC, e.id DESC LIMIT 2
+                        """,
+                        (umo, cue_text, tag_text),
+                    ).fetchall()
+                    for row in related:
+                        add_episode(row["id"])
+
+        expanded_episodes: list[dict[str, object]] = []
+        used_source_keys: set[str] = set()
+        total_messages = 0
+        for episode_id in episode_ids[:episode_cap]:
+            with self._lock:
+                episode = self._connection.execute(
+                    """
+                    SELECT id, started_at, ended_at, title, summary
+                    FROM episodes
+                    WHERE id=? AND umo=? AND status='READY'
+                    """,
+                    (episode_id, umo),
+                ).fetchone()
+                keywords = self._connection.execute(
+                    """
+                    SELECT cue, tag FROM episode_keywords
+                    WHERE episode_id=? ORDER BY cue, tag LIMIT 24
+                    """,
+                    (episode_id,),
+                ).fetchall()
+            if episode is None:
+                continue
+            context = self.query_event_context(
+                umo=umo,
+                event_id=episode_id,
+                limit=min(per_episode, message_cap - total_messages),
+            )
+            unique_context: list[dict[str, object]] = []
+            for message in context:
+                source_key = str(message.get("source_key") or "")
+                if not source_key or source_key in used_source_keys:
+                    continue
+                used_source_keys.add(source_key)
+                unique_context.append(message)
+                total_messages += 1
+                if total_messages >= message_cap:
+                    break
+            expanded_episodes.append(
+                {
+                    **dict(episode),
+                    "keywords": [dict(item) for item in keywords],
+                    "messages": unique_context,
+                }
+            )
+            if total_messages >= message_cap:
+                break
+
+        semantic_evidence: list[dict[str, object]] = []
+        for candidate in rows("semantic_memories")[:16]:
+            semantic_id = int(candidate.get("id") or 0)
+            if semantic_id <= 0:
+                continue
+            with self._lock:
+                evidence_rows = self._connection.execute(
+                    """
+                    SELECT DISTINCT m.source_key, m.sent_at, m.sender_id,
+                           m.sender_name, m.role, m.plain_text,
+                           COALESCE(ss.evidence_role, 'SUPPORT') AS evidence_role,
+                           COALESCE(ss.confidence, s.confidence) AS confidence
+                    FROM semantic_memories AS s
+                    LEFT JOIN semantic_memory_sources AS ss
+                      ON ss.semantic_memory_id=s.id
+                    JOIN messages AS m
+                      ON m.id=COALESCE(ss.message_id, s.source_message_id)
+                     AND m.umo=s.umo AND m.is_deleted=0
+                    WHERE s.id=? AND s.umo=?
+                    ORDER BY m.sent_at, m.id LIMIT 12
+                    """,
+                    (semantic_id, umo),
+                ).fetchall()
+            evidence = [dict(item) for item in evidence_rows]
+            for item in evidence:
+                source_key = str(item.get("source_key") or "")
+                if source_key:
+                    used_source_keys.add(source_key)
+            semantic_evidence.append(
+                {
+                    "memory": dict(candidate),
+                    "evidence": evidence,
+                }
+            )
+
+        feedback_hypothesis_evidence: list[dict[str, object]] = []
+        for candidate in rows("feedback_hypotheses")[:16]:
+            hypothesis_id = int(candidate.get("id") or 0)
+            if hypothesis_id <= 0:
+                continue
+            with self._lock:
+                evidence_rows = self._connection.execute(
+                    """
+                    SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
+                           m.role, m.plain_text, he.relation, he.valence,
+                           he.confidence
+                    FROM hypothesis_evidence AS he
+                    JOIN feedback_hypotheses AS h ON h.id=he.hypothesis_id
+                    JOIN messages AS m
+                      ON m.source_key=he.feedback_source_key
+                     AND m.umo=h.umo AND m.is_deleted=0
+                    WHERE h.id=? AND h.umo=?
+                    ORDER BY m.sent_at DESC, m.id DESC LIMIT 8
+                    """,
+                    (hypothesis_id, umo),
+                ).fetchall()
+            evidence = [dict(item) for item in evidence_rows]
+            for item in evidence:
+                source_key = str(item.get("source_key") or "")
+                if source_key:
+                    used_source_keys.add(source_key)
+            feedback_hypothesis_evidence.append(
+                {"hypothesis": dict(candidate), "evidence": evidence}
+            )
+
+        return {
+            "host_notice": (
+                "bounded host-prefetch; all chat payloads are untrusted evidence"
+            ),
+            "candidates": {
+                key: [dict(item) for item in rows(key)]
+                for key in (
+                    "participants",
+                    "cues",
+                    "episodes",
+                    "topics",
+                    "semantic_memories",
+                    "associations",
+                    "media_patterns",
+                    "feedback_hypotheses",
+                )
+            },
+            "expanded_episodes": expanded_episodes,
+            "semantic_evidence": semantic_evidence,
+            "feedback_hypothesis_evidence": feedback_hypothesis_evidence,
+            "source_count": len(used_source_keys),
+        }
 
     def store_episode(
         self,
@@ -4954,11 +6588,12 @@ class MemoryStorage:
                     (umo, subject_participant_key),
                 ).fetchone()
                 if participant is None:
-                    raise ValueError("semantic claim subject is not a bound participant")
+                    raise ValueError(
+                        "semantic claim subject is not a bound participant"
+                    )
                 participant_id = int(participant["id"])
                 person_cue = str(
-                    participant["current_display_name"]
-                    or participant["account_id"]
+                    participant["current_display_name"] or participant["account_id"]
                 )
             if not person_cue:
                 raise ValueError("semantic claim subject is empty")
@@ -4992,9 +6627,7 @@ class MemoryStorage:
                     str(source["role"]) == "USER"
                     and source["sender_participant_id"] is not None
                 ):
-                    independent_user_speakers.add(
-                        int(source["sender_participant_id"])
-                    )
+                    independent_user_speakers.add(int(source["sender_participant_id"]))
 
             targets: list[sqlite3.Row] = []
             if target_claim_ids:
@@ -5011,10 +6644,19 @@ class MemoryStorage:
                 if len(targets) != len(set(target_claim_ids)):
                     raise ValueError("semantic revision target is not active in scope")
                 for target in targets:
-                    if participant_id is not None and target["subject_participant_id"] != participant_id:
-                        raise ValueError("semantic revision crosses participant subjects")
-                    if participant_id is None and normalize_alias(target["subject_text"]) != normalize_alias(person_cue):
-                        raise ValueError("semantic revision crosses unresolved subjects")
+                    if (
+                        participant_id is not None
+                        and target["subject_participant_id"] != participant_id
+                    ):
+                        raise ValueError(
+                            "semantic revision crosses participant subjects"
+                        )
+                    if participant_id is None and normalize_alias(
+                        target["subject_text"]
+                    ) != normalize_alias(person_cue):
+                        raise ValueError(
+                            "semantic revision crosses unresolved subjects"
+                        )
 
             existing = self._connection.execute(
                 """
@@ -5041,8 +6683,7 @@ class MemoryStorage:
                     (int(existing["id"]), umo),
                 ).fetchall()
                 independent_user_speakers.update(
-                    int(row["sender_participant_id"])
-                    for row in prior_speakers
+                    int(row["sender_participant_id"]) for row in prior_speakers
                 )
 
             initial_status = "ACTIVE"
@@ -5054,7 +6695,12 @@ class MemoryStorage:
                 (str(claim_type), str(aspect), str(content))
             ).casefold()
             high_risk_markers = (
-                "管理员", "群主", "权限", "真实身份", "admin", "owner",
+                "管理员",
+                "群主",
+                "权限",
+                "真实身份",
+                "admin",
+                "owner",
             )
             if (
                 subject_participant_key
@@ -5205,7 +6851,10 @@ class MemoryStorage:
                 if any(role == "CONTRADICT" for _, role, _, _ in source_rows):
                     conflicting = [*conflicting]
                 if conflicting:
-                    conflict_ids = [semantic_id, *[int(row["id"]) for row in conflicting]]
+                    conflict_ids = [
+                        semantic_id,
+                        *[int(row["id"]) for row in conflicting],
+                    ]
                     placeholders = ",".join("?" for _ in conflict_ids)
                     self._connection.execute(
                         f"""
@@ -5531,9 +7180,7 @@ class MemoryStorage:
                             {
                                 "canonical_key": item["canonical_key"],
                                 "account_id": item["account_id"],
-                                "current_display_name": item[
-                                    "current_display_name"
-                                ],
+                                "current_display_name": item["current_display_name"],
                                 "aliases": item["aliases"],
                             }
                             for item in participants
@@ -5619,9 +7266,7 @@ class MemoryStorage:
                             {
                                 "canonical_key": item["canonical_key"],
                                 "account_id": item["account_id"],
-                                "current_display_name": item[
-                                    "current_display_name"
-                                ],
+                                "current_display_name": item["current_display_name"],
                                 "aliases": item["aliases"],
                             }
                             for item in participants
@@ -5681,7 +7326,11 @@ class MemoryStorage:
             ).fetchall()
         return [
             {
-                **{key: value for key, value in dict(row).items() if key != "source_keys_csv"},
+                **{
+                    key: value
+                    for key, value in dict(row).items()
+                    if key != "source_keys_csv"
+                },
                 "source_keys": [
                     item
                     for item in str(row["source_keys_csv"] or "").split(",")
@@ -5749,9 +7398,7 @@ class MemoryStorage:
     def _plastic_edge_stable_key(
         *, umo: str, source_node_key: str, relation_key: str, target_node_key: str
     ) -> str:
-        material = "\x1f".join(
-            (umo, source_node_key, relation_key, target_node_key)
-        )
+        material = "\x1f".join((umo, source_node_key, relation_key, target_node_key))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _validate_graph_evidence_locked(
@@ -5949,11 +7596,7 @@ class MemoryStorage:
             else None
         )
         negative_edges = (
-            {
-                int(edge_id)
-                for edge_id in allowed_negative_edge_ids
-                if int(edge_id) > 0
-            }
+            {int(edge_id) for edge_id in allowed_negative_edge_ids if int(edge_id) > 0}
             if allowed_negative_edge_ids is not None
             else None
         )
@@ -6107,8 +7750,10 @@ class MemoryStorage:
                         str(mutation.epistemic_state or "HYPOTHESIS"),
                         mutation.uncertainty,
                         delta,
-                        "DORMANT" if delta <= -1 else (
-                            "WEAKENED" if delta < 0 else "ACTIVE"
+                        (
+                            "DORMANT"
+                            if delta <= -1
+                            else ("WEAKENED" if delta < 0 else "ACTIVE")
                         ),
                         f"mutation:{mutation_id}",
                     ),
@@ -6205,8 +7850,10 @@ class MemoryStorage:
                     -4.0,
                     min(4.0, float(edge["utility"]) + mutation.utility_delta),
                 )
-                status = "DORMANT" if new_utility <= -1 else (
-                    "WEAKENED" if new_utility < 0 else "ACTIVE"
+                status = (
+                    "DORMANT"
+                    if new_utility <= -1
+                    else ("WEAKENED" if new_utility < 0 else "ACTIVE")
                 )
                 epistemic_state = str(mutation.epistemic_state)
                 self._connection.execute(
@@ -6291,10 +7938,14 @@ class MemoryStorage:
                         umo,
                     ),
                 )
-                role = "FEEDBACK_POSITIVE" if positive else (
-                    "RETRACTION"
-                    if mutation.operation == "retire_edge"
-                    else "FEEDBACK_NEGATIVE"
+                role = (
+                    "FEEDBACK_POSITIVE"
+                    if positive
+                    else (
+                        "RETRACTION"
+                        if mutation.operation == "retire_edge"
+                        else "FEEDBACK_NEGATIVE"
+                    )
                 )
                 for message_id in evidence.values():
                     self._connection.execute(
@@ -6455,9 +8106,7 @@ class MemoryStorage:
             dict.fromkeys(
                 str(value or "").strip().casefold()
                 for value in fingerprints
-                if re.fullmatch(
-                    r"[0-9a-fA-F]{64}", str(value or "").strip()
-                )
+                if re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "").strip())
             )
         )
         clauses = ["umo=?", "media_type=?", "observation_count>=?"]
@@ -6505,7 +8154,7 @@ class MemoryStorage:
                     ),
                 ).fetchall()
                 context_by_id: dict[int, dict[str, object]] = {}
-                for observation in direct[:3]:
+                for observation in direct[:2]:
                     context_rows = self._connection.execute(
                         """
                         SELECT id, source_key, sent_at, sender_id,
@@ -6513,7 +8162,7 @@ class MemoryStorage:
                         FROM messages
                         WHERE umo=? AND is_deleted=0
                           AND sent_at BETWEEN ? AND ?
-                        ORDER BY sent_at, id LIMIT 12
+                        ORDER BY sent_at, id LIMIT 8
                         """,
                         (
                             umo,
@@ -6522,7 +8171,7 @@ class MemoryStorage:
                         ),
                     ).fetchall()
                     for context in context_rows:
-                        if len(context_by_id) >= 24:
+                        if len(context_by_id) >= 12:
                             break
                         context_by_id[int(context["id"])] = dict(context)
                 results.append(
@@ -6534,9 +8183,7 @@ class MemoryStorage:
                         "media_type": str(row["media_type"]),
                         "reference_sha256": str(row["reference_sha256"]),
                         "observation_count": int(row["observation_count"]),
-                        "unique_sender_count": int(
-                            row["unique_sender_count"]
-                        ),
+                        "unique_sender_count": int(row["unique_sender_count"]),
                         "first_seen_at": int(row["first_seen_at"]),
                         "last_seen_at": int(row["last_seen_at"]),
                         "sample_source_keys": json.loads(
@@ -6545,9 +8192,7 @@ class MemoryStorage:
                         "observations": [dict(item) for item in direct],
                         "nearby_messages": sorted(
                             context_by_id.values(),
-                            key=lambda item: (
-                                int(item["sent_at"]), int(item["id"])
-                            ),
+                            key=lambda item: (int(item["sent_at"]), int(item["id"])),
                         ),
                         "semantic_notice": (
                             "opaque repeated-media anchor; infer no visual content"
@@ -6574,9 +8219,13 @@ class MemoryStorage:
         normalized_direction = str(direction or "both").strip().casefold()
         if normalized_direction not in {"out", "in", "both"}:
             raise ValueError("direction must be out, in, or both")
-        statuses = ("ACTIVE", "WEAKENED", "DORMANT") if include_dormant else (
-            "ACTIVE",
-            "WEAKENED",
+        statuses = (
+            ("ACTIVE", "WEAKENED", "DORMANT")
+            if include_dormant
+            else (
+                "ACTIVE",
+                "WEAKENED",
+            )
         )
         status_placeholders = ",".join("?" for _ in statuses)
         clauses = ["e.umo = ?", f"e.status IN ({status_placeholders})"]
@@ -6823,11 +8472,11 @@ class MemoryStorage:
                 elapsed_days = max(
                     0.0, (current - int(row["updated_epoch"] or current)) / 86400
                 )
-                value = float(row["utility"]) * math.pow(
-                    0.5, elapsed_days / half_life
-                )
-                status = "DORMANT" if value <= -1 else (
-                    "WEAKENED" if value < 0 else "ACTIVE"
+                value = float(row["utility"]) * math.pow(0.5, elapsed_days / half_life)
+                status = (
+                    "DORMANT"
+                    if value <= -1
+                    else ("WEAKENED" if value < 0 else "ACTIVE")
                 )
                 self._connection.execute(
                     """
@@ -6902,9 +8551,7 @@ class MemoryStorage:
             "state": json.loads(str(row["state_json"])),
             "last_query_sha256": str(row["last_query_sha256"]),
             "last_tick_at": (
-                int(row["last_tick_at"])
-                if row["last_tick_at"] is not None
-                else None
+                int(row["last_tick_at"]) if row["last_tick_at"] is not None else None
             ),
             "updated_at": str(row["updated_at"]),
         }
@@ -6937,7 +8584,9 @@ class MemoryStorage:
             )
         encoded = self._bounded_json(dict(state), max_chars=8000)
         digest = str(last_query_sha256 or "").strip()
-        if digest and (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+        if digest and (
+            len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+        ):
             raise ValueError("last_query_sha256 must be a lowercase SHA-256 digest")
         with self._lock, self._connection:
             self._connection.execute(
@@ -6987,6 +8636,8 @@ class MemoryStorage:
                         WHEN maintenance_jobs.status IN
                             ('DONE', 'CANCELLED')
                         THEN excluded.available_at
+                        WHEN maintenance_jobs.status='BUDGET_WAIT'
+                        THEN maintenance_jobs.available_at
                         ELSE min(maintenance_jobs.available_at,
                                  excluded.available_at)
                     END,
@@ -7029,6 +8680,69 @@ class MemoryStorage:
             ).fetchone()
         assert row is not None
         return int(row["id"])
+
+    def maintenance_job_ready(self, *, umo: str, job_id: int) -> bool:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM maintenance_jobs
+                WHERE id=? AND umo=? AND status='PENDING' AND available_at<=?
+                """,
+                (int(job_id), umo, int(time.time())),
+            ).fetchone()
+        return row is not None
+
+    def defer_maintenance_job_for_budget(
+        self,
+        *,
+        umo: str,
+        job_id: int,
+        available_at: int,
+        budget_class: str,
+    ) -> None:
+        self._assert_scope(umo)
+        normalized_class = str(budget_class).strip().casefold()
+        if normalized_class not in TOKEN_BUDGET_PHASES:
+            raise ValueError("budget_class must be online, feedback, or backfill")
+        with self._lock, self._connection:
+            updated = self._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='BUDGET_WAIT', available_at=?, lease_until=NULL,
+                    last_error=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=? AND status='RUNNING'
+                """,
+                (
+                    max(int(time.time()) + 1, int(available_at)),
+                    f"budget_wait:{normalized_class}",
+                    int(job_id),
+                    umo,
+                ),
+            ).rowcount
+        if not updated:
+            raise ValueError("maintenance job is not running")
+
+    def resume_due_budget_jobs(
+        self,
+        *,
+        umo: str,
+        now: int | None = None,
+    ) -> int:
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        with self._lock, self._connection:
+            return int(
+                self._connection.execute(
+                    """
+                    UPDATE maintenance_jobs
+                    SET status='PENDING', lease_until=NULL, last_error='',
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE umo=? AND status='BUDGET_WAIT' AND available_at<=?
+                    """,
+                    (umo, current),
+                ).rowcount
+            )
 
     def pending_maintenance_jobs(
         self,
@@ -7269,7 +8983,11 @@ class MemoryStorage:
                     self._bounded_json(content or {}, max_chars=8000),
                     max(0.0, min(1.0, float(activation))),
                     max(-4.0, min(4.0, float(utility))),
-                    int(expires_at) if expires_at is not None else int(trace["expires_at"]),
+                    (
+                        int(expires_at)
+                        if expires_at is not None
+                        else int(trace["expires_at"])
+                    ),
                 ),
             )
             row = self._connection.execute(
@@ -7489,8 +9207,9 @@ class MemoryStorage:
             trace_ids = [str(row["trace_id"]) for row in traces]
             if not trace_ids:
                 return None
-            reply_to_bot = self._connection.execute(
-                """
+            reply_to_bot = (
+                self._connection.execute(
+                    """
                 SELECT 1
                 FROM message_relations AS r
                 LEFT JOIN messages AS target ON target.id = r.target_message_id
@@ -7500,8 +9219,10 @@ class MemoryStorage:
                   AND (target.role = 'BOT' OR p.account_type = 'BOT')
                 LIMIT 1
                 """,
-                (int(feedback["id"]),),
-            ).fetchone() is not None
+                    (int(feedback["id"]),),
+                ).fetchone()
+                is not None
+            )
             closest = traces[0]
             score, reasons = feedback_surface_score(
                 str(feedback["plain_text"]),
@@ -7509,9 +9230,7 @@ class MemoryStorage:
                 seconds_after_response=(
                     sent_at - int(closest["response_at"] or sent_at)
                 ),
-                same_sender=(
-                    str(feedback["sender_id"]) == str(closest["sender_id"])
-                ),
+                same_sender=(str(feedback["sender_id"]) == str(closest["sender_id"])),
             )
             if score < 0.25:
                 return None
@@ -7561,9 +9280,7 @@ class MemoryStorage:
         return [
             {
                 **dict(row),
-                "candidate_trace_ids": json.loads(
-                    str(row["candidate_trace_ids_json"])
-                ),
+                "candidate_trace_ids": json.loads(str(row["candidate_trace_ids_json"])),
             }
             for row in rows
         ]
@@ -7711,7 +9428,13 @@ class MemoryStorage:
             ).fetchall()
         feedback_value = {
             key: feedback[key]
-            for key in ("source_key", "sender_id", "sender_name", "sent_at", "plain_text")
+            for key in (
+                "source_key",
+                "sender_id",
+                "sender_name",
+                "sent_at",
+                "plain_text",
+            )
         }
         feedback_value.update(self._component_evidence(str(feedback["content_json"])))
         return {
@@ -7730,9 +9453,7 @@ class MemoryStorage:
                 for row in observable_nodes
             ],
             "activated_hypotheses": [dict(row) for row in activation_rows],
-            "activated_plastic_edges": [
-                dict(row) for row in plastic_activation_rows
-            ],
+            "activated_plastic_edges": [dict(row) for row in plastic_activation_rows],
             "context": [dict(row) for row in context],
         }
 
@@ -8037,11 +9758,7 @@ class MemoryStorage:
             threshold = max(0.05, min(1.0, float(min_commit_score)))
             if decision.scope_type == "group":
                 threshold = max(threshold, 0.8)
-            if commit_score < threshold:
-                raise ValueError(
-                    f"feedback evidence score {commit_score:.3f} is below "
-                    f"the commit threshold {threshold:.3f}"
-                )
+            activation_status = "ACTIVE" if commit_score >= threshold else "PROVISIONAL"
             if decision.activation_mode == "always" and decision.trigger_cues:
                 raise ValueError("always hypotheses must not define trigger cues")
             if decision.activation_mode == "semantic" and not decision.trigger_cues:
@@ -8139,8 +9856,10 @@ class MemoryStorage:
                     -4.0,
                     min(4.0, float(activation["utility"]) + delta),
                 )
-                status = "DORMANT" if new_utility <= -1 else (
-                    "WEAKENED" if new_utility < 0 else "ACTIVE"
+                status = (
+                    "DORMANT"
+                    if new_utility <= -1
+                    else ("WEAKENED" if new_utility < 0 else "ACTIVE")
                 )
                 positive = delta >= 0
                 self._connection.execute(
@@ -8190,7 +9909,9 @@ class MemoryStorage:
                     trigger_cues=decision.trigger_cues,
                     activation_mode=decision.activation_mode,
                 )
-                increment = max(0.05, abs(decision.feedback_valence) * decision.confidence)
+                increment = max(
+                    0.05, abs(decision.feedback_valence) * decision.confidence
+                )
                 expires_at = feedback_sent_at + max(
                     86400, min(63072000, int(hypothesis_ttl_seconds))
                 )
@@ -8201,8 +9922,8 @@ class MemoryStorage:
                         statement, prospective_cue, trigger_cues_json,
                         activation_mode,
                         evidence_confidence, utility, support_count, learned_at,
-                        last_decay_at, source_trace_id, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        last_decay_at, source_trace_id, status, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                     ON CONFLICT(umo, fingerprint) DO UPDATE SET
                         statement=excluded.statement,
                         prospective_cue=excluded.prospective_cue,
@@ -8214,7 +9935,18 @@ class MemoryStorage:
                         ),
                         utility=min(4, feedback_hypotheses.utility + excluded.utility),
                         support_count=feedback_hypotheses.support_count + 1,
-                        status='ACTIVE', merged_into=NULL,
+                        status=CASE
+                            WHEN feedback_hypotheses.status='MERGED'
+                            THEN feedback_hypotheses.status
+                            WHEN feedback_hypotheses.status='ACTIVE'
+                            THEN 'ACTIVE'
+                            WHEN feedback_hypotheses.utility + excluded.utility >= ?
+                            THEN 'ACTIVE'
+                            ELSE 'PROVISIONAL'
+                        END,
+                        merged_into=CASE
+                            WHEN feedback_hypotheses.status='MERGED'
+                            THEN feedback_hypotheses.merged_into ELSE NULL END,
                         merge_previous_status='',
                         expires_at=max(feedback_hypotheses.expires_at, excluded.expires_at),
                         updated_at=CURRENT_TIMESTAMP
@@ -8234,7 +9966,9 @@ class MemoryStorage:
                         feedback_sent_at,
                         feedback_sent_at,
                         decision.target_trace_id,
+                        activation_status,
                         expires_at,
+                        threshold,
                     ),
                 )
                 hypothesis = self._connection.execute(
@@ -8260,7 +9994,9 @@ class MemoryStorage:
                 ):
                     raise ValueError("target hypothesis is outside the decision scope")
                 if int(hypothesis["learned_at"]) >= feedback_sent_at:
-                    raise ValueError("target hypothesis was not available at feedback time")
+                    raise ValueError(
+                        "target hypothesis was not available at feedback time"
+                    )
                 if str(hypothesis["status"]) == "MERGED":
                     raise ValueError("target hypothesis is a merged materialized view")
                 amount = abs(decision.feedback_valence) * decision.confidence
@@ -8271,10 +10007,19 @@ class MemoryStorage:
                         SET utility=min(4, utility + ?),
                             evidence_confidence=max(evidence_confidence, ?),
                             support_count=support_count + 1,
-                            status='ACTIVE', updated_at=CURRENT_TIMESTAMP
+                            status=CASE WHEN utility + ? >= ? THEN 'ACTIVE'
+                                        ELSE status END,
+                            updated_at=CURRENT_TIMESTAMP
                         WHERE id = ? AND umo = ?
                         """,
-                        (amount, decision.confidence, hypothesis_id, umo),
+                        (
+                            amount,
+                            decision.confidence,
+                            amount,
+                            threshold,
+                            hypothesis_id,
+                            umo,
+                        ),
                     )
                     relation = "SUPPORTS"
                 else:
@@ -8359,7 +10104,7 @@ class MemoryStorage:
             )
             hypothesis_row = self._connection.execute(
                 """
-                SELECT aspect, prospective_cue, activation_mode, utility
+                SELECT aspect, prospective_cue, activation_mode, utility, status
                 FROM feedback_hypotheses WHERE id = ?
                 """,
                 (hypothesis_id,),
@@ -8458,6 +10203,9 @@ class MemoryStorage:
             "proposal_id": int(proposal_id),
             "trace_id": decision.target_trace_id,
             "hypothesis_id": hypothesis_id,
+            "hypothesis_status": str(hypothesis_row["status"]),
+            "commit_score": round(commit_score, 6),
+            "activation_threshold": round(threshold, 6),
             "backward_credit": round(total_credit, 6),
             "plastic_backward_credit": round(plastic_credit, 6),
             "plastic_edges_credited": len(plastic_activation_rows),
@@ -8746,9 +10494,7 @@ class MemoryStorage:
             sender_participant_id=sender_participant_id,
             sender_participant_key=sender_key,
             revision_no=(
-                int(row["revision_no"] or 1)
-                if "revision_no" in row.keys()
-                else 1
+                int(row["revision_no"] or 1) if "revision_no" in row.keys() else 1
             ),
             content_sha256=(
                 str(row["content_sha256"] or "")

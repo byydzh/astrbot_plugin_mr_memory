@@ -200,21 +200,32 @@ class FeedbackMemoryTests(unittest.TestCase):
             trigger_cues=(),
             activation_mode="always",
         )
-        with self.assertRaises(ValueError):
-            self.storage.apply_feedback_decision(
-                umo=self.umo,
-                proposal_id=int(proposal_id),
-                decision=weak,
-                min_commit_score=0.65,
-            )
-        committed = self.storage.apply_feedback_decision(
+        provisional = self.storage.apply_feedback_decision(
             umo=self.umo,
             proposal_id=int(proposal_id),
-            decision=FeedbackDecision(
-                **{**weak.as_dict(), "confidence": 0.9}  # type: ignore[arg-type]
-            ),
+            decision=weak,
+            min_commit_score=0.65,
         )
-        self.assertGreater(int(committed["hypothesis_id"]), 0)
+        self.assertEqual(provisional["status"], "COMMITTED")
+        self.assertEqual(provisional["hypothesis_status"], "PROVISIONAL")
+        self.assertEqual(
+            self.storage.search_feedback_hypotheses(
+                umo=self.umo,
+                sender_id="user-a",
+                query="任意",
+                at=120,
+            ),
+            [],
+            "weak evidence is retained but must not affect behavior yet",
+        )
+        retained = self.storage.search_feedback_hypotheses(
+            umo=self.umo,
+            sender_id="user-a",
+            query="任意",
+            at=120,
+            include_inactive=True,
+        )
+        self.assertEqual(retained[0]["status"], "PROVISIONAL")
         self.assertEqual(
             self.storage.search_feedback_hypotheses(
                 umo=self.umo,
@@ -224,6 +235,59 @@ class FeedbackMemoryTests(unittest.TestCase):
                 include_inactive=True,
             ),
             [],
+        )
+
+    def test_repeated_weak_feedback_promotes_a_provisional_hypothesis(self) -> None:
+        for index, base_at in enumerate((100, 200), start=1):
+            trace_id = f"trace-provisional-{index}"
+            self.open_trace(
+                trace_id,
+                request_id=f"req-provisional-{index}",
+                query="继续",
+                sender_id="user-a",
+                sent_at=base_at,
+                response="要不要继续？",
+            )
+            feedback = self.message(
+                f"feedback-provisional-{index}",
+                "不要反问",
+                sender_id="user-a",
+                sent_at=base_at + 10,
+            )
+            self.storage.upsert_message(feedback)
+            proposal_id = self.storage.enqueue_feedback_candidate(
+                umo=self.umo,
+                feedback_source_key=feedback.resolved_source_key(),
+            )
+            result = self.storage.apply_feedback_decision(
+                umo=self.umo,
+                proposal_id=int(proposal_id),
+                decision=FeedbackDecision(
+                    target_trace_id=trace_id,
+                    mutation="upsert",
+                    feedback_valence=-1.0,
+                    confidence=0.4,
+                    scope_type="sender",
+                    scope_key="user-a",
+                    aspect="style",
+                    statement="不要反问",
+                    prospective_cue="直接完成回答。",
+                    trigger_cues=(),
+                    activation_mode="always",
+                ),
+                min_commit_score=0.65,
+            )
+        self.assertEqual(result["hypothesis_status"], "ACTIVE")
+        self.assertEqual(
+            len(
+                self.storage.search_feedback_hypotheses(
+                    umo=self.umo,
+                    sender_id="user-a",
+                    query="任意",
+                    at=220,
+                )
+            ),
+            1,
         )
 
     def test_feedback_is_strictly_masked_and_sender_scoped(self) -> None:

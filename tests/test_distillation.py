@@ -5,8 +5,11 @@ import json
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from mr_memory.distillation import (
+    build_distillation_prompt,
+    build_distillation_prompt_aliases,
     build_distillation_repair_prompt,
     distillation_generation_options,
     parse_distillation_response,
@@ -39,6 +42,13 @@ class DistillationPipelineTests(unittest.TestCase):
             thinking_mode="disabled",
         )
         self.assertEqual(options["thinking"], {"type": "disabled"})
+
+    def test_deepseek_v4_output_limit_is_not_silently_clamped(self) -> None:
+        options = distillation_generation_options(
+            model_name="deepseek-v4-flash",
+            max_tokens=384000,
+        )
+        self.assertEqual(options["max_tokens"], 384000)
 
     def test_other_providers_do_not_receive_deepseek_only_options(self) -> None:
         self.assertEqual(
@@ -165,6 +175,19 @@ class DistillationPipelineTests(unittest.TestCase):
             vector=foreign_vector,
         )
 
+        with mock.patch.object(
+            self.storage,
+            "_memory_owner_visible",
+            side_effect=AssertionError("embedding visibility must be resolved in bulk"),
+        ):
+            direct_matches = self.storage.search_memory_embeddings(
+                umo=self.umo,
+                model=backend.model_id,
+                query_vector=foreign_vector,
+                limit=12,
+            )
+        self.assertTrue(direct_matches)
+
         candidates = asyncio.run(
             self.service.initialize_candidates(
                 umo=self.umo,
@@ -202,6 +225,110 @@ class DistillationPipelineTests(unittest.TestCase):
                 json.dumps(value, ensure_ascii=False), self._messages()
             )
         self.assertEqual(self.storage.count_graph_units(umo=self.umo), 0)
+
+    def test_unit_capacity_scales_past_legacy_eight_episode_quota(self) -> None:
+        for index in range(5, 10):
+            text = f"第 {index} 个独立事件"
+            self.storage.upsert_message(
+                NormalizedMessage(
+                    platform="aiocqhttp",
+                    platform_id="shadow",
+                    umo=self.umo,
+                    group_id="group-a",
+                    message_id=str(index),
+                    sender_id="甲",
+                    sender_name="甲",
+                    sent_at=index * 100,
+                    plain_text=text,
+                    content=[{"type": "plain", "text": text}],
+                )
+            )
+        messages = self._messages()
+        value = {
+            "episodes": [
+                {
+                    "source_keys": [message.source_key],
+                    "title": f"事件 {index}",
+                    "summary": message.plain_text,
+                    "tag": "独立事件",
+                    "cues": [f"事件 {index}"],
+                }
+                for index, message in enumerate(messages)
+            ],
+            "claims": [],
+            "topics": [],
+            "associations": [],
+            "ignored_source_keys": [],
+        }
+        batch = parse_distillation_response(
+            json.dumps(value, ensure_ascii=False),
+            messages,
+        )
+        self.assertEqual(len(batch.episodes), 9)
+
+    def test_compact_prompt_aliases_round_trip_to_canonical_evidence(self) -> None:
+        messages = self._messages()
+        identity_context = self.storage.distillation_identity_context(
+            umo=self.umo,
+            source_keys=[message.source_key for message in messages],
+        )
+        aliases = build_distillation_prompt_aliases(
+            messages,
+            identity_context=identity_context,
+        )
+        prompt = build_distillation_prompt(
+            messages,
+            identity_context=identity_context,
+            aliases=aliases,
+        )
+        prompt_value = json.loads(prompt)
+
+        self.assertEqual(prompt_value["target_source_keys"], ["m0", "m1", "m2", "m3"])
+        for message in messages:
+            self.assertNotIn(message.source_key, prompt)
+            self.assertEqual(prompt.count(message.plain_text), 1)
+        for participant_key in aliases.participant_to_alias:
+            self.assertNotIn(participant_key, prompt)
+
+        response = json.loads(self._response())
+        for episode in response["episodes"]:
+            episode["source_keys"] = [
+                aliases.source_to_alias[key] for key in episode["source_keys"]
+            ]
+        batch = parse_distillation_response(
+            json.dumps(response, ensure_ascii=False),
+            messages,
+            aliases=aliases,
+        )
+        self.assertEqual(
+            {key for episode in batch.episodes for key in episode.source_keys},
+            {message.source_key for message in messages},
+        )
+
+    def test_compact_ignored_source_ids_are_restored_and_audited(self) -> None:
+        messages = self._messages()
+        aliases = build_distillation_prompt_aliases(messages)
+        response = json.loads(self._response())
+        kept_keys = response["episodes"][0]["source_keys"]
+        ignored_keys = response["episodes"][1]["source_keys"]
+        response["episodes"] = response["episodes"][:1]
+        response["episodes"][0]["source_keys"] = [
+            aliases.source_to_alias[key] for key in kept_keys
+        ]
+        response["topics"][0]["episode_indices"] = [0]
+        response["ignored_source_keys"] = [
+            aliases.source_to_alias[key] for key in ignored_keys
+        ]
+
+        batch = parse_distillation_response(
+            json.dumps(response, ensure_ascii=False),
+            messages,
+            aliases=aliases,
+        )
+        self.assertEqual(
+            {item.source_key for item in batch.ignored_sources},
+            set(ignored_keys),
+        )
 
     def test_requires_explicit_coverage_or_ignore_for_every_target(self) -> None:
         value = json.loads(self._response())

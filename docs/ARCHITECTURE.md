@@ -150,12 +150,15 @@ Use four complementary triggers:
 - embedding and lexical candidates as priors, not final relevance gates (implemented);
 - explicit consultation from the main LLM when the injected brief is insufficient
   (implemented);
-- a single bounded background queue after a message threshold or maintenance interval
-  (implemented; never runs when capture is disabled).
+- separate bounded construction and feedback workers after a message threshold,
+  proposal, or maintenance interval (implemented; never run when capture is disabled).
 
 The persistent component is the scheduler, maintenance jobs, graph revision, and
 bounded operational state (focus, selected edge IDs, last decision, and evidence
 keys). Hidden reasoning is never serialized. LLM calls remain bounded and
 event-driven rather than continuously running.
-Every group also has a rolling private-token budget; reaching it skips private work
-without blocking the main response.
+Every group has two rolling 24-hour private-token ledgers. `online` covers live
+construction, reconstruction, and feedback maintenance; `backfill` covers only
+one-off imported-history construction. A checkpoint carries one immutable processing
+class, live work has scheduling priority, and reaching either budget pauses only that
+class without blocking the main response or consuming the other ledger.

@@ -1,5 +1,133 @@
 # Changelog
 
+## 0.16.1
+
+- Keep graph-neighbor inspection local so selecting a connected entry no longer
+  discards an in-progress shortest-path start point.
+- Report neighborhood truncation only when that neighborhood actually exceeds
+  the canvas limit.
+- Replace per-vector SQLite visibility probes with one bounded query per memory
+  class, preventing semantic retrieval from starving live capture and graph reads.
+- Cache validated group scope bindings in memory instead of reacquiring the
+  shared SQLite lock for every incoming message.
+- Retry one empty provider completion for reconstruction and feedback stages,
+  with each attempt recorded separately in the token ledger.
+- Recover only expired maintenance leases when another storage handle opens the
+  same database, so read-oriented tooling cannot reclaim a live worker job.
+
+## 0.16.0
+
+- Turn the memory graph into a query-first analysis surface: search the full
+  analyzable graph, focus a result, and expand its one-to-three-hop neighborhood.
+- Add shortest-path inspection between any two visible memory entries and list
+  every relation of the selected node with direct navigation to its neighbor.
+- Add deterministic complex-network measures on the filtered undirected
+  projection: density, average degree, weak components, giant-component ratio,
+  clustering coefficient, reciprocity, sampled path length, degree distribution,
+  and k-core decomposition.
+- Add server-side node, relation, epistemic-state, degree, k-core, connected-only,
+  and giant-component filters so metrics describe the same graph being queried.
+- Replace the type-column layout with radial ego/path layouts and a deterministic
+  force layout for global structure; label only the focus and structural hubs.
+
+## 0.15.1
+
+- Split online feedback into a compact semantic attribution gate and a second
+  learning pass that runs only for attributable feedback.
+- Bound feedback evidence packets, retrieve existing graph associations by local
+  embedding only when learning is needed, and record both stages separately in
+  the runtime ledger.
+- Label the staged feedback path clearly in the management console.
+
+## 0.15.0
+
+- Replace automatic reconstruction's open-ended tool loop with one full-reasoning
+  semantic decision over a host-prefetched, source-key-bounded evidence packet.
+  The model may answer `brief`, return `none`, or explicitly escalate to the old
+  deep traversal path; manual consultation still forces deep traversal.
+- Microbatch up to six feedback proposals after a short debounce and decide them
+  in one full-reasoning call. Host code gathers raw response, feedback, activated
+  behavior hypotheses, and graph evidence before the call and strictly validates
+  every returned evidence key and mutation.
+- Give feedback maintenance its own rolling budget and reset control. Historical
+  backfill remains an uncapped one-off ledger, while answer-time reconstruction
+  and live construction keep their separate online budget.
+- Retain attributable feedback below the activation threshold as `PROVISIONAL`
+  instead of dropping it. Repeated matching evidence accumulates utility and may
+  promote the behavior memory to `ACTIVE`; provisional memory never affects a
+  response before promotion.
+- Migrate legacy feedback jobs that were incorrectly blocked by the online budget
+  into cancelled audit records, then create one clean batch job per group.
+- Add precise wakeups for feedback retry and budget expiry instead of waiting for
+  the daily construction sweeper.
+- Add privacy-safe 24-hour latency, token, outcome and queue summaries plus a
+  recent-call ledger for automatic reconstruction and feedback maintenance.
+- Redesign the Plugin Page around operator questions: whether memory is working,
+  why it ran, how long it took, how much it cost, what it changed, and what is
+  waiting. Move the graph, account binding and raw evidence to focused secondary
+  views and keep internal identifiers behind technical details.
+
+## 0.14.0
+
+- Remove the AngelEye detector/importer, import commands, web routes, UI, and tests
+  from the runtime plugin. Historical ingestion is deployment tooling, not a
+  reusable memory feature.
+- Stop reclassifying pre-existing plugin data during schema upgrades. `BACKFILL`
+  must now be explicit at ingestion, while later live adapter observations always
+  win and retain `adapter_live` provenance.
+- Treat external history construction as a finite uncapped backlog with a separate
+  immutable audit ledger. Keep the rolling limit only for online construction,
+  reconstruction, and feedback; add an audited online-budget reset that resumes
+  only matching budget-wait jobs.
+- Restrict startup recovery, threshold triggers, the periodic sweeper, and automatic
+  retries to `LIVE` messages. `BACKFILL` can be selected explicitly through the
+  authenticated manual API for a deployment-local one-shot driver, but the plugin
+  never turns a finite import into a permanent automatic maintenance policy.
+- Replace five-minute budget polling noise with persistent `BUDGET_WAIT` jobs whose
+  next eligible time is calculated from the exact rolling-ledger expiry.
+- Use reversible batch-local `mN` evidence IDs and `pN` participant IDs in
+  construction prompts, omit duplicate plain-text components, and replace verbose
+  per-message ignore reasons with a compact ignored-ID ledger. Canonical source and
+  participant keys are restored before strict host validation and persistence.
+- Record prompt protocol, prompt size, total tokens, and tokens per target for each
+  successful construction run. The console now shows ingestion provenance,
+  online/backfill progress and ledgers, recent failures, and online-budget reset.
+- Keep a provider-portable construction default of 80 messages, while allowing
+  long-context deployments to opt into larger batches. Production measurements
+  at 320 and 500 targets reached 297 and 259 tokens per target respectively;
+  this deployment uses 500 only for its finite history backlog.
+- Remove fixed graph-unit quotas that made a 500-target batch silently classify
+  416 ordinary messages as ignored. Output cardinality now scales with the target
+  set, while strict evidence, identity, and host validation remain unchanged.
+- Stop imposing the old 32k completion ceiling on DeepSeek V4 construction. The
+  deployment can use its configured 384k limit, and streamed progress plus actual
+  prompt/token/latency metadata are recorded without storing hidden reasoning.
+
+## 0.13.0
+
+- Split each group's private-LLM ledger into online and one-off history-backfill
+  classes. Only an external migration tool may explicitly label data `BACKFILL`;
+  plugin upgrades never reinterpret previously captured messages.
+- Keep live construction ahead of historical backlog and never mix the two classes
+  in one distillation checkpoint. A later idempotent history sync cannot demote an
+  already live-captured message back into the history queue.
+- Reserve one normal call of headroom before either budget can start more work, so
+  a final ordinary batch does not cross the configured ceiling.
+- Move feedback maintenance onto a dedicated worker and preserve proposal-specific
+  dedupe keys in the periodic sweeper, preventing historical construction from
+  starving feedback or generating duplicate jobs.
+- Reject the generic word `可以` as a standalone cheap feedback signal while
+  retaining explicit positive and corrective follow-ups for the private semantic
+  gate.
+- Bound every private tool result and the initial candidate set as valid JSON,
+  reduce broad repeated-media evidence, and instruct the agent not to repeat
+  identical broad calls. This removes the observed multi-turn context explosion.
+- Pin sensitive OpenAI/httpcore SDK namespaces to INFO because their DEBUG request
+  dump can contain private group evidence even when AstrBot's configured level is
+  INFO.
+- Expose per-scope online/backfill usage and pending counts in the console, and
+  persist bounded exception details for future construction/reconstruction audits.
+
 ## 0.12.1
 
 - Initialize tool visibility, maintenance workers, provider checks, and saved

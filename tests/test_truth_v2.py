@@ -908,6 +908,23 @@ class TruthLayerV2Tests(unittest.TestCase):
         self.assertGreaterEqual(corrective, 0.25)
         self.assertIn("feedback_lexicon", corrective_reasons)
 
+    def test_feedback_surface_gate_does_not_treat_generic_can_as_feedback(self) -> None:
+        score, reasons = feedback_surface_score(
+            "虽然确实可以深度回忆了",
+            reply_to_bot=False,
+            seconds_after_response=45,
+            same_sender=True,
+        )
+        accepted, accepted_reasons = feedback_surface_score(
+            "这样可以了",
+            reply_to_bot=False,
+            seconds_after_response=45,
+            same_sender=True,
+        )
+        self.assertEqual((score, reasons), (0.0, ()))
+        self.assertGreaterEqual(accepted, 0.25)
+        self.assertIn("feedback_lexicon", accepted_reasons)
+
     def test_evidence_brief_rejects_unvisited_sources_and_never_slices(self) -> None:
         valid = json.dumps(
             {

@@ -5,7 +5,6 @@ import time
 from astrbot.api import logger
 from quart import jsonify, request
 
-
 PLUGIN_NAME = "astrbot_plugin_mr_memory"
 WEB_LOG_PREFIX = "[MR Memory][WebUI]"
 
@@ -57,16 +56,10 @@ class WebConsoleMixin:
             "手动整理指定群范围的最近消息",
         )
         self._register_memory_web_api(
-            "history-import/status",
-            self._api_memory_history_import_status,
-            ["GET"],
-            "检测可迁移的 AngelEye 群聊历史及进度",
-        )
-        self._register_memory_web_api(
-            "history-import/start",
-            self._api_memory_history_import_start,
+            "scopes/<scope_id>/budget/reset",
+            self._api_memory_budget_reset,
             ["POST"],
-            "启动一次性 AngelEye 群聊历史迁移",
+            "重置指定群范围的在线回忆或反馈额度",
         )
 
     def _register_memory_web_api(self, route, handler, methods, desc) -> None:
@@ -130,7 +123,37 @@ class WebConsoleMixin:
             minimum=1,
             maximum=500,
         )
-        data = await self._web_memory_graph(scope_id=scope_id, limit=limit)
+        node_types = tuple(
+            item.strip()
+            for item in str(request.args.get("types") or "").split(",")
+            if item.strip()
+        )
+        epistemic_states = tuple(
+            item.strip()
+            for item in str(request.args.get("epistemic") or "").split(",")
+            if item.strip()
+        )
+        data = await self._web_memory_graph(
+            scope_id=scope_id,
+            limit=limit,
+            query=str(request.args.get("query") or "")[:300],
+            focus_node_id=str(request.args.get("focus") or "")[:300],
+            depth=self._bounded_int(
+                request.args.get("depth"), default=1, minimum=1, maximum=3
+            ),
+            node_types=node_types,
+            epistemic_states=epistemic_states,
+            relation=str(request.args.get("relation") or "")[:160],
+            min_degree=self._bounded_int(
+                request.args.get("min_degree"), default=0, minimum=0, maximum=1000
+            ),
+            min_core=self._bounded_int(
+                request.args.get("min_core"), default=0, minimum=0, maximum=100
+            ),
+            structure_scope=str(request.args.get("structure") or "all"),
+            path_source=str(request.args.get("path_source") or "")[:300],
+            path_target=str(request.args.get("path_target") or "")[:300],
+        )
         return self._memory_web_success(data)
 
     async def _api_memory_participants(self, scope_id: str):
@@ -195,21 +218,22 @@ class WebConsoleMixin:
             minimum=0,
             maximum=500,
         )
-        data = await self._web_memory_distill(scope_id=scope_id, limit=limit)
+        processing_class = str(payload.get("processing_class") or "").strip().upper()
+        if processing_class not in {"", "LIVE", "BACKFILL"}:
+            raise ValueError("processing_class 必须是 LIVE 或 BACKFILL")
+        data = await self._web_memory_distill(
+            scope_id=scope_id,
+            limit=limit,
+            processing_class=processing_class,
+        )
         return self._memory_web_success(data)
 
-    async def _api_memory_history_import_status(self):
-        return self._memory_web_success(
-            await self._web_memory_history_import_status(
-                platform_id=str(request.args.get("platform_id") or ""),
-            )
-        )
-
-    async def _api_memory_history_import_start(self):
+    async def _api_memory_budget_reset(self, scope_id: str):
         payload = await request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
             raise ValueError("请求正文必须是 JSON 对象")
-        data = await self._web_memory_history_import_start(
-            platform_id=str(payload.get("platform_id") or ""),
+        data = await self._web_memory_budget_reset(
+            scope_id=scope_id,
+            budget_class=str(payload.get("budget_class") or "online"),
         )
         return self._memory_web_success(data)

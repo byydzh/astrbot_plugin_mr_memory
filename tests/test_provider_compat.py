@@ -81,6 +81,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
 
     def test_streaming_path_returns_the_provider_final_response(self) -> None:
         provider = _StreamingPreparedPayloadProvider()
+        progress = []
 
         async def fallback(**kwargs):
             self.fail("fallback should not be used")
@@ -94,11 +95,18 @@ class ProviderCompatibilityTests(unittest.TestCase):
                 system_prompt="return json",
                 options={"thinking": {"type": "enabled"}},
                 stream=True,
+                on_stream_progress=lambda index, response: progress.append(
+                    (index, response)
+                ),
             )
         )
 
         self.assertEqual(result, "final-result")
         self.assertEqual(provider.payload["thinking"], {"type": "enabled"})
+        self.assertEqual(
+            progress,
+            [(1, "partial-result"), (2, "final-result")],
+        )
 
     def test_incomplete_stream_is_not_accepted_as_a_full_response(self) -> None:
         provider = _IncompleteStreamingProvider()

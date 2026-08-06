@@ -102,6 +102,7 @@ class DistillationWorkItem:
 
     batch_key: str
     umo: str
+    processing_class: Literal["LIVE", "BACKFILL"]
     messages: tuple[StoredMessage, ...]
     target_source_keys: tuple[str, ...]
     target_hashes: tuple[tuple[str, str], ...]

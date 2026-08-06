@@ -276,9 +276,13 @@ class LocalSentenceTransformerBackend:
                 "max_seq_length",
                 min(current_max_length, self._max_seq_length),
             )
-            dimension_getter = getattr(model, "get_sentence_embedding_dimension", None)
+            dimension_getter = getattr(model, "get_embedding_dimension", None)
             if not callable(dimension_getter):
-                dimension_getter = getattr(model, "get_embedding_dimension", None)
+                dimension_getter = getattr(
+                    model,
+                    "get_sentence_embedding_dimension",
+                    None,
+                )
             dimensions = int(dimension_getter() if callable(dimension_getter) else 0)
             if dimensions <= 0:
                 raise ValueError("local embedding model returned an invalid dimension")

@@ -1,11 +1,15 @@
 const state = {
   overview: null,
-  historyImport: null,
-  historyImportPollTimer: null,
   scopeId: "",
   graph: null,
   participants: [],
   selectedNodeId: "",
+  graphQuery: "",
+  graphFocusId: "",
+  graphPathSource: "",
+  graphPathTarget: "",
+  activeSection: "runtime",
+  loadedSections: new Set(),
   visibleTypes: new Set([
     "participant", "cue", "episode", "semantic", "topic",
     "plastic", "action", "feedback", "hypothesis",
@@ -20,8 +24,19 @@ const elements = {
   connectionDot: document.getElementById("connection-dot"),
   connectionLabel: document.getElementById("connection-label"),
   runtimeVersion: document.getElementById("runtime-version"),
+  healthBanner: document.getElementById("health-banner"),
+  healthTitle: document.getElementById("health-title"),
+  healthCopy: document.getElementById("health-copy"),
+  healthLabel: document.getElementById("health-label"),
+  metricRecallLatency: document.getElementById("metric-recall-latency"),
+  metricRecallCaption: document.getElementById("metric-recall-caption"),
+  metricRecallTokens: document.getElementById("metric-recall-tokens"),
+  metricFeedbackLatency: document.getElementById("metric-feedback-latency"),
+  metricFeedbackCaption: document.getElementById("metric-feedback-caption"),
+  metricFeedbackResults: document.getElementById("metric-feedback-results"),
+  metricFeedbackQueue: document.getElementById("metric-feedback-queue"),
+  metricFeedbackQueueCaption: document.getElementById("metric-feedback-queue-caption"),
   metricScopes: document.getElementById("metric-scopes"),
-  metricScopesCaption: document.getElementById("metric-scopes-caption"),
   metricMessages: document.getElementById("metric-messages"),
   metricEpisodes: document.getElementById("metric-episodes"),
   metricSemantics: document.getElementById("metric-semantics"),
@@ -34,19 +49,39 @@ const elements = {
   policyDistill: document.getElementById("policy-distill"),
   policyFeedback: document.getElementById("policy-feedback"),
   policyEmbedding: document.getElementById("policy-embedding"),
-  historyImportPanel: document.getElementById("history-import-panel"),
-  historyImportSummary: document.getElementById("history-import-summary"),
-  historyImportDetail: document.getElementById("history-import-detail"),
-  historyImportProgressWrap: document.getElementById("history-import-progress-wrap"),
-  historyImportProgress: document.getElementById("history-import-progress"),
-  historyImportProgressLabel: document.getElementById("history-import-progress-label"),
-  historyPlatformSelect: document.getElementById("history-platform-select"),
-  historyImportBtn: document.getElementById("history-import-btn"),
+  policyBudget: document.getElementById("policy-budget"),
+  policyFeedbackBudget: document.getElementById("policy-feedback-budget"),
   scopeSelect: document.getElementById("scope-select"),
+  scopeSummary: document.getElementById("scope-summary"),
   scopeMeta: document.getElementById("scope-meta"),
+  scopeErrors: document.getElementById("scope-errors"),
   refreshBtn: document.getElementById("refresh-btn"),
+  resetBudgetBtn: document.getElementById("reset-budget-btn"),
+  resetFeedbackBudgetBtn: document.getElementById("reset-feedback-budget-btn"),
   distillBtn: document.getElementById("distill-btn"),
   graphLimit: document.getElementById("graph-limit"),
+  graphDepth: document.getElementById("graph-depth"),
+  graphSearchForm: document.getElementById("graph-search-form"),
+  graphSearchInput: document.getElementById("graph-search-input"),
+  graphSearchResults: document.getElementById("graph-search-results"),
+  graphOverviewBtn: document.getElementById("graph-overview-btn"),
+  graphStructureFilter: document.getElementById("graph-structure-filter"),
+  graphDegreeFilter: document.getElementById("graph-degree-filter"),
+  graphCoreFilter: document.getElementById("graph-core-filter"),
+  graphEpistemicFilter: document.getElementById("graph-epistemic-filter"),
+  graphRelationFilter: document.getElementById("graph-relation-filter"),
+  graphPathStatus: document.getElementById("graph-path-status"),
+  graphPathClear: document.getElementById("graph-path-clear"),
+  graphViewKicker: document.getElementById("graph-view-kicker"),
+  graphViewTitle: document.getElementById("graph-view-title"),
+  graphMetricNodes: document.getElementById("graph-metric-nodes"),
+  graphMetricEdges: document.getElementById("graph-metric-edges"),
+  graphMetricDegree: document.getElementById("graph-metric-degree"),
+  graphMetricDensity: document.getElementById("graph-metric-density"),
+  graphMetricComponents: document.getElementById("graph-metric-components"),
+  graphMetricGiant: document.getElementById("graph-metric-giant"),
+  graphMetricClustering: document.getElementById("graph-metric-clustering"),
+  graphMetricCore: document.getElementById("graph-metric-core"),
   fitGraphBtn: document.getElementById("fit-graph-btn"),
   graphStage: document.getElementById("graph-stage"),
   graphSvg: document.getElementById("memory-graph"),
@@ -56,7 +91,11 @@ const elements = {
   graphNodes: document.getElementById("graph-nodes"),
   graphEmpty: document.getElementById("graph-empty"),
   graphLoading: document.getElementById("graph-loading"),
+  graphEmptyTitle: document.getElementById("graph-empty-title"),
+  graphEmptyCopy: document.getElementById("graph-empty-copy"),
   graphCaption: document.getElementById("graph-caption"),
+  inspectorKicker: document.getElementById("inspector-kicker"),
+  inspectorHeading: document.getElementById("inspector-heading"),
   inspector: document.getElementById("inspector-content"),
   messageForm: document.getElementById("message-search-form"),
   messageQuery: document.getElementById("message-query"),
@@ -64,6 +103,12 @@ const elements = {
   messageBody: document.getElementById("message-table-body"),
   participantStatus: document.getElementById("participant-status"),
   participantBody: document.getElementById("participant-table-body"),
+  runtimeTableBody: document.getElementById("runtime-table-body"),
+  queuePending: document.getElementById("queue-pending"),
+  queueProvisional: document.getElementById("queue-provisional"),
+  queueBudgetWait: document.getElementById("queue-budget-wait"),
+  queueOldest: document.getElementById("queue-oldest"),
+  queueExplanation: document.getElementById("queue-explanation"),
   aliasBindForm: document.getElementById("alias-bind-form"),
   aliasAccountId: document.getElementById("alias-account-id"),
   aliasValue: document.getElementById("alias-value"),
@@ -72,25 +117,20 @@ const elements = {
   distillLimit: document.getElementById("distill-limit"),
   distillCancel: document.getElementById("distill-cancel"),
   distillConfirm: document.getElementById("distill-confirm"),
-  historyImportDialog: document.getElementById("history-import-dialog"),
-  historyImportForm: document.getElementById("history-import-form"),
-  historyImportConfirmCopy: document.getElementById("history-import-confirm-copy"),
-  historyImportCancel: document.getElementById("history-import-cancel"),
-  historyImportConfirm: document.getElementById("history-import-confirm"),
   toastRegion: document.getElementById("toast-region"),
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const typeNames = {
-  participant: "账户主体 PARTICIPANT",
-  cue: "线索 CUE",
-  episode: "情节 EPISODE",
-  semantic: "语义 SEMANTIC",
-  topic: "主题 TOPIC",
-  action: "行动 ACTION",
-  feedback: "反馈 FEEDBACK",
-  hypothesis: "前瞻假设 HYPOTHESIS",
-  plastic: "可塑语义 PLASTIC",
+  participant: "账户主体",
+  cue: "检索线索",
+  episode: "情节记忆",
+  semantic: "人物与事实",
+  topic: "主题",
+  action: "回答与工具",
+  feedback: "后续反馈",
+  hypothesis: "行为记忆",
+  plastic: "群内语义",
 };
 
 function svgElement(name, attributes = {}) {
@@ -110,6 +150,29 @@ function textElement(name, text, className = "") {
 
 function formatNumber(value) {
   return new Intl.NumberFormat("zh-CN").format(Number(value || 0));
+}
+
+function formatDuration(value) {
+  const milliseconds = Number(value || 0);
+  if (!milliseconds) return "—";
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} 毫秒`;
+  const seconds = milliseconds / 1000;
+  return `${seconds >= 10 ? seconds.toFixed(1) : seconds.toFixed(2)} 秒`;
+}
+
+function formatAge(value) {
+  const seconds = Math.max(0, Number(value || 0));
+  if (!seconds) return "—";
+  if (seconds < 60) return `${Math.round(seconds)} 秒`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`;
+  return `${(seconds / 3600).toFixed(seconds < 10800 ? 1 : 0)} 小时`;
+}
+
+function formatWindow(secondsValue) {
+  const seconds = Math.max(0, Number(secondsValue || 0));
+  if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))} 分钟`;
+  const hours = seconds / 3600;
+  return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} 小时`;
 }
 
 function formatBytes(value) {
@@ -177,6 +240,17 @@ async function apiPost(endpoint, body = {}) {
   return window.AstrBotPluginPage.apiPost(endpoint, body);
 }
 
+async function waitForPluginBridge(timeoutMs = 5000) {
+  const startedAt = performance.now();
+  while (!window.AstrBotPluginPage) {
+    if (performance.now() - startedAt >= timeoutMs) {
+      throw new Error("AstrBot 插件页面桥接加载超时");
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 25));
+  }
+  return window.AstrBotPluginPage;
+}
+
 function selectedScope() {
   return (state.overview?.scopes || []).find(
     (scope) => scope.storage_id === state.scopeId,
@@ -194,145 +268,181 @@ function renderOverview() {
   elements.metricParticipants.textContent = formatNumber(totals.participants);
   elements.metricPending.textContent = formatNumber(totals.pending_distillation);
   elements.metricEmbeddings.textContent = formatNumber(totals.embeddings);
-  elements.metricStorage.textContent = `数据库 ${formatBytes(totals.database_bytes)}`;
+  elements.metricStorage.textContent = formatBytes(totals.database_bytes);
   elements.runtimeVersion.textContent = `MR Memory ${overview?.version || ""}`;
 
   const allowedUmos = runtime.allowed_umos || [];
   elements.policyScope.textContent = allowedUmos.length
-    ? `${formatNumber(allowedUmos.length)} 个指定 UMO`
+    ? `${formatNumber(allowedUmos.length)} 个指定群聊`
     : "全部群";
   elements.policyWake.textContent = !runtime.subconscious_enabled
     ? "关闭"
     : runtime.runtime_wake_mode === "manual_only"
-      ? "仅主 Agent 咨询"
-      : "每次主 LLM 请求";
+      ? "仅在主模型主动咨询时运行"
+      : "每次回答先快速判断，必要时再深挖";
   elements.policyDistill.textContent = runtime.auto_distillation_enabled
-    ? `${formatNumber(runtime.auto_distillation_min_pending)} 条或 ${Math.max(0.5, Number(runtime.maintenance_interval_seconds || 0) / 60)} 分钟 · ${runtime.distillation_thinking_mode === "disabled" ? "思考关闭" : "完整思考"}`
-    : `仅手动 · ${runtime.distillation_thinking_mode === "disabled" ? "思考关闭" : "完整思考"}`;
+    ? `${formatNumber(runtime.auto_distillation_min_pending)} 条立即整理，最迟 ${Math.max(0.5, Number(runtime.maintenance_interval_seconds || 0) / 60)} 分钟一次`
+    : "仅在管理员手动操作时整理";
   elements.policyFeedback.textContent = runtime.feedback_learning_enabled
-    ? `${Math.max(1 / 60, Number(runtime.feedback_window_seconds || 0) / 3600)} 小时归因窗`
+    ? `${formatNumber(runtime.feedback_debounce_seconds)} 秒合并，最多 ${formatNumber(runtime.feedback_batch_size)} 条/次，可关联 ${formatWindow(runtime.feedback_window_seconds)}内的回答`
     : "关闭";
   elements.policyEmbedding.textContent = runtime.embedding_enabled
-    ? `${compactModelName(runtime.embedding_model_name)} · ${runtime.embedding_model_loaded ? "已加载" : "待加载"}`
+    ? `${compactModelName(runtime.embedding_model_name)} · ${runtime.embedding_model_loaded ? "正在使用" : "首次检索时加载"}`
     : "关闭";
+  elements.policyBudget.textContent =
+    runtime.private_daily_token_budget
+      ? `${formatNumber(runtime.private_daily_token_budget)} Token / 群 / 24 小时`
+      : "不限额";
+  elements.policyFeedbackBudget.textContent =
+    runtime.feedback_daily_token_budget
+      ? `${formatNumber(runtime.feedback_daily_token_budget)} Token / 群 / 24 小时`
+      : "不限额";
 
-  const runtimeParts = ["已连接"];
-  runtimeParts.push(runtime.capture_enabled ? "采集开启" : "采集关闭");
-  runtimeParts.push(runtime.feedback_learning_enabled ? "反馈闭环开启" : "反馈闭环关闭");
+  const runtimeParts = [];
+  runtimeParts.push(runtime.capture_enabled ? "正在记录群消息" : "未记录群消息");
+  runtimeParts.push(runtime.feedback_learning_enabled ? "反馈学习已启用" : "反馈学习未启用");
   if (runtime.embedding_enabled) {
     if (!runtime.embedding_dependency_ready) {
-      runtimeParts.push(`${runtime.embedding_backend || "Embedding"} 依赖缺失`);
+      runtimeParts.push("本地语义检索不可用");
     } else if (runtime.embedding_model_loaded) {
-      runtimeParts.push("本地 Embedding 已加载");
+      runtimeParts.push("本地语义检索已就绪");
     } else {
-      runtimeParts.push("本地 Embedding 待首次加载");
+      runtimeParts.push("本地语义检索尚未首次使用");
     }
   }
   setConnection("online", runtimeParts.join(" · "));
 }
 
-function renderHistoryImport() {
-  const payload = state.historyImport || {};
-  const importState = payload.state || {};
-  const groups = (payload.groups || []).filter((group) => group.eligible);
-  const platforms = payload.platforms || [];
-  const previousPlatform = elements.historyPlatformSelect.value;
-  elements.historyPlatformSelect.replaceChildren();
-  platforms.forEach((platform) => {
-    elements.historyPlatformSelect.append(
-      new Option(
-        `${platform.platform_id} · ${platform.adapter}`,
-        platform.platform_id,
-      ),
-    );
-  });
-  const preferred = previousPlatform
-    || payload.recommended_platform_id
-    || platforms[0]?.platform_id
-    || "";
-  elements.historyPlatformSelect.value = preferred;
-  elements.historyPlatformSelect.disabled = platforms.length <= 1;
-  const platformGroupCount = Number(payload.platform_group_count || 0);
-  elements.metricScopesCaption.textContent = platformGroupCount
-    ? `物理隔离数据库 · 平台当前 ${formatNumber(platformGroupCount)} 群`
-    : "物理隔离数据库";
+function renderRuntimeHealth(scope) {
+  const health = scope?.runtime_health || {};
+  const reconstruction = health.reconstruction || {};
+  const feedback = health.feedback || {};
+  const queue = health.feedback_queue || {};
+  const proposalStatus = queue.proposal_status || {};
+  const hypothesisStatus = queue.hypothesis_status || {};
+  const jobStatus = queue.job_status || {};
+  const recallCalls = Number(reconstruction.calls || 0);
+  const feedbackCalls = Number(feedback.calls || 0);
+  const pending = Number(proposalStatus.pending || 0);
+  const provisional = Number(hypothesisStatus.provisional || 0);
+  const budgetWait = Number(jobStatus.budget_wait || 0);
+  const effectiveFeedback = Number(feedback.committed || 0) + Number(feedback.provisional || 0);
+  const decidedFeedback = effectiveFeedback
+    + Number(feedback.ignored || 0)
+    + Number(feedback.rejected || 0);
 
-  if (!payload.available) {
-    elements.historyImportSummary.textContent = "未检测到 AngelEye 群聊历史缓存。";
-    elements.historyImportDetail.textContent = payload.platform_group_count
-      ? `平台当前加入 ${formatNumber(payload.platform_group_count)} 个群；新消息仍会按当前采集设置进入 MR Memory。`
-      : "新消息仍会按当前采集设置进入 MR Memory。";
-    elements.historyImportBtn.disabled = true;
-    elements.historyImportProgressWrap.classList.add("hidden");
-    return;
+  elements.metricRecallLatency.textContent = recallCalls
+    ? formatDuration(reconstruction.p50_elapsed_ms)
+    : "暂无调用";
+  elements.metricRecallTokens.textContent = recallCalls
+    ? formatNumber(Math.round(Number(reconstruction.avg_tokens || 0)))
+    : "暂无调用";
+  elements.metricFeedbackLatency.textContent = feedbackCalls
+    ? formatDuration(feedback.p50_elapsed_ms)
+    : "暂无调用";
+  elements.metricFeedbackResults.textContent = decidedFeedback
+    ? `${formatNumber(effectiveFeedback)} / ${formatNumber(decidedFeedback)}`
+    : "暂无结果";
+  elements.metricFeedbackQueue.textContent = formatNumber(pending);
+  elements.metricFeedbackQueueCaption.textContent = pending
+    ? `最久已等待 ${formatAge(queue.oldest_pending_age_seconds)}`
+    : "当前没有等待分析的反馈";
+
+  elements.queuePending.textContent = formatNumber(pending);
+  elements.queueProvisional.textContent = formatNumber(provisional);
+  elements.queueBudgetWait.textContent = formatNumber(budgetWait);
+  elements.queueOldest.textContent = formatAge(queue.oldest_pending_age_seconds);
+  elements.queueExplanation.textContent = budgetWait
+    ? "反馈正在等待独立额度恢复；不会被回答前回忆或消息整理挤占。"
+    : provisional
+      ? "待验证记忆不会直接影响回答；后续同向证据足够时才会启用。"
+      : "普通聊天会被忽略；可归因但证据较弱的反馈会先保留为待验证。";
+
+  const runtime = state.overview?.runtime || {};
+  const issues = [];
+  if (runtime.embedding_enabled && !runtime.embedding_dependency_ready) {
+    issues.push("本地语义检索依赖不可用");
+  }
+  if (recallCalls && Number(reconstruction.p50_elapsed_ms || 0) > 10000) {
+    issues.push(`回答前回忆 p50 为 ${formatDuration(reconstruction.p50_elapsed_ms)}`);
+  }
+  if (feedbackCalls && Number(feedback.p50_elapsed_ms || 0) > 20000) {
+    issues.push(`反馈分析 p50 为 ${formatDuration(feedback.p50_elapsed_ms)}`);
+  }
+  if (budgetWait) issues.push(`${formatNumber(budgetWait)} 个反馈任务等待额度`);
+  if (Number(reconstruction.timeouts || 0)) {
+    issues.push(`${formatNumber(reconstruction.timeouts)} 次回答前回忆超时`);
   }
 
-  const sourceMessages = Number(payload.source_messages || 0);
-  const targetMessages = Number(payload.target_messages || 0);
-  const caughtUp = sourceMessages > 0 && targetMessages >= sourceMessages;
-  const unfinishedSources = groups.filter((group) => !group.history_exhausted).length;
-  const uncachedGroupCount = Number(payload.uncached_group_count || 0);
-  elements.historyImportSummary.textContent =
-    `AngelEye 仅有 ${formatNumber(groups.length)} 个群的按需缓存，共 ${formatNumber(sourceMessages)} 条；MR 当前已有 ${formatNumber(targetMessages)} 条。`;
-  const groupSummary = groups
-    .map((group) => `${group.group_id}: ${formatNumber(group.source_messages)}→${formatNumber(group.target_messages)}`)
-    .join(" · ");
-  elements.historyImportDetail.textContent = [
-    groupSummary,
-    unfinishedSources
-      ? `${formatNumber(unfinishedSources)} 个 AngelEye 缓存仍未标记为完整历史`
-      : "AngelEye 已标记历史覆盖完成",
-    platformGroupCount
-      ? `平台实际加入 ${formatNumber(platformGroupCount)} 个群；另 ${formatNumber(uncachedGroupCount)} 个群没有 AngelEye 旧历史，但新消息仍由 MR 按当前范围实时采集`
-      : "",
-  ].filter(Boolean).join(" · ");
-
-  const running = importState.status === "RUNNING";
-  const total = Number(importState.total || sourceMessages || 0);
-  const processed = Number(importState.processed || 0);
-  const percent = total > 0 ? Math.min(100, (processed / total) * 100) : 0;
-  elements.historyImportProgress.value = percent;
-  elements.historyImportProgressLabel.textContent =
-    `${percent.toFixed(1)}% · ${formatNumber(processed)}/${formatNumber(total)}`;
-  elements.historyImportProgressWrap.classList.toggle(
-    "hidden",
-    !running && !["COMPLETED", "FAILED", "CANCELLED"].includes(importState.status),
-  );
-  elements.historyImportBtn.disabled = running || !preferred || sourceMessages <= 0;
-  elements.historyImportBtn.textContent = running
-    ? `正在导入群 ${importState.current_group_id || "…"}`
-    : importState.status === "COMPLETED"
-      ? "同步新增历史"
-      : caughtUp
-        ? "已导入 · 检查新增"
-        : "导入已有历史";
-  if (importState.status === "FAILED") {
-    elements.historyImportDetail.textContent += ` · 上次失败：${importState.error || "未知错误"}`;
-  } else if (importState.status === "COMPLETED") {
-    elements.historyImportDetail.textContent +=
-      ` · 上次导入新增 ${formatNumber(importState.inserted)} 条，跳过 ${formatNumber(importState.skipped)} 条异常记录`;
+  if (issues.length) {
+    elements.healthBanner.className = "health-banner is-warning";
+    elements.healthLabel.textContent = "需要关注";
+    elements.healthTitle.textContent = "记忆正在运行，但实时体验没有达到目标";
+    elements.healthCopy.textContent = issues.join("；");
+  } else if (!recallCalls && !feedbackCalls) {
+    elements.healthBanner.className = "health-banner is-idle";
+    elements.healthLabel.textContent = "等待数据";
+    elements.healthTitle.textContent = "这个群还没有新的实时调用样本";
+    elements.healthCopy.textContent = "出现回答前回忆或后续反馈后，这里会显示真实时延和消耗。";
+  } else {
+    elements.healthBanner.className = "health-banner is-healthy";
+    elements.healthLabel.textContent = "运行正常";
+    elements.healthTitle.textContent = "实时记忆链路处于目标范围内";
+    const samples = [];
+    if (recallCalls) samples.push(`回答前回忆 p95 ${formatDuration(reconstruction.p95_elapsed_ms)}`);
+    if (feedbackCalls) samples.push(`反馈分析 p95 ${formatDuration(feedback.p95_elapsed_ms)}`);
+    elements.healthCopy.textContent = `${samples.join("；")}。`;
   }
+
+  renderRuntimeCalls(health.recent || []);
 }
 
-async function refreshHistoryImport({ refreshEverythingOnCompletion = false } = {}) {
-  const previousStatus = state.historyImport?.state?.status || "";
-  state.historyImport = await apiGet("history-import/status");
-  renderHistoryImport();
-  const currentStatus = state.historyImport?.state?.status || "";
-  if (currentStatus === "RUNNING") {
-    window.clearTimeout(state.historyImportPollTimer);
-    state.historyImportPollTimer = window.setTimeout(
-      () => refreshHistoryImport({ refreshEverythingOnCompletion: true }),
-      3000,
-    );
-  } else if (
-    refreshEverythingOnCompletion
-    && previousStatus === "RUNNING"
-    && currentStatus === "COMPLETED"
-  ) {
-    showToast("历史迁移完成，正在刷新群范围与待整理队列。");
-    await refreshOverview({ preserveSelection: true, loadScope: true });
+function renderRuntimeCalls(calls) {
+  elements.runtimeTableBody.replaceChildren();
+  if (!calls.length) {
+    const row = document.createElement("tr");
+    const cell = textElement("td", "最近 24 小时还没有实时调用。", "table-empty");
+    cell.colSpan = 6;
+    row.append(cell);
+    elements.runtimeTableBody.append(row);
+    return;
   }
+  const phaseNames = { reconstruction: "回答前回忆", feedback: "反馈分析" };
+  const outcomeNames = {
+    useful: "提供了记忆",
+    none: "没有相关记忆",
+    committed: "已启用",
+    provisional: "待验证",
+    ignored: "普通聊天",
+    rejected: "未采用",
+    failed: "失败",
+    completed: "已完成",
+  };
+  const pathNames = {
+    fast: "一次判断",
+    deep_escalation: "判断后深挖",
+    deep_forced: "主动深挖",
+    one_pass_batch: "合并判断",
+    semantic_gate_then_learn: "先判断，必要时学习",
+    legacy: "旧版多轮",
+  };
+  calls.forEach((call) => {
+    const outcomes = String(call.outcome || "")
+      .split(",")
+      .filter(Boolean)
+      .map((value) => outcomeNames[value] || value)
+      .join("、");
+    const row = document.createElement("tr");
+    row.append(
+      textElement("td", formatTime(call.started_at)),
+      textElement("td", phaseNames[call.phase] || call.phase),
+      textElement("td", outcomes || "—"),
+      textElement("td", formatDuration(call.elapsed_ms)),
+      textElement("td", formatNumber(call.tokens)),
+      textElement("td", pathNames[call.path] || call.path || "—"),
+    );
+    elements.runtimeTableBody.append(row);
+  });
 }
 
 function populateScopes(previousScopeId = "") {
@@ -343,13 +453,16 @@ function populateScopes(previousScopeId = "") {
     elements.scopeSelect.append(option);
     elements.scopeSelect.disabled = true;
     elements.distillBtn.disabled = true;
+    elements.resetBudgetBtn.disabled = true;
+    elements.resetFeedbackBudgetBtn.disabled = true;
     state.scopeId = "";
     state.participants = [];
     renderParticipants([]);
-    elements.scopeMeta.textContent = state.historyImport?.available
-      ? "可先从“现有群聊历史”导入；新群消息也会自动建立独立范围。"
-      : "启用采集并收到群消息后，此处会出现独立群范围。";
+    elements.scopeSummary.textContent = "启用群聊记忆并收到消息后，这里会出现群聊。";
+    elements.scopeMeta.textContent = "尚无群聊记忆库。";
+    elements.scopeErrors.classList.add("hidden");
     showEmptyGraph();
+    renderRuntimeHealth(null);
     return;
   }
 
@@ -367,30 +480,57 @@ function populateScopes(previousScopeId = "") {
   state.scopeId = available ? previousScopeId : scopes[0].storage_id;
   elements.scopeSelect.value = state.scopeId;
   elements.distillBtn.disabled = false;
+  elements.resetBudgetBtn.disabled = false;
+  elements.resetFeedbackBudgetBtn.disabled = false;
+  state.loadedSections.clear();
   renderScopeMeta();
 }
 
 function renderScopeMeta() {
   const scope = selectedScope();
   if (!scope) {
+    elements.scopeSummary.textContent = "尚未选择群聊";
     elements.scopeMeta.textContent = "尚未选择群范围";
+    elements.scopeErrors.classList.add("hidden");
+    renderRuntimeHealth(null);
     return;
   }
+  const runtime = state.overview?.runtime || {};
+  const usage = scope.token_usage_24h || {};
+  const rawLedger = scope.token_ledger_24h || {};
+  const pendingByClass = scope.pending_distillation_by_class || {};
+  elements.scopeSummary.textContent = [
+    `群 ${scope.group_id || "未知"}`,
+    `${formatNumber(scope.messages)} 条消息`,
+    `${formatNumber(scope.episodes)} 段情节记忆`,
+    `最近消息 ${formatTime(scope.last_message_at)}`,
+  ].join(" · ");
   elements.scopeMeta.textContent = [
     `UMO ${scope.umo}`,
-    `${formatNumber(scope.cues)} cues`,
-    `${formatNumber(scope.participants)} participants`,
-    `${formatNumber(scope.pending_distillation)} pending`,
-    `${formatNumber(scope.topics)} topics`,
-    `${formatNumber(scope.active_hypotheses)} active hypotheses`,
-    `${formatNumber(scope.plastic_edges)} plastic edges`,
-    `${formatNumber(scope.open_semantic_hypotheses)} 未决释义`,
-    `${formatNumber(scope.frequent_media)} 高频图片锚点`,
-    `${formatNumber(scope.pending_maintenance)} maintenance jobs`,
-    `state r${formatNumber(scope.subconscious_revision)}`,
-    `${formatNumber(scope.feedback_links)} feedback links`,
-    `最近消息 ${formatTime(scope.last_message_at)}`,
+    `${formatNumber(pendingByClass.live)} 条新消息待整理`,
+    `回忆与整理 ${formatNumber(usage.online)}/${formatNumber(runtime.private_daily_token_budget)} Token`,
+    `反馈 ${formatNumber(usage.feedback)}/${formatNumber(runtime.feedback_daily_token_budget)} Token`,
+    Number(rawLedger.online || 0) !== Number(usage.online || 0)
+      ? `回忆原始账本 ${formatNumber(rawLedger.online)} Token（已重置额度）`
+      : "回忆额度未人工重置",
+    Number(rawLedger.feedback || 0) !== Number(usage.feedback || 0)
+      ? `反馈原始账本 ${formatNumber(rawLedger.feedback)} Token（已重置额度）`
+      : "反馈额度未人工重置",
+    `${formatNumber(scope.open_semantic_hypotheses)} 条群内语义仍有疑问`,
+    `状态版本 ${formatNumber(scope.subconscious_revision)}`,
   ].join("  ·  ");
+  const recentErrors = [
+    ...(scope.recent_processing_errors || []),
+    ...(scope.recent_maintenance_errors || []),
+  ];
+  if (recentErrors.length) {
+    const latest = recentErrors[0];
+    elements.scopeErrors.textContent = `最近异常：${latest.last_error || "未知错误"}（${formatTime(latest.updated_at)}）`;
+    elements.scopeErrors.classList.remove("hidden");
+  } else {
+    elements.scopeErrors.classList.add("hidden");
+  }
+  renderRuntimeHealth(scope);
 }
 
 async function refreshOverview({ preserveSelection = true, loadScope = true } = {}) {
@@ -398,12 +538,8 @@ async function refreshOverview({ preserveSelection = true, loadScope = true } = 
   elements.refreshBtn.disabled = true;
   setConnection("loading", "正在同步运行状态");
   try {
-    [state.overview, state.historyImport] = await Promise.all([
-      apiGet("overview"),
-      apiGet("history-import/status"),
-    ]);
+    state.overview = await apiGet("overview");
     renderOverview();
-    renderHistoryImport();
     populateScopes(previousScopeId);
     if (loadScope && state.scopeId) {
       await loadSelectedScope();
@@ -413,13 +549,6 @@ async function refreshOverview({ preserveSelection = true, loadScope = true } = 
     showToast(error?.message || "无法读取 MR Memory 状态", "error");
   } finally {
     elements.refreshBtn.disabled = false;
-  }
-  if (state.historyImport?.state?.status === "RUNNING") {
-    window.clearTimeout(state.historyImportPollTimer);
-    state.historyImportPollTimer = window.setTimeout(
-      () => refreshHistoryImport({ refreshEverythingOnCompletion: true }),
-      3000,
-    );
   }
 }
 
@@ -444,91 +573,322 @@ async function loadSelectedScope() {
     return;
   }
   renderScopeMeta();
-  setGraphLoading(true);
-  elements.distillBtn.disabled = true;
+  if (state.activeSection === "runtime") return;
+  if (state.loadedSections.has(state.activeSection)) return;
+  if (state.activeSection === "graph") setGraphLoading(true);
   try {
-    await Promise.all([loadGraph(), loadMessages(), loadParticipants()]);
+    if (state.activeSection === "graph") await loadGraph();
+    else if (state.activeSection === "identity") await loadParticipants();
+    else if (state.activeSection === "evidence") await loadMessages();
+    state.loadedSections.add(state.activeSection);
   } catch (error) {
-    showToast(error?.message || "群范围数据加载失败", "error");
+    showToast(error?.message || "当前区域加载失败", "error");
   } finally {
-    setGraphLoading(false);
-    elements.distillBtn.disabled = false;
+    if (state.activeSection === "graph") setGraphLoading(false);
   }
+}
+
+async function activateSection(section) {
+  state.activeSection = section;
+  document.querySelectorAll("[data-section]").forEach((tab) => {
+    const active = tab.dataset.section === section;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-section-view]").forEach((view) => {
+    view.classList.toggle("hidden", view.dataset.sectionView !== section);
+  });
+  await loadSelectedScope();
+  if (section === "graph" && state.graph) window.requestAnimationFrame(fitGraph);
+}
+
+function graphRequestParams() {
+  const params = {
+    limit: Number(elements.graphLimit.value || 100),
+    depth: Number(elements.graphDepth.value || 2),
+    types: [...state.visibleTypes].sort().join(","),
+    min_degree: Number(elements.graphDegreeFilter.value || 0),
+    min_core: Number(elements.graphCoreFilter.value || 0),
+    structure: elements.graphStructureFilter.value || "all",
+  };
+  if (state.graphQuery) params.query = state.graphQuery;
+  if (state.graphFocusId) params.focus = state.graphFocusId;
+  if (elements.graphEpistemicFilter.value) {
+    params.epistemic = elements.graphEpistemicFilter.value;
+  }
+  if (elements.graphRelationFilter.value) {
+    params.relation = elements.graphRelationFilter.value;
+  }
+  if (state.graphPathSource && state.graphPathTarget) {
+    params.path_source = state.graphPathSource;
+    params.path_target = state.graphPathTarget;
+  }
+  return params;
 }
 
 async function loadGraph() {
-  const limit = Number(elements.graphLimit.value || 200);
-  const graph = await apiGet(`scopes/${state.scopeId}/graph`, { limit });
+  const graph = await apiGet(
+    `scopes/${state.scopeId}/graph`,
+    graphRequestParams(),
+  );
   if (state.scopeId !== graph?.scope?.storage_id) return;
   state.graph = graph;
+  state.graphFocusId = graph.focus_node_id || state.graphFocusId;
   state.selectedNodeId = "";
+  renderGraphMetrics();
+  renderSearchResults();
+  renderRelationOptions();
+  updatePathStatus();
   renderGraph();
-  renderInspectorPlaceholder();
+  const preferredNode = graph.mode === "path"
+    ? graph.path?.target
+    : graph.focus_node_id;
+  if (preferredNode && (graph.nodes || []).some((node) => node.id === preferredNode)) {
+    selectNode(preferredNode);
+  } else {
+    renderInspectorPlaceholder();
+  }
 }
 
-function calculateLayout(nodes) {
-  const grouped = {
-    participant: [], cue: [], episode: [], semantic: [], topic: [],
-    plastic: [], action: [], feedback: [], hypothesis: [],
-  };
-  nodes.forEach((node) => grouped[node.type]?.push(node));
-  const maxPrimary = Math.max(
-    grouped.participant.length,
-    grouped.cue.length,
-    grouped.episode.length,
-    8,
-  );
-  const rightCount = grouped.semantic.length + grouped.topic.length + grouped.plastic.length;
-  const feedbackCount = Math.max(
-    grouped.action.length,
-    grouped.feedback.length,
-    grouped.hypothesis.length,
-  );
-  const height = Math.max(
-    680,
-    maxPrimary * 58 + 120,
-    rightCount * 48 + 140,
-    feedbackCount * 58 + 140,
-  );
-  const width = 1760;
-  const positions = new Map();
+function renderGraphMetrics() {
+  const metrics = state.graph?.metrics || {};
+  elements.graphMetricNodes.textContent = formatNumber(metrics.node_count);
+  elements.graphMetricEdges.textContent = formatNumber(metrics.edge_count);
+  elements.graphMetricDegree.textContent = Number(metrics.average_degree || 0).toFixed(2);
+  elements.graphMetricDensity.textContent = `${(Number(metrics.density || 0) * 100).toFixed(2)}%`;
+  elements.graphMetricComponents.textContent = formatNumber(metrics.connected_components);
+  elements.graphMetricGiant.textContent = `最大分量 ${(Number(metrics.giant_component_ratio || 0) * 100).toFixed(1)}%`;
+  elements.graphMetricClustering.textContent = Number(metrics.average_clustering || 0).toFixed(3);
+  elements.graphMetricCore.textContent = formatNumber(metrics.max_core);
+}
 
-  function distribute(items, x, minY, maxY, wobble = 0) {
-    if (!items.length) return;
-    const span = Math.max(0, maxY - minY);
-    items.forEach((node, index) => {
-      const ratio = items.length === 1 ? 0.5 : index / (items.length - 1);
-      positions.set(node.id, {
-        x: x + (wobble ? ((index % 3) - 1) * wobble : 0),
-        y: minY + span * ratio,
-      });
-    });
+function renderSearchResults() {
+  const matches = state.graph?.matches || [];
+  elements.graphSearchResults.replaceChildren();
+  elements.graphSearchResults.classList.toggle("hidden", !state.graphQuery);
+  if (!state.graphQuery) return;
+  if (!matches.length) {
+    elements.graphSearchResults.append(
+      textElement("p", `没有找到“${state.graphQuery}”。可以换一个称呼、证据片段或更短的关键词。`, "panel-note"),
+    );
+    return;
   }
+  matches.slice(0, 9).forEach((match) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "graph-search-result";
+    button.classList.toggle("is-active", match.id === state.graph?.focus_node_id);
+    button.append(
+      textElement("span", match.label || match.id),
+      textElement("small", `${typeNames[match.type] || match.type} · 度 ${match.degree} · k-core ${match.core}`),
+      textElement("small", truncate(match.detail || "暂无摘要", 76)),
+    );
+    button.addEventListener("click", () => focusGraphNode(match.id));
+    elements.graphSearchResults.append(button);
+  });
+}
 
-  distribute(grouped.participant, 90, 80, height - 80, 12);
-  distribute(grouped.cue, 285, 80, height - 80, 16);
-  distribute(grouped.episode, 525, 90, height - 90, 22);
-  const topicEnd = grouped.topic.length ? Math.min(height * 0.4, 110 + grouped.topic.length * 62) : 90;
-  distribute(grouped.topic, 800, 90, topicEnd, 12);
-  distribute(
-    grouped.semantic,
-    800,
-    grouped.topic.length ? Math.max(height * 0.48, topicEnd + 70) : 100,
-    height - 90,
-    18,
-  );
-  distribute(grouped.plastic, 1030, 90, height - 90, 18);
-  distribute(grouped.action, 1240, 90, height - 90, 14);
-  distribute(grouped.feedback, 1460, 100, height - 100, 12);
-  distribute(grouped.hypothesis, 1690, 90, height - 90, 16);
+function renderRelationOptions() {
+  const current = elements.graphRelationFilter.value;
+  const options = [{ relation: "", count: null }, ...(state.graph?.relation_counts || [])];
+  if (current && !options.some((item) => item.relation === current)) {
+    options.splice(1, 0, { relation: current, count: null });
+  }
+  elements.graphRelationFilter.replaceChildren();
+  options.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = item.relation;
+    option.textContent = item.relation
+      ? `${item.relation}${item.count === null ? "" : ` (${formatNumber(item.count)})`}`
+      : "全部关系";
+    option.selected = item.relation === current;
+    elements.graphRelationFilter.append(option);
+  });
+}
 
+function updatePathStatus() {
+  elements.graphPathClear.disabled = !state.graphPathSource && !state.graphPathTarget;
+  const nodeMap = new Map((state.graph?.nodes || []).map((node) => [node.id, node]));
+  const source = nodeMap.get(state.graphPathSource)?.label || state.graphPathSource;
+  const target = nodeMap.get(state.graphPathTarget)?.label || state.graphPathTarget;
+  if (!state.graphPathSource) {
+    elements.graphPathStatus.textContent = "在右侧节点详情中选择起点和终点";
+    return;
+  }
+  if (!state.graphPathTarget) {
+    elements.graphPathStatus.textContent = `起点：${source}；再选择一个节点作为终点`;
+    return;
+  }
+  const path = state.graph?.path || {};
+  elements.graphPathStatus.textContent = path.found
+    ? `${source} → ${target}：${formatNumber(path.length)} 跳`
+    : `${source} 与 ${target} 在当前筛选网络中不连通`;
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function calculateNeighborhoodLayout(nodes) {
+  const width = 1180;
+  const height = 720;
+  const center = { x: width / 2, y: height / 2 };
+  const positions = new Map();
+  const focusId = state.graph?.focus_node_id;
+  if (focusId) positions.set(focusId, center);
+  const levels = new Map();
+  nodes.forEach((node) => {
+    if (node.id === focusId) return;
+    const level = Math.max(1, Number(node.distance || 1));
+    if (!levels.has(level)) levels.set(level, []);
+    levels.get(level).push(node);
+  });
+  [...levels.entries()].sort((a, b) => a[0] - b[0]).forEach(([level, items]) => {
+    items.sort((a, b) =>
+      Number(b.degree || 0) - Number(a.degree || 0) ||
+      String(a.type).localeCompare(String(b.type), "zh-CN") ||
+      String(a.label).localeCompare(String(b.label), "zh-CN")
+    );
+    let cursor = 0;
+    let ringIndex = 0;
+    while (cursor < items.length) {
+      const radius = 145 * level + ringIndex * 72;
+      const capacity = Math.max(8, Math.floor((Math.PI * 2 * radius) / 76));
+      const ringItems = items.slice(cursor, cursor + capacity);
+      const phase = ((level + ringIndex) % 2) * (Math.PI / Math.max(1, ringItems.length));
+      ringItems.forEach((node, index) => {
+        const angle = phase + (Math.PI * 2 * index) / ringItems.length - Math.PI / 2;
+        positions.set(node.id, {
+          x: center.x + Math.cos(angle) * radius,
+          y: center.y + Math.sin(angle) * radius,
+        });
+      });
+      cursor += ringItems.length;
+      ringIndex += 1;
+    }
+  });
   state.virtualSize = { width, height };
   return positions;
 }
 
+function calculatePathLayout(nodes) {
+  const width = 1180;
+  const height = 720;
+  const positions = new Map();
+  const ordered = [...nodes].sort(
+    (a, b) => Number(a.path_index || 0) - Number(b.path_index || 0),
+  );
+  ordered.forEach((node, index) => {
+    const ratio = ordered.length === 1 ? 0.5 : index / (ordered.length - 1);
+    positions.set(node.id, {
+      x: 120 + ratio * (width - 240),
+      y: height / 2 + (index % 2 ? 30 : -30),
+    });
+  });
+  state.virtualSize = { width, height };
+  return positions;
+}
+
+function calculateOverviewLayout(nodes, edges) {
+  const width = 1180;
+  const height = 720;
+  const center = { x: width / 2, y: height / 2 };
+  const positions = new Map();
+  const velocity = new Map();
+  const componentIds = [...new Set(nodes.map((node) => Number(node.component_id || 0)))];
+  const componentCenters = new Map();
+  componentIds.forEach((componentId, index) => {
+    if (componentId === 1) {
+      componentCenters.set(componentId, center);
+      return;
+    }
+    const angle = (Math.PI * 2 * (index - 1)) / Math.max(1, componentIds.length - 1);
+    componentCenters.set(componentId, {
+      x: center.x + Math.cos(angle) * 250,
+      y: center.y + Math.sin(angle) * 215,
+    });
+  });
+  nodes.forEach((node, index) => {
+    const seed = hashString(node.id);
+    const angle = ((seed % 10000) / 10000) * Math.PI * 2;
+    const radius = 42 + Math.sqrt(index + 1) * 22;
+    const componentCenter = componentCenters.get(Number(node.component_id || 0)) || center;
+    positions.set(node.id, {
+      x: componentCenter.x + Math.cos(angle) * radius,
+      y: componentCenter.y + Math.sin(angle) * radius,
+    });
+    velocity.set(node.id, { x: 0, y: 0 });
+  });
+  const edgePairs = edges
+    .map((edge) => [edge.source, edge.target])
+    .filter(([source, target]) => positions.has(source) && positions.has(target));
+  const iterations = nodes.length > 300 ? 34 : 54;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    for (let left = 0; left < nodes.length; left += 1) {
+      const a = nodes[left];
+      const pa = positions.get(a.id);
+      const va = velocity.get(a.id);
+      for (let right = left + 1; right < nodes.length; right += 1) {
+        const b = nodes[right];
+        const pb = positions.get(b.id);
+        const vb = velocity.get(b.id);
+        let dx = pa.x - pb.x;
+        let dy = pa.y - pb.y;
+        const distanceSquared = Math.max(100, dx * dx + dy * dy);
+        const distance = Math.sqrt(distanceSquared);
+        const force = Math.min(1.7, 6200 / distanceSquared);
+        dx /= distance;
+        dy /= distance;
+        va.x += dx * force;
+        va.y += dy * force;
+        vb.x -= dx * force;
+        vb.y -= dy * force;
+      }
+    }
+    edgePairs.forEach(([source, target]) => {
+      const sourcePosition = positions.get(source);
+      const targetPosition = positions.get(target);
+      const sourceVelocity = velocity.get(source);
+      const targetVelocity = velocity.get(target);
+      const dx = targetPosition.x - sourcePosition.x;
+      const dy = targetPosition.y - sourcePosition.y;
+      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const force = (distance - 92) * 0.0028;
+      sourceVelocity.x += (dx / distance) * force;
+      sourceVelocity.y += (dy / distance) * force;
+      targetVelocity.x -= (dx / distance) * force;
+      targetVelocity.y -= (dy / distance) * force;
+    });
+    nodes.forEach((node) => {
+      const position = positions.get(node.id);
+      const nodeVelocity = velocity.get(node.id);
+      const componentCenter = componentCenters.get(Number(node.component_id || 0)) || center;
+      nodeVelocity.x += (componentCenter.x - position.x) * 0.0018;
+      nodeVelocity.y += (componentCenter.y - position.y) * 0.0018;
+      nodeVelocity.x *= 0.82;
+      nodeVelocity.y *= 0.82;
+      position.x = Math.max(54, Math.min(width - 54, position.x + nodeVelocity.x));
+      position.y = Math.max(54, Math.min(height - 54, position.y + nodeVelocity.y));
+    });
+  }
+  state.virtualSize = { width, height };
+  return positions;
+}
+
+function calculateLayout(nodes, edges) {
+  if (state.graph?.mode === "neighborhood") return calculateNeighborhoodLayout(nodes);
+  if (state.graph?.mode === "path") return calculatePathLayout(nodes);
+  return calculateOverviewLayout(nodes, edges);
+}
+
 function renderGraph() {
   const graph = state.graph;
-  const nodes = (graph?.nodes || []).filter((node) => state.visibleTypes.has(node.type));
+  const nodes = graph?.nodes || [];
   const visibleIds = new Set(nodes.map((node) => node.id));
   const edges = (graph?.edges || []).filter(
     (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
@@ -538,18 +898,48 @@ function renderGraph() {
   elements.graphNodes.replaceChildren();
   elements.graphEmpty.classList.toggle("hidden", nodes.length > 0);
   if (!nodes.length) {
-    elements.graphCaption.textContent = "没有符合当前类型筛选的节点。";
+    elements.graphEmptyTitle.textContent = state.graphQuery
+      ? `没有找到“${state.graphQuery}”的连接`
+      : "没有符合当前筛选的记忆连接";
+    elements.graphEmptyCopy.textContent = state.graphQuery
+      ? "换一个称呼、证据片段或更短的关键词。"
+      : "放宽节点类型、最小度或 k-core 筛选后再试。";
+    elements.graphCaption.textContent = "当前查询没有可绘制节点。";
+    elements.graphViewKicker.textContent = state.graphQuery ? "检索结果" : "结构概览";
+    elements.graphViewTitle.textContent = state.graphQuery ? "没有匹配条目" : "没有可显示结构";
     return;
   }
 
-  const positions = calculateLayout(nodes);
+  const mode = graph.mode || "overview";
+  if (mode === "neighborhood") {
+    const focus = nodes.find((node) => node.id === graph.focus_node_id);
+    elements.graphViewKicker.textContent = `${graph.depth} 跳邻域`;
+    elements.graphViewTitle.textContent = focus?.label || "条目连接";
+  } else if (mode === "path") {
+    elements.graphViewKicker.textContent = "最短路径";
+    elements.graphViewTitle.textContent = graph.path?.found
+      ? `${formatNumber(graph.path.length)} 跳连接`
+      : "当前筛选下不连通";
+  } else {
+    elements.graphViewKicker.textContent = "结构概览";
+    elements.graphViewTitle.textContent = "这个群的关键连接";
+  }
+
+  const positions = calculateLayout(nodes, edges);
+  const labelledIds = new Set(
+    [...nodes]
+      .sort((a, b) => Number(b.degree || 0) - Number(a.degree || 0))
+      .slice(0, mode === "overview" ? 18 : 45)
+      .map((node) => node.id),
+  );
+  if (graph.focus_node_id) labelledIds.add(graph.focus_node_id);
   edges.forEach((edge, index) => {
     const source = positions.get(edge.source);
     const target = positions.get(edge.target);
     if (!source || !target) return;
-    const bend = ((index % 5) - 2) * 9;
-    const controlX = (source.x + target.x) / 2;
-    const controlY = (source.y + target.y) / 2 + bend;
+    const bend = ((hashString(`${edge.source}|${edge.target}|${index}`) % 7) - 3) * 3;
+    const controlX = (source.x + target.x) / 2 - (target.y - source.y) * 0.018 + bend;
+    const controlY = (source.y + target.y) / 2 + (target.x - source.x) * 0.018 + bend;
     const path = svgElement("path", {
       d: `M ${source.x} ${source.y} Q ${controlX} ${controlY} ${target.x} ${target.y}`,
       class: [
@@ -564,7 +954,7 @@ function renderGraph() {
     });
     elements.graphEdges.append(path);
 
-    if (edges.length <= 90) {
+    if (edges.length <= 42) {
       const label = svgElement("text", {
         x: controlX,
         y: controlY - 5,
@@ -580,26 +970,23 @@ function renderGraph() {
   nodes.forEach((node) => {
     const position = positions.get(node.id);
     if (!position) return;
-    const radius = node.type === "episode"
-      ? 17
-      : node.type === "participant"
-        ? 16
-      : node.type === "cue"
-        ? 11
-        : node.type === "feedback"
-          ? 16
-          : 14;
+    const radius = 8 + Math.min(10, Math.log2(Number(node.degree || 0) + 1) * 2.25) +
+      (node.id === graph.focus_node_id ? 3 : 0);
     const group = svgElement("g", {
-      class: "graph-node",
+      class: [
+        "graph-node",
+        labelledIds.has(node.id) ? "is-labeled" : "",
+        node.path_index !== undefined ? "is-path" : "",
+      ].filter(Boolean).join(" "),
       transform: `translate(${position.x} ${position.y})`,
       tabindex: "0",
       role: "button",
-      "aria-label": `${typeNames[node.type] || node.type}: ${node.label}`,
+      "aria-label": `${typeNames[node.type] || node.type}: ${node.label}，度 ${node.degree || 0}，k-core ${node.core || 0}`,
       "data-node-id": node.id,
       "data-type": node.type,
     });
     group.append(svgElement("circle", { r: radius }));
-    const label = svgElement("text", { y: radius + 18 });
+    const label = svgElement("text", { y: radius + 16 });
     label.textContent = truncate(node.label, node.type === "cue" ? 16 : 20);
     group.append(label);
     group.addEventListener("click", (event) => {
@@ -615,11 +1002,13 @@ function renderGraph() {
     elements.graphNodes.append(group);
   });
 
+  const metrics = graph.view_metrics || {};
   elements.graphCaption.textContent = [
-    `${formatNumber(nodes.length)} 个节点`,
-    `${formatNumber(edges.length)} 条关系`,
-    graph.truncated ? `仅显示最近 ${graph.limit} 个 Episode` : "完整范围",
-    "拖动 / 滚轮缩放",
+    `画布 ${formatNumber(nodes.length)} 个节点 / ${formatNumber(edges.length)} 条关系`,
+    `筛选全集 ${formatNumber(graph.metrics?.node_count)} 个节点`,
+    graph.truncated ? `画布按上限显示 ${graph.limit} 个` : "画布未截断",
+    `平均路径约 ${Number(graph.metrics?.average_path_length_estimate || 0).toFixed(2)} 跳`,
+    metrics.connected_components > 1 ? `${formatNumber(metrics.connected_components)} 个画布分量` : "画布连通",
   ].join("  ·  ");
   window.requestAnimationFrame(fitGraph);
 }
@@ -643,6 +1032,20 @@ function fitGraph() {
     y: (height - state.virtualSize.height * scale) / 2,
   };
   applyTransform();
+}
+
+async function focusGraphNode(nodeId) {
+  state.graphFocusId = nodeId;
+  state.graphPathSource = "";
+  state.graphPathTarget = "";
+  setGraphLoading(true);
+  try {
+    await loadGraph();
+  } catch (error) {
+    showToast(error?.message || "节点连接加载失败", "error");
+  } finally {
+    setGraphLoading(false);
+  }
 }
 
 function selectNode(nodeId) {
@@ -680,14 +1083,88 @@ function selectNode(nodeId) {
 }
 
 function renderInspectorPlaceholder() {
+  elements.inspectorKicker.textContent = "结构分析";
+  elements.inspectorHeading.textContent = "关键节点与分布";
   elements.inspector.replaceChildren();
+  const graph = state.graph;
+  if (!graph) {
+    const root = document.createElement("div");
+    root.className = "inspector-placeholder";
+    root.append(
+      textElement("strong", "先选择一个群聊"),
+      textElement("p", "读取结构后，这里会显示枢纽节点和度分布。"),
+    );
+    elements.inspector.append(root);
+    return;
+  }
   const root = document.createElement("div");
-  root.className = "inspector-placeholder";
+  root.className = "analysis-summary";
   root.append(
-    textElement("span", "⌁"),
-    textElement("strong", "选择一个节点"),
-    textElement("p", "Episode 可继续展开到关键词和原始聊天证据。"),
+    textElement(
+      "p",
+      `指标基于当前筛选图的无向投影；最短路径与分量按弱连通计算。路径长度为 ${graph.metrics?.path_sample_size || 0} 个起点的估计值。`,
+      "panel-note",
+    ),
   );
+  const metrics = graph.metrics || {};
+  const networkSummary = document.createElement("section");
+  networkSummary.className = "analysis-block";
+  networkSummary.append(textElement("h3", "网络摘要"));
+  appendDetailList(networkSummary, [
+    ["无向关系", formatNumber(metrics.unique_edge_count)],
+    ["孤立节点", formatNumber(metrics.isolated_nodes)],
+    [
+      "最大分量",
+      `${formatNumber(metrics.giant_component_size)}（${(
+        Number(metrics.giant_component_ratio || 0) * 100
+      ).toFixed(1)}%）`,
+    ],
+    ["平均最短路径（估计）", Number(metrics.average_path_length_estimate || 0).toFixed(2)],
+    ["直径（估计）", formatNumber(metrics.diameter_estimate)],
+    ["有向互惠率", `${(Number(metrics.reciprocity || 0) * 100).toFixed(2)}%`],
+  ]);
+  root.append(networkSummary);
+  const hubs = document.createElement("section");
+  hubs.className = "analysis-block";
+  hubs.append(textElement("h3", "连接度最高的条目"));
+  const hubList = document.createElement("div");
+  hubList.className = "hub-list";
+  (graph.top_nodes || []).slice(0, 8).forEach((node) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "hub-button";
+    button.append(
+      textElement("strong", node.label || node.id),
+      textElement("span", `度 ${node.degree}`),
+      textElement("small", `${typeNames[node.type] || node.type} · k-core ${node.core} · 分量 C${node.component_id}`),
+    );
+    button.addEventListener("click", () => focusGraphNode(node.id));
+    hubList.append(button);
+  });
+  if (!hubList.children.length) {
+    hubList.append(textElement("p", "当前筛选下没有节点。", "panel-note"));
+  }
+  hubs.append(hubList);
+  root.append(hubs);
+
+  const distribution = document.createElement("section");
+  distribution.className = "analysis-block";
+  distribution.append(textElement("h3", "度分布"));
+  const table = document.createElement("table");
+  table.className = "degree-table";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headRow.append(textElement("th", "度"), textElement("th", "节点数"));
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  (graph.degree_histogram || []).forEach((bucket) => {
+    const row = document.createElement("tr");
+    row.append(textElement("td", bucket.label), textElement("td", formatNumber(bucket.count)));
+    body.append(row);
+  });
+  table.append(head, body);
+  distribution.append(table);
+  root.append(distribution);
   elements.inspector.append(root);
 }
 
@@ -707,6 +1184,8 @@ function appendDetailList(container, rows) {
 }
 
 function renderInspector(node) {
+  elements.inspectorKicker.textContent = "条目连接";
+  elements.inspectorHeading.textContent = "它与哪些记忆相连";
   elements.inspector.replaceChildren();
   const root = document.createElement("div");
   root.append(
@@ -717,9 +1196,43 @@ function renderInspector(node) {
   const connected = (state.graph?.edges || []).filter(
     (edge) => edge.source === node.id || edge.target === node.id,
   );
+  const actions = document.createElement("div");
+  actions.className = "inspector-actions";
+  const focusButton = textElement("button", "以此为中心展开连接", "button secondary");
+  focusButton.type = "button";
+  focusButton.addEventListener("click", () => focusGraphNode(node.id));
+  const pathStartButton = textElement("button", "设为路径起点", "button ghost");
+  pathStartButton.type = "button";
+  pathStartButton.addEventListener("click", () => {
+    state.graphPathSource = node.id;
+    state.graphPathTarget = "";
+    updatePathStatus();
+    showToast(`已将“${node.label}”设为路径起点。`);
+  });
+  const pathTargetButton = textElement("button", "设为路径终点", "button ghost");
+  pathTargetButton.type = "button";
+  pathTargetButton.disabled = !state.graphPathSource || state.graphPathSource === node.id;
+  pathTargetButton.addEventListener("click", async () => {
+    if (!state.graphPathSource || state.graphPathSource === node.id) return;
+    state.graphPathTarget = node.id;
+    setGraphLoading(true);
+    try {
+      await loadGraph();
+    } catch (error) {
+      showToast(error?.message || "最短路径计算失败", "error");
+    } finally {
+      setGraphLoading(false);
+    }
+  });
+  actions.append(focusButton, pathStartButton, pathTargetButton);
+  root.append(actions);
   appendDetailList(root, [
     ["节点 ID", node.id],
-    ["关联数量", connected.length],
+    ["画布内关系", connected.length],
+    ["全集度", node.degree],
+    ["入度 / 出度", `${node.in_degree || 0} / ${node.out_degree || 0}`],
+    ["k-core", node.core],
+    ["弱连通分量", node.component_id ? `C${node.component_id}（${formatNumber(node.component_size)} 个节点）` : ""],
     ["开始时间", node.started_at ? formatTime(node.started_at) : ""],
     ["结束时间", node.ended_at ? formatTime(node.ended_at) : ""],
     ["原始证据", node.source_count ? `${node.source_count} 条` : ""],
@@ -730,22 +1243,48 @@ function renderInspector(node) {
     ["触发线索", Array.isArray(node.trigger_cues) ? node.trigger_cues.join(" · ") : ""],
     ["状态", node.status || ""],
     ["学习时间", node.learned_at ? formatTime(node.learned_at) : ""],
-    ["Source Key", node.source_key || ""],
-    ["Participant Key", node.canonical_key || ""],
+    ["证据键", node.source_key || ""],
+    ["内部主体键", node.canonical_key || ""],
     ["账户 ID", node.account_id || ""],
     ["账户类型", node.account_type || ""],
-    ["认知状态", node.epistemic_status || ""],
+    ["可信状态", node.epistemic_status || ""],
   ]);
+  const nodeMap = new Map(
+    (state.graph?.nodes || []).map((item) => [item.id, item]),
+  );
+  if (connected.length) {
+    const connections = document.createElement("section");
+    connections.className = "analysis-block";
+    connections.append(textElement("h3", `当前画布中的 ${formatNumber(connected.length)} 条连接`));
+    const list = document.createElement("div");
+    list.className = "connection-list";
+    [...connected]
+      .sort((a, b) => String(a.relation).localeCompare(String(b.relation), "zh-CN"))
+      .forEach((edge) => {
+        const outgoing = edge.source === node.id;
+        const neighborId = outgoing ? edge.target : edge.source;
+        const neighbor = nodeMap.get(neighborId);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "connection-button";
+        button.append(
+          textElement("span", outgoing ? `— ${edge.relation} →` : `← ${edge.relation} —`),
+          textElement("strong", neighbor?.label || neighborId),
+          textElement("small", `${typeNames[neighbor?.type] || neighbor?.type || "节点"} · 度 ${neighbor?.degree || 0}`),
+        );
+        button.addEventListener("click", () => selectNode(neighborId));
+        list.append(button);
+      });
+    connections.append(list);
+    root.append(connections);
+  }
   const plasticRelations = connected.filter(
     (edge) => edge.type === "plastic_relation",
   );
   if (plasticRelations.length) {
-    const nodeMap = new Map(
-      (state.graph?.nodes || []).map((item) => [item.id, item]),
-    );
     const block = document.createElement("section");
     block.className = "evidence-block";
-    block.append(textElement("h3", "可塑关系与语义疑虑"));
+    block.append(textElement("h3", "群内语义与仍待确认的解释"));
     plasticRelations.forEach((edge) => {
       const source = nodeMap.get(edge.source);
       const target = nodeMap.get(edge.target);
@@ -806,7 +1345,7 @@ async function loadEpisodeEvidence(node, root) {
       data.scope_id !== requestedScopeId
     ) return;
     block.replaceChildren();
-    block.append(textElement("h3", "Cue / Tag"));
+    block.append(textElement("h3", "检索线索"));
     const chips = document.createElement("div");
     chips.className = "keyword-list";
     (data.keywords || []).forEach((item) => {
@@ -1004,31 +1543,98 @@ function bindGraphInteractions() {
   });
 }
 
+async function resetBudget(budgetClass) {
+  if (!state.scopeId) return;
+  const isFeedback = budgetClass === "feedback";
+  const label = isFeedback ? "反馈学习" : "回忆与整理";
+  if (!window.confirm(`重置当前群的${label} 24 小时额度？原始 Token 记录会继续保留。`)) return;
+  const button = isFeedback ? elements.resetFeedbackBudgetBtn : elements.resetBudgetBtn;
+  button.disabled = true;
+  try {
+    await apiPost(`scopes/${state.scopeId}/budget/reset`, {
+      budget_class: budgetClass,
+    });
+    showToast(`${label}额度已重置，原始 Token 记录未删除。`);
+    await refreshOverview({ preserveSelection: true, loadScope: false });
+  } catch (error) {
+    showToast(error?.message || `${label}额度重置失败`, "error");
+  } finally {
+    button.disabled = !state.scopeId;
+  }
+}
+
+async function reloadGraphFromControls(errorMessage = "图分析加载失败") {
+  if (!state.scopeId) return;
+  setGraphLoading(true);
+  try {
+    await loadGraph();
+    state.loadedSections.add("graph");
+  } catch (error) {
+    showToast(error?.message || errorMessage, "error");
+  } finally {
+    setGraphLoading(false);
+  }
+}
+
 function bindEvents() {
   elements.refreshBtn.addEventListener("click", () => refreshOverview());
+  elements.resetBudgetBtn.addEventListener("click", () => resetBudget("online"));
+  elements.resetFeedbackBudgetBtn.addEventListener("click", () => resetBudget("feedback"));
+  document.querySelectorAll("[data-section]").forEach((tab) => {
+    tab.addEventListener("click", () => activateSection(tab.dataset.section));
+  });
   elements.scopeSelect.addEventListener("change", async () => {
     state.scopeId = elements.scopeSelect.value;
+    state.loadedSections.clear();
+    state.graph = null;
+    state.participants = [];
+    state.graphQuery = "";
+    state.graphFocusId = "";
+    state.graphPathSource = "";
+    state.graphPathTarget = "";
+    elements.graphSearchInput.value = "";
     renderScopeMeta();
     await loadSelectedScope();
   });
-  elements.graphLimit.addEventListener("change", async () => {
-    setGraphLoading(true);
-    try {
-      await loadGraph();
-    } catch (error) {
-      showToast(error?.message || "图谱加载失败", "error");
-    } finally {
-      setGraphLoading(false);
-    }
+  elements.graphSearchForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    state.graphQuery = elements.graphSearchInput.value.trim();
+    state.graphFocusId = "";
+    state.graphPathSource = "";
+    state.graphPathTarget = "";
+    await reloadGraphFromControls("记忆条目检索失败");
+  });
+  elements.graphOverviewBtn.addEventListener("click", async () => {
+    state.graphQuery = "";
+    state.graphFocusId = "";
+    state.graphPathSource = "";
+    state.graphPathTarget = "";
+    elements.graphSearchInput.value = "";
+    await reloadGraphFromControls();
+  });
+  elements.graphPathClear.addEventListener("click", async () => {
+    state.graphPathSource = "";
+    state.graphPathTarget = "";
+    await reloadGraphFromControls();
+  });
+  [
+    elements.graphLimit,
+    elements.graphDepth,
+    elements.graphStructureFilter,
+    elements.graphDegreeFilter,
+    elements.graphCoreFilter,
+    elements.graphEpistemicFilter,
+    elements.graphRelationFilter,
+  ].forEach((control) => {
+    control.addEventListener("change", () => reloadGraphFromControls());
   });
   elements.fitGraphBtn.addEventListener("click", fitGraph);
   document.querySelectorAll("[data-node-type]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
+    checkbox.addEventListener("change", async () => {
       if (checkbox.checked) state.visibleTypes.add(checkbox.dataset.nodeType);
       else state.visibleTypes.delete(checkbox.dataset.nodeType);
       state.selectedNodeId = "";
-      renderGraph();
-      renderInspectorPlaceholder();
+      await reloadGraphFromControls();
     });
   });
   elements.messageForm.addEventListener("submit", async (event) => {
@@ -1050,65 +1656,13 @@ function bindEvents() {
       });
       elements.aliasValue.value = "";
       showToast(`已将别名“${alias}”绑定到账号 ${accountId}`);
-      await Promise.all([loadParticipants(), loadGraph()]);
+      await loadParticipants();
+      if (state.loadedSections.has("graph")) await loadGraph();
       await refreshOverview({ preserveSelection: true, loadScope: false });
     } catch (error) {
       showToast(error?.message || "别名绑定失败", "error");
     } finally {
       submit.disabled = false;
-    }
-  });
-  elements.historyImportBtn.addEventListener("click", () => {
-    const payload = state.historyImport || {};
-    const groups = (payload.groups || []).filter((group) => group.eligible);
-    elements.historyImportConfirmCopy.textContent =
-      `将 ${formatNumber(payload.source_messages)} 条历史消息从 ${formatNumber(groups.length)} 个群导入平台实例 ${elements.historyPlatformSelect.value}。每个群仍使用独立数据库，已有消息按平台消息 ID 幂等去重。`;
-    elements.historyImportDialog.showModal();
-  });
-  elements.historyPlatformSelect.addEventListener("change", async () => {
-    const platformId = elements.historyPlatformSelect.value;
-    try {
-      state.historyImport = await apiGet("history-import/status", {
-        platform_id: platformId,
-      });
-      renderHistoryImport();
-    } catch (error) {
-      showToast(error?.message || "无法读取该平台的历史范围", "error");
-    }
-  });
-  elements.historyImportCancel.addEventListener("click", (event) => {
-    event.preventDefault();
-    elements.historyImportDialog.close();
-  });
-  elements.historyImportForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    elements.historyImportConfirm.click();
-  });
-  elements.historyImportConfirm.addEventListener("click", async (event) => {
-    event.preventDefault();
-    const platformId = elements.historyPlatformSelect.value;
-    if (!platformId) return;
-    elements.historyImportConfirm.disabled = true;
-    elements.historyImportCancel.disabled = true;
-    elements.historyImportConfirm.textContent = "正在启动…";
-    try {
-      const importState = await apiPost("history-import/start", {
-        platform_id: platformId,
-      });
-      state.historyImport = {
-        ...(state.historyImport || {}),
-        state: importState,
-      };
-      elements.historyImportDialog.close();
-      renderHistoryImport();
-      showToast("历史迁移已启动；可关闭页面，任务会在插件后台继续。");
-      await refreshHistoryImport({ refreshEverythingOnCompletion: true });
-    } catch (error) {
-      showToast(error?.message || "历史迁移启动失败", "error");
-    } finally {
-      elements.historyImportConfirm.disabled = false;
-      elements.historyImportCancel.disabled = false;
-      elements.historyImportConfirm.textContent = "开始导入";
     }
   });
   elements.distillBtn.addEventListener("click", () => {
@@ -1137,7 +1691,7 @@ function bindEvents() {
       const result = await apiPost(`scopes/${state.scopeId}/distill`, { limit });
       elements.distillDialog.close();
       showToast(
-        `整理完成：${result.episodes} episodes，${result.semantic_memories} 条语义记忆，${result.embedded_documents} 个向量文档。`,
+        `整理完成：新增 ${formatNumber(result.episodes)} 段情节记忆、${formatNumber(result.semantic_memories)} 条人物与事实，并更新 ${formatNumber(result.embedded_documents)} 个本地检索文档。`,
       );
       await refreshOverview({ preserveSelection: true, loadScope: true });
     } catch (error) {
@@ -1154,10 +1708,8 @@ function bindEvents() {
 async function initApp() {
   bindEvents();
   try {
-    if (!window.AstrBotPluginPage) {
-      throw new Error("AstrBot Plugin Page 桥接未加载");
-    }
-    await window.AstrBotPluginPage.ready();
+    const bridge = await waitForPluginBridge();
+    await bridge.ready();
     await refreshOverview({ preserveSelection: false, loadScope: true });
   } catch (error) {
     setConnection("error", "无法连接 AstrBot");

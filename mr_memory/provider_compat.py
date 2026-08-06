@@ -13,6 +13,7 @@ async def generate_with_enforced_options(
     system_prompt: str,
     options: Mapping[str, Any],
     stream: bool = False,
+    on_stream_progress: Callable[[int, Any], None] | None = None,
 ) -> Any:
     """Preserve request options on AstrBot 4.27.1 OpenAI providers.
 
@@ -34,12 +35,16 @@ async def generate_with_enforced_options(
         payload.update(dict(options))
         if stream and callable(query_stream):
             final_response = None
+            chunk_count = 0
             async for response in query_stream(
                 payload,
                 None,
                 request_max_retries=1,
             ):
+                chunk_count += 1
                 final_response = response
+                if on_stream_progress is not None:
+                    on_stream_progress(chunk_count, response)
             if final_response is None:
                 raise RuntimeError("provider stream ended without a response")
             if bool(getattr(final_response, "is_chunk", False)):

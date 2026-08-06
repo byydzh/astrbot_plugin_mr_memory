@@ -13,7 +13,7 @@ FeedbackScope = Literal["sender", "group"]
 FeedbackActivationMode = Literal["always", "semantic"]
 
 
-_FEEDBACK_SURFACE_MARKERS = (
+_STRONG_FEEDBACK_SURFACE_MARKERS = (
     "不对",
     "错了",
     "不是",
@@ -27,18 +27,13 @@ _FEEDBACK_SURFACE_MARKERS = (
     "太密",
     "太多",
     "太少",
-    "有点",
     "更好",
     "不错",
-    "可以",
-    "喜欢",
     "讨厌",
-    "谢谢",
     "改成",
     "修正",
     "还是",
     "让你",
-    "直接",
     "多点",
     "少点",
     "correct",
@@ -46,6 +41,12 @@ _FEEDBACK_SURFACE_MARKERS = (
     "too ",
     "next time",
     "prefer",
+)
+
+_POSITIVE_FEEDBACK_PATTERN = re.compile(
+    r"(?:这样|这次|现在|终于|这就)?可以(?:了|啦|吧|哦|呀|[！!。.]|$)"
+    r"|不错(?:了|啦|哦|呀|[！!。.]|$)"
+    r"|^(?:谢谢|感谢)(?:你|啦|了|[！!。.])?$"
 )
 
 
@@ -64,8 +65,8 @@ def feedback_surface_score(
     reasons: list[str] = []
     score = 0.0
     lexical_signal = any(
-        marker in value for marker in _FEEDBACK_SURFACE_MARKERS
-    )
+        marker in value for marker in _STRONG_FEEDBACK_SURFACE_MARKERS
+    ) or bool(_POSITIVE_FEEDBACK_PATTERN.search(value))
     if not reply_to_bot and not lexical_signal:
         return 0.0, ()
     if reply_to_bot:
