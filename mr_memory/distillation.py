@@ -9,7 +9,7 @@ from typing import Any
 
 from .embedding import EmbeddingBackend
 from .identity import sanitize_components
-from .models import StoredMessage
+from .models import DistillationWorkItem, StoredMessage
 from .plasticity import GraphMutation, parse_graph_mutation
 from .storage import MemoryStorage
 
@@ -338,13 +338,9 @@ def _compact_prompt_context(
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [
-            _compact_prompt_context(item, aliases=aliases) for item in value
-        ]
+        return [_compact_prompt_context(item, aliases=aliases) for item in value]
     if isinstance(value, tuple):
-        return [
-            _compact_prompt_context(item, aliases=aliases) for item in value
-        ]
+        return [_compact_prompt_context(item, aliases=aliases) for item in value]
     if isinstance(value, str):
         return aliases.source_to_alias.get(
             value,
@@ -555,8 +551,7 @@ def parse_distillation_response(
     active_claim_ids = {
         int(item["id"])
         for item in active_claim_items
-        if isinstance(item, dict)
-        and str(item.get("id", "")).isdigit()
+        if isinstance(item, dict) and str(item.get("id", "")).isdigit()
     }
 
     value = _extract_json_object(
@@ -637,11 +632,15 @@ def parse_distillation_response(
                 source_keys=source_keys,
                 started_at=started_at,
                 ended_at=ended_at,
-                title=_required_text(raw.get("title"), f"episodes[{index}].title", max_chars=200),
+                title=_required_text(
+                    raw.get("title"), f"episodes[{index}].title", max_chars=200
+                ),
                 summary=_required_text(
                     raw.get("summary"), f"episodes[{index}].summary"
                 ),
-                tag=_required_text(raw.get("tag"), f"episodes[{index}].tag", max_chars=200),
+                tag=_required_text(
+                    raw.get("tag"), f"episodes[{index}].tag", max_chars=200
+                ),
                 cues=cues,
             )
         )
@@ -685,9 +684,7 @@ def parse_distillation_response(
                 )
             role = str(evidence_raw.get("role") or "SUPPORT").strip().upper()
             if role not in {"SUPPORT", "CONTRADICT", "RETRACT"}:
-                raise ValueError(
-                    f"{semantic_field}[{index}].evidence role is invalid"
-                )
+                raise ValueError(f"{semantic_field}[{index}].evidence role is invalid")
             span = str(evidence_raw.get("span") or "").strip()
             if not legacy:
                 if not span:
@@ -746,9 +743,7 @@ def parse_distillation_response(
             subject = raw.get("subject")
             if not isinstance(subject, dict):
                 raise ValueError(f"claims[{index}].subject must be an object")
-            subject_participant_key = str(
-                subject.get("participant_key") or ""
-            ).strip()
+            subject_participant_key = str(subject.get("participant_key") or "").strip()
             subject_text = str(subject.get("unresolved_text") or "").strip()
             if subject_text:
                 subject_text = _required_text(
@@ -812,9 +807,9 @@ def parse_distillation_response(
             "FACT",
         }:
             raise ValueError(f"{semantic_field}[{index}].claim_type is invalid")
-        epistemic_status = str(
-            raw.get("epistemic_status") or "ASSERTED"
-        ).strip().upper()
+        epistemic_status = (
+            str(raw.get("epistemic_status") or "ASSERTED").strip().upper()
+        )
         if epistemic_status not in {
             "ASSERTED",
             "UNCERTAIN",
@@ -822,9 +817,7 @@ def parse_distillation_response(
             "JOKE",
             "CORRECTED",
         }:
-            raise ValueError(
-                f"{semantic_field}[{index}].epistemic_status is invalid"
-            )
+            raise ValueError(f"{semantic_field}[{index}].epistemic_status is invalid")
         operation = str(raw.get("operation") or "ASSERT").strip().upper()
         if operation not in {"ASSERT", "SUPERSEDE", "RETRACT"}:
             raise ValueError(f"{semantic_field}[{index}].operation is invalid")
@@ -893,7 +886,9 @@ def parse_distillation_response(
             raise ValueError(f"topics[{index}] references an unknown episode index")
         topics.append(
             TopicDraft(
-                name=_required_text(raw.get("name"), f"topics[{index}].name", max_chars=200),
+                name=_required_text(
+                    raw.get("name"), f"topics[{index}].name", max_chars=200
+                ),
                 summary=_required_text(raw.get("summary"), f"topics[{index}].summary"),
                 episode_indices=episode_indices,
             )
@@ -931,9 +926,7 @@ def parse_distillation_response(
             max_chars=512,
         )
         if source_key not in target_keys:
-            raise ValueError(
-                f"ignored[{index}] must reference a target source key"
-            )
+            raise ValueError(f"ignored[{index}] must reference a target source key")
         if source_key in ignored_keys:
             raise ValueError(f"ignored[{index}] duplicates a source key")
         ignored_keys.add(source_key)
@@ -958,9 +951,7 @@ def parse_distillation_response(
                 f"ignored_source_keys[{index}] must reference a target source key"
             )
         if source_key in ignored_keys:
-            raise ValueError(
-                f"ignored_source_keys[{index}] duplicates a source key"
-            )
+            raise ValueError(f"ignored_source_keys[{index}] duplicates a source key")
         ignored_keys.add(source_key)
         ignored_sources.append(
             IgnoredSourceDraft(
@@ -1075,9 +1066,7 @@ def _sanitize_distillation_validation_error(
         ignored_source_keys = value.get("ignored_source_keys")
         if isinstance(ignored_source_keys, list):
             filtered_keys = [
-                item
-                for item in ignored_source_keys
-                if str(item or "") not in overlap
+                item for item in ignored_source_keys if str(item or "") not in overlap
             ]
             if len(filtered_keys) != len(ignored_source_keys):
                 value["ignored_source_keys"] = filtered_keys
@@ -1171,9 +1160,7 @@ def persist_distillation(
 
     for episode in batch.episodes:
         # Evidence identity, not model wording, is the deterministic unit key.
-        fingerprint = _fingerprint(
-            {"source_keys": sorted(set(episode.source_keys))}
-        )
+        fingerprint = _fingerprint({"source_keys": sorted(set(episode.source_keys))})
         episode_id = storage.store_episode(
             umo=batch.umo,
             started_at=episode.started_at,
@@ -1293,6 +1280,35 @@ def persist_distillation(
         plastic_edge_ids=tuple(dict.fromkeys(plastic_edge_ids)),
         index_documents=tuple(documents.values()),
     )
+
+
+def commit_distillation_batch(
+    storage: MemoryStorage,
+    batch: DistillationBatch,
+    *,
+    work_item: DistillationWorkItem,
+    extractor_version: str,
+) -> PersistedDistillation:
+    """Atomically validate sources, persist graph units, and checkpoint the batch."""
+
+    if batch.umo != work_item.umo:
+        raise ValueError("distillation batch and work item scopes differ")
+    with storage.distillation_write(work_item=work_item):
+        persisted = persist_distillation(
+            storage,
+            batch,
+            extractor_version=extractor_version,
+        )
+        storage.record_distillation_ignored_sources(
+            umo=work_item.umo,
+            batch_key=work_item.batch_key,
+            items=[
+                {"source_key": item.source_key, "reason": item.reason}
+                for item in batch.ignored_sources
+            ],
+        )
+        storage.finish_distillation_batch(work_item=work_item)
+    return persisted
 
 
 async def index_distillation(

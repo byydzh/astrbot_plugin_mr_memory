@@ -153,7 +153,7 @@
   "distillation_max_messages": {"type": "int", "default": 80, "invisible": true},
   "distillation_overlap_messages": {"type": "int", "default": 12, "invisible": true},
   "distillation_max_output_tokens": {"type": "int", "default": 384000, "invisible": true},
-  "maintenance_interval_seconds": {"type": "int", "default": 300, "invisible": true},
+  "maintenance_interval_seconds": {"type": "int", "default": 86400, "invisible": true},
   "wake_on_llm_request": {"type": "bool", "default": true, "invisible": true},
   "candidate_seed_floor": {"type": "float", "default": -1.0, "invisible": true},
   "host_gate_min_score": {"type": "float", "default": -1.0, "invisible": true},

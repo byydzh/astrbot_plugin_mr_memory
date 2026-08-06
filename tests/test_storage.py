@@ -88,6 +88,62 @@ class MemoryStorageTests(unittest.TestCase):
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
 
+    def test_timestamp_correction_is_a_revision_and_requeues_distillation(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        original = self.message("time", "同一条消息", sent_at=100)
+        self.storage.upsert_message(original)
+        work_item = self.storage.next_distillation_batch(
+            umo=umo,
+            limit=1,
+            overlap=0,
+        )
+        assert work_item is not None
+        self.storage.finish_distillation_batch(work_item=work_item)
+
+        self.storage.upsert_message(self.message("time", "同一条消息", sent_at=125))
+        stored = self.storage.search_messages(umo=umo, limit=1)[0]
+        self.assertEqual(stored.sent_at, 125)
+        self.assertEqual(stored.revision_no, 2)
+        revision = self.storage._connection.execute(
+            """
+            SELECT revision_kind, sent_at FROM message_revisions
+            WHERE message_id=? ORDER BY revision_no DESC LIMIT 1
+            """,
+            (stored.id,),
+        ).fetchone()
+        self.assertEqual(revision["revision_kind"], "TIMESTAMP_CORRECTED")
+        self.assertEqual(revision["sent_at"], 100)
+        self.assertEqual(
+            self.storage.pending_distillation_count(
+                umo=umo,
+                processing_class="LIVE",
+            ),
+            1,
+        )
+
+    def test_future_maintenance_deadline_survives_reopen(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        self.storage.bind_scope(
+            umo=umo,
+            platform_id="shadow",
+            group_id="group-a",
+        )
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=umo,
+            job_type="distill",
+            dedupe_key="distill:pending",
+            available_at=2**31,
+        )
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        jobs = self.storage.pending_maintenance_jobs(
+            umo=umo,
+            job_type="distill",
+            include_future=True,
+        )
+        self.assertEqual([int(job["id"]) for job in jobs], [job_id])
+        self.assertEqual(int(jobs[0]["available_at"]), 2**31)
+
     def test_repeated_images_use_bounded_hash_metadata_not_media_bytes(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         fingerprint = "a" * 64

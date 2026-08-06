@@ -38,14 +38,18 @@ def content_fingerprint(
     role: str,
     plain_text: str,
     content: Iterable[dict[str, Any]],
+    sent_at: int | None = None,
 ) -> str:
+    value: dict[str, Any] = {
+        "sender_id": str(sender_id),
+        "role": str(role).upper(),
+        "plain_text": str(plain_text),
+        "content": list(content),
+    }
+    if sent_at is not None:
+        value["sent_at"] = int(sent_at)
     payload = json.dumps(
-        {
-            "sender_id": str(sender_id),
-            "role": str(role).upper(),
-            "plain_text": str(plain_text),
-            "content": list(content),
-        },
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -145,9 +149,7 @@ def extract_reply(content: Iterable[dict[str, Any]]) -> ReplyReference | None:
         return ReplyReference(
             message_id=message_id,
             relation=("RESPONDS_TO" if kind == "response_to" else "REPLY_TO"),
-            sender_id=str(
-                _first(component, "sender_id", "account_id", "qq")
-            ).strip(),
+            sender_id=str(_first(component, "sender_id", "account_id", "qq")).strip(),
             sender_name=str(
                 _first(component, "sender_name", "sender_nickname", "nickname")
             ).strip(),
@@ -159,7 +161,9 @@ def extract_reply(content: Iterable[dict[str, Any]]) -> ReplyReference | None:
     return None
 
 
-def attachment_metadata(content: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+def attachment_metadata(
+    content: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
     """Return bounded attachment descriptors; never retain blobs or credentials."""
 
     result: list[dict[str, Any]] = []
@@ -177,14 +181,10 @@ def attachment_metadata(content: Iterable[dict[str, Any]]) -> tuple[dict[str, An
             existing_hash
             if re.fullmatch(r"[0-9a-fA-F]{64}", existing_hash)
             else (
-                hashlib.sha256(raw_ref.encode("utf-8")).hexdigest()
-                if raw_ref
-                else ""
+                hashlib.sha256(raw_ref.encode("utf-8")).hexdigest() if raw_ref else ""
             )
         )
-        name = _safe_attachment_name(
-            _first(component, "name", "file_name", "title")
-        )
+        name = _safe_attachment_name(_first(component, "name", "file_name", "title"))
         result.append(
             {
                 "position": index,
@@ -203,7 +203,14 @@ def sanitize_components(
 
     result: list[dict[str, Any]] = []
     attachment_types = {
-        "image", "file", "video", "record", "audio", "forward", "node", "nodes",
+        "image",
+        "file",
+        "video",
+        "record",
+        "audio",
+        "forward",
+        "node",
+        "nodes",
     }
     for raw in content:
         if not isinstance(raw, dict):
@@ -221,12 +228,10 @@ def sanitize_components(
         if kind == "mention":
             item: dict[str, Any] = {
                 "type": "mention",
-                "account_id": str(
-                    _first(raw, "account_id", "qq", "user_id")
-                )[:300],
-                "display_name": str(
-                    _first(raw, "display_name", "name", "nickname")
-                )[:300],
+                "account_id": str(_first(raw, "account_id", "qq", "user_id"))[:300],
+                "display_name": str(_first(raw, "display_name", "name", "nickname"))[
+                    :300
+                ],
             }
             if raw.get("erased_participant"):
                 item = {"type": "mention", "erased_participant": True}
@@ -240,19 +245,15 @@ def sanitize_components(
                 parsed_sent_at = 0
             item = {
                 "type": kind,
-                "message_id": str(
-                    _first(raw, "message_id", "reply_id", "id")
-                )[:500],
-                "sender_id": str(
-                    _first(raw, "sender_id", "account_id", "qq")
-                )[:300],
+                "message_id": str(_first(raw, "message_id", "reply_id", "id"))[:500],
+                "sender_id": str(_first(raw, "sender_id", "account_id", "qq"))[:300],
                 "sender_name": str(
                     _first(raw, "sender_name", "sender_nickname", "nickname")
                 )[:300],
                 "sent_at": parsed_sent_at,
-                "plain_text": str(
-                    _first(raw, "plain_text", "message_str", "text")
-                )[:4000],
+                "plain_text": str(_first(raw, "plain_text", "message_str", "text"))[
+                    :4000
+                ],
             }
             if raw.get("erased_participant"):
                 item = {

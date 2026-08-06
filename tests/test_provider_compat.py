@@ -31,6 +31,14 @@ class _IncompleteStreamingProvider(_PreparedPayloadProvider):
         yield SimpleNamespace(is_chunk=True)
 
 
+class _DriftedPrivateProvider:
+    async def _prepare_chat_payload(self, request):
+        return request, []
+
+    async def _query(self, request):
+        return request
+
+
 class ProviderCompatibilityTests(unittest.TestCase):
     def test_options_are_injected_after_astrbot_prepares_payload(self) -> None:
         provider = _PreparedPayloadProvider()
@@ -78,6 +86,26 @@ class ProviderCompatibilityTests(unittest.TestCase):
         self.assertEqual(result, "fallback-result")
         self.assertEqual(captured["temperature"], 0.0)
         self.assertEqual(captured["chat_provider_id"], "another/provider")
+
+    def test_private_signature_drift_uses_public_fallback(self) -> None:
+        captured = {}
+
+        async def fallback(**kwargs):
+            captured.update(kwargs)
+            return "fallback-result"
+
+        result = asyncio.run(
+            generate_with_enforced_options(
+                provider=_DriftedPrivateProvider(),
+                fallback_generate=fallback,
+                chat_provider_id="another/provider",
+                prompt="data",
+                system_prompt="return json",
+                options={"temperature": 0.0},
+            )
+        )
+        self.assertEqual(result, "fallback-result")
+        self.assertEqual(captured["temperature"], 0.0)
 
     def test_streaming_path_returns_the_provider_final_response(self) -> None:
         provider = _StreamingPreparedPayloadProvider()

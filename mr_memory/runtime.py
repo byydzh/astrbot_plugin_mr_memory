@@ -9,7 +9,6 @@ from .brief import EvidenceBrief, parse_evidence_brief
 from .feedback import FeedbackDecision, parse_feedback_decision
 from .plasticity import GraphMutation, parse_graph_mutation
 
-
 FAST_RECONSTRUCTION_SYSTEM_PROMPT = """You are MR Memory's private one-pass
 semantic gate. You never answer the group user. The host has already retrieved a
 bounded candidate set and expanded it to raw source evidence. Think as deeply as
@@ -31,8 +30,8 @@ materially influenced the brief.
 
 Schema:
 {"decision":"brief|none|escalate","memory_brief":{"claims":[{"statement":"...","source_keys":["..."],"confidence":0.0}],"conflicts":[{"statement":"...","source_keys":["..."]}],"unresolved":[{"statement":"...","source_keys":["..."]}]},"activate_hypotheses":[{"id":1,"relevance":0.0}],"activate_edges":[{"id":1,"relevance":0.0}],"escalation_question":""}.
-For none or escalate, memory_brief arrays must be empty. Never expose hidden
-reasoning in the JSON."""
+For none or escalate, memory_brief arrays and both activation arrays must be
+empty. Never expose hidden reasoning in the JSON."""
 
 
 FEEDBACK_BATCH_SYSTEM_PROMPT = """You are MR Memory's private feedback gate.
@@ -138,6 +137,121 @@ class ReconstructionPlan:
     escalation_question: str = ""
 
 
+def _delivered_source_keys(value: object) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in {"source_key", "request_source_key"} and isinstance(item, str):
+                if item:
+                    found.add(item)
+            elif key in {"source_keys", "sample_source_keys"} and isinstance(
+                item, list
+            ):
+                found.update(str(source) for source in item if str(source))
+            else:
+                found.update(_delivered_source_keys(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.update(_delivered_source_keys(item))
+    return found
+
+
+def reconstruction_packet_allowlist(
+    packet: Mapping[str, object],
+) -> tuple[set[str], set[int], set[int]]:
+    """Derive every model allowlist from the packet it actually received."""
+
+    candidates = packet.get("candidates")
+    candidates = candidates if isinstance(candidates, Mapping) else {}
+
+    def ids(field: str) -> set[int]:
+        result: set[int] = set()
+        rows = candidates.get(field)
+        if not isinstance(rows, list):
+            return result
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                identifier = int(row.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if identifier > 0:
+                result.add(identifier)
+        return result
+
+    return (
+        _delivered_source_keys(packet),
+        ids("feedback_hypotheses"),
+        ids("associations"),
+    )
+
+
+def feedback_packet_evidence(
+    packet: Mapping[str, object],
+) -> dict[int, set[str]]:
+    """Return proposal evidence only for feedback items delivered to the model."""
+
+    result: dict[int, set[str]] = {}
+    items = packet.get("items")
+    if not isinstance(items, list):
+        return result
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            proposal_id = int(item.get("proposal_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if proposal_id > 0:
+            result[proposal_id] = _delivered_source_keys(item)
+    return result
+
+
+def feedback_packet_edge_ids(
+    packet: Mapping[str, object],
+) -> dict[int, set[int]]:
+    """Return existing edge IDs visible inside each delivered feedback item."""
+
+    result: dict[int, set[int]] = {}
+    items = packet.get("items")
+    if not isinstance(items, list):
+        return result
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            proposal_id = int(item.get("proposal_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if proposal_id <= 0:
+            continue
+        found: set[int] = set()
+        stack: list[object] = [item]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Mapping):
+                for key, child in current.items():
+                    if key in {"edge_id", "id"} and isinstance(child, (int, str)):
+                        try:
+                            identifier = int(child)
+                        except (TypeError, ValueError):
+                            identifier = 0
+                        if identifier > 0 and (
+                            key == "edge_id"
+                            or "relation" in current
+                            or "source" in current
+                            or "target" in current
+                        ):
+                            found.add(identifier)
+                    else:
+                        stack.append(child)
+            elif isinstance(current, (list, tuple)):
+                stack.extend(current)
+        result[proposal_id] = found
+    return result
+
+
 def parse_reconstruction_plan(
     value: str | Mapping[str, Any],
     *,
@@ -159,6 +273,10 @@ def parse_reconstruction_plan(
         field="activate_edges",
         allowed_ids={int(item) for item in allowed_edge_ids},
     )
+    if decision != "brief" and (hypothesis_activations or edge_activations):
+        raise ValueError(
+            "none or escalate reconstruction decisions cannot activate memory paths"
+        )
     brief: EvidenceBrief | None = None
     if decision == "brief":
         brief_value = raw.get("memory_brief")
@@ -264,6 +382,7 @@ def parse_feedback_batch_plan(
     value: str | Mapping[str, Any],
     *,
     proposal_evidence: Mapping[int, Iterable[str]],
+    proposal_edge_ids: Mapping[int, Iterable[int]] | None = None,
 ) -> tuple[FeedbackPlan, ...]:
     raw = _extract_object(value)
     raw_plans = raw.get("plans")
@@ -294,6 +413,16 @@ def parse_feedback_batch_plan(
                 raise ValueError(
                     f"plans[{index}] graph mutation cites unavailable evidence"
                 )
+            if proposal_edge_ids is not None and int(mutation.edge_id or 0) > 0:
+                allowed_edges = {
+                    int(edge_id)
+                    for edge_id in proposal_edge_ids.get(proposal_id, ())
+                    if int(edge_id) > 0
+                }
+                if int(mutation.edge_id or 0) not in allowed_edges:
+                    raise ValueError(
+                        f"plans[{index}] graph mutation cites an unavailable edge"
+                    )
         if decision.mutation == "ignore" and mutations:
             raise ValueError("ignored feedback cannot mutate the plastic graph")
         parsed.append(FeedbackPlan(proposal_id, decision, mutations))
