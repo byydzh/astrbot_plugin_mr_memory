@@ -3,7 +3,7 @@
 基准为论文 [Memory is Reconstructed, Not Retrieved: Graph Memory for LLM
 Agents](https://arxiv.org/abs/2606.06036) 及其
 [官方实现](https://github.com/Ji-shuo/MRAgent)。本表记录 2026-08-06、插件
-0.12.1 的状态。“结构完成”表示机制已进入核心代码和回归测试，不等于已经复现论文
+0.14.0 的状态。“结构完成”表示机制已进入核心代码和回归测试，不等于已经复现论文
 全部基准分数。
 
 | 论文机制 | 当前状态 | 本项目中的实现证据 | 仍缺什么 |

@@ -1,8 +1,8 @@
 name: astrbot_plugin_mr_memory
 author: byydzh
-desc: 群聊严格隔离、可追溯并由独立潜意识 LLM 主动重建的图记忆插件
-version: 0.12.1
+desc: 按群隔离、证据可追溯，并能从后续反馈持续修正的群聊记忆插件
+version: 0.16.1
 repo: https://github.com/byydzh/astrbot_plugin_mr_memory
-display_name: MR Memory 潜意识图记忆
-short_desc: 独立低价 LLM 驱动、按群隔离的主动图记忆
+display_name: MR Memory 群聊记忆
+short_desc: 独立模型驱动、按群隔离、可从反馈持续修正
 astrbot_version: ">=4.27.1,<5"

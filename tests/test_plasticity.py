@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import uuid
+import time
 from pathlib import Path
 
 from mr_memory.feedback import FeedbackDecision
@@ -103,9 +104,7 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["relation_key"], "group_usage")
-        self.assertEqual(
-            rows[0]["source_keys"], [evidence.resolved_source_key()]
-        )
+        self.assertEqual(rows[0]["source_keys"], [evidence.resolved_source_key()])
 
         revision = parse_graph_mutation(
             {
@@ -129,9 +128,9 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.assertEqual(result["version"], 2)
         self.assertEqual(
-            self.storage.query_plastic_associations(
-                umo=self.umo, query="好女孩"
-            )[0]["relation_version"],
+            self.storage.query_plastic_associations(umo=self.umo, query="好女孩")[0][
+                "relation_version"
+            ],
             2,
         )
 
@@ -178,13 +177,9 @@ class PlasticGraphTests(unittest.TestCase):
             umo=self.umo,
             mutation=parse_graph_mutation(euphemism),
         )
-        rows = self.storage.query_plastic_associations(
-            umo=self.umo, query="好女孩"
-        )
+        rows = self.storage.query_plastic_associations(umo=self.umo, query="好女孩")
         self.assertEqual(len(rows), 2)
-        self.assertEqual(
-            {row["epistemic_state"] for row in rows}, {"HYPOTHESIS"}
-        )
+        self.assertEqual({row["epistemic_state"] for row in rows}, {"HYPOTHESIS"})
         self.assertTrue(all(row["uncertainty"] for row in rows))
 
         revised = parse_graph_mutation(
@@ -340,6 +335,29 @@ class PlasticGraphTests(unittest.TestCase):
             now=101,
         )
         self.assertEqual([row["id"] for row in pending], [job_id])
+
+    def test_unexpired_maintenance_lease_survives_an_observer_reopen(self) -> None:
+        now = int(time.time())
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="feedback",
+            dedupe_key="feedback:live-lease",
+            available_at=now,
+        )
+        claimed = self.storage.claim_maintenance_job(
+            umo=self.umo,
+            job_id=job_id,
+            now=now,
+            lease_seconds=3600,
+        )
+        self.assertIsNotNone(claimed)
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        self.assertEqual(
+            self.storage.pending_maintenance_jobs(umo=self.umo, now=now + 1),
+            [],
+        )
+        self.storage.finish_maintenance_job(umo=self.umo, job_id=job_id)
 
     def test_terminal_maintenance_job_only_retries_when_explicit(self) -> None:
         job_id = self.storage.enqueue_maintenance_job(
