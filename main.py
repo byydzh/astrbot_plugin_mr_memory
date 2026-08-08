@@ -54,13 +54,12 @@ from .mr_memory.plasticity import (
 from .mr_memory.provider_compat import generate_with_enforced_options
 from .mr_memory.runtime import (
     FAST_RECONSTRUCTION_SYSTEM_PROMPT,
-    FEEDBACK_ATTRIBUTION_SYSTEM_PROMPT,
     FEEDBACK_BATCH_SYSTEM_PROMPT,
     feedback_packet_edge_ids,
     feedback_packet_evidence,
-    parse_feedback_attribution_plan,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
+    parse_structured_response,
     reconstruction_packet_allowlist,
 )
 from .mr_memory.scope import GroupMemoryScope, GroupScopeError
@@ -1412,6 +1411,22 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         event=event,
                     )
             except asyncio.CancelledError:
+                if claimed:
+                    try:
+                        await asyncio.shield(
+                            service.release_maintenance_job(
+                                umo=scope.key,
+                                job_id=job_id,
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "MR Memory could not release cancelled maintenance "
+                            "job | job=%s | kind=%s | umo=%s",
+                            job_id,
+                            kind,
+                            scope.key,
+                        )
                 raise
             except Exception as exc:
                 if claimed:
@@ -1471,6 +1486,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 event=event,
                 dedupe_key="feedback:batch",
                 payload={"proposal_id": 0},
+                retry_failed=True,
             )
         )
 
@@ -2988,6 +3004,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         run_id: str,
         prompt: str,
         call_index: int = 0,
+        thinking_mode: str = "enabled",
     ) -> tuple[Any, float]:
         """Run one full-reasoning semantic decision over host-prefetched evidence."""
 
@@ -3002,7 +3019,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         options = distillation_generation_options(
             model_name=_provider_model_name(provider),
             max_tokens=self.distillation_max_output_tokens,
-            thinking_mode="enabled",
+            thinking_mode=thinking_mode,
         )
         thinking = options.get("thinking")
         stream = (
@@ -3032,7 +3049,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             input_cached=usage.input_cached,
             output=usage.output,
             elapsed_ms=elapsed_ms,
-            usage_source="astrbot_response_one_pass",
+            usage_source=(
+                "astrbot_response_one_pass"
+                if call_index == 0
+                else "astrbot_response_protocol_repair"
+            ),
         )
         return response, first_chunk_ms
 
@@ -3317,6 +3338,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             path = initial_path
             first_chunk_ms = 0.0
             tool_steps = 0
+            response_source = ""
+            repair_attempted = False
             try:
                 fast_plan = None
                 if not force:
@@ -3372,13 +3395,35 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         ),
                         timeout=self.subconscious_timeout_seconds,
                     )
-                    if not str(response.completion_text or "").strip():
+                    def parse_fast_plan(value: str) -> Any:
+                        return parse_reconstruction_plan(
+                            value,
+                            allowed_source_keys=visited_source_keys,
+                            allowed_hypothesis_ids=allowed_hypothesis_ids,
+                            allowed_edge_ids=allowed_edge_ids,
+                        )
+                    try:
+                        fast_plan, response_source = parse_structured_response(
+                            completion_text=getattr(
+                                response, "completion_text", ""
+                            ),
+                            reasoning_content=getattr(
+                                response, "reasoning_content", ""
+                            ),
+                            parser=parse_fast_plan,
+                        )
+                    except ValueError as parse_error:
+                        repair_attempted = True
                         logger.warning(
-                            "MR Memory reconstruction provider returned an empty "
-                            "completion; retrying once | umo=%s | run=%s",
+                            "MR Memory reconstruction response violated the JSON "
+                            "contract; repairing once | umo=%s | run=%s | error=%s",
                             umo,
                             run_id,
+                            type(parse_error).__name__,
                         )
+                        previous_completion = str(
+                            getattr(response, "completion_text", "") or ""
+                        )[-12000:]
                         response, retry_first_chunk_ms = await asyncio.wait_for(
                             self._run_fast_reconstruction_with_ledger(
                                 provider=provider,
@@ -3386,22 +3431,30 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                                 run_id=run_id,
                                 prompt=(
                                     fast_prompt
-                                    + "\nThe previous provider response contained no final "
-                                    "answer. Return the required JSON object or exactly "
-                                    "NO_RELEVANT_MEMORY."
+                                    + "\nThe previous full-reasoning call reached a result "
+                                    "but violated the required JSON contract. Serialize the "
+                                    "same evidence-grounded decision as exactly one valid "
+                                    "schema object and no prose. Do not add new claims.\n"
+                                    + f"Parser error: {str(parse_error)[:500]}\n"
+                                    + "Previous public completion:\n"
+                                    + previous_completion
                                 ),
                                 call_index=1,
+                                thinking_mode="disabled",
                             ),
                             timeout=self.subconscious_timeout_seconds,
                         )
                         if first_chunk_ms <= 0:
                             first_chunk_ms = retry_first_chunk_ms
-                    fast_plan = parse_reconstruction_plan(
-                        response.completion_text or "",
-                        allowed_source_keys=visited_source_keys,
-                        allowed_hypothesis_ids=allowed_hypothesis_ids,
-                        allowed_edge_ids=allowed_edge_ids,
-                    )
+                        fast_plan, response_source = parse_structured_response(
+                            completion_text=getattr(
+                                response, "completion_text", ""
+                            ),
+                            reasoning_content=getattr(
+                                response, "reasoning_content", ""
+                            ),
+                            parser=parse_fast_plan,
+                        )
                     active_trace = self._active_interaction_traces.get(id(event))
                     trace_id = (
                         active_trace[1]
@@ -3504,6 +3557,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "tool_steps": tool_steps + (hooks.step_count if hooks else 0),
                         "path": path,
                         "first_chunk_ms": first_chunk_ms,
+                        "response_source": response_source,
+                        "repair_attempted": repair_attempted,
                     },
                 )
                 raise
@@ -3522,6 +3577,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "tool_steps": tool_steps,
                     "path": path,
                     "first_chunk_ms": first_chunk_ms,
+                    "response_source": response_source,
+                    "repair_attempted": repair_attempted,
                 },
             )
             await service.update_subconscious_state(
@@ -3552,6 +3609,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         run_id: str,
         prompt: str,
         call_index: int = 1,
+        thinking_mode: str = "enabled",
     ) -> tuple[Any, float]:
         """Make one full-reasoning decision for a bounded feedback microbatch."""
 
@@ -3566,7 +3624,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         options = distillation_generation_options(
             model_name=_provider_model_name(provider),
             max_tokens=self.distillation_max_output_tokens,
-            thinking_mode="enabled",
+            thinking_mode=thinking_mode,
         )
         thinking = options.get("thinking")
         stream = (
@@ -3598,63 +3656,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             input_cached=usage.input_cached,
             output=usage.output,
             elapsed_ms=elapsed_ms,
-            usage_source="astrbot_response_one_pass_batch",
-        )
-        return response, first_chunk_ms
-
-    async def _run_feedback_attribution_with_ledger(
-        self,
-        *,
-        provider: Any,
-        service: MemoryService,
-        run_id: str,
-        prompt: str,
-        call_index: int = 0,
-    ) -> tuple[Any, float]:
-        """Run the small semantic attribution stage before any graph synthesis."""
-
-        started = time.perf_counter()
-        first_chunk_ms = 0.0
-
-        def observe_stream(_chunk_count: int, _response: Any) -> None:
-            nonlocal first_chunk_ms
-            if first_chunk_ms <= 0:
-                first_chunk_ms = (time.perf_counter() - started) * 1000
-
-        options = distillation_generation_options(
-            model_name=_provider_model_name(provider),
-            max_tokens=self.distillation_max_output_tokens,
-            thinking_mode="enabled",
-        )
-        thinking = options.get("thinking")
-        stream = (
-            isinstance(thinking, dict)
-            and str(thinking.get("type") or "").casefold() == "enabled"
-        )
-        response = await generate_with_enforced_options(
-            provider=provider,
-            fallback_generate=self.context.llm_generate,
-            chat_provider_id=self.subconscious_provider_id,
-            prompt=prompt,
-            system_prompt=FEEDBACK_ATTRIBUTION_SYSTEM_PROMPT,
-            options=options,
-            stream=stream,
-            on_stream_progress=observe_stream,
-        )
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        usage = TokenUsageRecord.from_value(response.usage)
-        await service.record_llm_usage(
-            run_id=run_id,
-            phase="feedback_maintenance",
-            arm="memory",
-            call_index=call_index,
-            provider_id=self.subconscious_provider_id,
-            model=_provider_model_name(provider),
-            input_other=usage.input_other,
-            input_cached=usage.input_cached,
-            output=usage.output,
-            elapsed_ms=elapsed_ms,
-            usage_source="astrbot_response_attribution_gate",
+            usage_source=(
+                "astrbot_response_one_pass_batch"
+                if thinking_mode == "enabled"
+                else "astrbot_response_protocol_repair"
+            ),
         )
         return response, first_chunk_ms
 
@@ -3774,9 +3780,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 return
 
             gate_packets: list[dict[str, object]] = []
-            packet_by_id: dict[int, dict[str, object]] = {}
-            eligible_trace_ids: dict[int, set[str]] = {}
-            inspected_by_id: dict[int, dict[str, object]] = {}
             for proposal in proposals:
                 active_proposal_id = int(proposal["id"])
                 inspected = await service.inspect_feedback_proposal(
@@ -3784,28 +3787,47 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     proposal_id=active_proposal_id,
                     context_limit=8,
                 )
-                inspected_by_id[active_proposal_id] = inspected
                 compact_inspection = _compact_feedback_inspection(inspected)
+                feedback = inspected.get("feedback") or {}
+                if not isinstance(feedback, dict):
+                    feedback = {}
+                hypotheses = await service.search_feedback_hypotheses(
+                    umo=scope.key,
+                    sender_id=str(feedback.get("sender_id") or ""),
+                    query="",
+                    at=int(feedback.get("sent_at") or time.time()),
+                    limit=6,
+                    include_inactive=True,
+                )
                 packet = {
+                    "proposal_id": active_proposal_id,
                     "proposal": {
                         "id": active_proposal_id,
                         "surface_score": float(proposal.get("surface_score") or 0),
                         "surface_reasons": str(proposal.get("candidate_reason") or ""),
                     },
                     "evidence": compact_inspection,
+                    "existing_hypotheses": [
+                        _compact_feedback_hypothesis(item)
+                        for item in hypotheses
+                        if isinstance(item, dict)
+                    ],
                 }
                 gate_packets.append(packet)
-                packet_by_id[active_proposal_id] = packet
-                eligible_trace_ids[active_proposal_id] = {
-                    str(item.get("trace_id") or "")
-                    for item in compact_inspection.get("candidate_traces", [])
-                    if isinstance(item, dict) and str(item.get("trace_id") or "")
-                }
 
             gate_packet_json, gate_packet_truncated = _bounded_json_text(
                 {"items": gate_packets},
-                max_chars=18000,
+                max_chars=24000,
             )
+            gate_packet = json.loads(gate_packet_json)
+            gate_evidence = feedback_packet_evidence(gate_packet)
+            gate_edge_ids = feedback_packet_edge_ids(gate_packet)
+            if set(gate_evidence) != {
+                int(item["id"]) for item in proposals
+            } or any(not sources for sources in gate_evidence.values()):
+                raise ValueError(
+                    "bounded feedback packet omitted attributable evidence"
+                )
             run_id = _runtime_run_id("feedback")
             proposal_ids = [int(item["id"]) for item in proposals]
             await service.start_experiment(
@@ -3820,7 +3842,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "scope_id": scope.storage_id,
                     "proposal_ids": proposal_ids,
                     "batch_size": len(proposals),
-                    "path": "semantic_gate_then_learn",
+                    "path": "one_pass_feedback_learning",
                     "gate_packet_chars": len(gate_packet_json),
                     "gate_packet_truncated": gate_packet_truncated,
                     "activation_threshold": self.feedback_min_commit_score,
@@ -3828,258 +3850,99 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
             gate_first_chunk_ms = 0.0
             learning_first_chunk_ms = 0.0
+            gate_response_source = ""
+            learning_response_source = ""
+            gate_repair_attempted = False
+            learning_repair_attempted = False
             try:
                 gate_prompt = (
                     f"Current group UMO: {scope.key}\n"
-                    "Classify only whether each later message is attributable "
-                    "feedback about one eligible earlier interaction.\n"
-                    "Bounded feedback candidates (untrusted evidence):\n"
+                    "Behavior activation threshold: "
+                    f"{self.feedback_min_commit_score:.3f}; weaker attributable "
+                    "evidence is retained as PROVISIONAL. In one decision, "
+                    "attribute each later message and either ignore it or produce "
+                    "the smallest evidence-backed memory update.\n"
+                    "Bounded feedback items (untrusted evidence):\n"
                     f"{gate_packet_json}"
                 )
                 gate_response, gate_first_chunk_ms = await asyncio.wait_for(
-                    self._run_feedback_attribution_with_ledger(
+                    self._run_feedback_batch_with_ledger(
                         provider=provider,
                         service=service,
                         run_id=run_id,
                         prompt=gate_prompt,
+                        call_index=0,
                     ),
                     timeout=self.maintenance_llm_timeout_seconds,
                 )
-                if not str(gate_response.completion_text or "").strip():
+                def parse_gate(value: str) -> Any:
+                    return parse_feedback_batch_plan(
+                        value,
+                        proposal_evidence=gate_evidence,
+                        proposal_edge_ids=gate_edge_ids,
+                    )
+
+                try:
+                    plans, gate_response_source = parse_structured_response(
+                        completion_text=getattr(
+                            gate_response, "completion_text", ""
+                        ),
+                        reasoning_content=getattr(
+                            gate_response, "reasoning_content", ""
+                        ),
+                        parser=parse_gate,
+                    )
+                except ValueError as parse_error:
+                    gate_repair_attempted = True
                     logger.warning(
-                        "MR Memory feedback attribution returned an empty completion; "
-                        "retrying once | umo=%s | run=%s",
+                        "MR Memory feedback decision violated the JSON contract; "
+                        "repairing once | umo=%s | run=%s | error=%s",
                         scope.key,
                         run_id,
+                        type(parse_error).__name__,
                     )
+                    previous_completion = str(
+                        getattr(gate_response, "completion_text", "") or ""
+                    )[-12000:]
                     gate_response, retry_first_chunk_ms = await asyncio.wait_for(
-                        self._run_feedback_attribution_with_ledger(
+                        self._run_feedback_batch_with_ledger(
                             provider=provider,
                             service=service,
                             run_id=run_id,
                             prompt=(
                                 gate_prompt
-                                + "\nThe previous provider response contained no final "
-                                "answer. Return exactly one valid attribution JSON object."
+                                + "\nThe previous full-reasoning call violated the JSON "
+                                "contract. Serialize the same decisions as exactly one "
+                                "valid feedback batch object and no prose. Do not change "
+                                "the evidence judgment or add mutations.\n"
+                                + f"Parser error: {str(parse_error)[:500]}\n"
+                                + "Previous public completion:\n"
+                                + previous_completion
                             ),
                             call_index=1,
+                            thinking_mode="disabled",
                         ),
                         timeout=self.maintenance_llm_timeout_seconds,
                     )
                     if gate_first_chunk_ms <= 0:
                         gate_first_chunk_ms = retry_first_chunk_ms
-                attributions = parse_feedback_attribution_plan(
-                    gate_response.completion_text or "",
-                    eligible_trace_ids=eligible_trace_ids,
-                )
-                outcomes: list[dict[str, object]] = []
-                learning_attributions = [
-                    item for item in attributions if item.verdict == "learn"
-                ]
-                for attribution in attributions:
-                    if attribution.verdict != "ignore":
-                        continue
-                    decision = parse_feedback_decision(
-                        {
-                            "target_trace_id": "",
-                            "mutation": "ignore",
-                            "feedback_valence": attribution.feedback_valence,
-                            "confidence": attribution.confidence,
-                            "scope_type": "sender",
-                            "scope_key": "",
-                            "aspect": "",
-                            "statement": "",
-                            "prospective_cue": "",
-                            "trigger_cues": [],
-                            "activation_mode": "always",
-                        }
-                    )
-                    result = await service.apply_feedback_decision(
-                        umo=scope.key,
-                        proposal_id=attribution.proposal_id,
-                        decision=decision,
-                        hypothesis_ttl_seconds=self.feedback_hypothesis_ttl_seconds,
-                        min_commit_score=self.feedback_min_commit_score,
-                    )
-                    outcomes.append(
-                        {
-                            "proposal_id": attribution.proposal_id,
-                            "proposal_status": str(result.get("status") or ""),
-                            "hypothesis_status": "",
-                            "commit_score": 0.0,
-                            "graph_mutations": 0,
-                            "graph_mutation_errors": [],
-                            "stage": "attribution_gate",
-                        }
-                    )
-
-                learning_response = None
-                learning_packet_chars = 0
-                learning_packet_truncated = False
-                learning_edge_ids: dict[int, set[int]] = {}
-                plans = ()
-                if learning_attributions:
-                    learning_packets: list[dict[str, object]] = []
-                    for attribution in learning_attributions:
-                        active_proposal_id = attribution.proposal_id
-                        inspected = inspected_by_id[active_proposal_id]
-                        feedback = inspected.get("feedback") or {}
-                        if not isinstance(feedback, dict):
-                            feedback = {}
-                        selected_trace = next(
-                            (
-                                item
-                                for item in inspected.get("candidate_traces", [])
-                                if isinstance(item, dict)
-                                and str(item.get("trace_id") or "")
-                                == attribution.target_trace_id
-                            ),
-                            {},
-                        )
-                        candidate_text = " ".join(
-                            (
-                                str(feedback.get("plain_text") or ""),
-                                str(selected_trace.get("request_excerpt") or ""),
-                                str(selected_trace.get("response_excerpt") or ""),
-                            )
-                        )[: self.max_query_chars]
-                        hypotheses = await service.search_feedback_hypotheses(
-                            umo=scope.key,
-                            sender_id=str(feedback.get("sender_id") or ""),
-                            query=candidate_text,
-                            at=int(feedback.get("sent_at") or time.time()),
-                            limit=6,
-                            include_inactive=True,
-                        )
-                        associations: list[dict[str, object]] = []
-                        backend = self._embedding_backend()
-                        if backend is not None and candidate_text.strip():
-                            try:
-                                candidates = await service.initialize_candidates(
-                                    umo=scope.key,
-                                    query=candidate_text,
-                                    embedding_backend=backend,
-                                    limit=8,
-                                    min_score=self.candidate_seed_floor,
-                                    before_sent_at=int(
-                                        feedback.get("sent_at") or time.time()
-                                    ),
-                                )
-                                associations = [
-                                    item
-                                    for item in candidates.get("associations", [])
-                                    if isinstance(item, dict)
-                                ][:6]
-                            except Exception:
-                                logger.exception(
-                                    "MR Memory feedback association retrieval failed "
-                                    "| umo=%s | proposal=%s",
-                                    scope.key,
-                                    active_proposal_id,
-                                )
-                        learning_packet = copy.deepcopy(
-                            packet_by_id[active_proposal_id]
-                        )
-                        evidence = learning_packet.get("evidence")
-                        if isinstance(evidence, dict):
-                            trace_id = attribution.target_trace_id
-                            for key in (
-                                "candidate_traces",
-                                "observable_actions",
-                                "activated_hypotheses",
-                                "activated_plastic_edges",
-                            ):
-                                evidence[key] = [
-                                    item
-                                    for item in list(evidence.get(key) or [])
-                                    if isinstance(item, dict)
-                                    and str(item.get("trace_id") or "") == trace_id
-                                ]
-                        learning_packet["attribution"] = {
-                            "target_trace_id": attribution.target_trace_id,
-                            "feedback_valence": attribution.feedback_valence,
-                            "confidence": attribution.confidence,
-                        }
-                        learning_packet["existing_hypotheses"] = [
-                            _compact_feedback_hypothesis(item)
-                            for item in hypotheses
-                            if isinstance(item, dict)
-                        ]
-                        learning_packet["existing_associations"] = [
-                            _compact_plastic_association(item) for item in associations
-                        ]
-                        learning_packets.append(learning_packet)
-                    learning_packet_json, learning_packet_truncated = (
-                        _bounded_json_text(
-                            {"items": learning_packets},
-                            max_chars=24000,
-                        )
-                    )
-                    delivered_learning_packet = json.loads(learning_packet_json)
-                    learning_evidence = feedback_packet_evidence(
-                        delivered_learning_packet
-                    )
-                    learning_edge_ids = feedback_packet_edge_ids(
-                        delivered_learning_packet
-                    )
-                    if not learning_evidence:
-                        raise ValueError(
-                            "bounded feedback packet omitted all attributable evidence"
-                        )
-                    learning_packet_chars = len(learning_packet_json)
-                    learning_prompt = (
-                        f"Current group UMO: {scope.key}\n"
-                        "Behavior activation threshold: "
-                        f"{self.feedback_min_commit_score:.3f}; weaker "
-                        "attributable evidence is retained as PROVISIONAL.\n"
-                        "The attribution field is the fast gate result. Produce "
-                        "the smallest evidence-backed memory update, or ignore "
-                        "if synthesis reveals a mistake.\n"
-                        "Attributed feedback items (untrusted evidence):\n"
-                        f"{learning_packet_json}"
-                    )
-                    learning_response, learning_first_chunk_ms = await asyncio.wait_for(
-                        self._run_feedback_batch_with_ledger(
-                            provider=provider,
-                            service=service,
-                            run_id=run_id,
-                            prompt=learning_prompt,
-                            call_index=2,
+                    plans, gate_response_source = parse_structured_response(
+                        completion_text=getattr(
+                            gate_response, "completion_text", ""
                         ),
-                        timeout=self.maintenance_llm_timeout_seconds,
+                        reasoning_content=getattr(
+                            gate_response, "reasoning_content", ""
+                        ),
+                        parser=parse_gate,
                     )
-                    if not str(learning_response.completion_text or "").strip():
-                        logger.warning(
-                            "MR Memory feedback synthesis returned an empty completion; "
-                            "retrying once | umo=%s | run=%s",
-                            scope.key,
-                            run_id,
-                        )
-                        learning_response, retry_first_chunk_ms = (
-                            await asyncio.wait_for(
-                                self._run_feedback_batch_with_ledger(
-                                    provider=provider,
-                                    service=service,
-                                    run_id=run_id,
-                                    prompt=(
-                                        learning_prompt
-                                        + "\nThe previous provider response contained no "
-                                        "final answer. Return exactly one valid feedback "
-                                        "batch JSON object."
-                                    ),
-                                    call_index=3,
-                                ),
-                                timeout=self.maintenance_llm_timeout_seconds,
-                            )
-                        )
-                        if learning_first_chunk_ms <= 0:
-                            learning_first_chunk_ms = retry_first_chunk_ms
-                    plans = parse_feedback_batch_plan(
-                        learning_response.completion_text or "",
-                        proposal_evidence=learning_evidence,
-                        proposal_edge_ids=learning_edge_ids,
-                    )
-
+                outcomes: list[dict[str, object]] = []
+                learning_packet_chars = len(gate_packet_json)
+                learning_packet_truncated = gate_packet_truncated
+                learning_evidence = gate_evidence
+                learning_edge_ids = gate_edge_ids
+                learning_first_chunk_ms = gate_first_chunk_ms
+                learning_response_source = gate_response_source
+                learning_repair_attempted = gate_repair_attempted
                 for plan in plans:
                     result = await service.apply_feedback_decision(
                         umo=scope.key,
@@ -4139,7 +4002,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             "commit_score": float(result.get("commit_score") or 0),
                             "graph_mutations": len(mutation_results),
                             "graph_mutation_errors": mutation_errors,
-                            "stage": "learning_synthesis",
+                            "stage": "one_pass_learning",
                         }
                     )
                 await service.finish_experiment(
@@ -4148,27 +4011,26 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     result={
                         "outcomes": outcomes,
                         "batch_size": len(proposals),
-                        "path": "semantic_gate_then_learn",
+                        "path": "one_pass_feedback_learning",
                         "gate_ignored": sum(
-                            item.verdict == "ignore" for item in attributions
+                            item.decision.mutation == "ignore" for item in plans
                         ),
-                        "learning_items": len(learning_attributions),
+                        "learning_items": sum(
+                            item.decision.mutation != "ignore" for item in plans
+                        ),
                         "gate_packet_chars": len(gate_packet_json),
                         "gate_packet_truncated": gate_packet_truncated,
                         "learning_packet_chars": learning_packet_chars,
                         "learning_packet_truncated": learning_packet_truncated,
                         "gate_first_chunk_ms": gate_first_chunk_ms,
                         "learning_first_chunk_ms": learning_first_chunk_ms,
+                        "first_chunk_ms": gate_first_chunk_ms,
+                        "gate_response_source": gate_response_source,
+                        "learning_response_source": learning_response_source,
+                        "gate_repair_attempted": gate_repair_attempted,
+                        "learning_repair_attempted": learning_repair_attempted,
                         "completion_sha256": _stable_hash(
                             str(gate_response.completion_text or "")
-                            + str(
-                                getattr(
-                                    learning_response,
-                                    "completion_text",
-                                    "",
-                                )
-                                or ""
-                            )
                         ),
                     },
                 )
@@ -4180,9 +4042,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "error_type": type(exc).__name__,
                         "error_detail": str(exc)[:1000],
                         "batch_size": len(proposals),
-                        "path": "semantic_gate_then_learn",
+                        "path": "one_pass_feedback_learning",
                         "gate_first_chunk_ms": gate_first_chunk_ms,
                         "learning_first_chunk_ms": learning_first_chunk_ms,
+                        "first_chunk_ms": gate_first_chunk_ms,
+                        "gate_response_source": gate_response_source,
+                        "learning_response_source": learning_response_source,
+                        "gate_repair_attempted": gate_repair_attempted,
+                        "learning_repair_attempted": learning_repair_attempted,
                     },
                 )
                 logger.exception(

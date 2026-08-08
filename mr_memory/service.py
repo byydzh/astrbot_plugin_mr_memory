@@ -567,6 +567,9 @@ class MemoryService:
     async def finish_maintenance_job(self, **kwargs: object) -> None:
         await asyncio.to_thread(self.storage.finish_maintenance_job, **kwargs)
 
+    async def release_maintenance_job(self, **kwargs: object) -> bool:
+        return await asyncio.to_thread(self.storage.release_maintenance_job, **kwargs)
+
     async def fail_maintenance_job(self, **kwargs: object) -> str:
         return await asyncio.to_thread(self.storage.fail_maintenance_job, **kwargs)
 

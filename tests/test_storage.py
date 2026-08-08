@@ -144,6 +144,166 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertEqual([int(job["id"]) for job in jobs], [job_id])
         self.assertEqual(int(jobs[0]["available_at"]), 2**31)
 
+    def test_legacy_completed_maintenance_job_is_requeued(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        self.storage.bind_scope(
+            umo=umo,
+            platform_id="shadow",
+            group_id="group-a",
+        )
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=umo,
+            job_type="feedback",
+            dedupe_key="feedback:batch",
+            available_at=100,
+        )
+        self.assertIsNotNone(
+            self.storage.claim_maintenance_job(umo=umo, job_id=job_id, now=100)
+        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE maintenance_jobs SET status='COMPLETED' WHERE id=?",
+                (job_id,),
+            )
+            self.storage._connection.execute(
+                "DELETE FROM schema_meta WHERE key='maintenance_terminal_v15'"
+            )
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        migrated = self.storage._connection.execute(
+            "SELECT status FROM maintenance_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(migrated["status"], "DONE")
+
+        self.assertEqual(
+            self.storage.enqueue_maintenance_job(
+                umo=umo,
+                job_type="feedback",
+                dedupe_key="feedback:batch",
+                available_at=101,
+            ),
+            job_id,
+        )
+        self.assertIsNotNone(
+            self.storage.claim_maintenance_job(umo=umo, job_id=job_id, now=101)
+        )
+        self.storage.finish_maintenance_job(
+            umo=umo,
+            job_id=job_id,
+            status="completed",
+        )
+        finished = self.storage._connection.execute(
+            "SELECT status FROM maintenance_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(finished["status"], "DONE")
+
+    def test_dashboard_does_not_report_cancelled_housekeeping_as_error(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        self.storage.bind_scope(
+            umo=umo,
+            platform_id="shadow",
+            group_id="group-a",
+        )
+        cancelled_id = self.storage.enqueue_maintenance_job(
+            umo=umo,
+            job_type="feedback",
+            dedupe_key="feedback:old",
+            available_at=100,
+        )
+        failed_id = self.storage.enqueue_maintenance_job(
+            umo=umo,
+            job_type="feedback",
+            dedupe_key="feedback:failed",
+            available_at=100,
+        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='CANCELLED', last_error='superseded'
+                WHERE id=?
+                """,
+                (cancelled_id,),
+            )
+            self.storage._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='FAILED', last_error='ValueError'
+                WHERE id=?
+                """,
+                (failed_id,),
+            )
+
+        errors = self.storage.dashboard_summary(umo=umo)[
+            "recent_maintenance_errors"
+        ]
+        self.assertEqual([item["last_error"] for item in errors], ["ValueError"])
+
+    def test_runtime_health_uses_terminal_status_and_wall_clock_latency(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        for run_id in ("complete", "timeout", "running"):
+            self.storage.start_experiment(
+                run_id=run_id,
+                umo=umo,
+                experiment_type="runtime_reconstruction",
+            )
+        self.storage.record_llm_usage(
+            run_id="complete",
+            phase="reconstruction",
+            input_other=100,
+            output=20,
+            elapsed_ms=750,
+        )
+        self.storage.finish_experiment(
+            run_id="complete",
+            status="completed",
+            result={"no_relevant_memory": False, "path": "fast"},
+        )
+        self.storage.finish_experiment(
+            run_id="timeout",
+            status="failed",
+            result={"error_type": "TimeoutError", "path": "fast"},
+        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                """
+                UPDATE experiment_runs
+                SET started_at='2026-01-01 00:00:00',
+                    finished_at='2026-01-01 00:00:01'
+                WHERE run_id='complete'
+                """
+            )
+            self.storage._connection.execute(
+                """
+                UPDATE experiment_runs
+                SET started_at='2026-01-01 00:01:00',
+                    finished_at='2026-01-01 00:02:30'
+                WHERE run_id='timeout'
+                """
+            )
+            self.storage._connection.execute(
+                """
+                UPDATE experiment_runs
+                SET started_at='2026-01-01 00:03:00'
+                WHERE run_id='running'
+                """
+            )
+
+        health = self.storage.runtime_health_summary(umo=umo, since=0)
+        reconstruction = health["reconstruction"]
+        self.assertEqual(reconstruction["calls"], 3)
+        self.assertEqual(reconstruction["completed"], 1)
+        self.assertEqual(reconstruction["running"], 1)
+        self.assertEqual(reconstruction["failed"], 1)
+        self.assertEqual(reconstruction["timeouts"], 1)
+        self.assertAlmostEqual(reconstruction["p50_elapsed_ms"], 45500, delta=1)
+        recent = {item["run_id"]: item for item in health["recent"]}
+        self.assertAlmostEqual(recent["timeout"]["elapsed_ms"], 90000, delta=1)
+        self.assertEqual(recent["timeout"]["outcome"], "failed")
+        self.assertEqual(recent["running"]["outcome"], "running")
+
     def test_repeated_images_use_bounded_hash_metadata_not_media_bytes(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         fingerprint = "a" * 64

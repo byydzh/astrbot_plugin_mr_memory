@@ -43,7 +43,7 @@ from .plasticity import (
     RelationTypeProposal,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 TRUTH_V2_BACKFILL_VERSION = 8
 MEDIA_HEAVY_HITTER_LIMIT = 512
 MEDIA_SAMPLE_SOURCE_LIMIT = 8
@@ -1287,6 +1287,24 @@ class MemoryStorage:
                 self._connection.execute("""
                     INSERT INTO schema_meta(key, value)
                     VALUES ('feedback_budget_v13', 'completed')
+                    """)
+            maintenance_terminal_migration = self._connection.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key='maintenance_terminal_v15'"
+            ).fetchone()
+            if maintenance_terminal_migration is None:
+                # Early builds used the experiment terminal label COMPLETED for
+                # maintenance jobs. The queue protocol uses DONE; the legacy
+                # label otherwise makes a deduplicated job impossible to claim
+                # or enqueue again.
+                self._connection.execute("""
+                    UPDATE maintenance_jobs SET status='DONE', lease_until=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE status='COMPLETED'
+                    """)
+                self._connection.execute("""
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('maintenance_terminal_v15', 'completed')
                     """)
             self._connection.execute(
                 """
@@ -4298,7 +4316,7 @@ class MemoryStorage:
         """Return privacy-safe realtime latency, cost and outcome metrics."""
 
         self._assert_scope(umo)
-        cutoff = int(since or (time.time() - 86400))
+        cutoff = int(since if since is not None else (time.time() - 86400))
         with self._lock:
             rows = self._connection.execute(
                 """
@@ -4310,7 +4328,12 @@ class MemoryStorage:
                        COALESCE(SUM(
                            u.input_other + u.input_cached + u.output
                        ), 0) AS total,
-                       COALESCE(SUM(u.elapsed_ms), 0) AS elapsed_ms
+                       COALESCE(SUM(u.elapsed_ms), 0) AS llm_elapsed_ms,
+                       CASE WHEN r.finished_at IS NULL THEN 0 ELSE max(
+                           0,
+                           (julianday(r.finished_at) - julianday(r.started_at))
+                           * 86400000
+                       ) END AS wall_elapsed_ms
                 FROM experiment_runs AS r
                 LEFT JOIN llm_usage_events AS u ON u.run_id=r.run_id
                 WHERE r.umo=? AND unixepoch(r.started_at)>=?
@@ -4354,6 +4377,7 @@ class MemoryStorage:
             "reconstruction": {
                 "calls": 0,
                 "completed": 0,
+                "running": 0,
                 "failed": 0,
                 "timeouts": 0,
                 "useful": 0,
@@ -4365,6 +4389,7 @@ class MemoryStorage:
             "feedback": {
                 "calls": 0,
                 "completed": 0,
+                "running": 0,
                 "failed": 0,
                 "timeouts": 0,
                 "committed": 0,
@@ -4385,9 +4410,11 @@ class MemoryStorage:
             )
             aggregate = phases[phase]
             aggregate["calls"] = int(aggregate["calls"]) + 1
-            status = str(row["status"])
-            if status == "completed":
+            status = str(row["status"] or "").strip().upper()
+            if status == "COMPLETED":
                 aggregate["completed"] = int(aggregate["completed"]) + 1
+            elif status == "RUNNING":
+                aggregate["running"] = int(aggregate["running"]) + 1
             else:
                 aggregate["failed"] = int(aggregate["failed"]) + 1
             result = json.loads(str(row["result_json"] or "{}"))
@@ -4398,15 +4425,21 @@ class MemoryStorage:
             }:
                 aggregate["timeouts"] = int(aggregate["timeouts"]) + 1
             total = int(row["total"] or 0)
-            elapsed = float(row["elapsed_ms"] or 0.0)
+            llm_elapsed = float(row["llm_elapsed_ms"] or 0.0)
+            wall_elapsed = float(row["wall_elapsed_ms"] or 0.0)
+            elapsed = max(llm_elapsed, wall_elapsed)
             aggregate["tokens"] = int(aggregate["tokens"]) + total
             elapsed_values = aggregate["elapsed_values"]
             assert isinstance(elapsed_values, list)
             if elapsed > 0:
                 elapsed_values.append(elapsed)
 
-            outcome = "failed" if status != "completed" else "completed"
-            if phase == "reconstruction" and status == "completed":
+            outcome = (
+                "running"
+                if status == "RUNNING"
+                else ("failed" if status != "COMPLETED" else "completed")
+            )
+            if phase == "reconstruction" and status == "COMPLETED":
                 path = str(result.get("path") or metadata.get("path") or "legacy")
                 if path == "deep_escalation":
                     aggregate["escalated"] = int(aggregate["escalated"]) + 1
@@ -4416,7 +4449,7 @@ class MemoryStorage:
                 else:
                     aggregate["useful"] = int(aggregate["useful"]) + 1
                     outcome = "useful"
-            elif phase == "feedback" and status == "completed":
+            elif phase == "feedback" and status == "COMPLETED":
                 outcomes = result.get("outcomes")
                 if not isinstance(outcomes, list):
                     outcomes = [
@@ -4459,7 +4492,10 @@ class MemoryStorage:
                         "output": int(row["output"] or 0),
                         "tokens": total,
                         "elapsed_ms": round(elapsed, 3),
+                        "llm_elapsed_ms": round(llm_elapsed, 3),
                         "outcome": outcome,
+                        "error_type": str(result.get("error_type") or ""),
+                        "error_detail": str(result.get("error_detail") or "")[:500],
                         "path": str(
                             result.get("path") or metadata.get("path") or "legacy"
                         ),
@@ -4476,7 +4512,6 @@ class MemoryStorage:
             calls = int(value["calls"])
             tokens = int(value["tokens"])
             if elapsed_values:
-                median_index = (len(elapsed_values) - 1) // 2
                 p95_index = max(
                     0,
                     min(
@@ -4485,7 +4520,13 @@ class MemoryStorage:
                     ),
                 )
                 average_ms = sum(elapsed_values) / len(elapsed_values)
-                p50_ms = elapsed_values[median_index]
+                midpoint = len(elapsed_values) // 2
+                if len(elapsed_values) % 2:
+                    p50_ms = elapsed_values[midpoint]
+                else:
+                    p50_ms = (
+                        elapsed_values[midpoint - 1] + elapsed_values[midpoint]
+                    ) / 2
                 p95_ms = elapsed_values[p95_index]
             else:
                 average_ms = p50_ms = p95_ms = 0.0
@@ -4860,6 +4901,7 @@ class MemoryStorage:
                        available_at
                 FROM maintenance_jobs
                 WHERE umo=? AND last_error<>''
+                  AND status NOT IN ('DONE', 'COMPLETED', 'CANCELLED', 'BUDGET_WAIT')
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 5
                 """,
@@ -7636,7 +7678,7 @@ class MemoryStorage:
         proposal: RelationTypeProposal,
         created_by: str,
         force_revision: bool,
-    ) -> tuple[int, int, bool, int | None]:
+    ) -> tuple[int, int, bool, int | None, bool]:
         active = self._connection.execute(
             """
             SELECT * FROM relation_types
@@ -7656,11 +7698,17 @@ class MemoryStorage:
                 str(active["risk_class"]),
             )
             if stored == definition:
-                return int(active["id"]), int(active["version"]), False, None
+                return int(active["id"]), int(active["version"]), False, None, False
             if not force_revision:
-                raise ValueError(
-                    "relation definition conflicts with the active version; "
-                    "use revise_relation explicitly"
+                # An upsert may repeat a stable relation key with slightly
+                # different prose. Reuse the host-owned active schema; only an
+                # explicit revise_relation operation may version it.
+                return (
+                    int(active["id"]),
+                    int(active["version"]),
+                    False,
+                    None,
+                    True,
                 )
         previous_id = int(active["id"]) if active is not None else None
         latest = self._connection.execute(
@@ -7697,7 +7745,7 @@ class MemoryStorage:
                 str(created_by or "")[:200],
             ),
         )
-        return int(cursor.lastrowid), version, True, previous_id
+        return int(cursor.lastrowid), version, True, previous_id, False
 
     def apply_graph_mutation(
         self,
@@ -7807,6 +7855,40 @@ class MemoryStorage:
                 assert mutation.source is not None
                 assert mutation.target is not None
                 assert mutation.relation is not None
+                (
+                    relation_id,
+                    relation_version,
+                    _,
+                    _,
+                    relation_definition_reused,
+                ) = self._register_relation_type_locked(
+                    umo=umo,
+                    proposal=mutation.relation,
+                    created_by=f"mutation:{mutation_id}",
+                    force_revision=False,
+                )
+                relation_schema = self._connection.execute(
+                    """
+                    SELECT source_kinds_json, target_kinds_json
+                    FROM relation_types WHERE id=? AND umo=?
+                    """,
+                    (relation_id, umo),
+                ).fetchone()
+                assert relation_schema is not None
+                source_kinds = set(
+                    json.loads(str(relation_schema["source_kinds_json"]))
+                )
+                target_kinds = set(
+                    json.loads(str(relation_schema["target_kinds_json"]))
+                )
+                if mutation.source.kind not in source_kinds:
+                    raise ValueError(
+                        "source node kind is outside the active relation schema"
+                    )
+                if mutation.target.kind not in target_kinds:
+                    raise ValueError(
+                        "target node kind is outside the active relation schema"
+                    )
                 source_id = self._upsert_plastic_node_locked(
                     umo=umo,
                     proposal=mutation.source,
@@ -7820,14 +7902,6 @@ class MemoryStorage:
                     confidence=mutation.confidence,
                     utility_delta=max(0.0, mutation.utility_delta) / 2,
                     created_by=f"mutation:{mutation_id}",
-                )
-                relation_id, relation_version, _, _ = (
-                    self._register_relation_type_locked(
-                        umo=umo,
-                        proposal=mutation.relation,
-                        created_by=f"mutation:{mutation_id}",
-                        force_revision=False,
-                    )
                 )
                 stable_key = self._plastic_edge_stable_key(
                     umo=umo,
@@ -7898,6 +7972,7 @@ class MemoryStorage:
                 target_type = "edge"
                 target_id = int(edge["id"])
                 details["relation_version"] = relation_version
+                details["relation_definition_reused"] = relation_definition_reused
                 details["epistemic_state"] = str(edge["epistemic_state"])
                 details["uncertainty"] = str(edge["uncertainty"])
                 for source_key, message_id in evidence.items():
@@ -7912,7 +7987,7 @@ class MemoryStorage:
 
             elif mutation.operation == "revise_relation":
                 assert mutation.relation is not None
-                relation_id, version, created, previous_id = (
+                relation_id, version, created, previous_id, _ = (
                     self._register_relation_type_locked(
                         umo=umo,
                         proposal=mutation.relation,
@@ -8763,7 +8838,7 @@ class MemoryStorage:
                     payload_json=excluded.payload_json,
                     available_at=CASE
                         WHEN maintenance_jobs.status IN
-                            ('DONE', 'CANCELLED')
+                            ('DONE', 'COMPLETED', 'CANCELLED')
                         THEN excluded.available_at
                         WHEN maintenance_jobs.status='BUDGET_WAIT'
                         THEN maintenance_jobs.available_at
@@ -8772,17 +8847,17 @@ class MemoryStorage:
                     END,
                     status=CASE
                         WHEN maintenance_jobs.status IN
-                            ('DONE', 'CANCELLED')
+                            ('DONE', 'COMPLETED', 'CANCELLED')
                         THEN 'PENDING'
                         ELSE maintenance_jobs.status
                     END,
                     attempts=CASE
                         WHEN maintenance_jobs.status IN
-                            ('DONE', 'CANCELLED')
+                            ('DONE', 'COMPLETED', 'CANCELLED')
                         THEN 0 ELSE maintenance_jobs.attempts END,
                     last_error=CASE
                         WHEN maintenance_jobs.status IN
-                            ('DONE', 'CANCELLED')
+                            ('DONE', 'COMPLETED', 'CANCELLED')
                         THEN '' ELSE maintenance_jobs.last_error END,
                     updated_at=CURRENT_TIMESTAMP
                 """,
@@ -8950,6 +9025,8 @@ class MemoryStorage:
     ) -> None:
         self._assert_scope(umo)
         normalized = str(status or "DONE").strip().upper()
+        if normalized == "COMPLETED":
+            normalized = "DONE"
         if normalized not in {"DONE", "CANCELLED"}:
             raise ValueError("maintenance completion status is invalid")
         with self._lock, self._connection:
@@ -8963,6 +9040,30 @@ class MemoryStorage:
             ).rowcount
         if not updated:
             raise ValueError("maintenance job is not running")
+
+    def release_maintenance_job(
+        self,
+        *,
+        umo: str,
+        job_id: int,
+        now: int | None = None,
+    ) -> bool:
+        """Return an interrupted worker lease to the pending queue."""
+
+        self._assert_scope(umo)
+        current = int(now or time.time())
+        with self._lock, self._connection:
+            updated = self._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='PENDING', attempts=max(0, attempts - 1),
+                    available_at=?, lease_until=NULL, last_error='',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND umo=? AND status='RUNNING'
+                """,
+                (current, int(job_id), umo),
+            ).rowcount
+        return bool(updated)
 
     def fail_maintenance_job(
         self,

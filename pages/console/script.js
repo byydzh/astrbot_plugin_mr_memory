@@ -326,6 +326,8 @@ function renderRuntimeHealth(scope) {
   const pending = Number(proposalStatus.pending || 0);
   const provisional = Number(hypothesisStatus.provisional || 0);
   const budgetWait = Number(jobStatus.budget_wait || 0);
+  const recallFailures = Number(reconstruction.failed || 0);
+  const feedbackFailures = Number(feedback.failed || 0);
   const effectiveFeedback = Number(feedback.committed || 0) + Number(feedback.provisional || 0);
   const decidedFeedback = effectiveFeedback
     + Number(feedback.ignored || 0)
@@ -370,8 +372,19 @@ function renderRuntimeHealth(scope) {
     issues.push(`反馈分析 p50 为 ${formatDuration(feedback.p50_elapsed_ms)}`);
   }
   if (budgetWait) issues.push(`${formatNumber(budgetWait)} 个反馈任务等待额度`);
-  if (Number(reconstruction.timeouts || 0)) {
-    issues.push(`${formatNumber(reconstruction.timeouts)} 次回答前回忆超时`);
+  if (recallFailures) {
+    const timeouts = Number(reconstruction.timeouts || 0);
+    issues.push(
+      `${formatNumber(recallFailures)} 次回答前回忆失败`
+      + (timeouts ? `（其中 ${formatNumber(timeouts)} 次超时）` : ""),
+    );
+  }
+  if (feedbackFailures) {
+    const timeouts = Number(feedback.timeouts || 0);
+    issues.push(
+      `${formatNumber(feedbackFailures)} 次反馈分析失败`
+      + (timeouts ? `（其中 ${formatNumber(timeouts)} 次超时）` : ""),
+    );
   }
 
   if (issues.length) {
@@ -416,6 +429,7 @@ function renderRuntimeCalls(calls) {
     ignored: "普通聊天",
     rejected: "未采用",
     failed: "失败",
+    running: "进行中",
     completed: "已完成",
   };
   const pathNames = {
@@ -423,21 +437,35 @@ function renderRuntimeCalls(calls) {
     deep_escalation: "判断后深挖",
     deep_forced: "主动深挖",
     one_pass_batch: "合并判断",
+    one_pass_feedback_learning: "一次判断并学习",
     semantic_gate_then_learn: "先判断，必要时学习",
     legacy: "旧版多轮",
   };
   calls.forEach((call) => {
-    const outcomes = String(call.outcome || "")
+    let outcome = String(call.outcome || "");
+    if (outcome === "failed") {
+      if (call.error_type === "TimeoutError") outcome = "超时";
+      else if (call.error_type === "ValueError") outcome = "校验失败";
+    }
+    const outcomes = outcome
       .split(",")
       .filter(Boolean)
       .map((value) => outcomeNames[value] || value)
       .join("、");
     const row = document.createElement("tr");
+    const outcomeCell = textElement("td", outcomes || "—");
+    if (call.error_detail) outcomeCell.title = String(call.error_detail);
+    const elapsedCell = textElement("td", formatDuration(call.elapsed_ms));
+    elapsedCell.title = [
+      `端到端 ${formatDuration(call.elapsed_ms)}`,
+      `模型 ${formatDuration(call.llm_elapsed_ms)}`,
+      call.first_chunk_ms ? `首段 ${formatDuration(call.first_chunk_ms)}` : "",
+    ].filter(Boolean).join(" · ");
     row.append(
       textElement("td", formatTime(call.started_at)),
       textElement("td", phaseNames[call.phase] || call.phase),
-      textElement("td", outcomes || "—"),
-      textElement("td", formatDuration(call.elapsed_ms)),
+      outcomeCell,
+      elapsedCell,
       textElement("td", formatNumber(call.tokens)),
       textElement("td", pathNames[call.path] || call.path || "—"),
     );
