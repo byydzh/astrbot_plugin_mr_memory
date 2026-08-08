@@ -6,14 +6,68 @@ import unittest
 from mr_memory.runtime import (
     feedback_packet_edge_ids,
     feedback_packet_evidence,
-    parse_feedback_attribution_plan,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
+    parse_structured_response,
     reconstruction_packet_allowlist,
+    structured_response_candidates,
 )
 
 
 class RuntimePlanTests(unittest.TestCase):
+    @staticmethod
+    def none_plan() -> dict[str, object]:
+        return {
+            "decision": "none",
+            "memory_brief": {"claims": [], "conflicts": [], "unresolved": []},
+            "activate_hypotheses": [],
+            "activate_edges": [],
+            "escalation_question": "",
+        }
+
+    def test_terminal_json_is_recovered_without_accepting_scratch_objects(self) -> None:
+        value = (
+            'provider note {"diagnostic":true}\n'
+            + json.dumps(self.none_plan(), ensure_ascii=False)
+        )
+        plan = parse_reconstruction_plan(value, allowed_source_keys=set())
+        self.assertEqual(plan.decision, "none")
+
+        reasoning = (
+            "分析完成。\n```json\n"
+            + json.dumps(self.none_plan(), ensure_ascii=False)
+            + "\n```"
+        )
+        parsed, source = parse_structured_response(
+            completion_text="",
+            reasoning_content=reasoning,
+            parser=lambda item: parse_reconstruction_plan(
+                item,
+                allowed_source_keys=set(),
+            ),
+        )
+        self.assertEqual(parsed.decision, "none")
+        self.assertEqual(source, "reasoning_terminal")
+
+        self.assertEqual(
+            structured_response_candidates(
+                "",
+                json.dumps(self.none_plan()) + "\n仍在推理，尚未形成最终回答",
+            ),
+            (),
+        )
+        with self.assertRaisesRegex(ValueError, "terminal JSON"):
+            parse_structured_response(
+                completion_text="",
+                reasoning_content=(
+                    json.dumps(self.none_plan()) + "\n仍在推理，尚未形成最终回答"
+                ),
+                parser=lambda item: parse_reconstruction_plan(
+                    item,
+                    allowed_source_keys=set(),
+                ),
+            )
+
     def test_one_pass_reconstruction_is_grounded_and_bounded(self) -> None:
         plan = parse_reconstruction_plan(
             json.dumps(
@@ -155,47 +209,6 @@ class RuntimePlanTests(unittest.TestCase):
                 proposal_evidence={1: {"feedback-1"}, 2: {"feedback-2"}},
             )
 
-    def test_feedback_attribution_is_complete_and_trace_bounded(self) -> None:
-        items = parse_feedback_attribution_plan(
-            {
-                "items": [
-                    {
-                        "proposal_id": 1,
-                        "verdict": "learn",
-                        "target_trace_id": "trace-1",
-                        "feedback_valence": -0.8,
-                        "confidence": 0.7,
-                    },
-                    {
-                        "proposal_id": 2,
-                        "verdict": "ignore",
-                        "target_trace_id": "invented-is-cleared",
-                        "feedback_valence": 0,
-                        "confidence": 0.4,
-                    },
-                ]
-            },
-            eligible_trace_ids={1: {"trace-1"}, 2: {"trace-2"}},
-        )
-        self.assertEqual(items[0].target_trace_id, "trace-1")
-        self.assertEqual(items[1].target_trace_id, "")
-
-        with self.assertRaises(ValueError):
-            parse_feedback_attribution_plan(
-                {
-                    "items": [
-                        {
-                            "proposal_id": 1,
-                            "verdict": "learn",
-                            "target_trace_id": "invented",
-                            "feedback_valence": -1,
-                            "confidence": 0.8,
-                        }
-                    ]
-                },
-                eligible_trace_ids={1: {"trace-1"}},
-            )
-
     def test_allowlists_follow_only_the_delivered_packet(self) -> None:
         sources, hypotheses, edges = reconstruction_packet_allowlist(
             {
@@ -234,6 +247,27 @@ class RuntimePlanTests(unittest.TestCase):
             }
         )
         self.assertEqual(edge_ids, {4: {12}})
+
+    def test_feedback_packet_allowlists_accept_runtime_nested_proposal(self) -> None:
+        packet = {
+            "items": [
+                {
+                    "proposal": {"id": 12, "surface_score": 0.8},
+                    "evidence": {
+                        "feedback": {"source_key": "feedback:12"},
+                        "activated_plastic_edges": [
+                            {"edge_id": 37, "relation": "corrects"}
+                        ],
+                    },
+                }
+            ]
+        }
+
+        self.assertEqual(
+            feedback_packet_evidence(packet),
+            {12: {"feedback:12"}},
+        )
+        self.assertEqual(feedback_packet_edge_ids(packet), {12: {37}})
 
 
 if __name__ == "__main__":

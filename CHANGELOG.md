@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.3
+
+- Normalize the legacy maintenance terminal state `COMPLETED` to `DONE` so a
+  deduplicated feedback job can be scheduled again after hot reload.
+- Read experiment statuses case-insensitively, keep in-flight calls distinct
+  from failures, and report end-to-end wall latency even when a timed-out call
+  has no provider usage record.
+- Recover a terminal structured object from provider output or terminal
+  reasoning; when strict validation still fails, make one protocol-only repair
+  call while preserving full reasoning for the primary semantic decision.
+- Reuse an active host-owned relation definition during ordinary edge upserts;
+  only an explicit relation revision may create a new schema version.
+- Show actual failure types and running calls in the runtime console instead of
+  labeling every uppercase completed run as failed.
+- Preserve validation details and model/host latency in recent-call diagnostics;
+  cancelled housekeeping jobs no longer appear as live operational errors.
+- Accept the runtime packet's nested proposal identity when deriving feedback
+  evidence allowlists; explicitly reopen failed feedback batches while proposals
+  remain, and release worker leases immediately on plugin hot reload.
+- Replace serial attribution, per-item Harrier association lookup, and synthesis
+  with one full-reasoning feedback decision. Host validation still bounds trace,
+  account, evidence, edge, and group identity.
+
 ## 0.16.2
 
 - Atomically validate distillation source snapshots, graph writes, coverage

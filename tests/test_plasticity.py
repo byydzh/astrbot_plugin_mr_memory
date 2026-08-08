@@ -134,6 +134,49 @@ class PlasticGraphTests(unittest.TestCase):
             2,
         )
 
+    def test_upsert_reuses_active_relation_definition_until_explicit_revision(self) -> None:
+        first = self.message("e-1", "鉴定为好女孩", sent_at=100)
+        second = self.message("e-2", "这里也是群内反话", sent_at=110)
+        self.storage.upsert_message(first)
+        self.storage.upsert_message(second)
+        self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(
+                self.edge_payload(first.resolved_source_key())
+            ),
+        )
+
+        repeated = self.edge_payload(second.resolved_source_key())
+        repeated["relation"] = {
+            "key": "group_usage",
+            "name": "群聊特殊用法",
+            "description": "模型对同一稳定关系键生成了不同措辞",
+            "source_kinds": ["symbol"],
+            "target_kinds": ["concept"],
+        }
+        repeated["target"] = {
+            "kind": "concept",
+            "label": "反话",
+            "description": "局部语境中的非字面表达",
+        }
+        result = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(repeated),
+        )
+        self.assertEqual(result["relation_version"], 1)
+        self.assertTrue(result["relation_definition_reused"])
+        rows = self.storage._connection.execute(
+            """
+            SELECT version, canonical_name FROM relation_types
+            WHERE umo=? AND relation_key='group_usage'
+            """,
+            (self.umo,),
+        ).fetchall()
+        self.assertEqual(
+            [(int(row["version"]), str(row["canonical_name"])) for row in rows],
+            [(1, "群内用法")],
+        )
+
     def test_competing_meanings_keep_doubt_until_evidence_revision(self) -> None:
         first = self.message("e-1", "鉴定为好女孩", sent_at=100)
         second = self.message("e-2", "这里的好女孩是不是反话？", sent_at=110)
@@ -358,6 +401,32 @@ class PlasticGraphTests(unittest.TestCase):
             [],
         )
         self.storage.finish_maintenance_job(umo=self.umo, job_id=job_id)
+
+    def test_cancelled_worker_releases_maintenance_lease_without_spending_attempt(self) -> None:
+        job_id = self.storage.enqueue_maintenance_job(
+            umo=self.umo,
+            job_type="feedback",
+            dedupe_key="feedback:cancelled-worker",
+            available_at=100,
+        )
+        claimed = self.storage.claim_maintenance_job(
+            umo=self.umo,
+            job_id=job_id,
+            now=100,
+            lease_seconds=3600,
+        )
+        self.assertEqual(claimed["attempts"], 1)
+
+        self.assertTrue(
+            self.storage.release_maintenance_job(
+                umo=self.umo,
+                job_id=job_id,
+                now=101,
+            )
+        )
+        pending = self.storage.pending_maintenance_jobs(umo=self.umo, now=101)
+        self.assertEqual([row["id"] for row in pending], [job_id])
+        self.assertEqual(pending[0]["attempts"], 0)
 
     def test_terminal_maintenance_job_only_retries_when_explicit(self) -> None:
         job_id = self.storage.enqueue_maintenance_job(

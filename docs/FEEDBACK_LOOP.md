@@ -9,7 +9,7 @@
 ```text
 主请求 -> 活动工作图 -> 主 Agent 行动/回复
                       |
-后续群消息 -> reply/词面快门 -> 后台队列 -> 私有维护 Agent -> 宿主校验事务
+后续群消息 -> reply/词面快门 -> 后台队列 -> 一次语义判断/学习 -> 宿主校验事务
                                       |
                  反馈节点 <- 反向效用归因 -> 前瞻假设
                            \-> 可塑语义边/动态关系类型
@@ -29,8 +29,9 @@
   只会提高已有信号的分数，不能单独打开快门。
 - sender 假设只能检索当前反馈发送者及群级假设；修改已有假设时还会校验 scope、时间和
   合并状态。
-- 自动修改要求 `abs(feedback_valence) * confidence >= feedback_min_commit_score`；默认
-  为 `0.65`，群级规则最低为 `0.8`。
+- `abs(feedback_valence) * confidence` 达到 `feedback_min_commit_score` 才进入活动视图；
+  默认阈值为 `0.65`，群级规则最低为 `0.8`。较弱但可归因的证据写为 `PROVISIONAL`，
+  后续一致反馈可以提升它，而不是直接遗失。
 - `activation_mode=always` 仅用于跨主题的通用表达偏好，且不得带 trigger；
   `activation_mode=semantic` 用于任务条件规则，必须带至少一个证据来源的 trigger。
 - 词面 trigger 只负责廉价快门；没有命中字面词时，私有潜意识 Agent 可在有界候选集中
@@ -41,7 +42,8 @@
 - 负向抑制/废弃只能指向目标回答 trace 中实际激活的可塑边；维护时才搜索到的替代路径
   不能为旧回答承担负向 credit。
 - 写入、反馈边、证据关系和 proposal 状态在一个 SQLite 事务中提交。
-- 私有维护、构建和重建共享每群滚动 token 预算；达到预算后 fail-open，不阻断主回复。
+- 反馈学习与回答前回忆/增量构建使用两套按群滚动 token 预算；达到预算后 fail-open，
+  不阻断主回复。
 
 ## 保留、合并与遗忘
 
@@ -53,8 +55,9 @@
 
 `feedback_learning_enabled` 默认关闭，并且依赖 `capture_enabled=true`。开启后，只有通过
 快门的后续消息进入有界后台队列，由低价私有 Provider 每次最多处理
-`feedback_max_pending_per_wake` 条；维护不再同步阻塞下一次主请求。维护和重建 token 进入
-按群 ledger。线上是否自动唤醒由 `runtime_wake_mode` 控制，后续反馈归因范围由
+`feedback_max_pending_per_wake` 条。一次完整语义调用同时完成归因与最小学习计划，模型仍
+保留完整思考；宿主不再把 Harrier 去重检索放在提交关键路径。维护不再同步阻塞下一次主请求，
+所有调用进入按群 ledger。线上是否自动唤醒由 `runtime_wake_mode` 控制，后续反馈归因范围由
 `feedback_window_hours` 明确显示；两者不再依赖隐藏默认值。
 
 真实历史遮罩 A/B 的样本、评分矩阵和 token 见 [开发记录](DEVELOPMENT_LOG.md)。原始群聊
