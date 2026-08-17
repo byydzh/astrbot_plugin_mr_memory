@@ -4,14 +4,17 @@ import json
 import unittest
 
 from mr_memory.runtime import (
+    feedback_decision_graph_mutation,
     feedback_packet_edge_ids,
     feedback_packet_evidence,
+    materialize_reconstruction_packet,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
     parse_structured_response,
     reconstruction_packet_allowlist,
     structured_response_candidates,
 )
+from mr_memory.feedback import FeedbackDecision
 
 
 class RuntimePlanTests(unittest.TestCase):
@@ -268,6 +271,93 @@ class RuntimePlanTests(unittest.TestCase):
             {12: {"feedback:12"}},
         )
         self.assertEqual(feedback_packet_edge_ids(packet), {12: {37}})
+
+    def test_materialized_reconstruction_preserves_epistemic_state(self) -> None:
+        packet = {
+            "semantic_evidence": [
+                {
+                    "memory": {
+                        "id": 1,
+                        "content": "甲说自己不喜欢密集构图。",
+                        "confidence": 0.83,
+                        "epistemic_status": "ASSERTED",
+                        "status": "ACTIVE",
+                    },
+                    "evidence": [{"source_key": "message-1"}],
+                },
+                {
+                    "memory": {
+                        "id": 2,
+                        "content": "“好女孩”可能是群内反话。",
+                        "confidence": 0.58,
+                        "epistemic_status": "JOKE",
+                        "status": "ACTIVE",
+                    },
+                    "evidence": [{"source_key": "message-2"}],
+                },
+            ],
+            "expanded_episodes": [],
+            "feedback_hypothesis_evidence": [],
+            "candidates": {
+                "associations": [
+                    {
+                        "id": 9,
+                        "score": 0.71,
+                        "statement": "好女孩在该语境中存在竞争释义。",
+                        "source_keys": ["message-3"],
+                        "epistemic_confidence": 0.61,
+                        "epistemic_state": "CONTESTED",
+                    },
+                    {
+                        "id": 10,
+                        "statement": "未被本次查询召回的背景边。",
+                        "source_keys": ["message-4"],
+                        "epistemic_state": "SUPPORTED",
+                    },
+                ]
+            },
+        }
+        result = materialize_reconstruction_packet(packet, query="好女孩")
+        self.assertIsNotNone(result.brief)
+        assert result.brief is not None
+        self.assertEqual(len(result.brief.claims), 1)
+        self.assertEqual(len(result.brief.unresolved), 1)
+        self.assertEqual(len(result.brief.conflicts), 1)
+        self.assertEqual(result.edge_ids, (9,))
+        self.assertEqual(
+            result.source_keys,
+            ("message-1", "message-2", "message-3"),
+        )
+
+    def test_committed_feedback_has_a_default_forward_graph_path(self) -> None:
+        decision = FeedbackDecision(
+            target_trace_id="trace-1",
+            mutation="upsert",
+            feedback_valence=-1.0,
+            confidence=0.72,
+            scope_type="sender",
+            scope_key="user-a",
+            aspect="image_density",
+            statement="生成图的元素太密集。",
+            prospective_cue="后续生图减少同时出现的元素。",
+            trigger_cues=("生图", "画图"),
+            activation_mode="semantic",
+        )
+        mutation = feedback_decision_graph_mutation(
+            decision,
+            evidence_source_keys=["feedback-1", "request-1"],
+            hypothesis_status="PROVISIONAL",
+        )
+        self.assertIsNotNone(mutation)
+        assert mutation is not None
+        self.assertEqual(mutation.operation, "upsert_edge")
+        self.assertEqual(mutation.relation.key, "guides_response")
+        self.assertEqual(mutation.source.label, "生图")
+        self.assertEqual(mutation.epistemic_state, "HYPOTHESIS")
+        self.assertEqual(
+            mutation.evidence_source_keys,
+            ("feedback-1", "request-1"),
+        )
 
 
 if __name__ == "__main__":

@@ -3,9 +3,10 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.16.3 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
+0.17.0 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
 可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
-或 `CONFIRMED`；embedding 只生成候选，语义状态与遍历停止由独立潜意识 LLM 判断。
+或 `CONFIRMED`；embedding 只生成候选，图的语义状态由独立潜意识 LLM 维护，自动回答时
+由 AstrBot 主 LLM 判断候选是否相关。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -27,11 +28,13 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
 - `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
-- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会尝试潜意识重建；
-  可切换为 `manual_only`，仅允许主 Agent 主动咨询。
+- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会读取后台已经整理好的
+  本地工作记忆，不再额外等待一次网络 LLM；可切换为 `manual_only`。主 Agent 主动调用咨询
+  工具时仍由独立潜意识模型执行多步深挖。
 - 新消息达到 `auto_distillation_min_pending=150` 时立即整理；不足 150 条时，最迟由
   `maintenance_interval_minutes=1440`（一天）的后台轮询触发。
-- 回答前回忆和新消息整理使用 `private_daily_token_budget`；反馈学习使用独立的
+- 主动潜意识深挖和新消息整理使用 `private_daily_token_budget`；普通回答前的本地工作记忆
+  不调用网络模型。反馈学习使用独立的
   `feedback_daily_token_budget`。外部运维工具一次性写入的旧历史只保留独立审计账本，
   不设伪装成日常策略的每日额度，也不会挤占这两类在线预算。
 - 数据库固定写入本插件的 `plugin_data` 目录。
@@ -68,10 +71,11 @@ embedding candidate initialization (Cue / Episode / Semantic / Topic)
         v
 LLM-composable bounded traversal toolkit
         |
-        v
-private provider tool loop (DeepSeek by default)
+        +-- automatic local, evidence-bound working-memory brief
         |
-        +-- automatic bounded memory brief before main LLM request
+        v
+private provider tool loop (DeepSeek by default, maintenance/manual deep recall)
+        |
         +-- bounded feedback maintenance and prospective activation
         +-- persistent bounded operational state and resumable maintenance jobs
         +-- one optional consultation tool visible to the main LLM
@@ -83,18 +87,19 @@ private provider tool loop (DeepSeek by default)
 插件私有 LLM 的工具循环；主 LLM 默认只能接收有长度上限的证据摘要，或调用
 `mr_consult_subconscious` 请求一次更聚焦的重建。
 
-插件调用自己配置的 provider，不继承当前会话主 LLM。自动回答前回忆先由宿主一次性收集
-本群候选情节、原始消息、人物事实、竞争释义和反馈行为记忆，再交给独立模型做一次完整推理。
-模型只能返回“提供简报”“没有相关记忆”或“需要深挖”；只有第三种才进入旧的多轮工具遍历，
-管理员/主模型主动咨询仍可直接深挖。若当前群还没有任何图记忆，自动唤醒会直接跳过。
-embedding 只提供候选先验，不用固定相似度裁决语义。最终 claim、conflict 与 unresolved
+插件调用自己配置的 provider，不继承当前会话主 LLM。后台增量整理与反馈学习由该独立模型
+维护情节、人物事实、竞争释义和行为通路；普通回答前只在本群 SQLite 与本地 embedding 上
+生成带原始证据键的候选简报，交给 AstrBot 主 LLM 判断是否相关，因此不再串行增加一次网络
+模型时延或 Token。管理员/主模型主动咨询仍可调用独立潜意识模型执行多步图遍历。若当前群
+还没有任何图记忆，自动唤醒会直接跳过。embedding 只提供候选先验，不用固定相似度裁决
+语义。最终 claim、conflict 与 unresolved
 项都必须引用本轮实际访问的 source key，否则整份简报被宿主拒绝，而不是把未验证自由文本
 交给主 LLM。每次调用单独记录首块延迟、总耗时、Token、路径与结果。
 
 消息按 per-message checkpoint 增量整理：批次只选择最早的 `PENDING/FAILED` 消息，附带
 只读重叠上下文，成功后逐条推进；编辑或撤回会使派生图失效并重新排队。达到消息阈值或
-维护周期后由有界后台 worker 池处理，不阻塞主回复。后台整理使用独立长超时，主请求的
-潜意识重建仍保留较短超时。自动 worker 只处理适配器实时观察到的 `LIVE` 消息；一次性
+维护周期后由有界后台 worker 池处理，不阻塞主回复。后台整理使用独立长超时，主模型主动
+发起的潜意识深挖仍保留较短超时。自动 worker 只处理适配器实时观察到的 `LIVE` 消息；一次性
 `BACKFILL` 只能由管理员显式调用，启动恢复和周期 sweeper 都不会自行消费它。DeepSeek V4
 整理默认开启完整思考并流式消费响应；输出上限
 跟随当前 DSV4 的 384k 能力，不再用 4k/8k/32k 截断冒充成本控制。管理员仍可执行 `/mrmem distill`
@@ -122,10 +127,11 @@ LLM 必须为每条目标消息提供图证据或放入紧凑的批内忽略 ID 
 仪表盘共用登录鉴权，无需开放额外端口，提供：
 
 - 用最近 24 小时真实数据判断回答前回忆与反馈学习是否达到时延目标；
-- 逐次显示任务、结果、耗时、Token 与“一次判断/必要时深挖/先判断，必要时学习”路径；
+- 逐次显示任务、结果、耗时、Token 与“本地工作记忆/主动深挖/一次反馈学习”路径；点击任意
+  一行可查看该次调用的证据、公开简报、行为假设和图修改子图；
 - 显示反馈积压、待验证行为记忆、额度等待和最久等待时间；
 - 直接显示生效范围、回答前回忆、整理触发、反馈窗口与本地语义检索模型；
-- 分别重置当前群的回忆/整理额度和反馈额度，同时保留不可变的原始账单；
+- 分别重置当前群的深挖/整理额度和反馈额度，同时保留不可变的原始账单；
 - 所有已知群范围的消息量、图记忆量、向量量和数据库占用概览；
 - Cue--Tag--Episode、Participant--Aspect--Structured Claim、Topic--Episode 图谱；
 - Participant 节点、账号主键、当前群名片、别名历史和重名歧义计数；

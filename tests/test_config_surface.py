@@ -61,6 +61,21 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertIn("async function waitForPluginBridge", script)
         self.assertIn("await waitForPluginBridge()", script)
 
+    def test_recent_calls_open_an_evidence_graph_detail(self) -> None:
+        html = (Path.cwd() / "pages" / "console" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        script = (Path.cwd() / "pages" / "console" / "script.js").read_text(
+            encoding="utf-8"
+        )
+        web_api = (Path.cwd() / "mr_memory" / "web_api.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('id="run-detail-dialog"', html)
+        self.assertIn("function openRunDetail", script)
+        self.assertIn("graph.exact_memory_brief", script)
+        self.assertIn('"scopes/<scope_id>/runs/<run_id>"', web_api)
+
 
 if __name__ == "__main__":
     unittest.main()

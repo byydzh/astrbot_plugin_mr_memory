@@ -53,14 +53,13 @@ from .mr_memory.plasticity import (
 )
 from .mr_memory.provider_compat import generate_with_enforced_options
 from .mr_memory.runtime import (
-    FAST_RECONSTRUCTION_SYSTEM_PROMPT,
     FEEDBACK_BATCH_SYSTEM_PROMPT,
+    feedback_decision_graph_mutation,
     feedback_packet_edge_ids,
     feedback_packet_evidence,
+    materialize_reconstruction_packet,
     parse_feedback_batch_plan,
-    parse_reconstruction_plan,
     parse_structured_response,
-    reconstruction_packet_allowlist,
 )
 from .mr_memory.scope import GroupMemoryScope, GroupScopeError
 from .mr_memory.service import MemoryService
@@ -850,6 +849,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._pending_main_tools: dict[tuple[int, str], list[str]] = {}
         self._feedback_candidate_ids: dict[int, set[int]] = {}
         self._active_feedback_proposals: dict[int, tuple[str, int]] = {}
+        self._inflight_interaction_tasks: set[asyncio.Task[Any]] = set()
+        self._inflight_runtime_tasks: set[asyncio.Task[Any]] = set()
         self._scope_event_carriers: dict[str, AstrMessageEvent] = {}
         self._distillation_maintenance_queue: asyncio.Queue[
             tuple[int, str, GroupMemoryScope]
@@ -1886,6 +1887,21 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             path_source=path_source,
             path_target=path_target,
         )
+
+    async def _web_memory_run_detail(
+        self,
+        *,
+        scope_id: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        scope, service = self._service_for_storage_id(scope_id)
+        detail = await service.experiment_detail(
+            run_id=run_id,
+            umo=scope.key,
+        )
+        if detail is None:
+            raise FileNotFoundError("当前群聊中不存在这条调用记录")
+        return {"scope_id": scope.storage_id, **detail}
 
     async def _web_memory_participants(
         self,
@@ -2996,67 +3012,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "conclusion or qualification."
         )
 
-    async def _run_fast_reconstruction_with_ledger(
-        self,
-        *,
-        provider: Any,
-        service: MemoryService,
-        run_id: str,
-        prompt: str,
-        call_index: int = 0,
-        thinking_mode: str = "enabled",
-    ) -> tuple[Any, float]:
-        """Run one full-reasoning semantic decision over host-prefetched evidence."""
-
-        started = time.perf_counter()
-        first_chunk_ms = 0.0
-
-        def observe_stream(_chunk_count: int, _response: Any) -> None:
-            nonlocal first_chunk_ms
-            if first_chunk_ms <= 0:
-                first_chunk_ms = (time.perf_counter() - started) * 1000
-
-        options = distillation_generation_options(
-            model_name=_provider_model_name(provider),
-            max_tokens=self.distillation_max_output_tokens,
-            thinking_mode=thinking_mode,
-        )
-        thinking = options.get("thinking")
-        stream = (
-            isinstance(thinking, dict)
-            and str(thinking.get("type") or "").casefold() == "enabled"
-        )
-        response = await generate_with_enforced_options(
-            provider=provider,
-            fallback_generate=self.context.llm_generate,
-            chat_provider_id=self.subconscious_provider_id,
-            prompt=prompt,
-            system_prompt=FAST_RECONSTRUCTION_SYSTEM_PROMPT,
-            options=options,
-            stream=stream,
-            on_stream_progress=observe_stream,
-        )
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        usage = TokenUsageRecord.from_value(response.usage)
-        await service.record_llm_usage(
-            run_id=run_id,
-            phase="reconstruction",
-            arm="memory",
-            call_index=call_index,
-            provider_id=self.subconscious_provider_id,
-            model=_provider_model_name(provider),
-            input_other=usage.input_other,
-            input_cached=usage.input_cached,
-            output=usage.output,
-            elapsed_ms=elapsed_ms,
-            usage_source=(
-                "astrbot_response_one_pass"
-                if call_index == 0
-                else "astrbot_response_protocol_repair"
-            ),
-        )
-        return response, first_chunk_ms
-
     async def _run_private_agent_with_ledger(
         self,
         *,
@@ -3158,10 +3113,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
 
         if not self.subconscious_enabled:
             return "error: MR Memory subconscious agent is disabled."
-        if not self.subconscious_provider_id:
+        if force and not self.subconscious_provider_id:
             return "error: No subconscious provider is configured."
         if error := self._tool_guard(event):
             return error
+        runtime_task = asyncio.current_task()
+        if runtime_task is not None:
+            self._inflight_runtime_tasks.add(runtime_task)
+            runtime_task.add_done_callback(self._inflight_runtime_tasks.discard)
         scope = self._group_scope(event)
         lock = self._wake_locks.setdefault(scope.key, asyncio.Lock())
         if not force and lock.locked():
@@ -3180,6 +3139,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
         finally:
             lock.release()
+            if runtime_task is not None:
+                self._inflight_runtime_tasks.discard(runtime_task)
 
     async def _run_subconscious_locked(
         self,
@@ -3188,9 +3149,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         *,
         force: bool = False,
     ) -> str:
+        runtime_started = time.perf_counter()
         if not self.subconscious_enabled:
             return "error: MR Memory subconscious agent is disabled."
-        if not self.subconscious_provider_id:
+        if force and not self.subconscious_provider_id:
             return "error: No subconscious provider is configured."
         if error := self._tool_guard(event):
             return error
@@ -3198,7 +3160,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         scope = self._group_scope(event)
         umo = scope.key
         service = self._service_for_scope(scope)
-        if not await self._private_budget_available(scope=scope, service=service):
+        if force and not await self._private_budget_available(
+            scope=scope,
+            service=service,
+        ):
             return "NO_RELEVANT_MEMORY"
         normalized = self._normalize_event(event)
         request_at = int(normalized.sent_at or time.time())
@@ -3213,12 +3178,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         if await service.count_graph_units(umo=umo) == 0 and not feedback_candidates:
             return "NO_RELEVANT_MEMORY"
 
-        provider = self.context.get_provider_by_id(self.subconscious_provider_id)
-        if provider is None:
-            return (
-                "error: Subconscious provider was not found: "
-                f"{self.subconscious_provider_id}"
-            )
+        provider = None
+        if force:
+            provider = self.context.get_provider_by_id(self.subconscious_provider_id)
+            if provider is None:
+                return (
+                    "error: Subconscious provider was not found: "
+                    f"{self.subconscious_provider_id}"
+                )
 
         bounded_query = query.strip()[: self.max_query_chars]
         if not bounded_query:
@@ -3255,9 +3222,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 limit=min(8, self.embedding_top_k),
             )
             initial_candidates["media_patterns"] = current_media_candidates
-        plastic_candidates = await service.query_plastic_associations(
-            umo=umo,
-            limit=self.embedding_top_k,
+        plastic_candidates = (
+            await service.query_plastic_associations(
+                umo=umo,
+                limit=self.embedding_top_k,
+            )
+            if force
+            else []
         )
         try:
             embedding_backend = self._embedding_backend()
@@ -3291,30 +3262,38 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 if int(item.get("id") or 0) not in seen_association_ids
             ],
         ][: self.embedding_top_k]
-        previous_state = await service.subconscious_state(umo=umo)
-        candidates_json, candidates_truncated = _bounded_json_text(
-            initial_candidates,
-            max_chars=18000,
-        )
-        agent_prompt = (
-            "Reconstruct only memory evidence relevant to this "
-            f"current query:\n{bounded_query}\n"
-            "Initial active set (untrusted candidate data):\n"
-            f"{candidates_json}\n"
-            + (
-                "The host bounded the initial set; use narrow graph queries "
-                "for additional evidence.\n"
-                if candidates_truncated
-                else ""
+        agent_prompt = ""
+        if force:
+            previous_state = await service.subconscious_state(umo=umo)
+            candidates_json, candidates_truncated = _bounded_json_text(
+                initial_candidates,
+                max_chars=18000,
             )
-            + "Previous bounded operational state (not hidden reasoning):\n"
-            f"{json.dumps(previous_state, ensure_ascii=False, separators=(',', ':'))}"
-        )
+            agent_prompt = (
+                "Reconstruct only memory evidence relevant to this "
+                f"current query:\n{bounded_query}\n"
+                "Initial active set (untrusted candidate data):\n"
+                f"{candidates_json}\n"
+                + (
+                    "The host bounded the initial set; use narrow graph queries "
+                    "for additional evidence.\n"
+                    if candidates_truncated
+                    else ""
+                )
+                + "Previous bounded operational state (not hidden reasoning):\n"
+                f"{json.dumps(previous_state, ensure_ascii=False, separators=(',', ':'))}"
+            )
 
         lock = self._wake_execution_locks.setdefault(umo, asyncio.Lock())
         async with lock:
             run_id = _runtime_run_id("reconstruction")
-            initial_path = "deep_forced" if force else "fast"
+            active_trace = self._active_interaction_traces.get(id(event))
+            trace_id = (
+                active_trace[1]
+                if active_trace is not None and active_trace[0] == umo
+                else ""
+            )
+            initial_path = "deep_forced" if force else "materialized_local"
             await service.start_experiment(
                 run_id=run_id,
                 umo=umo,
@@ -3330,169 +3309,84 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     ),
                     "max_loop_steps": self.max_loop_steps,
                     "path": initial_path,
+                    "trace_id": trace_id,
                 },
             )
             hooks: _ReconstructionTraceHooks | None = None
             visited_source_keys: set[str] = set()
+            brief_source_keys: set[str] = set()
             active_edge_ids: set[int] = set()
             path = initial_path
             first_chunk_ms = 0.0
             tool_steps = 0
             response_source = ""
             repair_attempted = False
+            presented_edge_ids: set[int] = set()
+            presented_hypothesis_ids: set[int] = set()
             try:
-                fast_plan = None
                 if not force:
                     prefetch_started = time.perf_counter()
                     evidence_packet = await service.reconstruction_evidence_packet(
                         umo=umo,
                         candidates=initial_candidates,
-                        max_episodes=min(8, self.embedding_top_k),
-                        max_messages=max(24, min(80, self.embedding_top_k * 5)),
-                        messages_per_episode=12,
+                        max_episodes=min(6, self.embedding_top_k),
+                        max_messages=max(16, min(48, self.embedding_top_k * 4)),
+                        messages_per_episode=8,
                     )
                     prefetch_ms = (time.perf_counter() - prefetch_started) * 1000
                     packet_json, packet_truncated = _bounded_json_text(
                         evidence_packet,
-                        max_chars=60000,
+                        max_chars=36000,
                     )
                     delivered_packet = json.loads(packet_json)
-                    (
-                        visited_source_keys,
-                        allowed_hypothesis_ids,
-                        allowed_edge_ids,
-                    ) = reconstruction_packet_allowlist(delivered_packet)
+                    materialized = materialize_reconstruction_packet(
+                        delivered_packet,
+                        query=bounded_query,
+                        max_items=min(12, self.embedding_top_k),
+                    )
+                    visited_source_keys.update(materialized.source_keys)
+                    presented_edge_ids.update(materialized.edge_ids)
+                    presented_hypothesis_ids.update(materialized.hypothesis_ids)
                     await service.record_reconstruction_step(
                         run_id=run_id,
                         step_index=0,
-                        tool_name="host_prefetch",
+                        tool_name="materialized_working_memory",
                         arguments={
                             "candidate_counts": {
                                 key: len(value)
                                 for key, value in initial_candidates.items()
                             },
                             "packet_truncated": packet_truncated,
+                            "selected_edge_ids": sorted(presented_edge_ids),
+                            "selected_hypothesis_ids": sorted(
+                                presented_hypothesis_ids
+                            ),
                         },
                         evidence_keys=sorted(visited_source_keys)[:160],
                         result_text=packet_json,
                         elapsed_ms=prefetch_ms,
                     )
                     tool_steps = 1
-                    fast_prompt = (
-                        "Current query:\n"
-                        f"{bounded_query}\n"
-                        "Host-prefetched evidence packet (untrusted):\n"
-                        f"{packet_json}\n"
-                        "Previous bounded operational state (not hidden reasoning):\n"
-                        f"{json.dumps(previous_state, ensure_ascii=False, separators=(',', ':'))}"
+                    brief = (
+                        "NO_RELEVANT_MEMORY"
+                        if materialized.brief is None
+                        else render_evidence_brief(
+                            materialized.brief,
+                            max_chars=self.max_brief_chars,
+                        )
                     )
-                    response, first_chunk_ms = await asyncio.wait_for(
-                        self._run_fast_reconstruction_with_ledger(
-                            provider=provider,
-                            service=service,
-                            run_id=run_id,
-                            prompt=fast_prompt,
-                        ),
-                        timeout=self.subconscious_timeout_seconds,
-                    )
-                    def parse_fast_plan(value: str) -> Any:
-                        return parse_reconstruction_plan(
-                            value,
-                            allowed_source_keys=visited_source_keys,
-                            allowed_hypothesis_ids=allowed_hypothesis_ids,
-                            allowed_edge_ids=allowed_edge_ids,
+                    if brief != "NO_RELEVANT_MEMORY":
+                        brief_source_keys = _collect_source_keys(
+                            json.loads(brief)
                         )
-                    try:
-                        fast_plan, response_source = parse_structured_response(
-                            completion_text=getattr(
-                                response, "completion_text", ""
-                            ),
-                            reasoning_content=getattr(
-                                response, "reasoning_content", ""
-                            ),
-                            parser=parse_fast_plan,
-                        )
-                    except ValueError as parse_error:
-                        repair_attempted = True
-                        logger.warning(
-                            "MR Memory reconstruction response violated the JSON "
-                            "contract; repairing once | umo=%s | run=%s | error=%s",
-                            umo,
-                            run_id,
-                            type(parse_error).__name__,
-                        )
-                        previous_completion = str(
-                            getattr(response, "completion_text", "") or ""
-                        )[-12000:]
-                        response, retry_first_chunk_ms = await asyncio.wait_for(
-                            self._run_fast_reconstruction_with_ledger(
-                                provider=provider,
-                                service=service,
-                                run_id=run_id,
-                                prompt=(
-                                    fast_prompt
-                                    + "\nThe previous full-reasoning call reached a result "
-                                    "but violated the required JSON contract. Serialize the "
-                                    "same evidence-grounded decision as exactly one valid "
-                                    "schema object and no prose. Do not add new claims.\n"
-                                    + f"Parser error: {str(parse_error)[:500]}\n"
-                                    + "Previous public completion:\n"
-                                    + previous_completion
-                                ),
-                                call_index=1,
-                                thinking_mode="disabled",
-                            ),
-                            timeout=self.subconscious_timeout_seconds,
-                        )
-                        if first_chunk_ms <= 0:
-                            first_chunk_ms = retry_first_chunk_ms
-                        fast_plan, response_source = parse_structured_response(
-                            completion_text=getattr(
-                                response, "completion_text", ""
-                            ),
-                            reasoning_content=getattr(
-                                response, "reasoning_content", ""
-                            ),
-                            parser=parse_fast_plan,
-                        )
-                    active_trace = self._active_interaction_traces.get(id(event))
-                    trace_id = (
-                        active_trace[1]
-                        if active_trace is not None and active_trace[0] == umo
-                        else ""
-                    )
-                    for hypothesis_id, relevance in fast_plan.hypothesis_activations:
-                        await service.activate_feedback_hypotheses(
-                            umo=umo,
-                            sender_id=normalized.sender_id,
-                            query=bounded_query,
-                            at=request_at,
-                            trace_id=trace_id or None,
-                            limit=1,
-                            selected=[
-                                {
-                                    "id": hypothesis_id,
-                                    "activation_score": relevance,
-                                }
-                            ],
-                            activation_method="one_pass_gate",
-                        )
-                    for edge_id, relevance in fast_plan.edge_activations:
-                        activated = await service.activate_plastic_edges(
-                            umo=umo,
-                            edge_ids=[edge_id],
-                            at=request_at,
-                            trace_id=trace_id,
-                            relevance=relevance,
-                        )
-                        if activated:
-                            active_edge_ids.add(edge_id)
-
-                should_deepen = force or (
-                    fast_plan is not None and fast_plan.decision == "escalate"
-                )
-                if should_deepen:
-                    path = "deep_forced" if force else "deep_escalation"
+                    # The main model sees the rendered brief, not internal edge IDs.
+                    # Keep those candidate IDs in the reconstruction step only.
+                    presented_edge_ids.clear()
+                    presented_hypothesis_ids.clear()
+                    response_source = "materialized_working_memory"
+                else:
+                    assert provider is not None
+                    path = "deep_forced"
                     hooks = _ReconstructionTraceHooks(
                         service=service,
                         run_id=run_id,
@@ -3501,19 +3395,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         host_gate_enabled=self.runtime_host_evidence_gate,
                         host_gate_min_score=self.host_gate_min_score,
                     )
-                    focused_prompt = agent_prompt
-                    if fast_plan is not None and fast_plan.escalation_question:
-                        focused_prompt += (
-                            "\nOne-pass gate escalation focus:\n"
-                            + fast_plan.escalation_question
-                        )
                     response = await asyncio.wait_for(
                         self._run_private_agent_with_ledger(
                             event=event,
                             provider=provider,
                             service=service,
                             run_id=run_id,
-                            prompt=focused_prompt,
+                            prompt=agent_prompt,
                             hooks=hooks,
                             candidate_hypothesis_ids={
                                 int(item["id"]) for item in feedback_candidates
@@ -3537,16 +3425,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         )
                     )
                     visited_source_keys.update(hooks.evidence_keys)
+                    if brief != "NO_RELEVANT_MEMORY":
+                        brief_source_keys = _collect_source_keys(
+                            json.loads(brief)
+                        )
                     active_edge_ids.update(hooks.plastic_edge_ids)
                     tool_steps += hooks.step_count
-                elif fast_plan is None or fast_plan.decision == "none":
-                    brief = "NO_RELEVANT_MEMORY"
-                else:
-                    assert fast_plan.brief is not None
-                    brief = render_evidence_brief(
-                        fast_plan.brief,
-                        max_chars=self.max_brief_chars,
-                    )
             except Exception as exc:
                 await service.finish_experiment(
                     run_id=run_id,
@@ -3559,26 +3443,67 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "first_chunk_ms": first_chunk_ms,
                         "response_source": response_source,
                         "repair_attempted": repair_attempted,
+                        "elapsed_ms": (
+                            time.perf_counter() - runtime_started
+                        ) * 1000,
                     },
                 )
                 raise
             bounded_brief = brief
+            memory_brief_value = (
+                None
+                if bounded_brief == "NO_RELEVANT_MEMORY"
+                else json.loads(bounded_brief)
+            )
+            if trace_id:
+                try:
+                    await service.record_memory_brief_trace(
+                        trace_id=trace_id,
+                        umo=umo,
+                        run_id=run_id,
+                        memory_brief=memory_brief_value,
+                        source_keys=sorted(brief_source_keys),
+                        path=path,
+                        presented_edge_ids=sorted(presented_edge_ids),
+                        presented_hypothesis_ids=sorted(
+                            presented_hypothesis_ids
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "MR Memory could not attach the memory brief trace | "
+                        "umo=%s | run=%s",
+                        umo,
+                        run_id,
+                    )
             await service.finish_experiment(
                 run_id=run_id,
                 status="completed",
                 result={
                     "brief_sha256": _stable_hash(bounded_brief),
                     "brief_chars": len(bounded_brief),
+                    "memory_brief": memory_brief_value,
                     "no_relevant_memory": (bounded_brief == "NO_RELEVANT_MEMORY"),
                     "host_evidence_gate": bool(
                         hooks and hooks.host_gate_decision is not None
                     ),
                     "visited_evidence_count": len(visited_source_keys),
+                    "visited_source_keys": sorted(visited_source_keys)[:160],
+                    "brief_source_keys": sorted(brief_source_keys)[:160],
+                    "presented_edge_ids": sorted(presented_edge_ids)[:64],
+                    "presented_hypothesis_ids": sorted(
+                        presented_hypothesis_ids
+                    )[:64],
+                    "activated_edge_ids": sorted(active_edge_ids)[:64],
+                    "trace_id": trace_id,
                     "tool_steps": tool_steps,
                     "path": path,
                     "first_chunk_ms": first_chunk_ms,
                     "response_source": response_source,
                     "repair_attempted": repair_attempted,
+                    "elapsed_ms": (
+                        time.perf_counter() - runtime_started
+                    ) * 1000,
                 },
             )
             await service.update_subconscious_state(
@@ -3953,12 +3878,27 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     )
                     mutation_results: list[dict[str, object]] = []
                     mutation_errors: list[str] = []
+                    mutations = list(plan.graph_mutations)
+                    fallback_mutation = False
                     if result.get("status") == "COMMITTED":
+                        if not mutations:
+                            materialized = feedback_decision_graph_mutation(
+                                plan.decision,
+                                evidence_source_keys=learning_evidence[
+                                    plan.proposal_id
+                                ],
+                                hypothesis_status=str(
+                                    result.get("hypothesis_status") or ""
+                                ),
+                            )
+                            if materialized is not None:
+                                mutations.append(materialized)
+                                fallback_mutation = True
                         allowed_negative_edges = learning_edge_ids.get(
                             plan.proposal_id,
                             set(),
                         )
-                        for mutation in plan.graph_mutations:
+                        for mutation in mutations:
                             try:
                                 mutation_result = await service.apply_graph_mutation(
                                     umo=scope.key,
@@ -3970,7 +3910,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                                     allowed_negative_edge_ids=allowed_negative_edges,
                                     feedback_proposal_id=plan.proposal_id,
                                 )
-                                mutation_results.append(mutation_result)
+                                mutation_results.append(
+                                    {
+                                        **mutation_result,
+                                        "proposal": mutation.as_dict(),
+                                        "origin": (
+                                            "host_materialized_feedback_path"
+                                            if fallback_mutation
+                                            else "model_graph_mutation"
+                                        ),
+                                    }
+                                )
                                 if mutation_result.get(
                                     "target_type"
                                 ) == "edge" and mutation_result.get("target_id"):
@@ -4001,7 +3951,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             ),
                             "commit_score": float(result.get("commit_score") or 0),
                             "graph_mutations": len(mutation_results),
+                            "graph_mutation_results": mutation_results,
                             "graph_mutation_errors": mutation_errors,
+                            "trace_id": str(result.get("trace_id") or ""),
+                            "hypothesis_id": int(result.get("hypothesis_id") or 0),
+                            "forward_path_materialized": (
+                                fallback_mutation and bool(mutation_results)
+                            ),
+                            "forward_path_attempted": fallback_mutation,
                             "stage": "one_pass_learning",
                         }
                     )
@@ -4072,6 +4029,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         query: str,
     ) -> list[dict[str, object]]:
         event_key = id(event)
+        interaction_task = asyncio.current_task()
+        if interaction_task is not None:
+            self._inflight_interaction_tasks.add(interaction_task)
+            interaction_task.add_done_callback(
+                self._inflight_interaction_tasks.discard
+            )
         if len(self._active_interaction_traces) > 128:
             self._active_interaction_traces.clear()
             self._trace_tool_counters.clear()
@@ -4987,6 +4950,22 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
 
     async def terminate(self) -> None:
+        current_task = asyncio.current_task()
+        inflight = {
+            task
+            for task in (
+                *self._inflight_interaction_tasks,
+                *self._inflight_runtime_tasks,
+            )
+            if task is not current_task and not task.done()
+        }
+        if inflight:
+            logger.info(
+                "MR Memory hot reload is waiting for %d active request(s) "
+                "before closing their databases.",
+                len(inflight),
+            )
+            await asyncio.gather(*inflight, return_exceptions=True)
         tasks = list(self._maintenance_tasks)
         self._maintenance_tasks.clear()
         tasks.extend(self._maintenance_wakeup_tasks.values())
@@ -5018,6 +4997,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._pending_main_tools.clear()
         self._feedback_candidate_ids.clear()
         self._active_feedback_proposals.clear()
+        self._inflight_interaction_tasks.clear()
+        self._inflight_runtime_tasks.clear()
         self._scope_event_carriers.clear()
         self._maintenance_enqueued.clear()
         self._runtime_initialized = False

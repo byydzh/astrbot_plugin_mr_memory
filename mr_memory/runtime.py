@@ -5,7 +5,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, TypeVar
 
-from .brief import EvidenceBrief, parse_evidence_brief
+from .brief import (
+    EvidenceBrief,
+    EvidenceClaim,
+    EvidenceQualification,
+    parse_evidence_brief,
+)
 from .feedback import FeedbackDecision, parse_feedback_decision
 from .plasticity import GraphMutation, parse_graph_mutation
 
@@ -381,6 +386,289 @@ class FeedbackPlan:
     proposal_id: int
     decision: FeedbackDecision
     graph_mutations: tuple[GraphMutation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedReconstruction:
+    """A bounded, already-grounded working-memory view for the host LLM.
+
+    Distillation and feedback maintenance remain LLM-driven.  This view merely
+    projects their persisted, vector-ranked results into the main AstrBot request,
+    so an ordinary chat does not wait for a second network model to restate data
+    that is already present in SQLite.
+    """
+
+    brief: EvidenceBrief | None
+    source_keys: tuple[str, ...]
+    edge_ids: tuple[int, ...]
+    hypothesis_ids: tuple[int, ...]
+
+
+def _materialized_sources(value: object) -> tuple[str, ...]:
+    found = _delivered_source_keys(value)
+    if isinstance(value, str) and value:
+        found.add(value)
+    elif isinstance(value, (list, tuple)):
+        found.update(str(item) for item in value if isinstance(item, str) and item)
+    return tuple(sorted(found))[:32]
+
+
+def materialize_reconstruction_packet(
+    packet: Mapping[str, object],
+    *,
+    query: str = "",
+    max_items: int = 12,
+) -> MaterializedReconstruction:
+    """Build a source-key-bound brief from the materialized memory graph.
+
+    Retrieval order is respected, but an embedding score is never converted into
+    an epistemic verdict.  Assertive, conflicted and unresolved states come only
+    from the stored memory objects.  The receiving AstrBot LLM remains the semantic
+    gate that decides whether any candidate is useful for its answer.
+    """
+
+    cap = max(1, min(24, int(max_items)))
+    claims: list[EvidenceClaim] = []
+    conflicts: list[EvidenceQualification] = []
+    unresolved: list[EvidenceQualification] = []
+    selected_sources: set[str] = set()
+    selected_edges: list[int] = []
+    selected_hypotheses: list[int] = []
+    seen_statements: set[str] = set()
+
+    def add(
+        statement: object,
+        sources: object,
+        *,
+        confidence: float = 0.65,
+        disposition: str = "claim",
+    ) -> bool:
+        if len(claims) + len(conflicts) + len(unresolved) >= cap:
+            return False
+        text = " ".join(str(statement or "").strip().split())[:2000]
+        source_keys = _materialized_sources(sources)
+        normalized = text.casefold()
+        if not text or not source_keys or normalized in seen_statements:
+            return False
+        seen_statements.add(normalized)
+        selected_sources.update(source_keys)
+        if disposition == "conflict":
+            conflicts.append(EvidenceQualification(text, source_keys))
+        elif disposition == "unresolved":
+            unresolved.append(EvidenceQualification(text, source_keys))
+        else:
+            claims.append(
+                EvidenceClaim(
+                    text,
+                    source_keys,
+                    max(0.0, min(1.0, float(confidence))),
+                )
+            )
+        return True
+
+    raw_semantics = packet.get("semantic_evidence")
+    for item in raw_semantics if isinstance(raw_semantics, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        memory = item.get("memory")
+        memory = memory if isinstance(memory, Mapping) else {}
+        status = str(memory.get("status") or "").upper()
+        epistemic = str(memory.get("epistemic_status") or "ASSERTED").upper()
+        disposition = (
+            "conflict"
+            if status == "CONFLICTED" or epistemic == "CORRECTED"
+            else (
+                "unresolved"
+                if epistemic in {"UNCERTAIN", "HEARSAY", "JOKE"}
+                else "claim"
+            )
+        )
+        add(
+            memory.get("content"),
+            item.get("evidence"),
+            confidence=float(memory.get("confidence") or 0.65),
+            disposition=disposition,
+        )
+
+    expanded = packet.get("expanded_episodes")
+    for item in expanded if isinstance(expanded, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        add(
+            item.get("summary") or item.get("title"),
+            item.get("messages"),
+            confidence=0.62,
+        )
+
+    candidates = packet.get("candidates")
+    candidates = candidates if isinstance(candidates, Mapping) else {}
+    media_patterns = candidates.get("media_patterns")
+    for item in media_patterns if isinstance(media_patterns, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        nearby = item.get("nearby_messages")
+        nearby = nearby if isinstance(nearby, list) else []
+        excerpts = [
+            " ".join(str(message.get("plain_text") or "").strip().split())
+            for message in nearby
+            if isinstance(message, Mapping)
+            and str(message.get("plain_text") or "").strip()
+            and str(message.get("plain_text") or "").strip() not in {"[图片]", "[image]"}
+        ][:3]
+        statement = (
+            f"同一图片引用在群内累计出现 {int(item.get('observation_count') or 0)} 次"
+            + (f"；附近文本包括：{' / '.join(excerpts)}" if excerpts else "")
+            + "。图片内容本身尚未分析。"
+        )
+        add(
+            statement,
+            [item.get("observations"), nearby],
+            disposition="unresolved",
+        )
+
+    associations = candidates.get("associations")
+    for item in associations if isinstance(associations, list) else []:
+        if not isinstance(item, Mapping) or item.get("score") is None:
+            # Utility-ranked background edges were not selected by this query.
+            continue
+        state = str(item.get("epistemic_state") or "HYPOTHESIS").upper()
+        disposition = (
+            "conflict"
+            if state == "CONTESTED"
+            else ("unresolved" if state == "HYPOTHESIS" else "claim")
+        )
+        if add(
+            item.get("statement")
+            or (
+                f"{item.get('source_label') or ''} "
+                f"{item.get('relation_name') or item.get('relation_key') or ''} "
+                f"{item.get('target_label') or ''}"
+            ),
+            item.get("source_keys"),
+            confidence=float(item.get("epistemic_confidence") or 0.5),
+            disposition=disposition,
+        ):
+            try:
+                edge_id = int(item.get("id") or 0)
+            except (TypeError, ValueError):
+                edge_id = 0
+            if edge_id > 0:
+                selected_edges.append(edge_id)
+
+    normalized_query = str(query or "").casefold()
+    hypothesis_evidence = packet.get("feedback_hypothesis_evidence")
+    for item in (
+        hypothesis_evidence if isinstance(hypothesis_evidence, list) else []
+    ):
+        if not isinstance(item, Mapping):
+            continue
+        hypothesis = item.get("hypothesis")
+        hypothesis = hypothesis if isinstance(hypothesis, Mapping) else {}
+        cues = hypothesis.get("trigger_cues")
+        cues = cues if isinstance(cues, list) else []
+        activation_mode = str(hypothesis.get("activation_mode") or "semantic")
+        applicable = activation_mode == "always" or any(
+            str(cue).casefold() in normalized_query for cue in cues if str(cue)
+        )
+        if not applicable:
+            continue
+        if add(
+            hypothesis.get("prospective_cue") or hypothesis.get("statement"),
+            item.get("evidence"),
+            confidence=float(hypothesis.get("evidence_confidence") or 0.5),
+            disposition="claim",
+        ):
+            try:
+                hypothesis_id = int(hypothesis.get("id") or 0)
+            except (TypeError, ValueError):
+                hypothesis_id = 0
+            if hypothesis_id > 0:
+                selected_hypotheses.append(hypothesis_id)
+
+    brief = (
+        EvidenceBrief(tuple(claims), tuple(conflicts), tuple(unresolved))
+        if claims or conflicts or unresolved
+        else None
+    )
+    return MaterializedReconstruction(
+        brief=brief,
+        source_keys=tuple(sorted(selected_sources)),
+        edge_ids=tuple(dict.fromkeys(selected_edges)),
+        hypothesis_ids=tuple(dict.fromkeys(selected_hypotheses)),
+    )
+
+
+def feedback_decision_graph_mutation(
+    decision: FeedbackDecision,
+    *,
+    evidence_source_keys: Iterable[str],
+    hypothesis_status: str,
+) -> GraphMutation | None:
+    """Materialize an accepted new behavior into the plastic graph.
+
+    The model still decides attribution, wording, scope, cues and uncertainty.
+    This host fallback only prevents an accepted upsert from becoming an isolated
+    feedback row when the optional ``graph_mutations`` array was omitted.
+    """
+
+    if decision.mutation != "upsert" or not decision.prospective_cue:
+        return None
+    sources = tuple(
+        dict.fromkeys(str(item).strip() for item in evidence_source_keys if str(item))
+    )[:32]
+    if not sources:
+        return None
+    semantic = decision.activation_mode == "semantic" and bool(decision.trigger_cues)
+    source_label = (
+        decision.trigger_cues[0]
+        if semantic
+        else f"群内交互：{decision.aspect or '通用反馈'}"
+    )[:160]
+    target_label = decision.prospective_cue[:160]
+    active = str(hypothesis_status or "").upper() == "ACTIVE"
+    return parse_graph_mutation(
+        {
+            "operation": "upsert_edge",
+            "evidence_source_keys": list(sources),
+            "confidence": decision.confidence,
+            "utility_delta": max(
+                0.05,
+                min(2.0, abs(decision.feedback_valence) * decision.confidence),
+            ),
+            "statement": (
+                f"{decision.statement}；未来行为：{decision.prospective_cue}"
+            )[:1200],
+            "epistemic_state": "SUPPORTED" if active else "HYPOTHESIS",
+            "uncertainty": (
+                "该反馈已达到自动启用标准，但仍应随后续证据修订。"
+                if active
+                else "单次或较弱反馈形成的候选通路，等待后续一致证据。"
+            ),
+            "source": {
+                "kind": "concept" if semantic else "topic",
+                "label": source_label,
+                "description": (
+                    "由反馈模型识别的语义触发线索。"
+                    if semantic
+                    else "无需特定词面触发的群内交互场景。"
+                ),
+            },
+            "target": {
+                "kind": "behavior",
+                "label": target_label,
+                "description": decision.prospective_cue,
+            },
+            "relation": {
+                "key": "guides_response",
+                "name": "引导后续回答",
+                "description": "已归因的人类反馈将一个场景或线索连接到未来回答行为。",
+                "source_kinds": ["concept", "topic"],
+                "target_kinds": ["behavior"],
+                "symmetric": False,
+                "risk_class": "normal",
+            },
+        }
+    )
 
 
 def parse_feedback_batch_plan(

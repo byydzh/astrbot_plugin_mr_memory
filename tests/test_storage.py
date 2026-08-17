@@ -4,6 +4,7 @@ import unittest
 import uuid
 from pathlib import Path
 
+from mr_memory.feedback import FeedbackDecision
 from mr_memory.models import NormalizedMessage
 from mr_memory.storage import MemoryStorage
 
@@ -471,6 +472,174 @@ class MemoryStorageTests(unittest.TestCase):
         recent = self.storage.recent_experiments(umo=umo)
         self.assertEqual([item["run_id"] for item in recent], [run_id])
         self.assertEqual(recent[0]["total"], 150)
+
+    def test_experiment_detail_restores_the_exact_memory_provenance_graph(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("detail-request", "群内怎么称呼这个？", sent_at=100)
+        evidence = self.message("detail-evidence", "大家是在用反话。", sent_at=90)
+        self.storage.upsert_message(evidence)
+        self.storage.upsert_message(request)
+        trace_id = "trace-detail"
+        run_id = "runtime-reconstruction-detail"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        brief = {
+            "claims": [
+                {
+                    "statement": "该称呼在这段对话里是反话。",
+                    "source_keys": [evidence.resolved_source_key()],
+                    "confidence": 0.72,
+                }
+            ],
+            "conflicts": [],
+            "unresolved": [],
+        }
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_reconstruction",
+            metadata={"trace_id": trace_id, "path": "materialized_local"},
+        )
+        self.storage.record_reconstruction_step(
+            run_id=run_id,
+            step_index=0,
+            tool_name="materialized_working_memory",
+            evidence_keys=[evidence.resolved_source_key()],
+        )
+        self.storage.record_memory_brief_trace(
+            trace_id=trace_id,
+            umo=umo,
+            run_id=run_id,
+            memory_brief=brief,
+            source_keys=[evidence.resolved_source_key()],
+            path="materialized_local",
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "path": "materialized_local",
+                "memory_brief": brief,
+                "visited_source_keys": [evidence.resolved_source_key()],
+                "trace_id": trace_id,
+                "no_relevant_memory": False,
+            },
+        )
+
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertTrue(detail["graph"]["exact_memory_brief"])
+        self.assertEqual(detail["graph"]["warnings"], [])
+        nodes = detail["graph"]["nodes"]
+        node_types = {item["type"] for item in nodes}
+        self.assertIn("memory_claim", node_types)
+        self.assertIn("memory_brief", node_types)
+        self.assertIn("evidence", node_types)
+        relations = {item["relation"] for item in detail["graph"]["edges"]}
+        self.assertIn("SUPPORTS", relations)
+        self.assertIn("SUPPORTS_RECALL", relations)
+        with self.assertRaisesRegex(ValueError, "group boundary"):
+            self.storage.experiment_detail(
+                run_id=run_id,
+                umo="shadow:GroupMessage:group-b",
+            )
+
+    def test_experiment_detail_recovers_legacy_feedback_provenance(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("legacy-request", "帮我画一张海报", sent_at=100)
+        feedback = self.message(
+            "legacy-feedback",
+            "元素太密了，下次少放一点。",
+            sent_at=110,
+        )
+        self.storage.upsert_message(request)
+        trace_id = "legacy-feedback-trace"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            response_text="已生成元素丰富的海报。",
+            response_at=101,
+        )
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        learned = self.storage.apply_feedback_decision(
+            umo=umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id=trace_id,
+                mutation="upsert",
+                feedback_valence=-1.0,
+                confidence=0.92,
+                scope_type="sender",
+                scope_key=request.sender_id,
+                aspect="image_composition",
+                statement="用户认为画面元素过于密集。",
+                prospective_cue="再次生图时减少元素数量并留出空间。",
+                trigger_cues=("生图", "海报"),
+                activation_mode="semantic",
+            ),
+        )
+        run_id = "legacy-feedback-run"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_feedback_maintenance",
+        )
+        # Version 0.16.x only persisted this shallow outcome in the run ledger.
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "outcomes": [
+                    {
+                        "proposal_id": int(proposal_id or 0),
+                        "proposal_status": learned["status"],
+                        "commit_score": learned["commit_score"],
+                    }
+                ],
+                "path": "one_pass_feedback_learning",
+            },
+        )
+
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        nodes = detail["graph"]["nodes"]
+        node_types = {item["type"] for item in nodes}
+        self.assertTrue(
+            {"request", "response", "evidence", "feedback_proposal", "hypothesis"}
+            <= node_types
+        )
+        relations = {item["relation"] for item in detail["graph"]["edges"]}
+        self.assertIn("RECEIVES_FEEDBACK", relations)
+        self.assertIn("EVALUATED_AS", relations)
+        self.assertIn("MATERIALIZED", relations)
+        proposal_node = next(
+            item for item in nodes if item["type"] == "feedback_proposal"
+        )
+        self.assertEqual(
+            proposal_node["content"]["decision"]["target_trace_id"],
+            trace_id,
+        )
 
     def test_interrupted_experiment_is_closed_on_reopen(self) -> None:
         umo = "shadow:GroupMessage:group-a"
