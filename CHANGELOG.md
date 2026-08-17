@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.1
+
+- Restore the 0.16 answer-time inference structure as a deliberately weak,
+  measurable baseline: host prefetch, one full-reasoning private-LLM semantic
+  decision, and conditional escalation into the bounded graph-tool Agent loop.
+  Embedding and host code no longer make the final semantic relevance decision.
+- Retain 0.17's exact public-brief/source provenance, accepted-feedback graph
+  materialization, clickable run details, end-to-end timing, and in-flight task
+  drain during plugin hot reload.
+- Correct the configuration and console language so `every_request`, its Token
+  budget and observed latency describe the network LLM call that actually occurs.
+
 ## 0.17.0
 
 - Serve ordinary answer-time memory from the already distilled, locally embedded

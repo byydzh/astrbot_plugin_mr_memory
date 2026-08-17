@@ -6851,7 +6851,7 @@ class MemoryStorage:
     ) -> dict[str, object]:
         """Deterministically expand retrieval seeds to bounded raw evidence.
 
-        This is the host-side fast path: SQLite does the cheap graph expansion once,
+        This is an experimental cache-ablation path: SQLite expands the graph once,
         then the model performs one semantic decision over the resulting packet.
         """
 

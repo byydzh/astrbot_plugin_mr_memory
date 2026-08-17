@@ -3,10 +3,10 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.17.0 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
+0.17.1 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
 可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
-或 `CONFIRMED`；embedding 只生成候选，图的语义状态由独立潜意识 LLM 维护，自动回答时
-由 AstrBot 主 LLM 判断候选是否相关。
+或 `CONFIRMED`；embedding 只生成候选，图的语义状态与回答前相关性均由独立潜意识 LLM
+判断，宿主只执行证据、身份和作用域约束。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -28,13 +28,12 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
 - `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
-- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会读取后台已经整理好的
-  本地工作记忆，不再额外等待一次网络 LLM；可切换为 `manual_only`。主 Agent 主动调用咨询
-  工具时仍由独立潜意识模型执行多步深挖。
+- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会先由独立潜意识模型
+  对宿主预取证据做完整语义判断；只有模型明确认为缺少关键图遍历时才进入多步深挖。
+  可切换为 `manual_only`，仅保留主 Agent 主动咨询。
 - 新消息达到 `auto_distillation_min_pending=150` 时立即整理；不足 150 条时，最迟由
   `maintenance_interval_minutes=1440`（一天）的后台轮询触发。
-- 主动潜意识深挖和新消息整理使用 `private_daily_token_budget`；普通回答前的本地工作记忆
-  不调用网络模型。反馈学习使用独立的
+- 回答前记忆判断、主动潜意识深挖和新消息整理使用 `private_daily_token_budget`。反馈学习使用独立的
   `feedback_daily_token_budget`。外部运维工具一次性写入的旧历史只保留独立审计账本，
   不设伪装成日常策略的每日额度，也不会挤占这两类在线预算。
 - 数据库固定写入本插件的 `plugin_data` 目录。
@@ -71,10 +70,13 @@ embedding candidate initialization (Cue / Episode / Semantic / Topic)
         v
 LLM-composable bounded traversal toolkit
         |
-        +-- automatic local, evidence-bound working-memory brief
+        +-- host-prefetched, source-key-bounded evidence packet
         |
         v
-private provider tool loop (DeepSeek by default, maintenance/manual deep recall)
+private provider semantic gate (DeepSeek by default, full reasoning)
+        |
+        +-- relevant / none -> grounded brief or no memory
+        +-- essential missing traversal -> bounded private tool loop
         |
         +-- bounded feedback maintenance and prospective activation
         +-- persistent bounded operational state and resumable maintenance jobs
@@ -88,9 +90,9 @@ private provider tool loop (DeepSeek by default, maintenance/manual deep recall)
 `mr_consult_subconscious` 请求一次更聚焦的重建。
 
 插件调用自己配置的 provider，不继承当前会话主 LLM。后台增量整理与反馈学习由该独立模型
-维护情节、人物事实、竞争释义和行为通路；普通回答前只在本群 SQLite 与本地 embedding 上
-生成带原始证据键的候选简报，交给 AstrBot 主 LLM 判断是否相关，因此不再串行增加一次网络
-模型时延或 Token。管理员/主模型主动咨询仍可调用独立潜意识模型执行多步图遍历。若当前群
+维护情节、人物事实、竞争释义和行为通路；普通回答前先由本群 SQLite 与本地 embedding 生成
+有界候选及原始证据包，再由独立潜意识模型完整判断相关性并生成带证据键的简报。只有模型
+明确判断缺少关键遍历时才升级为多步图工具循环；管理员/主模型主动咨询则直接执行深挖。若当前群
 还没有任何图记忆，自动唤醒会直接跳过。embedding 只提供候选先验，不用固定相似度裁决
 语义。最终 claim、conflict 与 unresolved
 项都必须引用本轮实际访问的 source key，否则整份简报被宿主拒绝，而不是把未验证自由文本
@@ -127,7 +129,7 @@ LLM 必须为每条目标消息提供图证据或放入紧凑的批内忽略 ID 
 仪表盘共用登录鉴权，无需开放额外端口，提供：
 
 - 用最近 24 小时真实数据判断回答前回忆与反馈学习是否达到时延目标；
-- 逐次显示任务、结果、耗时、Token 与“本地工作记忆/主动深挖/一次反馈学习”路径；点击任意
+- 逐次显示任务、结果、耗时、Token 与“一次判断/判断后深挖/主动深挖/反馈学习”路径；点击任意
   一行可查看该次调用的证据、公开简报、行为假设和图修改子图；
 - 显示反馈积压、待验证行为记忆、额度等待和最久等待时间；
 - 直接显示生效范围、回答前回忆、整理触发、反馈窗口与本地语义检索模型；

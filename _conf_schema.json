@@ -46,7 +46,7 @@
     "default": "every_request",
     "obvious_hint": true,
     "condition": {"subconscious_enabled": true},
-    "hint": "every_request：每次回答前读取本地工作记忆，不额外调用网络模型；manual_only：只在主模型主动咨询时深挖。"
+    "hint": "every_request：每次回答前由独立记忆模型完整判断相关证据，必要时继续多步图遍历；manual_only：只在主模型主动咨询时运行。"
   },
   "consult_tool_enabled": {
     "description": "允许主模型按需深挖记忆",
@@ -124,11 +124,11 @@
     "hint": "只要存在待处理消息，后台最迟在此时间后触发整理；同时也是失败任务的重试周期。"
   },
   "private_daily_token_budget": {
-    "description": "每群每日深挖与在线整理额度",
+    "description": "每群每日回忆、深挖与在线整理额度",
     "type": "int",
     "default": 500000,
     "condition": {"subconscious_enabled": true},
-    "hint": "覆盖主模型主动发起的潜意识深挖和新消息整理；普通回答前的本地工作记忆不消耗 Token。另不含反馈学习与一次性历史导入；0 表示不限。"
+    "hint": "覆盖每次回答前的记忆判断、主模型主动深挖和新消息整理；另不含反馈学习与一次性历史导入；0 表示不限。"
   },
   "feedback_daily_token_budget": {
     "description": "每群每日反馈学习额度",
