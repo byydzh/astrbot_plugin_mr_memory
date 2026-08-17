@@ -4,8 +4,8 @@
     "version": 1,
     "surface": "report",
     "title": "从检索到重建：面向真实群聊 Agent 的实时、缓存与反馈驱动图记忆研究",
-    "description": "基于匿名聚合线上遥测、人工确认的候选检索基准与一手论文证据，对 MR Memory 的在线推理基线、候选检索层和后续实验路线进行技术审计。",
-    "generatedAt": "2026-08-17T03:11:12.6300797Z",
+    "description": "基于匿名聚合线上遥测、人工确认的候选检索基准、单案例三臂 Provider 诊断与一手论文证据，对 MR Memory 的在线推理基线、候选检索层和实验路线进行技术审计。",
+    "generatedAt": "2026-08-17T04:32:08.2011923Z",
     "cards": [],
     "charts": [
       {
@@ -66,7 +66,7 @@
           ]
         },
         "xAxisTitle": "候选检索方法",
-        "yAxisTitle": "得分（0–1）",
+        "yAxisTitle": "得分",
         "valueFormat": "percent",
         "layout": "wide",
         "maxRows": 8,
@@ -153,6 +153,63 @@
             "align": "right"
           }
         ]
+      },
+      {
+        "id": "pilot_arm_table",
+        "title": "单案例三臂 Provider 诊断的路径与成本",
+        "subtitle": "每个 arm 仅运行一次，语义状态均待独立盲评；时间不是 AstrBot 线上端到端时延",
+        "showDescription": true,
+        "dataset": "pilot_arms",
+        "density": "comfortable",
+        "sourceId": "pilot_provider_aggregate",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "measured_tokens",
+          "direction": "desc"
+        },
+        "columns": [
+          {
+            "field": "arm_label",
+            "label": "路径",
+            "type": "text"
+          },
+          {
+            "field": "call_span",
+            "label": "模型 / 工具调用",
+            "type": "text"
+          },
+          {
+            "field": "source_span",
+            "label": "访问 / 引用来源",
+            "type": "text"
+          },
+          {
+            "field": "required_group_recall",
+            "label": "必要证据组召回",
+            "type": "percent",
+            "format": "percent",
+            "align": "right"
+          },
+          {
+            "field": "gold_key_precision_lower_bound",
+            "label": "Gold-key 精确率下界",
+            "type": "percent",
+            "format": "percent",
+            "align": "right"
+          },
+          {
+            "field": "measured_tokens",
+            "label": "已测 Token",
+            "type": "number",
+            "format": "compact",
+            "align": "right"
+          },
+          {
+            "field": "controlled_total_label",
+            "label": "受控总时延",
+            "type": "text"
+          }
+        ]
       }
     ],
     "sources": [
@@ -167,14 +224,77 @@
         "path": "docs/research/data/pilot_smoke_aggregate.json"
       },
       {
+        "id": "pilot_provider_aggregate",
+        "label": "单案例三臂 Provider 诊断聚合",
+        "path": "docs/research/data/pilot_provider_smoke_aggregate.json",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "WITH src AS (SELECT arms FROM read_json_auto('docs/research/data/pilot_provider_smoke_aggregate.json')) SELECT a.arm.arm AS arm, CASE a.arm.arm WHEN 'cache' THEN 'A1 本地物化' WHEN 'b16' THEN 'B0/B16 单次语义 gate' WHEN 'full-mr' THEN 'A2 有界主动重建' END AS arm_label, a.arm.status, a.arm.model_calls, a.arm.tool_steps, CAST(a.arm.model_calls AS VARCHAR) || ' / ' || CAST(a.arm.tool_steps AS VARCHAR) AS call_span, a.arm.visited_source_count, a.arm.cited_source_count, CAST(a.arm.visited_source_count AS VARCHAR) || ' / ' || CAST(a.arm.cited_source_count AS VARCHAR) AS source_span, a.arm.required_group_recall, a.arm.gold_key_precision_lower_bound, a.arm.tokens.total AS measured_tokens, a.arm.elapsed_seconds AS controlled_total_seconds, CASE WHEN a.arm.elapsed_seconds < 1 THEN printf('%.1f ms', a.arm.elapsed_seconds * 1000) ELSE printf('%.1f s', a.arm.elapsed_seconds) END AS controlled_total_label, a.arm.semantic_judgment_status AS semantic_status, '待独立盲评' AS semantic_status_label, a.arm.researcher_diagnostic.direct_pragmatic_interpretation, a.arm.researcher_diagnostic.additional_cross_episode_launch_evidence AS additional_cross_episode_evidence, a.arm.source_audit_passed FROM src, UNNEST(src.arms) AS a(arm)",
+          "description": "从隐私安全三臂聚合中读取单个遮罩开发案例的路径、来源覆盖、成本和待审核语义状态。",
+          "tables_used": [
+            "docs/research/data/pilot_provider_smoke_aggregate.json"
+          ],
+          "filters": [
+            "单个预选开发诊断调用，每个 arm 一次运行",
+            "固定相同候选包；所有访问来源通过逐来源 cutoff 审计",
+            "不包含消息正文、群号、账号、source key、Provider endpoint 或配置"
+          ],
+          "metric_definitions": [
+            "必要证据组召回 = 最终 brief 在每个预注册证据组中至少引用一条 required source 的比例",
+            "Gold-key precision lower bound = 引用 source key 中属于预注册 required/support key 的比例下界；不是 Supported-Claim Precision",
+            "已测 Token = Provider usage ledger 的 ordinary input、cached input 与 output 合计",
+            "受控总时延 = 本地物化运行时间或非流式直连接口完整响应时间；不是 AstrBot 线上端到端或首块时延"
+          ]
+        }
+      },
+      {
         "id": "retrieval_aggregate",
         "label": "候选检索聚合查询",
-        "path": "docs/research/data/observed_evidence.json"
+        "path": "docs/research/data/observed_evidence.json",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "WITH src AS (SELECT candidate_retrieval FROM read_json_auto('docs/research/data/observed_evidence.json')), models AS (SELECT m.model.key AS model_key, CASE m.model.key WHEN 'minilm-l12-v2' THEN 'MiniLM' WHEN 'harrier-270m' THEN 'Harrier 270M' WHEN 'bm25-char-bigram' THEN 'BM25 char-bigram' WHEN 'harrier-270m-group-memory' THEN 'Harrier group-memory' END AS model_label, CASE WHEN m.model.key = 'bm25-char-bigram' THEN 'lexical' ELSE 'dense embedding' END AS family, m.model.mrr_at_20, m.model.mean_evidence_recall_at_20, m.model.hit_at_20, m.model.all_evidence_at_20, candidate_retrieval.source.queries AS n_queries, candidate_retrieval.source.corpus_documents FROM src, UNNEST(candidate_retrieval.models) AS m(model) WHERE m.model.key IN ('minilm-l12-v2', 'harrier-270m', 'bm25-char-bigram', 'harrier-270m-group-memory')) SELECT model_key, model_label, family, metric_label, score, hit_at_20, all_evidence_at_20, n_queries, corpus_documents FROM models CROSS JOIN LATERAL (VALUES ('MRR@20', mrr_at_20), ('平均证据召回率@20', mean_evidence_recall_at_20)) AS metric(metric_label, score)",
+          "description": "从匿名聚合证据文件读取四个关键候选检索方法，并转换为 MRR@20 与平均证据召回率@20 的长表。",
+          "tables_used": [
+            "docs/research/data/observed_evidence.json"
+          ],
+          "filters": [
+            "只保留 MiniLM、Harrier 270M、BM25 char-bigram 与 Harrier group-memory 四个关键比较臂",
+            "同一组 47 个查询和 24,804 条候选文档"
+          ],
+          "metric_definitions": [
+            "MRR@20 = 每个查询在前 20 个结果中第一个标注正例倒数排名的均值",
+            "平均证据召回率@20 = 每个查询的标注证据进入前 20 个结果的比例，再对 47 个查询取平均",
+            "得分按 0 到 1 的比例存储"
+          ]
+        }
       },
       {
         "id": "runtime_aggregate",
         "label": "在线运行时聚合查询",
-        "path": "docs/research/data/observed_evidence.json"
+        "path": "docs/research/data/observed_evidence.json",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "WITH src AS (SELECT online_runtime AS rt FROM read_json_auto('docs/research/data/observed_evidence.json')) SELECT 1 AS display_order, '全部运行' AS outcome, 'fast（54/54）' AS path, rt.quality_checks.runs AS runs, rt.tokens_per_run_with_provider_usage.n AS ledger_runs, rt.tokens_measured_all_runs.mean AS mean_tokens, rt.tokens_measured_all_runs.p95_linear AS p95_tokens, rt.wall_seconds.median AS median_latency_s, rt.wall_seconds.p95_linear AS p95_latency_s, rt.wall_seconds.max AS max_latency_s, false AS semantic_labels FROM src UNION ALL SELECT 2, 'brief', 'fast', rt.outcomes.brief.wall_seconds.n, rt.outcomes.brief.tokens_with_provider_usage.n, rt.outcomes.brief.tokens_measured_all_runs.mean, rt.outcomes.brief.tokens_measured_all_runs.p95_linear, rt.outcomes.brief.wall_seconds.median, rt.outcomes.brief.wall_seconds.p95_linear, rt.outcomes.brief.wall_seconds.max, false FROM src UNION ALL SELECT 3, 'none', 'fast', rt.outcomes.none.wall_seconds.n, rt.outcomes.none.tokens_with_provider_usage.n, rt.outcomes.none.tokens_measured_all_runs.mean, rt.outcomes.none.tokens_measured_all_runs.p95_linear, rt.outcomes.none.wall_seconds.median, rt.outcomes.none.wall_seconds.p95_linear, rt.outcomes.none.wall_seconds.max, false FROM src UNION ALL SELECT 4, 'failed', 'fast', rt.outcomes.failed.wall_seconds.n, rt.outcomes.failed.tokens_with_provider_usage.n, rt.outcomes.failed.tokens_measured_all_runs.mean, rt.outcomes.failed.tokens_measured_all_runs.p95_linear, rt.outcomes.failed.wall_seconds.median, rt.outcomes.failed.wall_seconds.p95_linear, rt.outcomes.failed.wall_seconds.max, false FROM src ORDER BY display_order",
+          "description": "从匿名聚合证据文件读取在线基线的总体与分结果 Token、延迟和账本覆盖统计。",
+          "tables_used": [
+            "docs/research/data/observed_evidence.json"
+          ],
+          "filters": [
+            "UTC 截止时间 2026-08-06 19:21:33",
+            "54 次 automatic runtime_reconstruction 运行",
+            "不包含群号、账号、消息文本、source key 或 provider 配置"
+          ],
+          "metric_definitions": [
+            "平均与 P95 Token 使用 tokens_measured_all_runs；两次 timeout 缺少 provider usage，按未观测到处理",
+            "延迟为运行记录的墙钟秒数；P95 使用线性分位数",
+            "ledger_runs 为能够关联 provider usage 的运行数",
+            "brief、none、failed 和 fast 仅是系统行为标签，不是语义质量标签"
+          ]
+        }
       },
       {
         "id": "runtime_study_paper",
@@ -221,8 +341,19 @@
       {
         "id": "technical_summary",
         "type": "markdown",
+        "body": "## 技术摘要\n\n**当前证据不支持把 0.16 或完整多步 MR 当作合格的语义基准。** 线上弱基线具有明显长尾且从未进入主动图遍历；候选检索改善了证据可见性，但不能证明最终语义正确；单案例受控诊断中，full-MR 找到更多跨情节证据，却没有形成更直接的群内释义。该诊断没有独立盲评，不能用来宣称 B16 更优，只能定位搜索深度与最终 synthesis 的脱节。\n\n因此，后续实验必须把 **候选召回、LLM 读取/推理、图更新与在线延迟** 分开测量，并把“未发现证据”与“发现但误读证据”区分开。"
+      },
+      {
+        "id": "technical_summary_observed",
+        "type": "markdown",
         "sourceId": "observed_evidence",
-        "body": "## 技术摘要\n\n**当前证据支持恢复 0.16 的完整单次判断链作为待检验基线，但不支持把它视为语义质量基准。** 在线样本中的 54 次自动重建全部停留在 fast 路径：平均实测 23.3k Token，延迟中位数 7.0 秒、P95 80.3 秒，并有 5 次失败。候选层上，Harrier 默认提示相对 MiniLM 的 MRR@20 提升 0.200（95% bootstrap CI 0.075–0.327），平均证据召回率@20 提升 0.148（0.060–0.238）；但这些指标只衡量人工标注证据是否进入候选集，不能证明最终语义重建正确。\n\n因此，后续实验必须把 **候选召回、LLM 读取/推理、图更新与在线延迟** 分开测量，并把“未发现证据”与“发现但误读证据”区分开。"
+        "body": "### 线上与候选层证据\n\n54 次线上自动重建全部停留在 fast 路径：平均实测 23.3k Token，延迟中位数 7.0 秒、P95 80.3 秒，并有 5 次失败。候选层上，Harrier 默认提示相对 MiniLM 的 MRR@20 提升 0.200（95% bootstrap CI 0.075–0.327），平均证据召回率@20 提升 0.148（0.060–0.238）。这些候选指标不等于语义准确率。"
+      },
+      {
+        "id": "technical_summary_pilot",
+        "type": "markdown",
+        "sourceId": "pilot_provider_aggregate",
+        "body": "### 单案例三臂诊断\n\nfull-MR 相对 B16 使用 11.93 倍 Token、3.49 倍受控总时延，访问更多来源，却没有把新增证据转化为更直接的语义终判。该调用是污染开发案例，每个 arm 仅运行一次，语义状态仍为待独立盲评。"
       },
       {
         "id": "retrieval_result_heading",
@@ -247,10 +378,32 @@
         "tableId": "runtime_cost_table"
       },
       {
+        "id": "pilot_result_heading",
+        "type": "markdown",
+        "sourceId": "pilot_provider_aggregate",
+        "body": "## 更深的搜索扩大了证据面，但没有证明终判更好\n\n固定同一遮罩候选包后，cache、B16 和 full-MR 三臂均完成且通过逐来源 cutoff 审计。B16 用 1 次调用、10.8k Token 和 21.1 秒，从 38 条预取来源中精选引用 6 条；full-MR 用 9 次调用、129.1k Token 和 73.6 秒，访问 62 条、引用 10 条。两者必要证据组召回都为 1.0；full-MR 找到了 B16 漏掉的后续行为证据，却没有在最终 brief 中完成目标跨情节释义。\n\n**诊断含义：** 当前瓶颈不只是候选召回，而是边际证据收益停止、跨情节连接裁决和最终 synthesis。29 次工具调用中有 18 次没有返回 source key，最后连续 6 次也没有新增可审计来源；继续放大轮数或上下文没有现成依据。该调用已被反复用于开发，且没有独立人类盲评、重复或主 LLM 最终回答，因此下表是路径/成本诊断，不是总体语义 A/B。"
+      },
+      {
+        "id": "pilot_table_block",
+        "type": "table",
+        "tableId": "pilot_arm_table"
+      },
+      {
         "id": "scope_definitions",
         "type": "markdown",
+        "body": "## 证据范围与指标定义\n\n- **在线运行时样本：** 自动重建 ledger 的描述性切片。`brief`、`none` 与 `fast` 是系统状态，不是正确/错误标签。\n- **候选检索基准：** 金标来自回复链与人工证据确认；词法 decoy 并非经过验证的负例。\n- **三臂诊断：** 固定同一候选包与遮罩图副本。`required_group_recall` 和 gold-key precision lower bound 只衡量最终 brief 的 source-key 引用覆盖，不是 Supported-Claim Precision 或人类帮助度。\n- **MRR@20：** 第一个标注正例在前 20 个结果中的倒数排名均值。\n- **平均证据召回率@20：** 每个查询的标注证据中，进入前 20 个候选的比例，再对查询取平均。\n- **延迟：** 线上表使用运行记录墙钟；三臂表使用本地物化或非流式直连接口的完整响应时间。二者都不是首块时延，且不能直接互换。"
+      },
+      {
+        "id": "scope_observed_counts",
+        "type": "markdown",
         "sourceId": "observed_evidence",
-        "body": "## 证据范围与指标定义\n\n- **在线运行时样本：** 单一隔离数据库中的 54 次自动重建记录；49 次完成、5 次失败。`brief`、`none` 与 `fast` 是系统状态，不是正确/错误标签。\n- **候选检索基准：** 47 个查询、24,804 条候选文档。金标来自回复链与人工证据确认；词法 decoy 并非经过验证的负例。\n- **MRR@20：** 第一个标注正例在前 20 个结果中的倒数排名均值。\n- **平均证据召回率@20：** 每个查询的标注证据中，进入前 20 个候选的比例，再对查询取平均。\n- **延迟：** 运行记录的墙钟时间。P95 使用线性分位数；Token 统计把缺失 provider usage 的两次 timeout 记为“未观测到”，因此只代表实测值。"
+        "body": "### 已复核线上与检索数据\n\n线上切片包含 54 次自动重建，其中 49 次完成、5 次失败；候选检索基准包含 47 个查询和 24,804 条候选文档。"
+      },
+      {
+        "id": "scope_pilot_counts",
+        "type": "markdown",
+        "sourceId": "pilot_provider_aggregate",
+        "body": "### 三臂诊断数据\n\n诊断只覆盖一个被开发过程反复使用的真实调用，每个 arm 运行一次；三个运行均完成，全部语义判断仍待独立盲评。"
       },
       {
         "id": "methodology_architecture",
@@ -260,12 +413,12 @@
       {
         "id": "limitations",
         "type": "markdown",
-        "body": "## 局限、不确定性与稳健性边界\n\n- 当前线上样本没有人工语义标签，不能用 `brief` 比例或完成率推断记忆质量。\n- 候选检索金标偏向回复链证据，不能代表自然 `/chat` 查询的完整分布；decoy 也不能用于估计精确率。\n- 在线数据只覆盖一个数据库范围，跨群、账号别名、群内反讽和竞争释义仍需独立测试。\n- 目前 0.16 样本没有进入 full Agent 路径，无法从线上观测推断有界多步 MR 的收益或成本。\n- `好女孩` 与历史调用案例只适合作为困难案例；在没有预注册判分规则、时间遮罩和独立重复前，不能作为成功证据。"
+        "body": "## 局限、不确定性与稳健性边界\n\n- 当前线上样本没有人工语义标签，不能用 `brief` 比例或完成率推断记忆质量。\n- 候选检索金标偏向回复链证据，不能代表自然 `/chat` 查询的完整分布；decoy 也不能用于估计精确率。\n- 在线数据只覆盖一个数据库范围，跨群、账号别名、群内反讽和竞争释义仍需独立测试。\n- 线上观察窗口没有进入 full Agent 路径；独立受控 full-MR 只覆盖污染开发案例且未重复，不能估计总体收益、方差或尾部延迟。\n- 三臂时延来自非流式直连且没有宿主事件调度、流式传输与重试；不能替代 AstrBot 线上端到端或首块时延。\n- `好女孩` 与历史调用案例只适合作为困难案例；在没有预注册判分规则、未污染 holdout、独立盲评和重复前，不能作为成功证据。"
       },
       {
         "id": "next_steps",
         "type": "markdown",
-        "body": "## 下一步：用同候选集的遮罩实验决定实时与缓存的边界\n\n已完成的 cache-only 单案例 smoke 为 1/1 完成、0 Provider 调用、0 Token；必要证据组召回为 1.0，但 gold-key precision lower bound 仅 0.158。它在经研究者声明的 masked fixture 上验证了 cache 执行与逐来源 cutoff 审计，也暴露了候选噪声；它既不能独立证明图构建历史，也不能作为 A1 质量结论。\n\n1. 在严格时间截断的数据库副本上，对 **cache / 0.16 gate / full MR** 使用相同候选集和相同语义金标，继续真实 Provider smoke 与重复实验。\n2. 对每个 arm 同时记录语义证据组命中、禁止结论、来源覆盖、工具步数、Token、墙钟延迟、timeout 与 JSON 修复；不保存隐藏思维链。\n3. 把召回失败与阅读失败分开：前者改候选策略，后者改 gate、工具接口或重建路径。\n4. 在线默认策略只在实验显示质量损失可控后再调整；缓存应是可审计的快速路径，而不是绕过潜意识重建的永久替代。"
+        "body": "## 下一步：先修 synthesis 与停止条件，再做未污染确认集\n\n三臂协议 smoke 已经证明路径、cutoff 审计和成本账本可以运行；继续在同一个开发案例上增加轮数不会提供独立证据。\n\n1. 让最终 synthesis 逐项裁决必要跨情节连接、目标群内释义与必须保留的更强措辞疑虑；把“证据不足”和“更强说法没有逐字证据”分开。\n2. 为多步 MR 增加边际证据收益与连续无新增来源的停止条件，并让 trace 区分空结果、导航结果和 recoverable error。\n3. 在冻结实现后抽取未污染 holdout，加入 C0、R0、A3 和主 LLM 最终回答；采用交替/随机顺序、重复采样与独立人类盲评。\n4. 只在确认集显示 supported-claim precision、false-none、正确疑虑保留和端到端帮助度收益后，才调整线上默认路径；缓存应是可审计的快速路径，而不是永久替代潜意识重建。"
       },
       {
         "id": "further_questions",
@@ -276,7 +429,7 @@
   },
   "snapshot": {
     "version": 1,
-    "generatedAt": "2026-08-17T03:11:12.6300797Z",
+    "generatedAt": "2026-08-17T04:32:08.2011923Z",
     "status": "ready",
     "datasets": {
       "retrieval_metrics": [
@@ -422,6 +575,71 @@
           "max_latency_s": 89.999995,
           "semantic_labels": false
         }
+      ],
+      "pilot_arms": [
+        {
+          "arm": "cache",
+          "arm_label": "A1 本地物化",
+          "status": "COMPLETED",
+          "model_calls": 0,
+          "tool_steps": 0,
+          "call_span": "0 / 0",
+          "visited_source_count": 38,
+          "cited_source_count": 38,
+          "source_span": "38 / 38",
+          "required_group_recall": 1.0,
+          "gold_key_precision_lower_bound": 0.15789473684210525,
+          "measured_tokens": 0,
+          "controlled_total_seconds": 0.001277,
+          "controlled_total_label": "1.3 ms",
+          "semantic_status": "PENDING_BLIND_HUMAN_REVIEW",
+          "semantic_status_label": "待独立盲评",
+          "direct_pragmatic_interpretation": false,
+          "additional_cross_episode_evidence": false,
+          "source_audit_passed": true
+        },
+        {
+          "arm": "b16",
+          "arm_label": "B0/B16 单次语义 gate",
+          "status": "COMPLETED",
+          "model_calls": 1,
+          "tool_steps": 0,
+          "call_span": "1 / 0",
+          "visited_source_count": 38,
+          "cited_source_count": 6,
+          "source_span": "38 / 6",
+          "required_group_recall": 1.0,
+          "gold_key_precision_lower_bound": 1.0,
+          "measured_tokens": 10820,
+          "controlled_total_seconds": 21.09429,
+          "controlled_total_label": "21.1 s",
+          "semantic_status": "PENDING_BLIND_HUMAN_REVIEW",
+          "semantic_status_label": "待独立盲评",
+          "direct_pragmatic_interpretation": true,
+          "additional_cross_episode_evidence": false,
+          "source_audit_passed": true
+        },
+        {
+          "arm": "full-mr",
+          "arm_label": "A2 有界主动重建",
+          "status": "COMPLETED",
+          "model_calls": 9,
+          "tool_steps": 29,
+          "call_span": "9 / 29",
+          "visited_source_count": 62,
+          "cited_source_count": 10,
+          "source_span": "62 / 10",
+          "required_group_recall": 1.0,
+          "gold_key_precision_lower_bound": 0.7,
+          "measured_tokens": 129050,
+          "controlled_total_seconds": 73.55981,
+          "controlled_total_label": "73.6 s",
+          "semantic_status": "PENDING_BLIND_HUMAN_REVIEW",
+          "semantic_status_label": "待独立盲评",
+          "direct_pragmatic_interpretation": false,
+          "additional_cross_episode_evidence": true,
+          "source_audit_passed": true
+        }
       ]
     },
     "accessIssues": []
@@ -436,6 +654,31 @@
       "id": "pilot_smoke_aggregate",
       "label": "遮罩 cache smoke 聚合",
       "path": "docs/research/data/pilot_smoke_aggregate.json"
+    },
+    {
+      "id": "pilot_provider_aggregate",
+      "label": "单案例三臂 Provider 诊断聚合",
+      "path": "docs/research/data/pilot_provider_smoke_aggregate.json",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "WITH src AS (SELECT arms FROM read_json_auto('docs/research/data/pilot_provider_smoke_aggregate.json')) SELECT a.arm.arm AS arm, CASE a.arm.arm WHEN 'cache' THEN 'A1 本地物化' WHEN 'b16' THEN 'B0/B16 单次语义 gate' WHEN 'full-mr' THEN 'A2 有界主动重建' END AS arm_label, a.arm.status, a.arm.model_calls, a.arm.tool_steps, CAST(a.arm.model_calls AS VARCHAR) || ' / ' || CAST(a.arm.tool_steps AS VARCHAR) AS call_span, a.arm.visited_source_count, a.arm.cited_source_count, CAST(a.arm.visited_source_count AS VARCHAR) || ' / ' || CAST(a.arm.cited_source_count AS VARCHAR) AS source_span, a.arm.required_group_recall, a.arm.gold_key_precision_lower_bound, a.arm.tokens.total AS measured_tokens, a.arm.elapsed_seconds AS controlled_total_seconds, CASE WHEN a.arm.elapsed_seconds < 1 THEN printf('%.1f ms', a.arm.elapsed_seconds * 1000) ELSE printf('%.1f s', a.arm.elapsed_seconds) END AS controlled_total_label, a.arm.semantic_judgment_status AS semantic_status, '待独立盲评' AS semantic_status_label, a.arm.researcher_diagnostic.direct_pragmatic_interpretation, a.arm.researcher_diagnostic.additional_cross_episode_launch_evidence AS additional_cross_episode_evidence, a.arm.source_audit_passed FROM src, UNNEST(src.arms) AS a(arm)",
+        "description": "从隐私安全三臂聚合中读取单个遮罩开发案例的路径、来源覆盖、成本和待审核语义状态。",
+        "tables_used": [
+          "docs/research/data/pilot_provider_smoke_aggregate.json"
+        ],
+        "filters": [
+          "单个预选开发诊断调用，每个 arm 一次运行",
+          "固定相同候选包；所有访问来源通过逐来源 cutoff 审计",
+          "不包含消息正文、群号、账号、source key、Provider endpoint 或配置"
+        ],
+        "metric_definitions": [
+          "必要证据组召回 = 最终 brief 在每个预注册证据组中至少引用一条 required source 的比例",
+          "Gold-key precision lower bound = 引用 source key 中属于预注册 required/support key 的比例下界；不是 Supported-Claim Precision",
+          "已测 Token = Provider usage ledger 的 ordinary input、cached input 与 output 合计",
+          "受控总时延 = 本地物化运行时间或非流式直连接口完整响应时间；不是 AstrBot 线上端到端或首块时延"
+        ]
+      }
     },
     {
       "id": "retrieval_aggregate",

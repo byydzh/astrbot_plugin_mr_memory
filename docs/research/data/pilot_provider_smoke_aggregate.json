@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-17T04:32:08.2011923Z",
+  "protocol": "masked-provider-diagnostic-v1",
+  "case": "masked-diagnostic-01",
+  "packet_sha256": "002dc9289f3a534bfa8d45ac1551a3b2c1c44fd4e66577d7c6dc3eec004fa382",
+  "source_artifacts": {
+    "manifest_sha256": "fddf3c55c3672770da80b5bfcc5d2277fc506b3e1520e0fe29a38c7961f48c21",
+    "summary_sha256": "82859844fe1f51838b0f5ed56c8f41c843dbf1355158098c7cec6706c06a7db3",
+    "usage_ledger_sha256": "e47d8f2ae85b53aec3aac55d5e8ae1631ac8a9bf5cdf28595cb24731c83097c4",
+    "result_sha256": {
+      "cache": "ae5e18055990e0ff7f1b08107e21f49cdf1e324f4bb19710396f445e0f3b1c1d",
+      "b16": "5f2257b54afc810622fcd78f19caffde83b171ff24f7dd601ce7b544c739f281",
+      "full-mr": "aa37102feca31c728f2d40402cb8c249dd2fd9c23183d09511e5957de685dd55"
+    }
+  },
+  "scope": {
+    "arms": [
+      "cache",
+      "b16",
+      "full-mr"
+    ],
+    "repetitions_per_arm": 1,
+    "max_steps": 8,
+    "deadline_seconds": 90,
+    "max_output_tokens": 384000,
+    "thinking": "enabled",
+    "provider_call_cap": 10,
+    "soft_token_limit": 200000,
+    "same_candidate_packet": true,
+    "per_source_cutoff_audit": true,
+    "source_cutoff_all_passed": true,
+    "missing_source_count": 0,
+    "final_surface_llm_answer": false,
+    "hidden_reasoning_persisted": false
+  },
+  "completion": {
+    "completed_runs": 3,
+    "failed_runs": 0,
+    "provider_calls": 10,
+    "provider_tokens_measured_lower_bound": 139870,
+    "usage_complete": true,
+    "unknown_usage_calls": 0,
+    "stopped_by_budget": false
+  },
+  "arms": [
+    {
+      "arm": "cache",
+      "display_name": "A1 local materialization",
+      "status": "COMPLETED",
+      "completed": 1,
+      "decision": "brief",
+      "model_calls": 0,
+      "provider_calls": 0,
+      "tokens": {
+        "input_other": 0,
+        "input_cached": 0,
+        "output": 0,
+        "total": 0
+      },
+      "elapsed_seconds": 0.001277,
+      "visited_source_count": 38,
+      "cited_source_count": 38,
+      "tool_steps": 0,
+      "zero_evidence_key_steps": 0,
+      "required_group_recall": 1.0,
+      "gold_key_precision_lower_bound": 0.15789473684210525,
+      "identity_anchor_match": true,
+      "forbidden_term_hits": 0,
+      "source_audit_passed": true,
+      "semantic_judgment_status": "PENDING_BLIND_HUMAN_REVIEW",
+      "researcher_diagnostic": {
+        "direct_pragmatic_interpretation": false,
+        "explicit_uncertainty": false,
+        "additional_cross_episode_launch_evidence": false,
+        "note": "Deterministic materialization exposed all prefetched sources without a reader-level semantic judgment."
+      }
+    },
+    {
+      "arm": "b16",
+      "display_name": "B0/B16 single semantic gate",
+      "status": "COMPLETED",
+      "completed": 1,
+      "decision": "brief",
+      "model_calls": 1,
+      "provider_calls": 1,
+      "tokens": {
+        "input_other": 8052,
+        "input_cached": 384,
+        "output": 2384,
+        "total": 10820
+      },
+      "elapsed_seconds": 21.09429,
+      "visited_source_count": 38,
+      "cited_source_count": 6,
+      "tool_steps": 0,
+      "zero_evidence_key_steps": 0,
+      "required_group_recall": 1.0,
+      "gold_key_precision_lower_bound": 1.0,
+      "identity_anchor_match": true,
+      "forbidden_term_hits": 0,
+      "source_audit_passed": true,
+      "semantic_judgment_status": "PENDING_BLIND_HUMAN_REVIEW",
+      "researcher_diagnostic": {
+        "direct_pragmatic_interpretation": true,
+        "explicit_uncertainty": true,
+        "additional_cross_episode_launch_evidence": false,
+        "note": "The brief directly expressed the calibrated group-chat interpretation and preserved the stronger-claim uncertainty, but did not recover the later launch/play evidence."
+      }
+    },
+    {
+      "arm": "full-mr",
+      "display_name": "A2 bounded active reconstruction",
+      "status": "COMPLETED",
+      "completed": 1,
+      "decision": "brief",
+      "model_calls": 9,
+      "provider_calls": 9,
+      "tokens": {
+        "input_other": 32127,
+        "input_cached": 87424,
+        "output": 9499,
+        "total": 129050
+      },
+      "elapsed_seconds": 73.55981,
+      "visited_source_count": 62,
+      "cited_source_count": 10,
+      "tool_steps": 29,
+      "zero_evidence_key_steps": 18,
+      "required_group_recall": 1.0,
+      "gold_key_precision_lower_bound": 0.7,
+      "identity_anchor_match": true,
+      "forbidden_term_hits": 0,
+      "source_audit_passed": true,
+      "semantic_judgment_status": "PENDING_BLIND_HUMAN_REVIEW",
+      "researcher_diagnostic": {
+        "direct_pragmatic_interpretation": false,
+        "explicit_uncertainty": true,
+        "additional_cross_episode_launch_evidence": true,
+        "note": "Active traversal recovered additional launch/play evidence and preserved uncertainty, but the final brief did not convert the broader evidence into the direct calibrated group-chat interpretation."
+      }
+    }
+  ],
+  "full_mr_trace": {
+    "agent_model_calls": 8,
+    "forced_final_model_calls": 1,
+    "tool_steps": 29,
+    "distinct_tool_types": 8,
+    "steps_with_evidence_keys": 11,
+    "steps_without_evidence_keys": 18,
+    "distinct_result_hashes": 21,
+    "repeated_result_hash_steps": 8,
+    "last_consecutive_steps_without_evidence_keys": 6,
+    "final_synthesis_trigger": "step_budget_exhausted",
+    "tool_execution_elapsed_ms": 14.427
+  },
+  "comparisons": {
+    "full_mr_vs_b16_token_ratio": 11.927,
+    "full_mr_vs_b16_elapsed_ratio": 3.4872,
+    "full_mr_minus_b16_visited_source_count": 24,
+    "full_mr_minus_b16_cited_source_count": 4
+  },
+  "semantic_review": {
+    "status": "RESEARCHER_DIAGNOSTIC_PENDING_INDEPENDENT_BLIND_HUMAN_REVIEW",
+    "result": "B16 produced the most direct calibrated semantic brief in this case. Full-MR broadened evidence coverage but did not improve the final semantic judgment enough to justify its measured cost on this case.",
+    "not_established": [
+      "general semantic accuracy",
+      "cross-query win rate",
+      "end-to-end main-LLM answer quality",
+      "online user-visible latency",
+      "independent proof of graph construction history"
+    ]
+  },
+  "interpretation_boundary": "Single preselected researcher-labeled diagnostic case with one run per arm, no final surface-model answer, no independent blind human judgment, and no repeated sampling. The masked fixture and candidates are hash-bound and every cited source passed the cutoff audit, but the base-graph construction history still relies on researcher attestation. These data diagnose search-versus-reader behavior; they are not a confirmatory A/B estimate.",
+  "privacy": {
+    "raw_query_included": false,
+    "message_text_included": false,
+    "account_or_group_identifiers_included": false,
+    "source_identifiers_included": false,
+    "provider_configuration_included": false
+  }
+}
