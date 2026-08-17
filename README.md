@@ -193,9 +193,15 @@ python -m scripts.reproduce_fixture `
 - 使用相同主模型和最近上下文运行 control/MR 两个 arm；
 - 审计所有被访问 source key 的时间并逐阶段记录 token。
 
+`pilot` 子命令进一步固定同一候选包，比较 `cache`、0.16 单次语义 gate（`b16`）
+和从第一步开放只读图工具的 `full-mr`。源数据库只读备份，迁移仅作用于实验副本；
+每个 arm/repetition 独立克隆，并记录 attempted/completed/failed、payload/options hash、
+Token、时延和 cutoff 审计。实验可恢复，但恢复时会拒绝候选、gold 或协议参数漂移。
+
 首个真实调用实验的方法、消融矩阵和 token 结果见
 [开发记录](docs/DEVELOPMENT_LOG.md)。论文机制当前覆盖范围与缺口见
-[论文覆盖矩阵](docs/PAPER_COVERAGE.md)。
+[论文覆盖矩阵](docs/PAPER_COVERAGE.md)。实时、缓存与主动重建的当前证据、预注册指标和
+成本边界见[运行时研究报告](docs/research/MR_MEMORY_RUNTIME_STUDY.md)。
 
 ## 反馈学习闭环
 
@@ -219,7 +225,9 @@ python -m unittest discover -s tests -v
 
 真实群聊 embedding 选型目前使用证据式模型初标集，构建规则、隐私边界和评测口径见
 [群聊检索测试集](docs/RETRIEVAL_BENCHMARK.md)。真实正文只保存在 Git 忽略的
-`.dev/`，不会进入仓库或外部推理服务。
+`.dev/`，不会进入仓库。启用线上潜意识或显式运行真实 Provider 实验时，有界证据包会发送
+给所选 LLM Provider；离线 `cache` arm 不调用 Provider。执行真实数据实验前应确认该
+Provider 和数据外发范围符合部署者的隐私要求。
 
 ## 当前边界
 

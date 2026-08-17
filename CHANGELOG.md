@@ -11,6 +11,10 @@
   drain during plugin hot reload.
 - Correct the configuration and console language so `every_request`, its Token
   budget and observed latency describe the network LLM call that actually occurs.
+- Add a resumable, provenance-bound and cutoff-audited research pilot that compares deterministic cache,
+  the deliberately weak 0.16 one-pass gate, and a full read-only MR tool loop on
+  identical candidates, with isolated SQLite clones, durable usage accounting,
+  source-key gold audits, and a paper-style evidence report.
 
 ## 0.17.0
 

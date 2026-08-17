@@ -1,0 +1,524 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "从检索到重建：面向真实群聊 Agent 的实时、缓存与反馈驱动图记忆研究",
+    "description": "基于匿名聚合线上遥测、人工确认的候选检索基准与一手论文证据，对 MR Memory 的在线推理基线、候选检索层和后续实验路线进行技术审计。",
+    "generatedAt": "2026-08-17T03:11:12.6300797Z",
+    "cards": [],
+    "charts": [
+      {
+        "id": "candidate_retrieval_chart",
+        "title": "候选检索器的 MRR@20 与证据召回率@20",
+        "subtitle": "47 个查询、24,804 条候选文档；Harrier 默认提示优于 MiniLM，但提示改写会显著改变结果",
+        "showDescription": true,
+        "type": "bar",
+        "dataset": "retrieval_metrics",
+        "sourceId": "retrieval_aggregate",
+        "encodings": {
+          "x": {
+            "field": "model_label",
+            "type": "nominal",
+            "label": "候选检索方法"
+          },
+          "y": {
+            "field": "score",
+            "type": "quantitative",
+            "format": "percent",
+            "label": "得分"
+          },
+          "color": {
+            "field": "metric_label",
+            "type": "nominal",
+            "label": "指标"
+          },
+          "tooltip": [
+            {
+              "field": "model_key",
+              "type": "text",
+              "label": "模型键"
+            },
+            {
+              "field": "score",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "得分"
+            },
+            {
+              "field": "hit_at_20",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "Hit@20"
+            },
+            {
+              "field": "all_evidence_at_20",
+              "type": "quantitative",
+              "format": "percent",
+              "label": "全部证据命中@20"
+            },
+            {
+              "field": "n_queries",
+              "type": "quantitative",
+              "format": "number",
+              "label": "查询数"
+            }
+          ]
+        },
+        "xAxisTitle": "候选检索方法",
+        "yAxisTitle": "得分（0–1）",
+        "valueFormat": "percent",
+        "layout": "wide",
+        "maxRows": 8,
+        "compatibleTypes": [
+          "bar"
+        ]
+      }
+    ],
+    "tables": [
+      {
+        "id": "runtime_cost_table",
+        "title": "0.16 在线推理基线的路径、成本与延迟",
+        "subtitle": "54 次自动重建调用；所有调用均停留在 fast 路径，结果标签描述系统行为而非语义正确性",
+        "showDescription": true,
+        "dataset": "runtime_outcomes",
+        "density": "comfortable",
+        "sourceId": "runtime_aggregate",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "runs",
+          "direction": "desc"
+        },
+        "columns": [
+          {
+            "field": "outcome",
+            "label": "系统结果",
+            "type": "text"
+          },
+          {
+            "field": "path",
+            "label": "路径",
+            "type": "text"
+          },
+          {
+            "field": "runs",
+            "label": "运行数",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "ledger_runs",
+            "label": "有 Provider usage",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "mean_tokens",
+            "label": "平均实测 Token",
+            "type": "number",
+            "format": "compact",
+            "align": "right"
+          },
+          {
+            "field": "p95_tokens",
+            "label": "P95 实测 Token",
+            "type": "number",
+            "format": "compact",
+            "align": "right"
+          },
+          {
+            "field": "median_latency_s",
+            "label": "延迟中位数",
+            "type": "number",
+            "format": "number",
+            "unit": "s",
+            "align": "right"
+          },
+          {
+            "field": "p95_latency_s",
+            "label": "P95 延迟",
+            "type": "number",
+            "format": "number",
+            "unit": "s",
+            "align": "right"
+          },
+          {
+            "field": "max_latency_s",
+            "label": "最大延迟",
+            "type": "number",
+            "format": "number",
+            "unit": "s",
+            "align": "right"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "observed_evidence",
+        "label": "匿名聚合观测证据",
+        "path": "docs/research/data/observed_evidence.json"
+      },
+      {
+        "id": "pilot_smoke_aggregate",
+        "label": "遮罩 cache smoke 聚合",
+        "path": "docs/research/data/pilot_smoke_aggregate.json"
+      },
+      {
+        "id": "retrieval_aggregate",
+        "label": "候选检索聚合查询",
+        "path": "docs/research/data/observed_evidence.json"
+      },
+      {
+        "id": "runtime_aggregate",
+        "label": "在线运行时聚合查询",
+        "path": "docs/research/data/observed_evidence.json"
+      },
+      {
+        "id": "runtime_study_paper",
+        "label": "MR Memory 运行时研究论文",
+        "path": "docs/research/MR_MEMORY_RUNTIME_STUDY.md"
+      },
+      {
+        "id": "mragent_paper",
+        "label": "MRAgent",
+        "href": "https://arxiv.org/html/2606.06036v1"
+      },
+      {
+        "id": "longmemeval_paper",
+        "label": "LongMemEval",
+        "href": "https://arxiv.org/html/2410.10813"
+      },
+      {
+        "id": "locomo_paper",
+        "label": "LoCoMo",
+        "href": "https://arxiv.org/html/2402.17753"
+      },
+      {
+        "id": "amem_paper",
+        "label": "A-MEM",
+        "href": "https://arxiv.org/html/2502.12110"
+      },
+      {
+        "id": "zep_paper",
+        "label": "Zep / Graphiti",
+        "href": "https://arxiv.org/html/2501.13956"
+      },
+      {
+        "id": "mem0_paper",
+        "label": "Mem0",
+        "href": "https://arxiv.org/html/2504.19413"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "report_title",
+        "type": "markdown",
+        "body": "# 从检索到重建：面向真实群聊 Agent 的实时、缓存与反馈驱动图记忆研究"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "observed_evidence",
+        "body": "## 技术摘要\n\n**当前证据支持恢复 0.16 的完整单次判断链作为待检验基线，但不支持把它视为语义质量基准。** 在线样本中的 54 次自动重建全部停留在 fast 路径：平均实测 23.3k Token，延迟中位数 7.0 秒、P95 80.3 秒，并有 5 次失败。候选层上，Harrier 默认提示相对 MiniLM 的 MRR@20 提升 0.200（95% bootstrap CI 0.075–0.327），平均证据召回率@20 提升 0.148（0.060–0.238）；但这些指标只衡量人工标注证据是否进入候选集，不能证明最终语义重建正确。\n\n因此，后续实验必须把 **候选召回、LLM 读取/推理、图更新与在线延迟** 分开测量，并把“未发现证据”与“发现但误读证据”区分开。"
+      },
+      {
+        "id": "retrieval_result_heading",
+        "type": "markdown",
+        "sourceId": "observed_evidence",
+        "body": "## 候选检索已改善证据可见性，但提示本身仍是敏感变量\n\nHarrier 默认提示在这组证据导向基准上取得最高的 MRR@20（0.841）和平均证据召回率@20（0.665）。BM25 的 MRR@20 为 0.836，与 Harrier 的差异区间跨过 0；但 Harrier 的证据召回率高 0.100，95% bootstrap CI 为 0.014–0.193。把 Harrier 提示改成 group-memory 版本后，MRR@20 反而下降 0.078（CI −0.140 至 −0.027）。\n\n这意味着 embedding 只解决“哪些证据值得先看”的排序问题，且提示模板必须被视为模型配置的一部分；它不能替代语义 gate、跨轮推理或反馈校正。"
+      },
+      {
+        "id": "retrieval_chart_block",
+        "type": "chart",
+        "chartId": "candidate_retrieval_chart"
+      },
+      {
+        "id": "runtime_result_heading",
+        "type": "markdown",
+        "sourceId": "observed_evidence",
+        "body": "## 在线基线的典型延迟不高，但尾部延迟与失败成本不可忽略\n\n54 次观测中，24 次返回 none，25 次返回 brief，5 次失败；这些标签没有人工语义金标。none 的延迟中位数为 3.5 秒，而 brief 为 25.0 秒；全体调用的 P95 达 80.3 秒。两次 timeout 没有 provider usage，因此 1.26M Token 是可观测账本总量，不是计费上界。\n\n**产品含义：** 不能只用总体均值判断实时可用性。必须分别报告成功分支、无记忆分支、失败分支和升级分支，并对超时、JSON 修复与 provider usage 缺失单独记账。"
+      },
+      {
+        "id": "runtime_table_block",
+        "type": "table",
+        "tableId": "runtime_cost_table"
+      },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "sourceId": "observed_evidence",
+        "body": "## 证据范围与指标定义\n\n- **在线运行时样本：** 单一隔离数据库中的 54 次自动重建记录；49 次完成、5 次失败。`brief`、`none` 与 `fast` 是系统状态，不是正确/错误标签。\n- **候选检索基准：** 47 个查询、24,804 条候选文档。金标来自回复链与人工证据确认；词法 decoy 并非经过验证的负例。\n- **MRR@20：** 第一个标注正例在前 20 个结果中的倒数排名均值。\n- **平均证据召回率@20：** 每个查询的标注证据中，进入前 20 个候选的比例，再对查询取平均。\n- **延迟：** 运行记录的墙钟时间。P95 使用线性分位数；Token 统计把缺失 provider usage 的两次 timeout 记为“未观测到”，因此只代表实测值。"
+      },
+      {
+        "id": "methodology_architecture",
+        "type": "markdown",
+        "body": "## 方法框架：把检索、重建、更新与服务路径拆开\n\n[MRAgent](https://arxiv.org/html/2606.06036v1) 将记忆读取建模为带活动集合与累积证据的迭代遍历，embedding 只是候选先验；[LongMemEval](https://arxiv.org/html/2410.10813) 则明确区分索引、检索和阅读。[A-MEM](https://arxiv.org/html/2502.12110)、[Zep / Graphiti](https://arxiv.org/html/2501.13956) 与 [Mem0](https://arxiv.org/html/2504.19413) 分别提供动态链接、双时态失效和增量 ADD/UPDATE/DELETE/NOOP 的实现参照。\n\n据此，报告采用三层可检验分解：\n\n1. **候选层：** 固定时间截断与同一候选集，比较 lexical、embedding 与混合召回。\n2. **重建层：** 比较纯缓存、0.16 单次 gate 和有界多步 MR；记录访问过的证据、工具步数、Token、延迟与失败类型。\n3. **反馈层：** 原始证据不可变，派生节点和边版本化，保留 provenance、有效期、冲突与撤销记录；LLM 提议更新，确定性规则执行群范围、账号主体与审计约束。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 局限、不确定性与稳健性边界\n\n- 当前线上样本没有人工语义标签，不能用 `brief` 比例或完成率推断记忆质量。\n- 候选检索金标偏向回复链证据，不能代表自然 `/chat` 查询的完整分布；decoy 也不能用于估计精确率。\n- 在线数据只覆盖一个数据库范围，跨群、账号别名、群内反讽和竞争释义仍需独立测试。\n- 目前 0.16 样本没有进入 full Agent 路径，无法从线上观测推断有界多步 MR 的收益或成本。\n- `好女孩` 与历史调用案例只适合作为困难案例；在没有预注册判分规则、时间遮罩和独立重复前，不能作为成功证据。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 下一步：用同候选集的遮罩实验决定实时与缓存的边界\n\n已完成的 cache-only 单案例 smoke 为 1/1 完成、0 Provider 调用、0 Token；必要证据组召回为 1.0，但 gold-key precision lower bound 仅 0.158。它在经研究者声明的 masked fixture 上验证了 cache 执行与逐来源 cutoff 审计，也暴露了候选噪声；它既不能独立证明图构建历史，也不能作为 A1 质量结论。\n\n1. 在严格时间截断的数据库副本上，对 **cache / 0.16 gate / full MR** 使用相同候选集和相同语义金标，继续真实 Provider smoke 与重复实验。\n2. 对每个 arm 同时记录语义证据组命中、禁止结论、来源覆盖、工具步数、Token、墙钟延迟、timeout 与 JSON 修复；不保存隐藏思维链。\n3. 把召回失败与阅读失败分开：前者改候选策略，后者改 gate、工具接口或重建路径。\n4. 在线默认策略只在实验显示质量损失可控后再调整；缓存应是可审计的快速路径，而不是绕过潜意识重建的永久替代。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 尚待回答的问题\n\n- 哪些查询特征能在不降低困难语义质量的前提下安全命中缓存？\n- 多步 MR 的收益来自更深遍历、更多候选，还是 LLM 对证据冲突的重新表述？\n- 账号主体、别名与群昵称变化应在何时建立确定性绑定，何时只保留竞争假设？\n- 反馈边的遗忘、合并和失效阈值能否用可逆审计记录替代固定相似度阈值？\n- 在跨群隔离前提下，怎样定义可上线的延迟、Token 与错误率预算，而不牺牲语义重建能力？"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-17T03:11:12.6300797Z",
+    "status": "ready",
+    "datasets": {
+      "retrieval_metrics": [
+        {
+          "model_key": "minilm-l12-v2",
+          "model_label": "MiniLM",
+          "family": "dense embedding",
+          "metric_label": "MRR@20",
+          "score": 0.641084,
+          "hit_at_20": 0.851064,
+          "all_evidence_at_20": 0.255319,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "minilm-l12-v2",
+          "model_label": "MiniLM",
+          "family": "dense embedding",
+          "metric_label": "平均证据召回率@20",
+          "score": 0.517021,
+          "hit_at_20": 0.851064,
+          "all_evidence_at_20": 0.255319,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "harrier-270m",
+          "model_label": "Harrier 270M",
+          "family": "dense embedding",
+          "metric_label": "MRR@20",
+          "score": 0.841312,
+          "hit_at_20": 1.0,
+          "all_evidence_at_20": 0.361702,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "harrier-270m",
+          "model_label": "Harrier 270M",
+          "family": "dense embedding",
+          "metric_label": "平均证据召回率@20",
+          "score": 0.665248,
+          "hit_at_20": 1.0,
+          "all_evidence_at_20": 0.361702,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "bm25-char-bigram",
+          "model_label": "BM25 char-bigram",
+          "family": "lexical",
+          "metric_label": "MRR@20",
+          "score": 0.835697,
+          "hit_at_20": 0.893617,
+          "all_evidence_at_20": 0.234043,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "bm25-char-bigram",
+          "model_label": "BM25 char-bigram",
+          "family": "lexical",
+          "metric_label": "平均证据召回率@20",
+          "score": 0.564894,
+          "hit_at_20": 0.893617,
+          "all_evidence_at_20": 0.234043,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "harrier-270m-group-memory",
+          "model_label": "Harrier group-memory",
+          "family": "dense embedding",
+          "metric_label": "MRR@20",
+          "score": 0.763155,
+          "hit_at_20": 0.978723,
+          "all_evidence_at_20": 0.382979,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        },
+        {
+          "model_key": "harrier-270m-group-memory",
+          "model_label": "Harrier group-memory",
+          "family": "dense embedding",
+          "metric_label": "平均证据召回率@20",
+          "score": 0.661702,
+          "hit_at_20": 0.978723,
+          "all_evidence_at_20": 0.382979,
+          "n_queries": 47,
+          "corpus_documents": 24804
+        }
+      ],
+      "runtime_outcomes": [
+        {
+          "display_order": 1,
+          "outcome": "全部运行",
+          "path": "fast（54/54）",
+          "runs": 54,
+          "ledger_runs": 52,
+          "mean_tokens": 23302.462963,
+          "p95_tokens": 43086.7,
+          "median_latency_s": 7.000002,
+          "p95_latency_s": 80.349981,
+          "max_latency_s": 89.999995,
+          "semantic_labels": false
+        },
+        {
+          "display_order": 2,
+          "outcome": "brief",
+          "path": "fast",
+          "runs": 25,
+          "ledger_runs": 25,
+          "mean_tokens": 23911.28,
+          "p95_tokens": 34089.8,
+          "median_latency_s": 24.999985,
+          "p95_latency_s": 77.999971,
+          "max_latency_s": 81.000003,
+          "semantic_labels": false
+        },
+        {
+          "display_order": 3,
+          "outcome": "none",
+          "path": "fast",
+          "runs": 24,
+          "ledger_runs": 24,
+          "mean_tokens": 21963.375,
+          "p95_tokens": 38991.9,
+          "median_latency_s": 3.500001,
+          "p95_latency_s": 17.650019,
+          "max_latency_s": 24.999985,
+          "semantic_labels": false
+        },
+        {
+          "display_order": 4,
+          "outcome": "failed",
+          "path": "fast",
+          "runs": 5,
+          "ledger_runs": 3,
+          "mean_tokens": 26686.0,
+          "p95_tokens": 46275.0,
+          "median_latency_s": 16.999988,
+          "p95_latency_s": 89.999995,
+          "max_latency_s": 89.999995,
+          "semantic_labels": false
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "observed_evidence",
+      "label": "匿名聚合观测证据",
+      "path": "docs/research/data/observed_evidence.json"
+    },
+    {
+      "id": "pilot_smoke_aggregate",
+      "label": "遮罩 cache smoke 聚合",
+      "path": "docs/research/data/pilot_smoke_aggregate.json"
+    },
+    {
+      "id": "retrieval_aggregate",
+      "label": "候选检索聚合查询",
+      "path": "docs/research/data/observed_evidence.json",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "WITH src AS (SELECT candidate_retrieval FROM read_json_auto('docs/research/data/observed_evidence.json')), models AS (SELECT m.model.key AS model_key, CASE m.model.key WHEN 'minilm-l12-v2' THEN 'MiniLM' WHEN 'harrier-270m' THEN 'Harrier 270M' WHEN 'bm25-char-bigram' THEN 'BM25 char-bigram' WHEN 'harrier-270m-group-memory' THEN 'Harrier group-memory' END AS model_label, CASE WHEN m.model.key = 'bm25-char-bigram' THEN 'lexical' ELSE 'dense embedding' END AS family, m.model.mrr_at_20, m.model.mean_evidence_recall_at_20, m.model.hit_at_20, m.model.all_evidence_at_20, candidate_retrieval.source.queries AS n_queries, candidate_retrieval.source.corpus_documents FROM src, UNNEST(candidate_retrieval.models) AS m(model) WHERE m.model.key IN ('minilm-l12-v2', 'harrier-270m', 'bm25-char-bigram', 'harrier-270m-group-memory')) SELECT model_key, model_label, family, metric_label, score, hit_at_20, all_evidence_at_20, n_queries, corpus_documents FROM models CROSS JOIN LATERAL (VALUES ('MRR@20', mrr_at_20), ('平均证据召回率@20', mean_evidence_recall_at_20)) AS metric(metric_label, score)",
+        "description": "从匿名聚合证据文件读取四个关键候选检索方法，并转换为 MRR@20 与平均证据召回率@20 的长表。",
+        "tables_used": [
+          "docs/research/data/observed_evidence.json"
+        ],
+        "filters": [
+          "只保留 MiniLM、Harrier 270M、BM25 char-bigram 与 Harrier group-memory 四个关键比较臂",
+          "同一组 47 个查询和 24,804 条候选文档"
+        ],
+        "metric_definitions": [
+          "MRR@20 = 每个查询在前 20 个结果中第一个标注正例倒数排名的均值",
+          "平均证据召回率@20 = 每个查询的标注证据进入前 20 个结果的比例，再对 47 个查询取平均",
+          "得分按 0 到 1 的比例存储"
+        ]
+      }
+    },
+    {
+      "id": "runtime_aggregate",
+      "label": "在线运行时聚合查询",
+      "path": "docs/research/data/observed_evidence.json",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "WITH src AS (SELECT online_runtime AS rt FROM read_json_auto('docs/research/data/observed_evidence.json')) SELECT 1 AS display_order, '全部运行' AS outcome, 'fast（54/54）' AS path, rt.quality_checks.runs AS runs, rt.tokens_per_run_with_provider_usage.n AS ledger_runs, rt.tokens_measured_all_runs.mean AS mean_tokens, rt.tokens_measured_all_runs.p95_linear AS p95_tokens, rt.wall_seconds.median AS median_latency_s, rt.wall_seconds.p95_linear AS p95_latency_s, rt.wall_seconds.max AS max_latency_s, false AS semantic_labels FROM src UNION ALL SELECT 2, 'brief', 'fast', rt.outcomes.brief.wall_seconds.n, rt.outcomes.brief.tokens_with_provider_usage.n, rt.outcomes.brief.tokens_measured_all_runs.mean, rt.outcomes.brief.tokens_measured_all_runs.p95_linear, rt.outcomes.brief.wall_seconds.median, rt.outcomes.brief.wall_seconds.p95_linear, rt.outcomes.brief.wall_seconds.max, false FROM src UNION ALL SELECT 3, 'none', 'fast', rt.outcomes.none.wall_seconds.n, rt.outcomes.none.tokens_with_provider_usage.n, rt.outcomes.none.tokens_measured_all_runs.mean, rt.outcomes.none.tokens_measured_all_runs.p95_linear, rt.outcomes.none.wall_seconds.median, rt.outcomes.none.wall_seconds.p95_linear, rt.outcomes.none.wall_seconds.max, false FROM src UNION ALL SELECT 4, 'failed', 'fast', rt.outcomes.failed.wall_seconds.n, rt.outcomes.failed.tokens_with_provider_usage.n, rt.outcomes.failed.tokens_measured_all_runs.mean, rt.outcomes.failed.tokens_measured_all_runs.p95_linear, rt.outcomes.failed.wall_seconds.median, rt.outcomes.failed.wall_seconds.p95_linear, rt.outcomes.failed.wall_seconds.max, false FROM src ORDER BY display_order",
+        "description": "从匿名聚合证据文件读取在线基线的总体与分结果 Token、延迟和账本覆盖统计。",
+        "tables_used": [
+          "docs/research/data/observed_evidence.json"
+        ],
+        "filters": [
+          "UTC 截止时间 2026-08-06 19:21:33",
+          "54 次 automatic runtime_reconstruction 运行",
+          "不包含群号、账号、消息文本、source key 或 provider 配置"
+        ],
+        "metric_definitions": [
+          "平均与 P95 Token 使用 tokens_measured_all_runs；两次 timeout 缺少 provider usage，按未观测到处理",
+          "延迟为运行记录的墙钟秒数；P95 使用线性分位数",
+          "ledger_runs 为能够关联 provider usage 的运行数",
+          "brief、none、failed 和 fast 仅是系统行为标签，不是语义质量标签"
+        ]
+      }
+    },
+    {
+      "id": "runtime_study_paper",
+      "label": "MR Memory 运行时研究论文",
+      "path": "docs/research/MR_MEMORY_RUNTIME_STUDY.md"
+    },
+    {
+      "id": "mragent_paper",
+      "label": "MRAgent",
+      "href": "https://arxiv.org/html/2606.06036v1"
+    },
+    {
+      "id": "longmemeval_paper",
+      "label": "LongMemEval",
+      "href": "https://arxiv.org/html/2410.10813"
+    },
+    {
+      "id": "locomo_paper",
+      "label": "LoCoMo",
+      "href": "https://arxiv.org/html/2402.17753"
+    },
+    {
+      "id": "amem_paper",
+      "label": "A-MEM",
+      "href": "https://arxiv.org/html/2502.12110"
+    },
+    {
+      "id": "zep_paper",
+      "label": "Zep / Graphiti",
+      "href": "https://arxiv.org/html/2501.13956"
+    },
+    {
+      "id": "mem0_paper",
+      "label": "Mem0",
+      "href": "https://arxiv.org/html/2504.19413"
+    }
+  ]
+}
