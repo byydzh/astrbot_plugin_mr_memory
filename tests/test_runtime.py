@@ -71,6 +71,21 @@ class RuntimePlanTests(unittest.TestCase):
                 ),
             )
 
+    def test_completion_validation_error_is_not_masked_by_reasoning_fallback(self) -> None:
+        completion = json.dumps({"channel": "completion"})
+        reasoning = json.dumps({"channel": "reasoning"})
+
+        def reject(value: str):
+            channel = json.loads(value)["channel"]
+            raise ValueError(f"{channel} schema violation")
+
+        with self.assertRaisesRegex(ValueError, "completion schema violation"):
+            parse_structured_response(
+                completion_text=completion,
+                reasoning_content=reasoning,
+                parser=reject,
+            )
+
     def test_one_pass_reconstruction_is_grounded_and_bounded(self) -> None:
         plan = parse_reconstruction_plan(
             json.dumps(
