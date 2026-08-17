@@ -3,9 +3,9 @@
   "manifest": {
     "version": 1,
     "surface": "report",
-    "title": "从检索到重建：面向真实群聊 Agent 的实时、缓存与反馈驱动图记忆研究",
-    "description": "基于匿名聚合线上遥测、人工确认的候选检索基准、单案例三臂 Provider 诊断与一手论文证据，对 MR Memory 的在线推理基线、候选检索层和实验路线进行技术审计。",
-    "generatedAt": "2026-08-17T04:32:08.2011923Z",
+    "title": "证据契约与反证闭合：真实群聊图记忆的查询时重建、缓存路由与反馈修订",
+    "description": "提出并真实测试 ECCR，分离候选检索、证据契约、假说构建、最终回答和成本；给出实时/缓存四层路由、图连接生命周期及负结果。",
+    "generatedAt": "2026-08-17T06:53:25.723627+00:00",
     "cards": [],
     "charts": [
       {
@@ -210,6 +210,161 @@
             "type": "text"
           }
         ]
+      },
+      {
+        "id": "eccr_case_table",
+        "title": "真实调用：ECCR 工程迭代、语用案例与主体约束",
+        "subtitle": "所有语义案例均为开发诊断；固定证据包不评价端到端检索",
+        "showDescription": true,
+        "dataset": "eccr_case_runs",
+        "density": "comfortable",
+        "sourceId": "eccr_case_study_aggregate",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "tokens",
+          "direction": "desc"
+        },
+        "columns": [
+          {
+            "field": "case",
+            "label": "案例",
+            "type": "text"
+          },
+          {
+            "field": "arm",
+            "label": "方法",
+            "type": "text"
+          },
+          {
+            "field": "status",
+            "label": "状态",
+            "type": "text"
+          },
+          {
+            "field": "calls",
+            "label": "调用",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "tokens",
+            "label": "已测 Token",
+            "type": "number",
+            "format": "compact",
+            "align": "right"
+          },
+          {
+            "field": "time_label",
+            "label": "受控墙钟",
+            "type": "text"
+          },
+          {
+            "field": "semantic_outcome",
+            "label": "诊断结论",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "surface_answer_table",
+        "title": "#726 最终可见回答：模型 judge 与逐项证据复核冲突",
+        "subtitle": "同一最近上下文、同一主模型；自动分数不是人类准确率",
+        "showDescription": true,
+        "dataset": "surface_answer_runs",
+        "density": "comfortable",
+        "sourceId": "eccr_case_study_aggregate",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "evidence_review_rank",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "arm",
+            "label": "Brief",
+            "type": "text"
+          },
+          {
+            "field": "tokens",
+            "label": "表层 Token",
+            "type": "number",
+            "format": "compact",
+            "align": "right"
+          },
+          {
+            "field": "latency_label",
+            "label": "表层墙钟",
+            "type": "text"
+          },
+          {
+            "field": "model_judge_composite",
+            "label": "模型 composite",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "model_judge_overall",
+            "label": "模型 overall",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "evidence_review_rank",
+            "label": "证据复核名次",
+            "type": "number",
+            "format": "number",
+            "align": "right"
+          },
+          {
+            "field": "finding",
+            "label": "覆盖缺口",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "runtime_route_table",
+        "title": "建议产品路由：确定性真值、证书缓存、一次读取与有界深挖",
+        "subtitle": "缓存不取代语义 gate，深挖也不阻塞每次聊天",
+        "showDescription": true,
+        "dataset": "runtime_route",
+        "density": "comfortable",
+        "sourceId": "eccr_case_study_aggregate",
+        "layout": "wide",
+        "defaultSort": {
+          "field": "layer",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "layer",
+            "label": "层",
+            "type": "text"
+          },
+          {
+            "field": "work",
+            "label": "处理内容",
+            "type": "text"
+          },
+          {
+            "field": "model_calls",
+            "label": "模型调用",
+            "type": "text"
+          },
+          {
+            "field": "trigger",
+            "label": "触发条件",
+            "type": "text"
+          },
+          {
+            "field": "output",
+            "label": "产物",
+            "type": "text"
+          }
+        ]
       }
     ],
     "sources": [
@@ -330,36 +485,83 @@
         "id": "mem0_paper",
         "label": "Mem0",
         "href": "https://arxiv.org/html/2504.19413"
+      },
+      {
+        "id": "eccr_case_study_aggregate",
+        "label": "ECCR 真实 Provider 案例安全聚合",
+        "path": "docs/research/data/eccr_case_study_aggregate.json",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "SELECT * FROM read_json_auto('docs/research/data/eccr_case_study_aggregate.json')",
+          "description": "读取脱敏的 ECCR 工程迭代、固定证据包、表层回答与确定性主体诊断。",
+          "tables_used": [
+            "docs/research/data/eccr_case_study_aggregate.json"
+          ],
+          "filters": [
+            "只包含真实完成或明确失败的 Provider 调用和零调用确定性诊断",
+            "不包含正文、query、群号、账号、source-key 值、endpoint、凭据或 Provider 配置",
+            "固定证据包案例不评价候选生成或端到端检索"
+          ],
+          "metric_definitions": [
+            "已测 Token = Provider usage 中 ordinary input、cached input 与 output 的合计",
+            "受控墙钟 = 单次实验进程从调用开始到完整响应或 fail-closed 的时长，不等于 AstrBot 线上端到端时延",
+            "required-group recall 是最终 brief 对预注册 source group 的引用覆盖，不是语义准确率",
+            "模型 judge 是一次自动评分；post-hoc evidence review 逐原子证据复核，二者都不是独立人类盲评"
+          ]
+        }
       }
     ],
     "blocks": [
       {
         "id": "report_title",
         "type": "markdown",
-        "body": "# 从检索到重建：面向真实群聊 Agent 的实时、缓存与反馈驱动图记忆研究"
+        "body": "# 证据契约与反证闭合：真实群聊图记忆的查询时重建、缓存路由与反馈修订"
       },
       {
-        "id": "technical_summary",
+        "id": "answer_first",
         "type": "markdown",
-        "body": "## 技术摘要\n\n**当前证据不支持把 0.16 或完整多步 MR 当作合格的语义基准。** 线上弱基线具有明显长尾且从未进入主动图遍历；候选检索改善了证据可见性，但不能证明最终语义正确；单案例受控诊断中，full-MR 找到更多跨情节证据，却没有形成更直接的群内释义。该诊断没有独立盲评，不能用来宣称 B16 更优，只能定位搜索深度与最终 synthesis 的脱节。\n\n因此，后续实验必须把 **候选召回、LLM 读取/推理、图更新与在线延迟** 分开测量，并把“未发现证据”与“发现但误读证据”区分开。"
+        "sourceId": "eccr_case_study_aggregate",
+        "body": "## 结论先行\n\nECCR 已经被实现并发生真实 Provider 调用，但目前不是默认在线路径。它在 #726 上能生成校准的内部 brief，却用了 3 次调用、76,224 Token 和 379.4 秒；随后表层模型还丢失了两个核心证据锚点。‘好女孩’两轮审计找齐两段事实但没构造核心语义桥。当前最可靠的产品结论是：主体与时间真值留在零调用宿主，缓存保存可失效的证据证书，一次 LLM 做普通语义读取，完整 ECCR 只用于异步深挖、强歧义与反馈复核。"
       },
       {
-        "id": "technical_summary_observed",
+        "id": "method_heading",
+        "type": "markdown",
+        "sourceId": "runtime_study_paper",
+        "body": "## 新方法：证据契约—反证闭合\n\nECCR 把控制单元从自由工具轮数改为答案义务：主体、待证问题、竞争释义、反证条件、疑虑与未探索前沿都进入显式 contract。每次搜索必须说明要区分什么；只有各项义务得到来源支持、反驳、争议标记或安全弃答后才生成 brief。宿主验证 scope、cutoff、账号、来源、状态迁移和预算，LLM 保留语义判断权。"
+      },
+      {
+        "id": "route_table_block",
+        "type": "table",
+        "tableId": "runtime_route_table"
+      },
+      {
+        "id": "case_heading",
+        "type": "markdown",
+        "sourceId": "eccr_case_study_aggregate",
+        "body": "## 真实调用与负结果\n\n表中同时保留完成、超时前闭合失败、结构化协议失败和修复后重试。更多 Token 不是能力代理；source-group recall 也不是语义理解。"
+      },
+      {
+        "id": "case_table_block",
+        "type": "table",
+        "tableId": "eccr_case_table"
+      },
+      {
+        "id": "surface_heading",
+        "type": "markdown",
+        "sourceId": "eccr_case_study_aggregate",
+        "body": "## 最终回答是独立瓶颈\n\n原始模型 judge 把 ECCR 排第一，逐项证据复核却把 B16 排第一：ECCR 的内部 brief 更完整，但表层压缩漏掉核心锚点。研究不能停在‘图里搜到了’，必须测用户实际看到的答案。"
+      },
+      {
+        "id": "surface_table_block",
+        "type": "table",
+        "tableId": "surface_answer_table"
+      },
+      {
+        "id": "retrieval_heading",
         "type": "markdown",
         "sourceId": "observed_evidence",
-        "body": "### 线上与候选层证据\n\n54 次线上自动重建全部停留在 fast 路径：平均实测 23.3k Token，延迟中位数 7.0 秒、P95 80.3 秒，并有 5 次失败。候选层上，Harrier 默认提示相对 MiniLM 的 MRR@20 提升 0.200（95% bootstrap CI 0.075–0.327），平均证据召回率@20 提升 0.148（0.060–0.238）。这些候选指标不等于语义准确率。"
-      },
-      {
-        "id": "technical_summary_pilot",
-        "type": "markdown",
-        "sourceId": "pilot_provider_aggregate",
-        "body": "### 单案例三臂诊断\n\nfull-MR 相对 B16 使用 11.93 倍 Token、3.49 倍受控总时延，访问更多来源，却没有把新增证据转化为更直接的语义终判。该调用是污染开发案例，每个 arm 仅运行一次，语义状态仍为待独立盲评。"
-      },
-      {
-        "id": "retrieval_result_heading",
-        "type": "markdown",
-        "sourceId": "observed_evidence",
-        "body": "## 候选检索已改善证据可见性，但提示本身仍是敏感变量\n\nHarrier 默认提示在这组证据导向基准上取得最高的 MRR@20（0.841）和平均证据召回率@20（0.665）。BM25 的 MRR@20 为 0.836，与 Harrier 的差异区间跨过 0；但 Harrier 的证据召回率高 0.100，95% bootstrap CI 为 0.014–0.193。把 Harrier 提示改成 group-memory 版本后，MRR@20 反而下降 0.078（CI −0.140 至 −0.027）。\n\n这意味着 embedding 只解决“哪些证据值得先看”的排序问题，且提示模板必须被视为模型配置的一部分；它不能替代语义 gate、跨轮推理或反馈校正。"
+        "body": "## 候选层：现代 embedding 有收益，但 BM25 仍不可替代\n\nHarrier 在 47 题上的 MRR@20 和证据召回率高于 MiniLM；Harrier 与字符 BM25 的 MRR 差异区间跨零。候选覆盖只负责缩小搜索空间，不能作为语义 gate。"
       },
       {
         "id": "retrieval_chart_block",
@@ -367,10 +569,10 @@
         "chartId": "candidate_retrieval_chart"
       },
       {
-        "id": "runtime_result_heading",
+        "id": "runtime_heading",
         "type": "markdown",
         "sourceId": "observed_evidence",
-        "body": "## 在线基线的典型延迟不高，但尾部延迟与失败成本不可忽略\n\n54 次观测中，24 次返回 none，25 次返回 brief，5 次失败；这些标签没有人工语义金标。none 的延迟中位数为 3.5 秒，而 brief 为 25.0 秒；全体调用的 P95 达 80.3 秒。两次 timeout 没有 provider usage，因此 1.26M Token 是可观测账本总量，不是计费上界。\n\n**产品含义：** 不能只用总体均值判断实时可用性。必须分别报告成功分支、无记忆分支、失败分支和升级分支，并对超时、JSON 修复与 provider usage 缺失单独记账。"
+        "body": "## 线上弱基线：54 次均未进入图工具循环\n\n0.16 观察窗口的所有自动调用都停在 fast/host-prefetch；这是运行行为，不是语义正确性。长尾和协议失败说明单次 LLM gate 也需要严格成本与可靠性观测。"
       },
       {
         "id": "runtime_table_block",
@@ -378,58 +580,45 @@
         "tableId": "runtime_cost_table"
       },
       {
-        "id": "pilot_result_heading",
+        "id": "old_pilot_heading",
         "type": "markdown",
         "sourceId": "pilot_provider_aggregate",
-        "body": "## 更深的搜索扩大了证据面，但没有证明终判更好\n\n固定同一遮罩候选包后，cache、B16 和 full-MR 三臂均完成且通过逐来源 cutoff 审计。B16 用 1 次调用、10.8k Token 和 21.1 秒，从 38 条预取来源中精选引用 6 条；full-MR 用 9 次调用、129.1k Token 和 73.6 秒，访问 62 条、引用 10 条。两者必要证据组召回都为 1.0；full-MR 找到了 B16 漏掉的后续行为证据，却没有在最终 brief 中完成目标跨情节释义。\n\n**诊断含义：** 当前瓶颈不只是候选召回，而是边际证据收益停止、跨情节连接裁决和最终 synthesis。29 次工具调用中有 18 次没有返回 source key，最后连续 6 次也没有新增可审计来源；继续放大轮数或上下文没有现成依据。该调用已被反复用于开发，且没有独立人类盲评、重复或主 LLM 最终回答，因此下表是路径/成本诊断，不是总体语义 A/B。"
+        "body": "## 旧控制器基线\n\n在同一污染案例上，B16 一次 gate 已覆盖必要证据组；full-MR 用 9 次模型调用和 29 次工具调用扩大证据面，却没有自动可证的语义收益。"
       },
       {
-        "id": "pilot_table_block",
+        "id": "old_pilot_table",
         "type": "table",
         "tableId": "pilot_arm_table"
       },
       {
-        "id": "scope_definitions",
+        "id": "graph_feedback",
         "type": "markdown",
-        "body": "## 证据范围与指标定义\n\n- **在线运行时样本：** 自动重建 ledger 的描述性切片。`brief`、`none` 与 `fast` 是系统状态，不是正确/错误标签。\n- **候选检索基准：** 金标来自回复链与人工证据确认；词法 decoy 并非经过验证的负例。\n- **三臂诊断：** 固定同一候选包与遮罩图副本。`required_group_recall` 和 gold-key precision lower bound 只衡量最终 brief 的 source-key 引用覆盖，不是 Supported-Claim Precision 或人类帮助度。\n- **MRR@20：** 第一个标注正例在前 20 个结果中的倒数排名均值。\n- **平均证据召回率@20：** 每个查询的标注证据中，进入前 20 个候选的比例，再对查询取平均。\n- **延迟：** 线上表使用运行记录墙钟；三臂表使用本地物化或非流式直连接口的完整响应时间。二者都不是首块时延，且不能直接互换。"
-      },
-      {
-        "id": "scope_observed_counts",
-        "type": "markdown",
-        "sourceId": "observed_evidence",
-        "body": "### 已复核线上与检索数据\n\n线上切片包含 54 次自动重建，其中 49 次完成、5 次失败；候选检索基准包含 47 个查询和 24,804 条候选文档。"
-      },
-      {
-        "id": "scope_pilot_counts",
-        "type": "markdown",
-        "sourceId": "pilot_provider_aggregate",
-        "body": "### 三臂诊断数据\n\n诊断只覆盖一个被开发过程反复使用的真实调用，每个 arm 运行一次；三个运行均完成，全部语义判断仍待独立盲评。"
-      },
-      {
-        "id": "methodology_architecture",
-        "type": "markdown",
-        "body": "## 方法框架：把检索、重建、更新与服务路径拆开\n\n[MRAgent](https://arxiv.org/html/2606.06036v1) 将记忆读取建模为带活动集合与累积证据的迭代遍历，embedding 只是候选先验；[LongMemEval](https://arxiv.org/html/2410.10813) 则明确区分索引、检索和阅读。[A-MEM](https://arxiv.org/html/2502.12110)、[Zep / Graphiti](https://arxiv.org/html/2501.13956) 与 [Mem0](https://arxiv.org/html/2504.19413) 分别提供动态链接、双时态失效和增量 ADD/UPDATE/DELETE/NOOP 的实现参照。\n\n据此，报告采用三层可检验分解：\n\n1. **候选层：** 固定时间截断与同一候选集，比较 lexical、embedding 与混合召回。\n2. **重建层：** 比较纯缓存、0.16 单次 gate 和有界多步 MR；记录访问过的证据、工具步数、Token、延迟与失败类型。\n3. **反馈层：** 原始证据不可变，派生节点和边版本化，保留 provenance、有效期、冲突与撤销记录；LLM 提议更新，确定性规则执行群范围、账号主体与审计约束。"
+        "sourceId": "runtime_study_paper",
+        "body": "## 高级图连接与反馈\n\n查询时临时论证图允许注册 SUPPORTS、CONTRADICTS、IDENTIFIES、PRECEDES 与 DISCRIMINATES 等关系；LLM 提议，宿主验证证据与作用域。只有经后台复核的派生关系才能晋升为双时间、可 supersede、可回滚的持久边。事实置信度与路径 utility 分离；负面情绪只打开复核门，反馈只归因于真实回答 trace 中实际激活的路径。"
       },
       {
         "id": "limitations",
         "type": "markdown",
-        "body": "## 局限、不确定性与稳健性边界\n\n- 当前线上样本没有人工语义标签，不能用 `brief` 比例或完成率推断记忆质量。\n- 候选检索金标偏向回复链证据，不能代表自然 `/chat` 查询的完整分布；decoy 也不能用于估计精确率。\n- 在线数据只覆盖一个数据库范围，跨群、账号别名、群内反讽和竞争释义仍需独立测试。\n- 线上观察窗口没有进入 full Agent 路径；独立受控 full-MR 只覆盖污染开发案例且未重复，不能估计总体收益、方差或尾部延迟。\n- 三臂时延来自非流式直连且没有宿主事件调度、流式传输与重试；不能替代 AstrBot 线上端到端或首块时延。\n- `好女孩` 与历史调用案例只适合作为困难案例；在没有预注册判分规则、未污染 holdout、独立盲评和重复前，不能作为成功证据。"
+        "sourceId": "runtime_study_paper",
+        "body": "## 边界\n\n语义案例均为开发污染样本，缺少独立人类盲评和跨群重复；固定 packet 不测真实检索；Provider 缓存和排队会改变时延；现有持久图仍有双时间、幂等、休眠恢复与 alias fallback 阻断项。ECCR 是可运行研究原型，不是已证明总体优越的生产默认。"
       },
       {
         "id": "next_steps",
         "type": "markdown",
-        "body": "## 下一步：先修 synthesis 与停止条件，再做未污染确认集\n\n三臂协议 smoke 已经证明路径、cutoff 审计和成本账本可以运行；继续在同一个开发案例上增加轮数不会提供独立证据。\n\n1. 让最终 synthesis 逐项裁决必要跨情节连接、目标群内释义与必须保留的更强措辞疑虑；把“证据不足”和“更强说法没有逐字证据”分开。\n2. 为多步 MR 增加边际证据收益与连续无新增来源的停止条件，并让 trace 区分空结果、导航结果和 recoverable error。\n3. 在冻结实现后抽取未污染 holdout，加入 C0、R0、A3 和主 LLM 最终回答；采用交替/随机顺序、重复采样与独立人类盲评。\n4. 只在确认集显示 supported-claim precision、false-none、正确疑虑保留和端到端帮助度收益后，才调整线上默认路径；缓存应是可审计的快速路径，而不是永久替代潜意识重建。"
+        "sourceId": "eccr_case_study_aggregate",
+        "body": "## 下一步\n\n1. 第二轮允许创建受严格限制的 AUDIT_DISCOVERY 假说：必须引用此前未选证据、区分一个既有解释，并以 hypothesis/contested + unresolved 收口。\n2. 在未污染跨群 holdout 上同时测 retrieval、hypothesis construction、surface reading 和反馈修订。\n3. 以质量非劣、L2 产品 deadline、L3 异步完成、身份零硬错误和 cache stale error=0 作为上线 gate。"
       },
       {
-        "id": "further_questions",
+        "id": "paper_link",
         "type": "markdown",
-        "body": "## 尚待回答的问题\n\n- 哪些查询特征能在不降低困难语义质量的前提下安全命中缓存？\n- 多步 MR 的收益来自更深遍历、更多候选，还是 LLM 对证据冲突的重新表述？\n- 账号主体、别名与群昵称变化应在何时建立确定性绑定，何时只保留竞争假设？\n- 反馈边的遗忘、合并和失效阈值能否用可逆审计记录替代固定相似度阈值？\n- 在跨群隔离前提下，怎样定义可上线的延迟、Token 与错误率预算，而不牺牲语义重建能力？"
+        "sourceId": "runtime_study_paper",
+        "body": "## 完整论文\n\n完整形式化、实验表、成本分账、有效性威胁与一手文献引用见 `docs/research/MR_MEMORY_RUNTIME_STUDY.md`。"
       }
     ]
   },
   "snapshot": {
     "version": 1,
-    "generatedAt": "2026-08-17T04:32:08.2011923Z",
+    "generatedAt": "2026-08-17T06:53:25.723627+00:00",
     "status": "ready",
     "datasets": {
       "retrieval_metrics": [
@@ -640,6 +829,160 @@
           "additional_cross_episode_evidence": true,
           "source_audit_passed": true
         }
+      ],
+      "eccr_case_runs": [
+        {
+          "case": "#726 时序遮罩",
+          "arm": "eccr-v1",
+          "status": "UNRESOLVED",
+          "calls": 1,
+          "tokens": 28564,
+          "time_ms": 156710.365,
+          "time_label": "156.7 s",
+          "semantic_outcome": "BUDGET_EXHAUSTED"
+        },
+        {
+          "case": "#726 时序遮罩",
+          "arm": "eccr-v2",
+          "status": "FAILED",
+          "calls": 1,
+          "tokens": 23314,
+          "time_ms": 98605.735,
+          "time_label": "98.6 s",
+          "semantic_outcome": "STRUCTURED_PROTOCOL_FAILURE"
+        },
+        {
+          "case": "#726 时序遮罩",
+          "arm": "eccr-v3",
+          "status": "FAILED",
+          "calls": 1,
+          "tokens": 23005,
+          "time_ms": 111485.282,
+          "time_label": "111.5 s",
+          "semantic_outcome": "COMPLETION_SCHEMA_FAILURE"
+        },
+        {
+          "case": "#726 时序遮罩",
+          "arm": "eccr-v4",
+          "status": "COMPLETED",
+          "calls": 3,
+          "tokens": 76224,
+          "time_ms": 379393.726,
+          "time_label": "379.4 s",
+          "semantic_outcome": "The internal brief recovered the temporal contrast and preserved that purchase intent is not direct evidence of payment, pre-order, or launch rushing."
+        },
+        {
+          "case": "好女孩固定证据包",
+          "arm": "one-pass",
+          "status": "COMPLETED",
+          "calls": 1,
+          "tokens": 24582,
+          "time_ms": 119303.229,
+          "time_label": "119.3 s",
+          "semantic_outcome": "PARTIAL_SUCCESS_CLOSEST_TO_FROZEN_GOLD"
+        },
+        {
+          "case": "好女孩固定证据包",
+          "arm": "one-call-eccr",
+          "status": "COMPLETED",
+          "calls": 1,
+          "tokens": 22758,
+          "time_ms": 92445.528,
+          "time_label": "92.4 s",
+          "semantic_outcome": "FAILED"
+        },
+        {
+          "case": "好女孩固定证据包",
+          "arm": "two-call-audit-v1",
+          "status": "FAILED",
+          "calls": 2,
+          "tokens": 70033,
+          "time_ms": 289432.992,
+          "time_label": "289.4 s",
+          "semantic_outcome": "NO_VALID_BRIEF"
+        },
+        {
+          "case": "好女孩固定证据包",
+          "arm": "two-call-audit-v2",
+          "status": "COMPLETED",
+          "calls": 2,
+          "tokens": 62291,
+          "time_ms": 215642.992,
+          "time_label": "215.6 s",
+          "semantic_outcome": "PARTIAL_SUCCESS_EVIDENCE_COVERED_HYPOTHESIS_MISSING"
+        },
+        {
+          "case": "真实改名主体",
+          "arm": "deterministic-host",
+          "status": "COMPLETED",
+          "calls": 0,
+          "tokens": 0,
+          "time_ms": 0,
+          "time_label": "<1 ms",
+          "semantic_outcome": "2/2 cutoff exact"
+        }
+      ],
+      "surface_answer_runs": [
+        {
+          "arm": "control",
+          "tokens": 696,
+          "latency_ms": 2309.797,
+          "latency_label": "2.3 s",
+          "model_judge_composite": 72,
+          "model_judge_overall": 60,
+          "evidence_review_rank": 3,
+          "finding": "Natural but generic; the historical chain was not recovered."
+        },
+        {
+          "arm": "b16",
+          "tokens": 2419,
+          "latency_ms": 8038.332,
+          "latency_label": "8.0 s",
+          "model_judge_composite": 80,
+          "model_judge_overall": 80,
+          "evidence_review_rank": 1,
+          "finding": "Recovered the prior dislike and launch-period play while explicitly qualifying launch-rush uncertainty; omitted purchase intent and one genre attribution."
+        },
+        {
+          "arm": "eccr",
+          "tokens": 2914,
+          "latency_ms": 10109.617,
+          "latency_label": "10.1 s",
+          "model_judge_composite": 100,
+          "model_judge_overall": 95,
+          "evidence_review_rank": 2,
+          "finding": "Used richer context but surface compression dropped two core anchors and did not explicitly qualify the absence of direct launch-rush or pre-order evidence."
+        }
+      ],
+      "runtime_route": [
+        {
+          "layer": "L0",
+          "work": "账号主体、cutoff、scope、结构化引用",
+          "model_calls": "0",
+          "trigger": "每次请求必经",
+          "output": "确定性约束"
+        },
+        {
+          "layer": "L1",
+          "work": "修订向量绑定的证据证书",
+          "model_calls": "0（命中）",
+          "trigger": "依赖未变且证书仍新鲜",
+          "output": "可复用 evidence，不缓存无条件真值"
+        },
+        {
+          "layer": "L2",
+          "work": "一次语义读取与竞争释义 gate",
+          "model_calls": "1",
+          "trigger": "普通语义查询、缓存不足",
+          "output": "brief / unresolved / escalate"
+        },
+        {
+          "layer": "L3",
+          "work": "有界 ECCR、反证闭合、反馈复核",
+          "model_calls": "2–3",
+          "trigger": "高歧义、显式深挖、反馈修订",
+          "output": "证据契约与闭合证书"
+        }
       ]
     },
     "accessIssues": []
@@ -762,6 +1105,31 @@
       "id": "mem0_paper",
       "label": "Mem0",
       "href": "https://arxiv.org/html/2504.19413"
+    },
+    {
+      "id": "eccr_case_study_aggregate",
+      "label": "ECCR 真实 Provider 案例安全聚合",
+      "path": "docs/research/data/eccr_case_study_aggregate.json",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "SELECT * FROM read_json_auto('docs/research/data/eccr_case_study_aggregate.json')",
+        "description": "读取脱敏的 ECCR 工程迭代、固定证据包、表层回答与确定性主体诊断。",
+        "tables_used": [
+          "docs/research/data/eccr_case_study_aggregate.json"
+        ],
+        "filters": [
+          "只包含真实完成或明确失败的 Provider 调用和零调用确定性诊断",
+          "不包含正文、query、群号、账号、source-key 值、endpoint、凭据或 Provider 配置",
+          "固定证据包案例不评价候选生成或端到端检索"
+        ],
+        "metric_definitions": [
+          "已测 Token = Provider usage 中 ordinary input、cached input 与 output 的合计",
+          "受控墙钟 = 单次实验进程从调用开始到完整响应或 fail-closed 的时长，不等于 AstrBot 线上端到端时延",
+          "required-group recall 是最终 brief 对预注册 source group 的引用覆盖，不是语义准确率",
+          "模型 judge 是一次自动评分；post-hoc evidence review 逐原子证据复核，二者都不是独立人类盲评"
+        ]
+      }
     }
   ]
 }

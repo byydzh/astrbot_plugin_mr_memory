@@ -1,0 +1,284 @@
+{
+  "schema_version": "mr-memory.eccr-case-study.v1",
+  "generated_at": "2026-08-17T06:52:49.3508885Z",
+  "title": "ECCR 真实 Provider 案例与表层回答诊断聚合",
+  "method": {
+    "name": "Evidence-Contract + Counterfactual-Closure Reconstruction",
+    "short_name": "ECCR",
+    "control_unit": "source-bound obligation state transition",
+    "host_guards": [
+      "scope",
+      "historical cutoff",
+      "participant identity",
+      "source and graph allowlists",
+      "monotonic provenance",
+      "budget and stop state"
+    ],
+    "llm_responsibilities": [
+      "semantic gate",
+      "competing interpretations",
+      "evidence-bound hypothesis construction",
+      "conflict and uncertainty closure"
+    ],
+    "online_route": [
+      "L0 deterministic identity and temporal truth",
+      "L1 revision-bound evidence certificate cache",
+      "L2 one-call semantic read",
+      "L3 bounded ECCR for ambiguity, feedback, or explicit deep analysis"
+    ]
+  },
+  "evidence_boundary": {
+    "masked_temporal_case": "One repeatedly used development call. Source cutoff is audited, but the case is contaminated and lacks independent human blind review.",
+    "fixed_packet_cases": "Oracle synthesis diagnostics over frozen evidence packets. Candidate generation and end-to-end retrieval are not evaluated.",
+    "surface_case": "One fixed generation matrix. Gold was physically absent during generation and loaded only for post-generation scoring.",
+    "semantic_scores": "Source overlap and model-judge scores are not human semantic accuracy. Post-hoc evidence review is reported separately.",
+    "privacy": "No raw message, query, account, group, source-key value, endpoint, credential, or provider configuration is included."
+  },
+  "masked_temporal_reconstruction": {
+    "case_label": "masked-temporal-development-case",
+    "packet_consistent": true,
+    "attempts": [
+      {
+        "arm": "eccr-v1",
+        "status": "UNRESOLVED",
+        "model_calls": 1,
+        "retrieval_rounds": 0,
+        "measured_tokens": 28564,
+        "controlled_total_ms": 156710.365,
+        "stop_reason": "BUDGET_EXHAUSTED",
+        "required_group_recall": 0.0
+      },
+      {
+        "arm": "eccr-v2",
+        "status": "FAILED",
+        "model_calls": 1,
+        "measured_tokens": 23314,
+        "controlled_total_ms": 98605.735,
+        "stop_reason": "STRUCTURED_PROTOCOL_FAILURE"
+      },
+      {
+        "arm": "eccr-v3",
+        "status": "FAILED",
+        "model_calls": 1,
+        "measured_tokens": 23005,
+        "controlled_total_ms": 111485.282,
+        "stop_reason": "COMPLETION_SCHEMA_FAILURE"
+      },
+      {
+        "arm": "eccr-v4",
+        "status": "COMPLETED",
+        "model_calls": 3,
+        "retrieval_rounds": 2,
+        "tool_calls": 6,
+        "visited_sources": 40,
+        "selected_sources": 17,
+        "cited_sources": 12,
+        "measured_tokens": 76224,
+        "controlled_total_ms": 379393.726,
+        "stop_reason": "CERTIFIED_CLOSE",
+        "required_group_recall": 1.0,
+        "gold_key_precision_lower_bound": 0.4166666667,
+        "semantic_review_status": "RESEARCHER_REVIEWED_PENDING_INDEPENDENT_BLIND_REVIEW",
+        "semantic_finding": "The internal brief recovered the temporal contrast and preserved that purchase intent is not direct evidence of payment, pre-order, or launch rushing."
+      }
+    ],
+    "source_artifact_sha256": "fcabc6c639d1a9bad813ff1dab4056498c79cea6e3e2af848c7867bdc1ea1dd0"
+  },
+  "surface_answer_case": {
+    "case_label": "masked-temporal-surface-development-case",
+    "generation": [
+      {
+        "arm": "control",
+        "provider_calls": 1,
+        "measured_tokens": 696,
+        "provider_latency_ms": 2309.797,
+        "model_judge_composite": 72,
+        "model_judge_overall": 60,
+        "posthoc_evidence_review_rank": 3,
+        "posthoc_finding": "Natural but generic; the historical chain was not recovered."
+      },
+      {
+        "arm": "b16",
+        "provider_calls": 1,
+        "measured_tokens": 2419,
+        "provider_latency_ms": 8038.332,
+        "model_judge_composite": 80,
+        "model_judge_overall": 80,
+        "posthoc_evidence_review_rank": 1,
+        "posthoc_finding": "Recovered the prior dislike and launch-period play while explicitly qualifying launch-rush uncertainty; omitted purchase intent and one genre attribution."
+      },
+      {
+        "arm": "eccr",
+        "provider_calls": 1,
+        "measured_tokens": 2914,
+        "provider_latency_ms": 10109.617,
+        "model_judge_composite": 100,
+        "model_judge_overall": 95,
+        "posthoc_evidence_review_rank": 2,
+        "posthoc_finding": "Used richer context but surface compression dropped two core anchors and did not explicitly qualify the absence of direct launch-rush or pre-order evidence."
+      }
+    ],
+    "judge_attempts": [
+      {
+        "attempt": 1,
+        "status": "LOCAL_PROTOCOL_PARSE_FAILURE",
+        "provider_call_completed": true,
+        "measured_tokens": 1840,
+        "provider_latency_ms": 5067.991
+      },
+      {
+        "attempt": 2,
+        "status": "COMPLETED",
+        "provider_call_completed": true,
+        "measured_tokens": 1793,
+        "provider_latency_ms": 4781.901
+      }
+    ],
+    "totals": {
+      "provider_calls": 5,
+      "measured_tokens": 9662,
+      "provider_latency_ms": 30307.638,
+      "usage_complete": true
+    },
+    "interpretation": "The raw model judge preferred ECCR, while post-hoc atomic evidence review preferred B16. This is direct evidence that final reading and compression must be evaluated separately from retrieval and brief quality.",
+    "source_artifact_sha256": {
+      "manifest": "a1dbcb0cc04d359ea58d2ff0a4ee8f3060816267c12f2a0ae5ae8dd8674b8343",
+      "generation_summary": "2be8c2e4dc0e8c49954c1d1c1f437c49d11c17fbcada948d2ba5fe565004ea20",
+      "successful_judge_result": "256f149a14388b1520164bc36a748797e857003d768b7026e35c7f9926da6f53"
+    }
+  },
+  "pragmatic_language_case": {
+    "case_label": "competing-meaning-fixed-packet",
+    "delivered_sources": 73,
+    "runs": [
+      {
+        "arm": "one-pass",
+        "status": "COMPLETED",
+        "provider_calls": 1,
+        "measured_tokens": 24582,
+        "provider_latency_ms": 119303.229,
+        "automatic_required_group_recall": 1.0,
+        "core_hypothesis_outcome": "PARTIAL_SUCCESS_CLOSEST_TO_FROZEN_GOLD",
+        "semantic_finding": "Found both temporal segments and explicitly kept intentional linkage uncertain."
+      },
+      {
+        "arm": "one-call-eccr",
+        "status": "COMPLETED",
+        "provider_calls": 1,
+        "measured_tokens": 22758,
+        "provider_latency_ms": 92445.528,
+        "automatic_required_group_recall": 1.0,
+        "core_hypothesis_outcome": "FAILED",
+        "semantic_finding": "Missed the key derogatory reaction despite an automatic recall of 1.0."
+      },
+      {
+        "arm": "two-call-audit-v1",
+        "status": "FAILED",
+        "provider_calls": 2,
+        "measured_tokens": 70033,
+        "provider_latency_ms": 289432.992,
+        "core_hypothesis_outcome": "NO_VALID_BRIEF",
+        "semantic_finding": "Fail-closed after the second response omitted previously selected uncertainty evidence."
+      },
+      {
+        "arm": "two-call-audit-v2",
+        "status": "COMPLETED",
+        "provider_calls": 2,
+        "measured_tokens": 62291,
+        "provider_latency_ms": 215642.992,
+        "cached_input_tokens": 9984,
+        "automatic_required_group_recall": 1.0,
+        "core_hypothesis_outcome": "PARTIAL_SUCCESS_EVIDENCE_COVERED_HYPOTHESIS_MISSING",
+        "semantic_finding": "Recovered both temporal segments and source-role caveats but kept them inside a broad irony candidate instead of constructing the protected euphemism-and-second-order-rejoke hypothesis."
+      }
+    ],
+    "totals": {
+      "provider_calls": 6,
+      "measured_tokens": 179664,
+      "provider_latency_ms": 716824.741
+    },
+    "metric_warning": "All successful synthesis arms received automatic required-group recall 1.0; the metric therefore failed to distinguish the known semantic miss.",
+    "source_artifact_sha256": {
+      "one_pass_and_one_call": "a7da01f9123da32ed9f5df6bfe30ae0389bb1138a0d2ec6df9987fca52ecaece",
+      "audit_v1": "5e6ab51ac44cff255b5da6d962ea8a075ccdd269d22a4b730b47939569683631",
+      "audit_v2": "b7f6fe59ef6ba68379f4bf4c1620ee341f33e62a790f751454d33148ea3fb8ca"
+    }
+  },
+  "identity_case": {
+    "case_label": "real-multi-alias-fixed-packet",
+    "historical_cutoffs": 2,
+    "deterministic_host": {
+      "provider_calls": 0,
+      "measured_tokens": 0,
+      "identity_exact_match": true,
+      "snapshots_passed": 2,
+      "snapshots_evaluated": 2,
+      "future_aliases_excluded": true,
+      "cross_scope_sources_excluded": true
+    },
+    "llm_diagnostics": [
+      {
+        "arm": "one-pass",
+        "provider_calls": 1,
+        "measured_tokens": 7213,
+        "provider_latency_ms": 25563.867,
+        "finding": "The visible content described the same-account aliases correctly but omitted the structured subject object."
+      },
+      {
+        "arm": "eccr",
+        "provider_calls": 1,
+        "measured_tokens": 22064,
+        "provider_latency_ms": 119214.398,
+        "finding": "Explicitly emitted the correct subject binding but added no deterministic identity truth beyond the host."
+      }
+    ],
+    "interpretation": "Stable account binding belongs at L0. The LLM may interpret referring expressions but must not merge accounts or cross scopes.",
+    "source_artifact_sha256": "6b5ea513ff358e456806d3b33a2397b1134f840bfc90d0fd57af4471be2eb9e3"
+  },
+  "runtime_route": [
+    {
+      "layer": "L0",
+      "work": "账号主体、cutoff、scope、结构化引用",
+      "model_calls": "0",
+      "trigger": "每次请求必经",
+      "output": "确定性约束"
+    },
+    {
+      "layer": "L1",
+      "work": "修订向量绑定的证据证书",
+      "model_calls": "0（命中）",
+      "trigger": "依赖未变且证书仍新鲜",
+      "output": "可复用 evidence，不缓存无条件真值"
+    },
+    {
+      "layer": "L2",
+      "work": "一次语义读取与竞争释义 gate",
+      "model_calls": "1",
+      "trigger": "普通语义查询、缓存不足",
+      "output": "brief / unresolved / escalate"
+    },
+    {
+      "layer": "L3",
+      "work": "有界 ECCR、反证闭合、反馈复核",
+      "model_calls": "2–3",
+      "trigger": "高歧义、显式深挖、反馈修订",
+      "output": "证据契约与闭合证书"
+    }
+  ],
+  "decision": {
+    "current_status": "RESEARCH_PROTOTYPE_NOT_DEFAULT_ONLINE_PATH",
+    "supported": [
+      "ECCR can produce an auditable calibrated brief on one masked temporal case.",
+      "Full ECCR is too slow for synchronous execution on every chat request under the measured provider.",
+      "Deterministic identity outperforms LLM use on stable account facts.",
+      "Evidence coverage, hypothesis construction, and final surface reading are separate failure surfaces."
+    ],
+    "not_supported": [
+      "ECCR is generally more accurate than the weak baseline, one-pass synthesis, or full-MR.",
+      "Automatic source-group recall is semantic accuracy.",
+      "The pragmatic-language core hypothesis test has passed.",
+      "A model-judge score from one contaminated case is a win rate."
+    ],
+    "next_protocol_change": "Permit a second-round AUDIT_DISCOVERY interpretation only when it cites previously unselected evidence, discriminates an existing interpretation, remains HYPOTHESIS or CONTESTED, and is surfaced as unresolved; it may not be promoted directly into persistent graph truth."
+  }
+}

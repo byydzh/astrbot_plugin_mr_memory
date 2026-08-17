@@ -159,7 +159,7 @@ def parse_structured_response(
 ) -> tuple[_ParsedResponse, str]:
     """Parse a provider response while retaining which channel was accepted."""
 
-    last_error: ValueError | None = None
+    first_error: ValueError | None = None
     for source, candidate in structured_response_candidates(
         completion_text,
         reasoning_content,
@@ -167,9 +167,14 @@ def parse_structured_response(
         try:
             return parser(candidate), source
         except ValueError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        # The completion channel is authoritative when no candidate validates.
+        # Still try a terminal reasoning object as a compatibility fallback, but
+        # do not let its usually less relevant parse error mask the real schema
+        # violation in the provider's final completion.
+        raise first_error
     raise ValueError("runtime response did not contain a terminal JSON object")
 
 

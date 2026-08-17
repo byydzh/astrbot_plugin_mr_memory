@@ -26,6 +26,7 @@ from scripts.masked_ab_experiment import (
     _provider_fingerprint,
     _readonly_sqlite_backup,
     _run_pilot_b16,
+    _run_pilot_eccr,
     _run_pilot_full_mr,
     _score_pilot_gold,
     _usage_ledger_audit,
@@ -279,6 +280,337 @@ class MaskedPilotTests(unittest.TestCase):
             event_id=7,
             limit=20,
             before_sent_at=200,
+        )
+
+    def test_eccr_can_certify_direct_packet_evidence_in_one_call(self) -> None:
+        packet = {
+            "candidates": {"feedback_hypotheses": [], "associations": []},
+            "expanded_episodes": [
+                {
+                    "source_key": "source-1",
+                    "sender_participant_key": "participant-1",
+                    "sent_at": 100,
+                    "plain_text": "类魂玩吐了",
+                }
+            ],
+        }
+        response = {
+            "contract": {
+                "subjects": [
+                    {
+                        "reference": "说话者",
+                        "participant_key": "participant-1",
+                        "mode": "HOST",
+                        "candidate_participant_keys": [],
+                        "source_keys": ["source-1"],
+                        "valid_at": 100,
+                    }
+                ],
+                "obligations": [
+                    {
+                        "id": "prior_preference",
+                        "kind": "semantic",
+                        "question": "是否明确表达过厌倦类魂",
+                        "critical": True,
+                        "status": "SUPPORTED",
+                        "support_keys": ["source-1"],
+                        "counter_keys": [],
+                        "last_changed_step": 0,
+                    }
+                ],
+                "interpretations": [],
+                "uncertainties": [],
+                "guarded_claims": ["只能说此前表达厌倦"],
+                "visited_source_keys": ["source-1"],
+                "selected_edge_ids": [],
+                "selected_hypothesis_ids": [],
+                "exhausted_discriminators": [],
+                "frontier_discriminators": [],
+            },
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "该参与者此前说类魂玩吐了。",
+                        "source_keys": ["source-1"],
+                        "confidence": 0.9,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [],
+            },
+            "terminal": True,
+        }
+        with patch(
+            "scripts.masked_ab_experiment._pilot_completion",
+            return_value=_completion(content=json.dumps(response, ensure_ascii=False)),
+        ) as mocked:
+            result = _run_pilot_eccr(
+                storage=Mock(),
+                call={
+                    "query": "谁说过类魂玩吐了",
+                    "umo": self.umo,
+                    "cutoff_at": 200,
+                },
+                packet=packet,
+                client=object(),
+                provider_id="deepseek/test",
+                model="deepseek-v4-flash",
+                provider_extra_body={},
+                max_output_tokens=384000,
+                thinking_mode="enabled",
+                max_model_calls=3,
+                max_retrieval_rounds=2,
+                deadline_seconds=90,
+                ledger_path=Path("unused.jsonl"),
+                budget=PilotBudget(max_calls=30, soft_token_limit=600000),
+                run_id="pilot-eccr-direct",
+                repetition=1,
+            )
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(result["stop_reason"], "CERTIFIED_CLOSE")
+        self.assertEqual(result["model_calls"], 1)
+        self.assertEqual(result["selected_source_keys"], ["source-1"])
+        self.assertEqual(result["tool_trace"], [])
+
+    def test_eccr_nonterminal_last_call_is_not_scored_as_a_valid_brief(self) -> None:
+        packet = {
+            "candidates": {"feedback_hypotheses": [], "associations": []},
+            "expanded_episodes": [
+                {
+                    "source_key": "source-1",
+                    "sender_participant_key": "participant-1",
+                    "sent_at": 100,
+                    "plain_text": "候选证据",
+                }
+            ],
+        }
+        response = {
+            "contract": {
+                "subjects": [
+                    {
+                        "reference": "说话者",
+                        "participant_key": "participant-1",
+                        "mode": "HOST",
+                        "candidate_participant_keys": [],
+                        "source_keys": ["source-1"],
+                        "valid_at": 100,
+                    }
+                ],
+                "obligations": [
+                    {
+                        "id": "meaning",
+                        "kind": "semantic",
+                        "question": "候选证据表达什么",
+                        "critical": True,
+                        "status": "SUPPORTED",
+                        "support_keys": ["source-1"],
+                        "counter_keys": [],
+                        "last_changed_step": 0,
+                    }
+                ],
+                "interpretations": [],
+                "uncertainties": [
+                    {
+                        "id": "u-provisional",
+                        "statement": "尚无来源支撑的保留条件不能被假装闭合。",
+                        "status": "PRESERVED",
+                        "source_keys": [],
+                    }
+                ],
+                "guarded_claims": [],
+                "visited_source_keys": ["source-1"],
+                "selected_edge_ids": [],
+                "selected_hypothesis_ids": [],
+                "exhausted_discriminators": [],
+                "frontier_discriminators": [],
+            },
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "这是尚未确认完成的暂定解释。",
+                        "source_keys": ["source-1"],
+                        "confidence": 0.6,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [
+                    {
+                        "statement": "控制器没有给出 terminal 证书。",
+                        "source_keys": ["source-1"],
+                    }
+                ],
+            },
+            "terminal": False,
+        }
+        with patch(
+            "scripts.masked_ab_experiment._pilot_completion",
+            return_value=_completion(content=json.dumps(response, ensure_ascii=False)),
+        ) as mocked:
+            result = _run_pilot_eccr(
+                storage=Mock(),
+                call={"query": "测试", "umo": self.umo, "cutoff_at": 200},
+                packet=packet,
+                client=object(),
+                provider_id="deepseek/test",
+                model="deepseek-v4-flash",
+                provider_extra_body={},
+                max_output_tokens=384000,
+                thinking_mode="enabled",
+                max_model_calls=1,
+                max_retrieval_rounds=0,
+                deadline_seconds=90,
+                ledger_path=Path("unused.jsonl"),
+                budget=PilotBudget(max_calls=1, soft_token_limit=600000),
+                run_id="pilot-eccr-incomplete",
+                repetition=1,
+            )
+        self.assertEqual(result["decision"], "unresolved")
+        self.assertEqual(result["stop_reason"], "BUDGET_EXHAUSTED")
+        self.assertIsNone(result["brief"])
+        self.assertIsNotNone(result["diagnostic_partial_brief"])
+        self.assertEqual(
+            result["contract_trace"][0]["protocol_normalizations"][0]["operation"],
+            "demote_ungrounded_closed_uncertainty",
+        )
+        prompt = mocked.call_args.kwargs["messages"][1]["content"]
+        self.assertIn('"allowed_retrieval_tools":[]', prompt)
+
+    def test_eccr_action_is_bound_to_obligation_and_updates_contract(self) -> None:
+        packet = {
+            "candidates": {"feedback_hypotheses": [], "associations": []},
+            "expanded_episodes": [
+                {
+                    "source_key": "source-1",
+                    "sender_participant_key": "participant-1",
+                    "sent_at": 100,
+                    "plain_text": "候选事件",
+                }
+            ],
+        }
+        initial_contract = {
+            "subjects": [
+                {
+                    "reference": "说话者",
+                    "participant_key": "participant-1",
+                    "mode": "HOST",
+                    "candidate_participant_keys": [],
+                    "source_keys": ["source-1"],
+                    "valid_at": 100,
+                }
+            ],
+            "obligations": [
+                {
+                    "id": "raw_context",
+                    "kind": "semantic",
+                    "question": "候选事件的原话是什么",
+                    "critical": True,
+                    "status": "OPEN",
+                    "support_keys": [],
+                    "counter_keys": [],
+                    "last_changed_step": 0,
+                }
+            ],
+            "interpretations": [],
+            "uncertainties": [],
+            "guarded_claims": ["必须读取原话"],
+            "visited_source_keys": ["source-1"],
+            "selected_edge_ids": [],
+            "selected_hypothesis_ids": [],
+            "exhausted_discriminators": [],
+            "frontier_discriminators": ["read_event_7"],
+        }
+        first = {
+            "contract": initial_contract,
+            "actions": [
+                {
+                    "obligation_id": "raw_context",
+                    "tool_name": "mr_query_event_context",
+                    "arguments": {"event_id": 7, "limit": 20},
+                    "discriminator": "read_event_7",
+                    "expected_delta": "raw_context becomes supported or exhausted",
+                }
+            ],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        second_contract = dict(initial_contract)
+        second_contract.update(
+            {
+                "obligations": [
+                    {
+                        "id": "raw_context",
+                        "kind": "semantic",
+                        "question": "候选事件的原话是什么",
+                        "critical": True,
+                        "status": "SUPPORTED",
+                        "support_keys": ["source-2"],
+                        "counter_keys": [],
+                        "last_changed_step": 1,
+                    }
+                ],
+                "visited_source_keys": ["source-1", "source-2"],
+                "frontier_discriminators": [],
+            }
+        )
+        second = {
+            "contract": second_contract,
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "原话已经找到。",
+                        "source_keys": ["source-2"],
+                        "confidence": 0.9,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [],
+            },
+            "terminal": True,
+        }
+        storage = Mock()
+        storage.query_event_context.return_value = [
+            {"source_key": "source-2", "sent_at": 150, "plain_text": "原话"}
+        ]
+        with patch(
+            "scripts.masked_ab_experiment._pilot_completion",
+            side_effect=[
+                _completion(content=json.dumps(first, ensure_ascii=False)),
+                _completion(content=json.dumps(second, ensure_ascii=False)),
+            ],
+        ) as mocked:
+            result = _run_pilot_eccr(
+                storage=storage,
+                call={
+                    "query": "读取候选事件原话",
+                    "umo": self.umo,
+                    "cutoff_at": 200,
+                },
+                packet=packet,
+                client=object(),
+                provider_id="deepseek/test",
+                model="deepseek-v4-flash",
+                provider_extra_body={},
+                max_output_tokens=384000,
+                thinking_mode="enabled",
+                max_model_calls=3,
+                max_retrieval_rounds=2,
+                deadline_seconds=90,
+                ledger_path=Path("unused.jsonl"),
+                budget=PilotBudget(max_calls=30, soft_token_limit=600000),
+                run_id="pilot-eccr-action",
+                repetition=1,
+            )
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(result["stop_reason"], "CERTIFIED_CLOSE")
+        self.assertEqual(result["retrieval_rounds"], 1)
+        self.assertEqual(result["selected_source_keys"], ["source-1", "source-2"])
+        self.assertEqual(result["tool_trace"][0]["obligation_id"], "raw_context")
+        self.assertEqual(
+            result["contract_trace"][1]["gain"]["obligation_transitions"],
+            ["raw_context:OPEN->SUPPORTED"],
         )
 
     def test_gold_scoring_distinguishes_required_groups_and_calibration_terms(
