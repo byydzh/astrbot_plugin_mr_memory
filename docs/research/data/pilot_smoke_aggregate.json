@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-17T03:11:12.6300797Z",
+  "source_manifest_sha256": "98618fadd705c0a362fc707dbb4a4394614400e32d3344c5ccb15941da630953",
+  "source_result_sha256": "93649b8133c109ff96e16a094b16dd711800ca533ae038ff38622957cde778bc",
+  "case": "masked-diagnostic-01",
+  "arm": "cache",
+  "repetitions": 1,
+  "completed": 1,
+  "failed": 0,
+  "decision": "brief",
+  "model_calls": 0,
+  "provider_calls": 0,
+  "provider_tokens": 0,
+  "provider_tokens_measured_lower_bound": 0,
+  "usage_complete": true,
+  "packet_sha256": "002dc9289f3a534bfa8d45ac1551a3b2c1c44fd4e66577d7c6dc3eec004fa382",
+  "source_audit": {
+    "strictly_before_cutoff": true,
+    "visited_count": 38,
+    "missing_source_keys": 0
+  },
+  "researcher_diagnostic_score": {
+    "required_group_recall": 1.0,
+    "gold_key_precision_lower_bound": 0.15789473684210525,
+    "identity_text_match": true,
+    "forbidden_term_hits": 0,
+    "semantic_judgment_status": "PENDING_BLIND_HUMAN_REVIEW"
+  },
+  "interpretation_boundary": "One researcher-labeled diagnostic case rerun under the current protocol. It validates cache execution and per-source cutoff auditing on a researcher-attested masked fixture, while exposing candidate noise; the attestation is not independent proof of graph construction history, nor is this an end-to-end semantic quality estimate or confirmatory A/B result."
+}

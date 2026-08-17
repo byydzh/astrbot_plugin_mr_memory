@@ -1,0 +1,287 @@
+{
+  "candidate_retrieval": {
+    "interpretation_boundary": "The gold set is one-group, reply-chain-derived and evidence-oriented. Lexical decoys are not verified negatives, so these metrics measure retrieval of annotated positives, not end-to-end semantic understanding or precision over all relevant documents.",
+    "models": [
+      {
+        "all_evidence_at_20": 0.255319,
+        "hit_at_20": 0.851064,
+        "key": "minilm-l12-v2",
+        "mean_evidence_recall_at_20": 0.517021,
+        "mrr_at_20": 0.641084
+      },
+      {
+        "all_evidence_at_20": 0.297872,
+        "hit_at_20": 0.957447,
+        "key": "bge-small-zh-v1.5",
+        "mean_evidence_recall_at_20": 0.641844,
+        "mrr_at_20": 0.823877
+      },
+      {
+        "all_evidence_at_20": 0.234043,
+        "hit_at_20": 0.893617,
+        "key": "granite-107m-r1",
+        "mean_evidence_recall_at_20": 0.544681,
+        "mrr_at_20": 0.744765
+      },
+      {
+        "all_evidence_at_20": 0.297872,
+        "hit_at_20": 0.978723,
+        "key": "granite-97m-r2",
+        "mean_evidence_recall_at_20": 0.634752,
+        "mrr_at_20": 0.822126
+      },
+      {
+        "all_evidence_at_20": 0.361702,
+        "hit_at_20": 0.978723,
+        "key": "granite-311m-r2",
+        "mean_evidence_recall_at_20": 0.66383,
+        "mrr_at_20": 0.819267
+      },
+      {
+        "all_evidence_at_20": 0.361702,
+        "hit_at_20": 1.0,
+        "key": "harrier-270m",
+        "mean_evidence_recall_at_20": 0.665248,
+        "mrr_at_20": 0.841312
+      },
+      {
+        "all_evidence_at_20": 0.234043,
+        "hit_at_20": 0.893617,
+        "key": "bm25-char-bigram",
+        "mean_evidence_recall_at_20": 0.564894,
+        "mrr_at_20": 0.835697
+      },
+      {
+        "all_evidence_at_20": 0.319149,
+        "hit_at_20": 0.957447,
+        "key": "bge-small-zh-v1.5-no-instruction",
+        "mean_evidence_recall_at_20": 0.643617,
+        "mrr_at_20": 0.807506
+      },
+      {
+        "all_evidence_at_20": 0.382979,
+        "hit_at_20": 0.978723,
+        "key": "harrier-270m-group-memory",
+        "mean_evidence_recall_at_20": 0.661702,
+        "mrr_at_20": 0.763155
+      }
+    ],
+    "paired_bootstrap": [
+      {
+        "ci95_high": 0.32707763244680843,
+        "ci95_low": 0.07517729787234043,
+        "left": "harrier-270m",
+        "mean_difference": 0.20022793617021276,
+        "metric": "mrr_at_20",
+        "n_queries": 47,
+        "right": "minilm-l12-v2",
+        "samples": 20000,
+        "seed": 20260817
+      },
+      {
+        "ci95_high": 0.23758865248226949,
+        "ci95_low": 0.05957446808510638,
+        "left": "harrier-270m",
+        "mean_difference": 0.14822695035460992,
+        "metric": "mean_evidence_recall_at_20",
+        "n_queries": 47,
+        "right": "minilm-l12-v2",
+        "samples": 20000,
+        "seed": 20260817
+      },
+      {
+        "ci95_high": 0.11199763882978722,
+        "ci95_low": -0.09899529787234042,
+        "left": "harrier-270m",
+        "mean_difference": 0.005614659574468084,
+        "metric": "mrr_at_20",
+        "n_queries": 47,
+        "right": "bm25-char-bigram",
+        "samples": 20000,
+        "seed": 20260817
+      },
+      {
+        "ci95_high": 0.19326241134751773,
+        "ci95_low": 0.014184397163120569,
+        "left": "harrier-270m",
+        "mean_difference": 0.10035460992907802,
+        "metric": "mean_evidence_recall_at_20",
+        "n_queries": 47,
+        "right": "bm25-char-bigram",
+        "samples": 20000,
+        "seed": 20260817
+      },
+      {
+        "ci95_high": -0.027124786170212817,
+        "ci95_low": -0.1397590324468085,
+        "left": "harrier-270m-group-memory",
+        "mean_difference": -0.0781569574468085,
+        "metric": "mrr_at_20",
+        "n_queries": 47,
+        "right": "harrier-270m",
+        "samples": 20000,
+        "seed": 20260817
+      },
+      {
+        "ci95_high": 0.04609929078014184,
+        "ci95_low": -0.06382978723404255,
+        "left": "harrier-270m-group-memory",
+        "mean_difference": -0.003546099290780141,
+        "metric": "mean_evidence_recall_at_20",
+        "n_queries": 47,
+        "right": "harrier-270m",
+        "samples": 20000,
+        "seed": 20260817
+      }
+    ],
+    "source": {
+      "artifact": "embedding_matrix.json",
+      "benchmark_sha256": "4fdbbc91a524cd798fcd36946ddff4accee398eacb81bc77e16dda3c59b96f4e",
+      "corpus_documents": 24804,
+      "corpus_sha256": "357654f33daf7256befdb16d76c05f0f724ea4de7213990a47d9dd9d1ae9dfc8",
+      "matrix_sha256": "0cdaa195199cc11e55d8ec2c5f25adcc7e65f4d7cc8d7e0c722624770d6baaad",
+      "positive_evidence_annotations": 132,
+      "queries": 47
+    }
+  },
+  "generated_at": "2026-08-17T03:03:02.686370+00:00",
+  "online_runtime": {
+    "error_counts": {
+      "TimeoutError": 2,
+      "ValueError": 3
+    },
+    "interpretation_boundary": "These rows have no human semantic labels. brief/none/path describe system behavior, not correctness; timeout rows without provider usage make the ledger a measured total rather than a billing upper bound.",
+    "outcome_counts": {
+      "brief": 25,
+      "failed": 5,
+      "none": 24
+    },
+    "outcomes": {
+      "brief": {
+        "tokens_measured_all_runs": {
+          "max": 39584.0,
+          "mean": 23911.28,
+          "median": 23620.0,
+          "n": 25,
+          "p95_linear": 34089.79999999998
+        },
+        "tokens_with_provider_usage": {
+          "max": 39584.0,
+          "mean": 23911.28,
+          "median": 23620.0,
+          "n": 25,
+          "p95_linear": 34089.79999999998
+        },
+        "wall_seconds": {
+          "max": 81.00000321865082,
+          "mean": 30.87999826669693,
+          "median": 24.999985098838806,
+          "n": 25,
+          "p95_linear": 77.99997121095655
+        }
+      },
+      "failed": {
+        "tokens_measured_all_runs": {
+          "max": 46854.0,
+          "mean": 26686.0,
+          "median": 42617.0,
+          "n": 5,
+          "p95_linear": 46275.0
+        },
+        "tokens_with_provider_usage": {
+          "max": 46854.0,
+          "mean": 44476.666666666664,
+          "median": 43959.0,
+          "n": 3,
+          "p95_linear": 46564.5
+        },
+        "wall_seconds": {
+          "max": 89.99999463558197,
+          "mean": 40.799995958805084,
+          "median": 16.99998825788498,
+          "n": 5,
+          "p95_linear": 89.99999463558197
+        }
+      },
+      "none": {
+        "tokens_measured_all_runs": {
+          "max": 44760.0,
+          "mean": 21963.375,
+          "median": 19516.5,
+          "n": 24,
+          "p95_linear": 38991.899999999994
+        },
+        "tokens_with_provider_usage": {
+          "max": 44760.0,
+          "mean": 21963.375,
+          "median": 19516.5,
+          "n": 24,
+          "p95_linear": 38991.899999999994
+        },
+        "wall_seconds": {
+          "max": 24.999985098838806,
+          "mean": 5.708332546055317,
+          "median": 3.5000011324882507,
+          "n": 24,
+          "p95_linear": 17.650018930435163
+        }
+      }
+    },
+    "path_counts": {
+      "fast": 54
+    },
+    "quality_checks": {
+      "foreign_key_violations": 0,
+      "integrity_check": "ok",
+      "runs": 54
+    },
+    "repair_runs": 3,
+    "source": {
+      "artifact": "online-sample.db",
+      "cutoff_utc": "2026-08-06 19:21:33",
+      "database_scope_count": 1,
+      "sha256": "4d8a4159a8ae050870b9c4b6135a7e6b98b0c85b1222d3dff6e51363fcb929c3"
+    },
+    "status_counts": {
+      "COMPLETED": 49,
+      "FAILED": 5
+    },
+    "tokens_measured_all_runs": {
+      "max": 46854.0,
+      "mean": 23302.462962962964,
+      "median": 21315.5,
+      "n": 54,
+      "p95_linear": 43086.7
+    },
+    "tokens_per_run_with_provider_usage": {
+      "max": 46854.0,
+      "mean": 24198.71153846154,
+      "median": 21450.5,
+      "n": 52,
+      "p95_linear": 43220.899999999994
+    },
+    "tool_steps": {
+      "max": 1.0,
+      "mean": 1.0,
+      "median": 1.0,
+      "n": 54,
+      "p95_linear": 1.0
+    },
+    "usage_totals": {
+      "calls": 60,
+      "input_cached": 136576,
+      "input_other": 1013599,
+      "output": 108158,
+      "total": 1258333
+    },
+    "wall_seconds": {
+      "max": 89.99999463558197,
+      "mean": 20.61110958456993,
+      "median": 7.0000022649765015,
+      "n": 54,
+      "p95_linear": 80.34998059272766
+    }
+  },
+  "privacy": "Aggregate-only artifact. It contains no group message text, account id, group id, source key, credential, or provider configuration.",
+  "schema_version": 1
+}
