@@ -299,7 +299,7 @@ function renderOverview() {
     ? "关闭"
     : runtime.runtime_wake_mode === "manual_only"
       ? "仅在主模型主动咨询时运行"
-      : "每次回答读取本地工作记忆；主动咨询时才调用潜意识模型深挖";
+      : "每次回答由独立记忆模型判断；证据不足时继续图遍历";
   elements.policyDistill.textContent = runtime.auto_distillation_enabled
     ? `${formatNumber(runtime.auto_distillation_min_pending)} 条立即整理，最迟 ${Math.max(0.5, Number(runtime.maintenance_interval_seconds || 0) / 60)} 分钟一次`
     : "仅在管理员手动操作时整理";
