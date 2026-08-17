@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.17.0
+
+- Serve ordinary answer-time memory from the already distilled, locally embedded
+  working graph; the main AstrBot LLM remains the relevance gate and automatic
+  recall no longer waits for or bills a second network LLM. Manual consultation
+  retains the independent provider's deep multi-step traversal.
+- Persist each new public memory brief, its exact cited source keys, candidate
+  ledger and interaction trace. The console's recent-call rows now open a focused
+  provenance graph showing evidence, generated claims, feedback hypotheses and
+  graph mutations; legacy rows explicitly disclose when only evidence can be
+  reconstructed.
+- Materialize every accepted new feedback behavior as an evidence-bound plastic
+  cue/scenario-to-behavior path when the model omits its optional graph mutation.
+  Model attribution and semantics remain authoritative; the host fallback only
+  prevents an accepted decision from becoming an isolated row.
+- Record true local end-to-end recall latency even when no provider usage event
+  exists, and distinguish the new local working-memory path in runtime history.
+- Drain active interaction and reconstruction tasks before a plugin hot reload
+  closes their SQLite handles, so a reload cannot cut through an in-flight main
+  reply or manual deep consultation.
+
 ## 0.16.3
 
 - Normalize the legacy maintenance terminal state `COMPLETED` to `DONE` so a

@@ -26,6 +26,12 @@ class WebConsoleMixin:
             "读取指定群范围的记忆图",
         )
         self._register_memory_web_api(
+            "scopes/<scope_id>/runs/<run_id>",
+            self._api_memory_run_detail,
+            ["GET"],
+            "读取一次实时记忆调用的结果与证据子图",
+        )
+        self._register_memory_web_api(
             "scopes/<scope_id>/participants",
             self._api_memory_participants,
             ["GET"],
@@ -153,6 +159,16 @@ class WebConsoleMixin:
             structure_scope=str(request.args.get("structure") or "all"),
             path_source=str(request.args.get("path_source") or "")[:300],
             path_target=str(request.args.get("path_target") or "")[:300],
+        )
+        return self._memory_web_success(data)
+
+    async def _api_memory_run_detail(self, scope_id: str, run_id: str):
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id or len(normalized_run_id) > 200:
+            raise ValueError("调用记录 ID 无效")
+        data = await self._web_memory_run_detail(
+            scope_id=scope_id,
+            run_id=normalized_run_id,
         )
         return self._memory_web_success(data)
 

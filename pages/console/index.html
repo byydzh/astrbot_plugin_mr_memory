@@ -67,7 +67,7 @@
           <article class="metric-card metric-primary">
             <span>回答前回忆</span>
             <strong id="metric-recall-latency">—</strong>
-            <small id="metric-recall-caption">最近 24 小时 p50，目标不超过 10 秒</small>
+            <small id="metric-recall-caption">最近 24 小时 p50，本地工作记忆目标不超过 3 秒</small>
           </article>
           <article class="metric-card">
             <span>单次回忆消耗</span>
@@ -108,6 +108,7 @@
               <div>
                 <p class="section-kicker">最近调用</p>
                 <h2>每次调用花了多久，得到了什么</h2>
+                <p class="panel-note">点击一行可检查该次调用实际读取、生成或修改的记忆子图。</p>
               </div>
             </div>
             <div class="table-wrap runtime-table-wrap">
@@ -120,10 +121,11 @@
                     <th>耗时</th>
                     <th>Token</th>
                     <th>路径</th>
+                    <th><span class="sr-only">查看详情</span></th>
                   </tr>
                 </thead>
                 <tbody id="runtime-table-body">
-                  <tr><td colspan="6" class="table-empty">选择群聊后显示最近调用。</td></tr>
+                  <tr><td colspan="7" class="table-empty">选择群聊后显示最近调用。</td></tr>
                 </tbody>
               </table>
             </div>
@@ -157,7 +159,7 @@
           <article><span>新消息整理</span><strong id="policy-distill">—</strong></article>
           <article><span>本地语义检索</span><strong id="policy-embedding">—</strong></article>
           <article class="policy-action">
-            <span>回忆与整理额度</span><strong id="policy-budget">—</strong>
+            <span>深挖与整理额度</span><strong id="policy-budget">—</strong>
             <button id="reset-budget-btn" class="text-button" type="button" disabled>重置额度</button>
           </article>
           <article><span>反馈额度</span><strong id="policy-feedback-budget">—</strong></article>
@@ -427,12 +429,73 @@
             本次最多整理多少条
             <input id="distill-limit" type="number" min="4" max="500" step="1" value="80" />
           </label>
-          <p class="cost-note">这是一项人工维护操作，会消耗“回忆与整理额度”。</p>
+          <p class="cost-note">这是一项人工维护操作，会消耗“深挖与整理额度”。</p>
           <div class="dialog-actions">
             <button id="distill-cancel" class="button ghost" type="button">取消</button>
             <button id="distill-confirm" class="button primary" type="submit">开始整理</button>
           </div>
         </form>
+      </dialog>
+
+      <dialog id="run-detail-dialog" class="run-detail-dialog">
+        <article class="run-detail-shell">
+          <header class="run-detail-header">
+            <div>
+              <p class="section-kicker">调用追溯</p>
+              <h2 id="run-detail-title">本次调用生成了什么记忆</h2>
+              <p id="run-detail-subtitle" class="panel-note">正在读取调用账本与证据连接。</p>
+            </div>
+            <button id="run-detail-close" class="icon-button" type="button" aria-label="关闭调用详情">×</button>
+          </header>
+          <div id="run-detail-metrics" class="run-detail-metrics" aria-label="调用指标"></div>
+          <div id="run-detail-warning" class="run-detail-warning hidden" role="status"></div>
+          <div class="run-detail-workspace">
+            <section class="run-detail-graph-panel">
+              <div class="run-detail-graph-heading">
+                <div>
+                  <strong>本次记忆子图</strong>
+                  <small id="run-detail-graph-caption">证据 → 记忆 → 调用或反馈结果</small>
+                </div>
+                <button id="run-detail-fit" class="button ghost" type="button">回到图起点</button>
+              </div>
+              <div id="run-detail-graph-stage" class="run-detail-graph-stage">
+                <svg id="run-detail-graph" viewBox="0 0 1040 620" role="img" aria-label="调用记忆子图">
+                  <defs>
+                    <marker id="run-detail-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                      <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                    </marker>
+                  </defs>
+                  <g id="run-detail-viewport">
+                    <g id="run-detail-edges"></g>
+                    <g id="run-detail-nodes"></g>
+                  </g>
+                </svg>
+                <div id="run-detail-loading" class="loading-layer hidden">
+                  <span class="spinner"></span>
+                  <p>正在还原调用子图…</p>
+                </div>
+                <div id="run-detail-empty" class="empty-state hidden">
+                  <strong>这条记录没有可还原的图数据</strong>
+                  <p>旧调用可能只保存了耗时与 Token 账本。</p>
+                </div>
+              </div>
+            </section>
+            <aside class="run-detail-inspector">
+              <p class="section-kicker">节点详情</p>
+              <h3 id="run-detail-inspector-title">选择一个节点</h3>
+              <div id="run-detail-inspector-content" class="run-detail-inspector-content">
+                <p class="panel-note">点击图中的证据、记忆结论、反馈或图修改查看完整公开内容。</p>
+              </div>
+            </aside>
+          </div>
+          <section class="run-detail-result">
+            <div>
+              <p class="section-kicker">公开结果</p>
+              <h3>该次调用最终落盘的结果</h3>
+            </div>
+            <pre id="run-detail-result-json">—</pre>
+          </section>
+        </article>
       </dialog>
 
       <div id="toast-region" class="toast-region" aria-live="polite"></div>

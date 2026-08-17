@@ -4273,6 +4273,482 @@ class MemoryStorage:
             ],
         }
 
+    def experiment_detail(
+        self,
+        *,
+        run_id: str,
+        umo: str,
+    ) -> dict[str, object] | None:
+        """Return one run plus a bounded, human-inspectable provenance graph."""
+
+        self._assert_scope(umo)
+        report = self.experiment_report(run_id=run_id)
+        if report is None:
+            return None
+        run = report["run"]
+        assert isinstance(run, dict)
+        if str(run.get("umo") or "") != umo:
+            return None
+        result = run.get("result")
+        result = result if isinstance(result, dict) else {}
+        metadata = run.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+
+        nodes: dict[str, dict[str, object]] = {}
+        edges: list[dict[str, object]] = []
+        edge_keys: set[tuple[str, str, str]] = set()
+
+        def add_node(
+            node_id: str,
+            node_type: str,
+            label: object,
+            *,
+            detail: object = "",
+            content: object = None,
+            status: object = "",
+            source_key: object = "",
+        ) -> None:
+            if not node_id or node_id in nodes or len(nodes) >= 180:
+                return
+            nodes[node_id] = {
+                "id": node_id,
+                "type": str(node_type or "action")[:40],
+                "label": str(label or node_id)[:240],
+                "detail": str(detail or "")[:2000],
+                "content": content if content is not None else {},
+                "status": str(status or "")[:80],
+                "source_key": str(source_key or "")[:300],
+            }
+
+        def add_edge(source: str, target: str, relation: object) -> None:
+            key = (source, target, str(relation or "RELATED"))
+            if source not in nodes or target not in nodes or key in edge_keys:
+                return
+            edge_keys.add(key)
+            edges.append(
+                {
+                    "id": f"edge:{len(edges) + 1}",
+                    "source": source,
+                    "target": target,
+                    "relation": key[2],
+                }
+            )
+
+        run_node = f"run:{run_id}"
+        experiment_type = str(run.get("experiment_type") or "")
+        run_label = (
+            "回答前记忆重建"
+            if experiment_type == "runtime_reconstruction"
+            else (
+                "后续反馈学习"
+                if experiment_type == "runtime_feedback_maintenance"
+                else experiment_type or "记忆调用"
+            )
+        )
+        add_node(
+            run_node,
+            "run",
+            run_label,
+            detail=f"{run_id} · {run.get('started_at') or ''}",
+            content={
+                "run_id": run_id,
+                "status": run.get("status"),
+                "path": result.get("path") or metadata.get("path"),
+            },
+            status=run.get("status"),
+        )
+
+        exact_brief = "memory_brief" in result
+        source_to_claims: dict[str, list[str]] = {}
+        brief_value = result.get("memory_brief")
+        if isinstance(brief_value, dict):
+            for kind, label, node_type in (
+                ("claims", "记忆结论", "memory_claim"),
+                ("conflicts", "冲突解释", "memory_conflict"),
+                ("unresolved", "待确认解释", "memory_unresolved"),
+            ):
+                values = brief_value.get(kind)
+                for index, item in enumerate(values if isinstance(values, list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    node_id = f"brief:{kind}:{index}"
+                    statement = str(item.get("statement") or "")
+                    add_node(
+                        node_id,
+                        node_type,
+                        statement or label,
+                        detail=label,
+                        content=item,
+                    )
+                    add_edge(run_node, node_id, "GENERATED")
+                    raw_sources = item.get("source_keys")
+                    if isinstance(raw_sources, list):
+                        for source in raw_sources:
+                            source_to_claims.setdefault(str(source), []).append(node_id)
+
+        outcomes_value = result.get("outcomes")
+        outcomes = [
+            item
+            for item in outcomes_value if isinstance(item, dict)
+        ] if isinstance(outcomes_value, list) else []
+        trace_ids = {
+            str(value)
+            for value in (result.get("trace_id"), metadata.get("trace_id"))
+            if str(value or "")
+        }
+        feedback_records: dict[int, dict[str, object]] = {}
+        for outcome in outcomes:
+            outcome_trace_id = str(outcome.get("trace_id") or "")
+            if outcome_trace_id:
+                trace_ids.add(outcome_trace_id)
+            proposal_id = int(outcome.get("proposal_id") or 0)
+            if proposal_id <= 0:
+                continue
+            with self._lock:
+                proposal = self._connection.execute(
+                    """
+                    SELECT id, status, feedback_source_key, feedback_sent_at,
+                           candidate_trace_ids_json, surface_score,
+                           candidate_reason, decision_json, error, decided_at
+                    FROM feedback_proposals
+                    WHERE id=? AND umo=?
+                    """,
+                    (proposal_id, umo),
+                ).fetchone()
+                if proposal is None:
+                    continue
+                try:
+                    decision_value = json.loads(str(proposal["decision_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    decision_value = {}
+                decision = decision_value if isinstance(decision_value, dict) else {}
+                target_trace_id = str(
+                    outcome.get("trace_id")
+                    or decision.get("target_trace_id")
+                    or ""
+                )
+                if target_trace_id:
+                    trace_ids.add(target_trace_id)
+                feedback_source_key = str(proposal["feedback_source_key"] or "")
+                feedback = self._connection.execute(
+                    """
+                    SELECT source_key, sender_id, sender_name, sent_at,
+                           plain_text, role
+                    FROM messages
+                    WHERE umo=? AND source_key=? AND is_deleted=0
+                    """,
+                    (umo, feedback_source_key),
+                ).fetchone()
+                hypothesis_id = int(
+                    outcome.get("hypothesis_id")
+                    or decision.get("target_hypothesis_id")
+                    or 0
+                )
+                if hypothesis_id <= 0 and feedback_source_key:
+                    hypothesis = self._connection.execute(
+                        """
+                        SELECT he.hypothesis_id
+                        FROM hypothesis_evidence AS he
+                        JOIN feedback_hypotheses AS h
+                          ON h.id=he.hypothesis_id AND h.umo=?
+                        WHERE he.feedback_source_key=?
+                          AND (?='' OR he.trace_id=?)
+                        ORDER BY he.created_at DESC, he.hypothesis_id DESC
+                        LIMIT 1
+                        """,
+                        (
+                            umo,
+                            feedback_source_key,
+                            target_trace_id,
+                            target_trace_id,
+                        ),
+                    ).fetchone()
+                    if hypothesis is not None:
+                        hypothesis_id = int(hypothesis["hypothesis_id"])
+            proposal_value = dict(proposal)
+            proposal_value.pop("decision_json", None)
+            try:
+                proposal_value["candidate_trace_ids"] = json.loads(
+                    str(proposal_value.pop("candidate_trace_ids_json"))
+                )
+            except (TypeError, json.JSONDecodeError):
+                proposal_value["candidate_trace_ids"] = []
+            feedback_records[proposal_id] = {
+                "proposal": proposal_value,
+                "decision": decision,
+                "target_trace_id": target_trace_id,
+                "hypothesis_id": hypothesis_id,
+                "feedback": dict(feedback) if feedback is not None else None,
+            }
+
+        source_keys: set[str] = set()
+        if exact_brief:
+            source_keys.update(
+                str(item)
+                for item in result.get("brief_source_keys", [])
+                if str(item)
+            )
+        else:
+            source_keys.update(
+                str(item)
+                for item in result.get("visited_source_keys", [])
+                if str(item)
+            )
+            for step in report.get("steps", []):
+                if not isinstance(step, dict):
+                    continue
+                source_keys.update(
+                    str(item) for item in step.get("evidence_keys", []) if str(item)
+                )
+        source_keys.update(source_to_claims)
+        source_keys.update(
+            str(record["proposal"].get("feedback_source_key") or "")
+            for record in feedback_records.values()
+            if isinstance(record.get("proposal"), dict)
+            and str(record["proposal"].get("feedback_source_key") or "")
+        )
+
+        if source_keys:
+            bounded_sources = sorted(source_keys)[:160]
+            placeholders = ",".join("?" for _ in bounded_sources)
+            with self._lock:
+                messages = self._connection.execute(
+                    f"""
+                    SELECT source_key, sender_name, sender_id, sent_at,
+                           plain_text, role
+                    FROM messages
+                    WHERE umo=? AND is_deleted=0
+                      AND source_key IN ({placeholders})
+                    ORDER BY sent_at, id
+                    """,
+                    (umo, *bounded_sources),
+                ).fetchall()
+            for message in messages:
+                source_key = str(message["source_key"])
+                node_id = (
+                    "evidence:"
+                    + hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
+                )
+                add_node(
+                    node_id,
+                    "evidence",
+                    f"{message['sender_name'] or message['sender_id']}: "
+                    f"{str(message['plain_text'])[:140]}",
+                    detail=f"{message['sent_at']} · {message['role']}",
+                    content={
+                        "source_key": source_key,
+                        "sender_name": str(message["sender_name"]),
+                        "sender_id": str(message["sender_id"]),
+                        "sent_at": int(message["sent_at"]),
+                        "plain_text": str(message["plain_text"])[:1200],
+                        "role": str(message["role"]),
+                    },
+                    source_key=source_key,
+                )
+                targets = source_to_claims.get(source_key) or [run_node]
+                for target in targets:
+                    add_edge(node_id, target, "SUPPORTS")
+
+        trace_anchors: dict[str, dict[str, str]] = {}
+        for trace_id in sorted(trace_ids)[:8]:
+            trace_graph = self.interaction_trace_graph(umo=umo, trace_id=trace_id)
+            if trace_graph is None:
+                continue
+            trace_node_ids: dict[str, str] = {}
+            for raw_node in trace_graph.get("nodes", []):
+                if not isinstance(raw_node, dict):
+                    continue
+                content = raw_node.get("content")
+                content = content if isinstance(content, dict) else {}
+                node_key = str(raw_node.get("node_key") or "")
+                node_type = str(raw_node.get("node_type") or "action")
+                trace_source_key = str(content.get("source_key") or "")
+                node_id = (
+                    "evidence:"
+                    + hashlib.sha256(
+                        trace_source_key.encode("utf-8")
+                    ).hexdigest()[:24]
+                    if node_type == "memory_evidence" and trace_source_key
+                    else f"trace:{trace_id}:{node_key}"
+                )
+                label = (
+                    content.get("excerpt")
+                    or content.get("prospective_cue")
+                    or content.get("tool")
+                    or ("本次实际记忆简报" if node_type == "memory_brief" else node_key)
+                )
+                add_node(
+                    node_id,
+                    node_type,
+                    label,
+                    detail=node_key,
+                    content=content,
+                    status=raw_node.get("status"),
+                    source_key=content.get("source_key"),
+                )
+                trace_node_ids[node_key] = node_id
+            for raw_edge in trace_graph.get("edges", []):
+                if not isinstance(raw_edge, dict):
+                    continue
+                source = trace_node_ids.get(str(raw_edge.get("source") or ""))
+                target = trace_node_ids.get(str(raw_edge.get("target") or ""))
+                if source and target:
+                    add_edge(source, target, raw_edge.get("relation"))
+            request_node = trace_node_ids.get("request")
+            if request_node:
+                add_edge(request_node, run_node, "STARTS")
+            trace_anchors[trace_id] = {
+                "request": request_node or "",
+                "response": trace_node_ids.get("response") or request_node or "",
+            }
+
+        for outcome_index, outcome in enumerate(outcomes):
+            proposal_id = int(outcome.get("proposal_id") or 0)
+            feedback_record = feedback_records.get(proposal_id, {})
+            proposal_value = feedback_record.get("proposal")
+            proposal_value = (
+                proposal_value if isinstance(proposal_value, dict) else {}
+            )
+            decision_value = feedback_record.get("decision")
+            decision_value = (
+                decision_value if isinstance(decision_value, dict) else {}
+            )
+            proposal_node = f"proposal:{proposal_id or outcome_index}"
+            add_node(
+                proposal_node,
+                "feedback_proposal",
+                decision_value.get("aspect")
+                or f"反馈候选 #{proposal_id or outcome_index + 1}",
+                detail=(
+                    f"{outcome.get('proposal_status') or proposal_value.get('status') or ''} · "
+                    f"commit {float(outcome.get('commit_score') or 0):.3f}"
+                ),
+                content={
+                    "outcome": outcome,
+                    "proposal": proposal_value,
+                    "decision": decision_value,
+                },
+                status=outcome.get("proposal_status") or proposal_value.get("status"),
+            )
+            add_edge(run_node, proposal_node, "DECIDED")
+            target_trace_id = str(feedback_record.get("target_trace_id") or "")
+            feedback_value = feedback_record.get("feedback")
+            feedback_value = (
+                feedback_value if isinstance(feedback_value, dict) else {}
+            )
+            feedback_source_key = str(
+                feedback_value.get("source_key")
+                or proposal_value.get("feedback_source_key")
+                or ""
+            )
+            if feedback_source_key:
+                feedback_node = (
+                    "evidence:"
+                    + hashlib.sha256(
+                        feedback_source_key.encode("utf-8")
+                    ).hexdigest()[:24]
+                )
+                add_edge(feedback_node, proposal_node, "EVALUATED_AS")
+                response_node = trace_anchors.get(target_trace_id, {}).get("response")
+                if response_node:
+                    add_edge(response_node, feedback_node, "RECEIVES_FEEDBACK")
+            hypothesis_id = int(
+                feedback_record.get("hypothesis_id")
+                or outcome.get("hypothesis_id")
+                or 0
+            )
+            if hypothesis_id > 0:
+                with self._lock:
+                    hypothesis = self._connection.execute(
+                        """
+                        SELECT aspect, statement, prospective_cue, trigger_cues_json,
+                               activation_mode, evidence_confidence, utility, status
+                        FROM feedback_hypotheses WHERE id=? AND umo=?
+                        """,
+                        (hypothesis_id, umo),
+                    ).fetchone()
+                if hypothesis is not None:
+                    hypothesis_node = f"hypothesis:{hypothesis_id}"
+                    content = dict(hypothesis)
+                    content["trigger_cues"] = json.loads(
+                        str(content.pop("trigger_cues_json"))
+                    )
+                    add_node(
+                        hypothesis_node,
+                        "hypothesis",
+                        hypothesis["prospective_cue"] or hypothesis["statement"],
+                        detail=hypothesis["aspect"],
+                        content=content,
+                        status=hypothesis["status"],
+                    )
+                    add_edge(proposal_node, hypothesis_node, "MATERIALIZED")
+            mutation_results = outcome.get("graph_mutation_results")
+            for mutation_index, mutation_result in enumerate(
+                mutation_results if isinstance(mutation_results, list) else []
+            ):
+                if not isinstance(mutation_result, dict):
+                    continue
+                proposal = mutation_result.get("proposal")
+                proposal = proposal if isinstance(proposal, dict) else {}
+                source = proposal.get("source")
+                target = proposal.get("target")
+                relation = proposal.get("relation")
+                source = source if isinstance(source, dict) else {}
+                target = target if isinstance(target, dict) else {}
+                relation = relation if isinstance(relation, dict) else {}
+                mutation_id = int(mutation_result.get("mutation_id") or 0)
+                mutation_node = f"mutation:{mutation_id or proposal_id}:{mutation_index}"
+                add_node(
+                    mutation_node,
+                    "graph_mutation",
+                    relation.get("name") or proposal.get("operation") or "图修改",
+                    detail=proposal.get("statement"),
+                    content=mutation_result,
+                    status=mutation_result.get("status"),
+                )
+                add_edge(proposal_node, mutation_node, "COMMITS")
+                if source and target:
+                    source_node = f"plastic:{source.get('node_key') or mutation_node + ':source'}"
+                    target_node = f"plastic:{target.get('node_key') or mutation_node + ':target'}"
+                    add_node(
+                        source_node,
+                        "plastic",
+                        source.get("label") or "关联起点",
+                        detail=source.get("description"),
+                        content=source,
+                    )
+                    add_node(
+                        target_node,
+                        "plastic",
+                        target.get("label") or "关联终点",
+                        detail=target.get("description"),
+                        content=target,
+                    )
+                    add_edge(
+                        source_node,
+                        target_node,
+                        relation.get("name") or relation.get("key") or "ASSOCIATES",
+                    )
+                    add_edge(mutation_node, source_node, "WRITES")
+
+        warnings: list[str] = []
+        if experiment_type == "runtime_reconstruction" and not exact_brief:
+            warnings.append(
+                "该旧调用只保存了摘要哈希和证据键；可以还原证据连接，无法恢复当时未落盘的最终记忆简报。"
+            )
+        if result.get("no_relevant_memory") is True:
+            warnings.append("该次调用明确判断为没有相关记忆。")
+        return {
+            **report,
+            "graph": {
+                "nodes": list(nodes.values()),
+                "edges": edges,
+                "exact_memory_brief": exact_brief,
+                "source_count": len(source_keys),
+                "warnings": warnings,
+            },
+        }
+
     def recent_experiments(
         self,
         *,
@@ -4427,7 +4903,8 @@ class MemoryStorage:
             total = int(row["total"] or 0)
             llm_elapsed = float(row["llm_elapsed_ms"] or 0.0)
             wall_elapsed = float(row["wall_elapsed_ms"] or 0.0)
-            elapsed = max(llm_elapsed, wall_elapsed)
+            recorded_elapsed = float(result.get("elapsed_ms") or 0.0)
+            elapsed = max(llm_elapsed, wall_elapsed, recorded_elapsed)
             aggregate["tokens"] = int(aggregate["tokens"]) + total
             elapsed_values = aggregate["elapsed_values"]
             assert isinstance(elapsed_values, list)
@@ -9300,6 +9777,147 @@ class MemoryStorage:
             ).fetchone()
         return int(row["id"])
 
+    def record_memory_brief_trace(
+        self,
+        *,
+        trace_id: str,
+        umo: str,
+        run_id: str,
+        memory_brief: dict[str, object] | None,
+        source_keys: Iterable[str] = (),
+        path: str = "",
+        presented_edge_ids: Iterable[int] = (),
+        presented_hypothesis_ids: Iterable[int] = (),
+    ) -> str:
+        """Attach the exact public memory projection to an interaction trace."""
+
+        self._assert_scope(umo)
+        brief_key = f"memory_brief:{str(run_id).strip()}"
+        if not str(run_id).strip() or len(brief_key) > 200:
+            raise ValueError("invalid memory brief run identity")
+        bounded_sources = tuple(
+            dict.fromkeys(str(item).strip() for item in source_keys if str(item))
+        )[:64]
+        with self._lock, self._connection:
+            trace = self._connection.execute(
+                "SELECT expires_at FROM interaction_traces WHERE trace_id=? AND umo=?",
+                (trace_id, umo),
+            ).fetchone()
+            if trace is None:
+                raise ValueError("trace does not belong to this group")
+            expires_at = int(trace["expires_at"])
+            self._connection.execute(
+                """
+                INSERT INTO trace_nodes(
+                    trace_id, umo, node_key, node_type, content_json,
+                    activation, expires_at
+                ) VALUES (?, ?, ?, 'memory_brief', ?, 1, ?)
+                ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                    content_json=excluded.content_json, activation=1
+                """,
+                (
+                    trace_id,
+                    umo,
+                    brief_key,
+                    self._bounded_json(
+                        {
+                            "run_id": str(run_id),
+                            "path": str(path)[:80],
+                            "memory_brief": memory_brief,
+                            "source_keys": list(bounded_sources),
+                            "presented_edge_ids": [
+                                int(item)
+                                for item in list(presented_edge_ids)[:32]
+                                if int(item) > 0
+                            ],
+                            "presented_hypothesis_ids": [
+                                int(item)
+                                for item in list(presented_hypothesis_ids)[:32]
+                                if int(item) > 0
+                            ],
+                        },
+                        max_chars=12000,
+                    ),
+                    expires_at,
+                ),
+            )
+            request = self._connection.execute(
+                "SELECT id FROM trace_nodes WHERE trace_id=? AND node_key='request'",
+                (trace_id,),
+            ).fetchone()
+            brief = self._connection.execute(
+                "SELECT id FROM trace_nodes WHERE trace_id=? AND node_key=?",
+                (trace_id, brief_key),
+            ).fetchone()
+            assert brief is not None
+            if request is not None:
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO trace_edges(
+                        trace_id, umo, source_node_id, target_node_id, relation,
+                        contribution, eligibility
+                    ) VALUES (?, ?, ?, ?, 'RECALLS', 1, 1)
+                    """,
+                    (trace_id, umo, int(request["id"]), int(brief["id"])),
+                )
+            if bounded_sources:
+                placeholders = ",".join("?" for _ in bounded_sources)
+                messages = self._connection.execute(
+                    f"""
+                    SELECT source_key, sender_name, sent_at, plain_text
+                    FROM messages
+                    WHERE umo=? AND is_deleted=0
+                      AND source_key IN ({placeholders})
+                    """,
+                    (umo, *bounded_sources),
+                ).fetchall()
+                for message in messages:
+                    source_key = str(message["source_key"])
+                    evidence_key = (
+                        "memory_evidence:"
+                        + hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO trace_nodes(
+                            trace_id, umo, node_key, node_type, content_json,
+                            activation, expires_at
+                        ) VALUES (?, ?, ?, 'memory_evidence', ?, 1, ?)
+                        ON CONFLICT(trace_id, node_key) DO UPDATE SET
+                            content_json=excluded.content_json, activation=1
+                        """,
+                        (
+                            trace_id,
+                            umo,
+                            evidence_key,
+                            self._bounded_json(
+                                {
+                                    "source_key": source_key,
+                                    "sender_name": str(message["sender_name"]),
+                                    "sent_at": int(message["sent_at"]),
+                                    "excerpt": str(message["plain_text"])[:700],
+                                },
+                                max_chars=1600,
+                            ),
+                            expires_at,
+                        ),
+                    )
+                    evidence = self._connection.execute(
+                        "SELECT id FROM trace_nodes WHERE trace_id=? AND node_key=?",
+                        (trace_id, evidence_key),
+                    ).fetchone()
+                    assert evidence is not None
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO trace_edges(
+                            trace_id, umo, source_node_id, target_node_id, relation,
+                            contribution, eligibility
+                        ) VALUES (?, ?, ?, ?, 'SUPPORTS_RECALL', 1, 1)
+                        """,
+                        (trace_id, umo, int(evidence["id"]), int(brief["id"])),
+                    )
+        return brief_key
+
     def finish_interaction_trace(
         self,
         *,
@@ -9602,7 +10220,10 @@ class MemoryStorage:
                     SELECT trace_id, node_key, node_type, content_json
                     FROM trace_nodes
                     WHERE umo = ? AND trace_id IN ({placeholders})
-                      AND node_type IN ('tool_call', 'tool_result', 'artifact')
+                      AND node_type IN (
+                        'tool_call', 'tool_result', 'artifact',
+                        'memory_brief', 'memory_evidence'
+                      )
                     ORDER BY trace_id, id
                     LIMIT 64
                     """,

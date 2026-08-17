@@ -8,6 +8,8 @@ const state = {
   graphFocusId: "",
   graphPathSource: "",
   graphPathTarget: "",
+  runDetail: null,
+  runDetailNodeId: "",
   activeSection: "runtime",
   loadedSections: new Set(),
   visibleTypes: new Set([
@@ -104,6 +106,24 @@ const elements = {
   participantStatus: document.getElementById("participant-status"),
   participantBody: document.getElementById("participant-table-body"),
   runtimeTableBody: document.getElementById("runtime-table-body"),
+  runDetailDialog: document.getElementById("run-detail-dialog"),
+  runDetailClose: document.getElementById("run-detail-close"),
+  runDetailTitle: document.getElementById("run-detail-title"),
+  runDetailSubtitle: document.getElementById("run-detail-subtitle"),
+  runDetailMetrics: document.getElementById("run-detail-metrics"),
+  runDetailWarning: document.getElementById("run-detail-warning"),
+  runDetailGraphCaption: document.getElementById("run-detail-graph-caption"),
+  runDetailFit: document.getElementById("run-detail-fit"),
+  runDetailGraphStage: document.getElementById("run-detail-graph-stage"),
+  runDetailGraph: document.getElementById("run-detail-graph"),
+  runDetailViewport: document.getElementById("run-detail-viewport"),
+  runDetailEdges: document.getElementById("run-detail-edges"),
+  runDetailNodes: document.getElementById("run-detail-nodes"),
+  runDetailLoading: document.getElementById("run-detail-loading"),
+  runDetailEmpty: document.getElementById("run-detail-empty"),
+  runDetailInspectorTitle: document.getElementById("run-detail-inspector-title"),
+  runDetailInspectorContent: document.getElementById("run-detail-inspector-content"),
+  runDetailResultJson: document.getElementById("run-detail-result-json"),
   queuePending: document.getElementById("queue-pending"),
   queueProvisional: document.getElementById("queue-provisional"),
   queueBudgetWait: document.getElementById("queue-budget-wait"),
@@ -279,7 +299,7 @@ function renderOverview() {
     ? "关闭"
     : runtime.runtime_wake_mode === "manual_only"
       ? "仅在主模型主动咨询时运行"
-      : "每次回答先快速判断，必要时再深挖";
+      : "每次回答读取本地工作记忆；主动咨询时才调用潜意识模型深挖";
   elements.policyDistill.textContent = runtime.auto_distillation_enabled
     ? `${formatNumber(runtime.auto_distillation_min_pending)} 条立即整理，最迟 ${Math.max(0.5, Number(runtime.maintenance_interval_seconds || 0) / 60)} 分钟一次`
     : "仅在管理员手动操作时整理";
@@ -365,7 +385,7 @@ function renderRuntimeHealth(scope) {
   if (runtime.embedding_enabled && !runtime.embedding_dependency_ready) {
     issues.push("本地语义检索依赖不可用");
   }
-  if (recallCalls && Number(reconstruction.p50_elapsed_ms || 0) > 10000) {
+  if (recallCalls && Number(reconstruction.p50_elapsed_ms || 0) > 3000) {
     issues.push(`回答前回忆 p50 为 ${formatDuration(reconstruction.p50_elapsed_ms)}`);
   }
   if (feedbackCalls && Number(feedback.p50_elapsed_ms || 0) > 20000) {
@@ -415,7 +435,7 @@ function renderRuntimeCalls(calls) {
   if (!calls.length) {
     const row = document.createElement("tr");
     const cell = textElement("td", "最近 24 小时还没有实时调用。", "table-empty");
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     row.append(cell);
     elements.runtimeTableBody.append(row);
     return;
@@ -439,6 +459,7 @@ function renderRuntimeCalls(calls) {
     one_pass_batch: "合并判断",
     one_pass_feedback_learning: "一次判断并学习",
     semantic_gate_then_learn: "先判断，必要时学习",
+    materialized_local: "本地工作记忆",
     legacy: "旧版多轮",
   };
   calls.forEach((call) => {
@@ -453,6 +474,10 @@ function renderRuntimeCalls(calls) {
       .map((value) => outcomeNames[value] || value)
       .join("、");
     const row = document.createElement("tr");
+    row.className = "runtime-call-row";
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-label", `查看 ${phaseNames[call.phase] || call.phase} 调用详情`);
     const outcomeCell = textElement("td", outcomes || "—");
     if (call.error_detail) outcomeCell.title = String(call.error_detail);
     const elapsedCell = textElement("td", formatDuration(call.elapsed_ms));
@@ -461,6 +486,14 @@ function renderRuntimeCalls(calls) {
       `模型 ${formatDuration(call.llm_elapsed_ms)}`,
       call.first_chunk_ms ? `首段 ${formatDuration(call.first_chunk_ms)}` : "",
     ].filter(Boolean).join(" · ");
+    const detailCell = document.createElement("td");
+    const detailButton = textElement("button", "查看", "runtime-detail-button");
+    detailButton.type = "button";
+    detailButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openRunDetail(call.run_id);
+    });
+    detailCell.append(detailButton);
     row.append(
       textElement("td", formatTime(call.started_at)),
       textElement("td", phaseNames[call.phase] || call.phase),
@@ -468,9 +501,267 @@ function renderRuntimeCalls(calls) {
       elapsedCell,
       textElement("td", formatNumber(call.tokens)),
       textElement("td", pathNames[call.path] || call.path || "—"),
+      detailCell,
     );
+    row.addEventListener("click", () => openRunDetail(call.run_id));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openRunDetail(call.run_id);
+      }
+    });
     elements.runtimeTableBody.append(row);
   });
+}
+
+const runDetailTypeNames = {
+  ...typeNames,
+  run: "调用",
+  request: "请求",
+  response: "主模型回答",
+  evidence: "原始证据",
+  memory_evidence: "回忆证据",
+  memory_brief: "记忆简报",
+  memory_claim: "记忆结论",
+  memory_conflict: "冲突解释",
+  memory_unresolved: "待确认解释",
+  feedback_proposal: "反馈候选",
+  graph_mutation: "图修改",
+  tool_call: "工具调用",
+  tool_result: "工具结果",
+};
+
+function runDetailRank(node) {
+  const type = String(node.type || "");
+  if (["evidence", "memory_evidence", "request", "participant"].includes(type)) return 0;
+  if ([
+    "memory_claim", "memory_conflict", "memory_unresolved", "semantic",
+    "episode", "plastic", "hypothesis",
+  ].includes(type)) return 1;
+  if (["run", "memory_brief", "tool_call", "tool_result", "graph_mutation"].includes(type)) return 2;
+  return 3;
+}
+
+function layoutRunDetailGraph(nodes) {
+  const columns = [[], [], [], []];
+  nodes.forEach((node) => columns[runDetailRank(node)].push(node));
+  columns.forEach((column) => column.sort((a, b) => (
+    String(a.type).localeCompare(String(b.type), "zh-CN")
+    || String(a.label).localeCompare(String(b.label), "zh-CN")
+  )));
+  const maxColumn = Math.max(1, ...columns.map((column) => column.length));
+  const height = Math.max(620, maxColumn * 92 + 80);
+  const xValues = [125, 390, 665, 930];
+  const positions = new Map();
+  columns.forEach((column, rank) => {
+    const span = Math.max(1, column.length - 1) * 92;
+    const start = Math.max(52, (height - span) / 2);
+    column.forEach((node, index) => {
+      positions.set(node.id, { x: xValues[rank], y: start + index * 92 });
+    });
+  });
+  return { positions, width: 1060, height };
+}
+
+function fitRunDetailGraph() {
+  elements.runDetailGraphStage.scrollTo({
+    top: 0,
+    left: 0,
+    behavior: "smooth",
+  });
+}
+
+function runDetailNodeLabel(node) {
+  const label = String(node.label || node.id || "未命名节点");
+  return [truncate(label, 25), label.length > 25 ? truncate(label.slice(24), 25) : ""];
+}
+
+function renderRunDetailGraph() {
+  elements.runDetailEdges.replaceChildren();
+  elements.runDetailNodes.replaceChildren();
+  const graph = state.runDetail?.graph || {};
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  elements.runDetailEmpty.classList.toggle("hidden", nodes.length > 0);
+  if (!nodes.length) {
+    elements.runDetailGraph.style.height = "100%";
+    elements.runDetailGraphCaption.textContent = "没有可还原的节点";
+    return;
+  }
+  const layout = layoutRunDetailGraph(nodes);
+  elements.runDetailGraph.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+  elements.runDetailGraph.style.height = `${layout.height}px`;
+
+  edges.forEach((edge) => {
+    const source = layout.positions.get(edge.source);
+    const target = layout.positions.get(edge.target);
+    if (!source || !target) return;
+    const forward = target.x >= source.x;
+    const startX = source.x + (forward ? 102 : -102);
+    const endX = target.x + (forward ? -102 : 102);
+    const middleX = (startX + endX) / 2;
+    const path = svgElement("path", {
+      d: `M ${startX} ${source.y} C ${middleX} ${source.y}, ${middleX} ${target.y}, ${endX} ${target.y}`,
+      class: "run-detail-edge",
+      "data-source": edge.source,
+      "data-target": edge.target,
+      "marker-end": "url(#run-detail-arrow)",
+    });
+    const edgeTitle = svgElement("title");
+    edgeTitle.textContent = String(edge.relation || "RELATED");
+    path.append(edgeTitle);
+    elements.runDetailEdges.append(path);
+  });
+
+  nodes.forEach((node) => {
+    const position = layout.positions.get(node.id);
+    if (!position) return;
+    const group = svgElement("g", {
+      class: "run-detail-node",
+      transform: `translate(${position.x} ${position.y})`,
+      tabindex: "0",
+      role: "button",
+      "data-node-id": node.id,
+      "data-type": node.type || "action",
+      "aria-label": `${runDetailTypeNames[node.type] || node.type}: ${node.label}`,
+    });
+    group.append(svgElement("rect", { x: -102, y: -32, width: 204, height: 64, rx: 13 }));
+    const badge = svgElement("text", { x: -88, y: -14, class: "run-detail-node-type" });
+    badge.textContent = runDetailTypeNames[node.type] || node.type || "节点";
+    group.append(badge);
+    const label = svgElement("text", { x: -88, y: 7, class: "run-detail-node-label" });
+    const [firstLine, secondLine] = runDetailNodeLabel(node);
+    const first = svgElement("tspan", { x: -88, dy: 0 });
+    first.textContent = firstLine;
+    label.append(first);
+    if (secondLine) {
+      const second = svgElement("tspan", { x: -88, dy: 16 });
+      second.textContent = secondLine;
+      label.append(second);
+    }
+    group.append(label);
+    group.addEventListener("click", () => selectRunDetailNode(node.id));
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectRunDetailNode(node.id);
+      }
+    });
+    elements.runDetailNodes.append(group);
+  });
+  elements.runDetailGraphCaption.textContent = [
+    `${formatNumber(nodes.length)} 个节点`,
+    `${formatNumber(edges.length)} 条可追溯连接`,
+    graph.exact_memory_brief ? "包含当时实际生成的记忆简报" : "旧记录仅还原证据连接",
+  ].join(" · ");
+  selectRunDetailNode(nodes.find((node) => node.type === "run")?.id || nodes[0].id);
+}
+
+function selectRunDetailNode(nodeId) {
+  const graph = state.runDetail?.graph;
+  const node = (graph?.nodes || []).find((item) => item.id === nodeId);
+  if (!node) return;
+  state.runDetailNodeId = nodeId;
+  const connected = new Set([nodeId]);
+  (graph.edges || []).forEach((edge) => {
+    if (edge.source === nodeId || edge.target === nodeId) {
+      connected.add(edge.source);
+      connected.add(edge.target);
+    }
+  });
+  elements.runDetailNodes.querySelectorAll(".run-detail-node").forEach((item) => {
+    const id = item.getAttribute("data-node-id");
+    item.classList.toggle("is-selected", id === nodeId);
+    item.classList.toggle("is-muted", !connected.has(id));
+  });
+  elements.runDetailEdges.querySelectorAll(".run-detail-edge").forEach((item) => {
+    const active = item.getAttribute("data-source") === nodeId
+      || item.getAttribute("data-target") === nodeId;
+    item.classList.toggle("is-active", active);
+    item.classList.toggle("is-muted", !active);
+  });
+  renderRunDetailInspector(node);
+}
+
+function renderRunDetailInspector(node) {
+  elements.runDetailInspectorTitle.textContent = node.label || "节点详情";
+  elements.runDetailInspectorContent.replaceChildren();
+  elements.runDetailInspectorContent.append(
+    textElement("span", runDetailTypeNames[node.type] || node.type || "节点", "node-type-badge"),
+  );
+  appendDetailList(elements.runDetailInspectorContent, [
+    ["节点类型", runDetailTypeNames[node.type] || node.type],
+    ["状态", node.status],
+    ["说明", node.detail],
+    ["证据键", node.source_key],
+    ["节点 ID", node.id],
+  ]);
+  const content = node.content;
+  if (content && Object.keys(content).length) {
+    const pre = document.createElement("pre");
+    pre.className = "run-detail-node-json";
+    pre.textContent = JSON.stringify(content, null, 2);
+    elements.runDetailInspectorContent.append(pre);
+  }
+}
+
+function renderRunDetail(detail) {
+  const run = detail.run || {};
+  const result = run.result || {};
+  const metadata = run.metadata || {};
+  const usage = Array.isArray(detail.usage) ? detail.usage : [];
+  const tokens = usage.reduce((sum, item) => sum + Number(item.total || 0), 0);
+  const modelMs = usage.reduce((sum, item) => sum + Number(item.elapsed_ms || 0), 0);
+  const title = run.experiment_type === "runtime_feedback_maintenance"
+    ? "这次反馈修改了什么记忆"
+    : "这次回答前实际取出了什么记忆";
+  elements.runDetailTitle.textContent = title;
+  elements.runDetailSubtitle.textContent = `${run.run_id || ""} · ${formatTime(run.started_at)} · ${result.path || metadata.path || "未记录路径"}`;
+  elements.runDetailMetrics.replaceChildren();
+  [
+    ["状态", run.status || "—"],
+    ["模型耗时", formatDuration(modelMs)],
+    ["Token", formatNumber(tokens)],
+    ["证据", `${formatNumber(detail.graph?.source_count)} 条`],
+  ].forEach(([label, value]) => {
+    const card = document.createElement("article");
+    card.append(textElement("span", label), textElement("strong", value));
+    elements.runDetailMetrics.append(card);
+  });
+  const warnings = detail.graph?.warnings || [];
+  elements.runDetailWarning.replaceChildren();
+  elements.runDetailWarning.classList.toggle("hidden", !warnings.length);
+  warnings.forEach((warning) => elements.runDetailWarning.append(textElement("p", warning)));
+  elements.runDetailResultJson.textContent = JSON.stringify(result, null, 2);
+  renderRunDetailGraph();
+}
+
+async function openRunDetail(runId) {
+  if (!state.scopeId || !runId) return;
+  state.runDetail = null;
+  state.runDetailNodeId = "";
+  elements.runDetailLoading.classList.remove("hidden");
+  elements.runDetailEmpty.classList.add("hidden");
+  elements.runDetailEdges.replaceChildren();
+  elements.runDetailNodes.replaceChildren();
+  elements.runDetailMetrics.replaceChildren();
+  elements.runDetailWarning.classList.add("hidden");
+  elements.runDetailResultJson.textContent = "正在读取…";
+  if (!elements.runDetailDialog.open) elements.runDetailDialog.showModal();
+  try {
+    const detail = await apiGet(
+      `scopes/${state.scopeId}/runs/${encodeURIComponent(String(runId))}`,
+    );
+    if (detail.scope_id !== state.scopeId) return;
+    state.runDetail = detail;
+    renderRunDetail(detail);
+  } catch (error) {
+    elements.runDetailEmpty.classList.remove("hidden");
+    elements.runDetailResultJson.textContent = error?.message || "调用详情读取失败";
+    showToast(error?.message || "调用详情读取失败", "error");
+  } finally {
+    elements.runDetailLoading.classList.add("hidden");
+  }
 }
 
 function populateScopes(previousScopeId = "") {
@@ -536,7 +827,7 @@ function renderScopeMeta() {
   elements.scopeMeta.textContent = [
     `UMO ${scope.umo}`,
     `${formatNumber(pendingByClass.live)} 条新消息待整理`,
-    `回忆与整理 ${formatNumber(usage.online)}/${formatNumber(runtime.private_daily_token_budget)} Token`,
+    `深挖与整理 ${formatNumber(usage.online)}/${formatNumber(runtime.private_daily_token_budget)} Token`,
     `反馈 ${formatNumber(usage.feedback)}/${formatNumber(runtime.feedback_daily_token_budget)} Token`,
     Number(rawLedger.online || 0) !== Number(usage.online || 0)
       ? `回忆原始账本 ${formatNumber(rawLedger.online)} Token（已重置额度）`
@@ -1574,7 +1865,7 @@ function bindGraphInteractions() {
 async function resetBudget(budgetClass) {
   if (!state.scopeId) return;
   const isFeedback = budgetClass === "feedback";
-  const label = isFeedback ? "反馈学习" : "回忆与整理";
+  const label = isFeedback ? "反馈学习" : "深挖与整理";
   if (!window.confirm(`重置当前群的${label} 24 小时额度？原始 Token 记录会继续保留。`)) return;
   const button = isFeedback ? elements.resetFeedbackBudgetBtn : elements.resetBudgetBtn;
   button.disabled = true;
@@ -1606,6 +1897,8 @@ async function reloadGraphFromControls(errorMessage = "图分析加载失败") {
 
 function bindEvents() {
   elements.refreshBtn.addEventListener("click", () => refreshOverview());
+  elements.runDetailClose.addEventListener("click", () => elements.runDetailDialog.close());
+  elements.runDetailFit.addEventListener("click", fitRunDetailGraph);
   elements.resetBudgetBtn.addEventListener("click", () => resetBudget("online"));
   elements.resetFeedbackBudgetBtn.addEventListener("click", () => resetBudget("feedback"));
   document.querySelectorAll("[data-section]").forEach((tab) => {

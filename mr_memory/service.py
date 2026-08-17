@@ -236,6 +236,18 @@ class MemoryService:
             run_id=run_id,
         )
 
+    async def experiment_detail(
+        self,
+        *,
+        run_id: str,
+        umo: str,
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.experiment_detail,
+            run_id=run_id,
+            umo=umo,
+        )
+
     async def recent_experiments(
         self,
         *,
@@ -581,6 +593,12 @@ class MemoryService:
 
     async def record_trace_edge(self, **kwargs: object) -> int:
         return await asyncio.to_thread(self.storage.record_trace_edge, **kwargs)
+
+    async def record_memory_brief_trace(self, **kwargs: object) -> str:
+        return await asyncio.to_thread(
+            self.storage.record_memory_brief_trace,
+            **kwargs,
+        )
 
     async def finish_interaction_trace(self, **kwargs: object) -> None:
         await asyncio.to_thread(self.storage.finish_interaction_trace, **kwargs)
