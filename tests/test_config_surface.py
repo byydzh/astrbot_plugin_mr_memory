@@ -66,7 +66,10 @@ class ConfigSurfaceTests(unittest.TestCase):
         html = (
             Path.cwd() / "pages" / "console" / "index.html"
         ).read_text(encoding="utf-8")
-        self.assertIn('<script type="module" src="./script.js"></script>', html)
+        self.assertIn(
+            '<script type="module" src="./script.js?v=0.18.0-trace-label"></script>',
+            html,
+        )
 
         script = (
             Path.cwd() / "pages" / "console" / "script.js"
@@ -74,7 +77,7 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertIn("async function waitForPluginBridge", script)
         self.assertIn("await waitForPluginBridge()", script)
 
-    def test_recent_calls_open_an_evidence_graph_detail(self) -> None:
+    def test_recent_calls_open_a_provenance_trace_not_a_memory_graph(self) -> None:
         html = (Path.cwd() / "pages" / "console" / "index.html").read_text(
             encoding="utf-8"
         )
@@ -85,9 +88,25 @@ class ConfigSurfaceTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('id="run-detail-dialog"', html)
+        self.assertIn("本次调用追溯链路", html)
+        self.assertIn("输入证据 → 处理步骤 → 输出或反馈结果", html)
+        self.assertIn("重置链路视图", html)
+        self.assertIn("调用证据与处理追溯链路", html)
+        self.assertNotIn("本次记忆子图", html)
+        self.assertNotIn("调用记忆子图", html)
         self.assertIn("function openRunDetail", script)
-        self.assertIn("graph.exact_memory_brief", script)
+        self.assertIn("function runDetailTraceSummary", script)
+        self.assertIn('run: "处理运行"', script)
+        self.assertIn("detail?.graph?.exact_memory_brief", script)
+        self.assertIn('"包含本次反馈处理结果"', script)
+        self.assertIn('"仅显示已落盘的证据与结果"', script)
+        self.assertNotIn("旧记录仅还原证据", script)
+        self.assertIn('"这次反馈学习处理了什么"', script)
+        self.assertIn('"这次回答前实际读取了什么证据"', script)
+        self.assertNotIn('"这次反馈修改了什么记忆"', script)
         self.assertIn('"scopes/<scope_id>/runs/<run_id>"', web_api)
+        self.assertIn("结果与证据追溯链路", web_api)
+        self.assertNotIn("结果与证据子图", web_api)
 
 
 if __name__ == "__main__":

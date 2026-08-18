@@ -516,7 +516,7 @@ function renderRuntimeCalls(calls) {
 
 const runDetailTypeNames = {
   ...typeNames,
-  run: "调用",
+  run: "处理运行",
   request: "请求",
   response: "主模型回答",
   evidence: "原始证据",
@@ -576,6 +576,16 @@ function runDetailNodeLabel(node) {
   return [truncate(label, 25), label.length > 25 ? truncate(label.slice(24), 25) : ""];
 }
 
+function runDetailTraceSummary(detail) {
+  if (detail?.run?.experiment_type === "runtime_feedback_maintenance") {
+    return "包含本次反馈处理结果";
+  }
+  if (detail?.graph?.exact_memory_brief) {
+    return "包含当时实际生成的记忆简报";
+  }
+  return "仅显示已落盘的证据与结果";
+}
+
 function renderRunDetailGraph() {
   elements.runDetailEdges.replaceChildren();
   elements.runDetailNodes.replaceChildren();
@@ -585,7 +595,7 @@ function renderRunDetailGraph() {
   elements.runDetailEmpty.classList.toggle("hidden", nodes.length > 0);
   if (!nodes.length) {
     elements.runDetailGraph.style.height = "100%";
-    elements.runDetailGraphCaption.textContent = "没有可还原的节点";
+    elements.runDetailGraphCaption.textContent = "没有可还原的追溯节点";
     return;
   }
   const layout = layoutRunDetailGraph(nodes);
@@ -652,7 +662,7 @@ function renderRunDetailGraph() {
   elements.runDetailGraphCaption.textContent = [
     `${formatNumber(nodes.length)} 个节点`,
     `${formatNumber(edges.length)} 条可追溯连接`,
-    graph.exact_memory_brief ? "包含当时实际生成的记忆简报" : "旧记录仅还原证据连接",
+    runDetailTraceSummary(state.runDetail),
   ].join(" · ");
   selectRunDetailNode(nodes.find((node) => node.type === "run")?.id || nodes[0].id);
 }
@@ -713,8 +723,8 @@ function renderRunDetail(detail) {
   const tokens = usage.reduce((sum, item) => sum + Number(item.total || 0), 0);
   const modelMs = usage.reduce((sum, item) => sum + Number(item.elapsed_ms || 0), 0);
   const title = run.experiment_type === "runtime_feedback_maintenance"
-    ? "这次反馈修改了什么记忆"
-    : "这次回答前实际取出了什么记忆";
+    ? "这次反馈学习处理了什么"
+    : "这次回答前实际读取了什么证据";
   elements.runDetailTitle.textContent = title;
   elements.runDetailSubtitle.textContent = `${run.run_id || ""} · ${formatTime(run.started_at)} · ${result.path || metadata.path || "未记录路径"}`;
   elements.runDetailMetrics.replaceChildren();

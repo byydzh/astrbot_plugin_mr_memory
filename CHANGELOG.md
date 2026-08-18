@@ -25,6 +25,9 @@
 - Add no Python dependency. The trial-deployment boundary is one plugin hot reload
   plus per-group schema 15-to-16 migration; it does not require restarting AstrBot
   or NapCat and does not by itself claim semantic quality for the three-case study.
+- Label the per-run provenance view as a call trace rather than a memory subgraph;
+  feedback runs now describe their processing result without implying that every
+  proposal already mutated the persistent memory graph.
 
 ## 0.17.1
 
