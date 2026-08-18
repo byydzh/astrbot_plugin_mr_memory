@@ -40,13 +40,34 @@
     "hint": "保持 enabled 可保留完整语义判断能力；disabled 只适合临时排障。"
   },
   "runtime_wake_mode": {
-    "description": "回答前何时回忆",
+    "description": "回答时怎样使用长期记忆",
     "type": "string",
-    "options": ["every_request", "manual_only"],
-    "default": "every_request",
+    "options": ["low_latency", "balanced", "research", "manual_only"],
+    "default": "low_latency",
     "obvious_hint": true,
     "condition": {"subconscious_enabled": true},
-    "hint": "every_request：每次回答前由独立记忆模型完整判断相关证据，必要时继续多步图遍历；manual_only：只在主模型主动咨询时运行。"
+    "hint": "low_latency：只同步使用已验证证书，未命中时后台分析供后续使用；balanced：短暂等待一次证书分析；research：同步分析，并允许宿主在强歧义时有界深挖；manual_only：只在主模型主动咨询时运行。"
+  },
+  "runtime_l2_wait_seconds": {
+    "description": "本轮最多等待记忆分析（秒）",
+    "type": "float",
+    "default": 1,
+    "condition": {"subconscious_enabled": true},
+    "hint": "low_latency 建议 0–2 秒；超时不会伪装成“没有记忆”，分析会在后台完成。balanced/research 可适当提高。"
+  },
+  "runtime_auto_deep_analysis": {
+    "description": "强歧义时允许自动深挖",
+    "type": "bool",
+    "default": false,
+    "condition": {"subconscious_enabled": true},
+    "hint": "仅当宿主检测到多事件冲突、语义歧义或反馈复核时才允许进入 2–3 次有界 ECCR；普通聊天不会自动深挖。"
+  },
+  "runtime_certificate_ttl_minutes": {
+    "description": "记忆证书最长复用时间（分钟）",
+    "type": "int",
+    "default": 1440,
+    "condition": {"subconscious_enabled": true},
+    "hint": "证书还会受消息、身份、图、关系、反馈和模型协议修订约束；任一依赖变化都会提前失效。"
   },
   "consult_tool_enabled": {
     "description": "允许主模型按需深挖记忆",
@@ -155,6 +176,9 @@
   "distillation_max_output_tokens": {"type": "int", "default": 384000, "invisible": true},
   "maintenance_interval_seconds": {"type": "int", "default": 86400, "invisible": true},
   "wake_on_llm_request": {"type": "bool", "default": true, "invisible": true},
+  "runtime_l3_max_model_calls": {"type": "int", "default": 3, "invisible": true},
+  "runtime_l3_max_retrieval_rounds": {"type": "int", "default": 2, "invisible": true},
+  "runtime_l3_deadline_seconds": {"type": "int", "default": 300, "invisible": true},
   "candidate_seed_floor": {"type": "float", "default": -1.0, "invisible": true},
   "host_gate_min_score": {"type": "float", "default": -1.0, "invisible": true},
   "runtime_host_evidence_gate": {"type": "bool", "default": false, "invisible": true},

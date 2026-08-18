@@ -42,8 +42,14 @@ from .plasticity import (
     PlasticNodeProposal,
     RelationTypeProposal,
 )
+from .snapshot import (
+    DataRevisionVector,
+    InferenceRevisionVector,
+    RequestSnapshot,
+    stable_sha256,
+)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 TRUTH_V2_BACKFILL_VERSION = 8
 MEDIA_HEAVY_HITTER_LIMIT = 512
 MEDIA_SAMPLE_SOURCE_LIMIT = 8
@@ -53,6 +59,8 @@ TOKEN_BUDGET_PHASES = {
         "construction_repair",
         "reconstruction",
         "reconstruction_deep",
+        "certificate_reader",
+        "eccr_*",
     ),
     "feedback": ("feedback_maintenance",),
     "backfill": (
@@ -60,6 +68,27 @@ TOKEN_BUDGET_PHASES = {
         "history_construction_repair",
     ),
 }
+
+
+def _token_phase_predicate(
+    column: str,
+    phases: Iterable[str],
+) -> tuple[str, list[object]]:
+    """Build one exact-or-prefix phase predicate for the private token ledger."""
+
+    exact = [phase for phase in phases if "*" not in phase]
+    patterns = [phase for phase in phases if "*" in phase]
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if exact:
+        clauses.append(f"{column} IN ({','.join('?' for _ in exact)})")
+        parameters.extend(exact)
+    for pattern in patterns:
+        clauses.append(f"{column} GLOB ?")
+        parameters.append(pattern)
+    if not clauses:
+        return "", []
+    return f" AND ({' OR '.join(clauses)})", parameters
 
 GRAPH_NODE_TYPES = {
     "participant",
@@ -1121,6 +1150,291 @@ class MemoryStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_pending
                     ON maintenance_jobs (umo, status, available_at, id);
+
+                CREATE TABLE IF NOT EXISTS revision_heads (
+                    umo TEXT NOT NULL,
+                    revision_class TEXT NOT NULL
+                        CHECK (revision_class IN ('data', 'inference')),
+                    component TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (umo, revision_class, component)
+                );
+
+                CREATE TABLE IF NOT EXISTS request_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    umo TEXT NOT NULL,
+                    scope_sha256 TEXT NOT NULL,
+                    cutoff_at INTEGER NOT NULL,
+                    message_upper_bound INTEGER NOT NULL DEFAULT 0,
+                    request_source_key TEXT NOT NULL DEFAULT '',
+                    query_sha256 TEXT NOT NULL,
+                    context_sha256 TEXT NOT NULL DEFAULT '',
+                    sender_participant_key TEXT NOT NULL DEFAULT '',
+                    reply_source_key TEXT NOT NULL DEFAULT '',
+                    scope_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    identity_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    data_revision_json TEXT NOT NULL DEFAULT '{}',
+                    inference_revision_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    expires_at INTEGER,
+                    captured_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_request_snapshots_scope_time
+                    ON request_snapshots (umo, cutoff_at DESC, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS evidence_pack_cache (
+                    cache_key TEXT NOT NULL,
+                    umo TEXT NOT NULL,
+                    snapshot_id TEXT REFERENCES request_snapshots(snapshot_id)
+                        ON DELETE SET NULL,
+                    query_sha256 TEXT NOT NULL DEFAULT '',
+                    context_sha256 TEXT NOT NULL DEFAULT '',
+                    reply_source_key TEXT NOT NULL DEFAULT '',
+                    packet_hash TEXT NOT NULL,
+                    packet_json TEXT NOT NULL,
+                    source_keys_json TEXT NOT NULL DEFAULT '[]',
+                    data_revision_json TEXT NOT NULL DEFAULT '{}',
+                    retrieval_revision_json TEXT NOT NULL DEFAULT '{}',
+                    cache_status TEXT NOT NULL DEFAULT 'VALID',
+                    expires_at INTEGER,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    last_hit_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (umo, cache_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_evidence_pack_cache_lookup
+                    ON evidence_pack_cache (
+                        umo, cache_status, query_sha256, context_sha256
+                    );
+                CREATE INDEX IF NOT EXISTS idx_evidence_pack_cache_packet
+                    ON evidence_pack_cache (umo, packet_hash);
+
+                CREATE TABLE IF NOT EXISTS memory_certificates (
+                    certificate_id TEXT PRIMARY KEY,
+                    certificate_key TEXT NOT NULL,
+                    umo TEXT NOT NULL,
+                    snapshot_id TEXT REFERENCES request_snapshots(snapshot_id)
+                        ON DELETE SET NULL,
+                    packet_hash TEXT NOT NULL,
+                    certificate_status TEXT NOT NULL,
+                    certificate_json TEXT NOT NULL,
+                    data_revision_json TEXT NOT NULL DEFAULT '{}',
+                    inference_revision_json TEXT NOT NULL DEFAULT '{}',
+                    reader_model_revision TEXT NOT NULL DEFAULT '',
+                    reader_protocol_revision TEXT NOT NULL DEFAULT '',
+                    certificate_schema_revision TEXT NOT NULL DEFAULT '',
+                    surface_compiler_revision TEXT NOT NULL DEFAULT '',
+                    route_policy_revision TEXT NOT NULL DEFAULT '',
+                    open_frontier INTEGER NOT NULL DEFAULT 0,
+                    cache_status TEXT NOT NULL DEFAULT 'VALID',
+                    expires_at INTEGER,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    last_hit_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, certificate_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_certificates_lookup
+                    ON memory_certificates (
+                        umo, certificate_key, cache_status, expires_at
+                    );
+
+                CREATE TABLE IF NOT EXISTS certificate_dependencies (
+                    certificate_id TEXT NOT NULL
+                        REFERENCES memory_certificates(certificate_id)
+                        ON DELETE CASCADE,
+                    dependency_type TEXT NOT NULL,
+                    dependency_key TEXT NOT NULL,
+                    dependency_revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (
+                        certificate_id, dependency_type, dependency_key,
+                        dependency_revision
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_certificate_dependencies_lookup
+                    ON certificate_dependencies (
+                        dependency_type, dependency_key, dependency_revision,
+                        certificate_id
+                    );
+
+                CREATE TABLE IF NOT EXISTS reconstruction_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    job_key TEXT NOT NULL,
+                    umo TEXT NOT NULL,
+                    snapshot_id TEXT REFERENCES request_snapshots(snapshot_id)
+                        ON DELETE SET NULL,
+                    cache_key TEXT NOT NULL DEFAULT '',
+                    requested_level TEXT NOT NULL DEFAULT 'L2',
+                    route_reason TEXT NOT NULL DEFAULT '',
+                    contract_json TEXT NOT NULL DEFAULT '{}',
+                    round_index INTEGER NOT NULL DEFAULT 0,
+                    pending_actions_json TEXT NOT NULL DEFAULT '[]',
+                    budget_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at INTEGER NOT NULL,
+                    lease_until INTEGER,
+                    last_result_hash TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT,
+                    UNIQUE (umo, job_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reconstruction_jobs_ready
+                    ON reconstruction_jobs (umo, status, available_at, job_id);
+
+                CREATE TABLE IF NOT EXISTS invalidation_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    dependency_type TEXT NOT NULL DEFAULT '',
+                    dependency_key TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT '',
+                    affected_evidence_packs INTEGER NOT NULL DEFAULT 0,
+                    affected_certificates INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_invalidation_events_scope_time
+                    ON invalidation_events (umo, id DESC);
+
+                CREATE TABLE IF NOT EXISTS derived_claim_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL,
+                    claim_type TEXT NOT NULL,
+                    subject_key TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object_json TEXT NOT NULL DEFAULT '{}',
+                    statement TEXT NOT NULL DEFAULT '',
+                    valid_from INTEGER,
+                    valid_to INTEGER,
+                    transaction_from INTEGER NOT NULL DEFAULT (unixepoch()),
+                    transaction_to INTEGER,
+                    epistemic_state TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    activity_utility REAL NOT NULL DEFAULT 0,
+                    source_group_hash TEXT NOT NULL,
+                    protocol_revision TEXT NOT NULL DEFAULT '',
+                    model_revision TEXT NOT NULL DEFAULT '',
+                    supersedes_id INTEGER REFERENCES derived_claim_revisions(id),
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, stable_key, revision_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_derived_claims_visible
+                    ON derived_claim_revisions (
+                        umo, stable_key, status, valid_from, valid_to,
+                        transaction_from, transaction_to
+                    );
+
+                CREATE TABLE IF NOT EXISTS derived_edge_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL,
+                    source_key TEXT NOT NULL,
+                    relation_key TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    statement TEXT NOT NULL DEFAULT '',
+                    valid_from INTEGER,
+                    valid_to INTEGER,
+                    transaction_from INTEGER NOT NULL DEFAULT (unixepoch()),
+                    transaction_to INTEGER,
+                    epistemic_state TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    activity_utility REAL NOT NULL DEFAULT 0,
+                    source_group_hash TEXT NOT NULL,
+                    protocol_revision TEXT NOT NULL DEFAULT '',
+                    model_revision TEXT NOT NULL DEFAULT '',
+                    supersedes_id INTEGER REFERENCES derived_edge_revisions(id),
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, stable_key, revision_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_derived_edges_visible
+                    ON derived_edge_revisions (
+                        umo, stable_key, status, valid_from, valid_to,
+                        transaction_from, transaction_to
+                    );
+
+                CREATE TABLE IF NOT EXISTS derived_edge_evidence_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    edge_revision_id INTEGER NOT NULL
+                        REFERENCES derived_edge_revisions(id) ON DELETE CASCADE,
+                    umo TEXT NOT NULL,
+                    source_group_hash TEXT NOT NULL,
+                    source_keys_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_roles_json TEXT NOT NULL DEFAULT '{}',
+                    epistemic_state TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    protocol_revision TEXT NOT NULL DEFAULT '',
+                    model_revision TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (edge_revision_id, source_group_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_derived_edge_evidence_scope
+                    ON derived_edge_evidence_groups (umo, source_group_hash);
+
+                CREATE TABLE IF NOT EXISTS behavior_policy_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    stable_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL,
+                    sender_scope TEXT NOT NULL DEFAULT '',
+                    task_scope TEXT NOT NULL DEFAULT '',
+                    trigger_json TEXT NOT NULL DEFAULT '{}',
+                    policy_json TEXT NOT NULL DEFAULT '{}',
+                    valid_from INTEGER,
+                    valid_to INTEGER,
+                    transaction_from INTEGER NOT NULL DEFAULT (unixepoch()),
+                    transaction_to INTEGER,
+                    epistemic_state TEXT NOT NULL DEFAULT 'HYPOTHESIS',
+                    epistemic_confidence REAL NOT NULL DEFAULT 0,
+                    activity_utility REAL NOT NULL DEFAULT 0,
+                    source_group_hash TEXT NOT NULL,
+                    protocol_revision TEXT NOT NULL DEFAULT '',
+                    model_revision TEXT NOT NULL DEFAULT '',
+                    supersedes_id INTEGER REFERENCES behavior_policy_revisions(id),
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (umo, stable_key, revision_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_behavior_policy_visible
+                    ON behavior_policy_revisions (
+                        umo, sender_scope, task_scope, status,
+                        valid_from, valid_to, transaction_from, transaction_to
+                    );
+
+                CREATE TABLE IF NOT EXISTS mutation_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    proposal_sha256 TEXT NOT NULL,
+                    mutation_lane TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    target_stable_key TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    source_group_hash TEXT NOT NULL,
+                    evidence_source_keys_json TEXT NOT NULL DEFAULT '[]',
+                    protocol_revision TEXT NOT NULL DEFAULT '',
+                    model_revision TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    audit_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    reviewed_at TEXT,
+                    committed_at TEXT,
+                    UNIQUE (umo, proposal_sha256)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mutation_proposals_pending
+                    ON mutation_proposals (umo, status, id);
                 """)
 
             def ensure_column(table: str, name: str, declaration: str) -> None:
@@ -2169,7 +2483,7 @@ class MemoryStorage:
             )
             existing = self._connection.execute(
                 """
-                SELECT id, sender_id, sent_at, content_sha256, plain_text,
+                SELECT id, sender_id, sender_name, sent_at, content_sha256, plain_text,
                        content_json, role, revision_no, is_deleted
                 FROM messages WHERE source_key = ?
                 """,
@@ -2196,6 +2510,9 @@ class MemoryStorage:
                 payload_changed
                 or timestamp_changed
                 or int(existing["is_deleted"] or 0) != 0
+            )
+            identity_changed = existing is None or (
+                str(existing["sender_name"] or "") != message.sender_name
             )
             revision_no = 1
             if existing is not None:
@@ -2350,6 +2667,18 @@ class MemoryStorage:
                 content=content,
                 refresh_media_fingerprints=refresh_media_fingerprints,
             )
+            if existing is None or changed:
+                self._advance_revision_head_locked(
+                    umo=message.umo,
+                    revision_class="data",
+                    component="message",
+                )
+            if identity_changed:
+                self._advance_revision_head_locked(
+                    umo=message.umo,
+                    revision_class="data",
+                    component="identity",
+                )
         return existing is None
 
     def upsert_messages(
@@ -2462,6 +2791,16 @@ class MemoryStorage:
             self._refresh_media_fingerprints_locked(
                 umo=umo,
                 fingerprints=media_pairs,
+            )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="deletion",
+            )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="message",
             )
         return True
 
@@ -3125,6 +3464,12 @@ class MemoryStorage:
                 (umo,),
             )
             self._rebuild_media_fingerprints_locked(umo=umo)
+            for component in ("deletion", "message", "identity", "graph"):
+                self._advance_revision_head_locked(
+                    umo=umo,
+                    revision_class="data",
+                    component=component,
+                )
         return {
             "messages": len(message_ids),
             "episodes": len(episode_ids),
@@ -3166,6 +3511,11 @@ class MemoryStorage:
                 "SELECT * FROM participants WHERE id = ?",
                 (participant_id,),
             ).fetchone()
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="identity",
+            )
         return dict(row) if row is not None else {}
 
     def resolve_participants(
@@ -3174,41 +3524,178 @@ class MemoryStorage:
         umo: str,
         reference: str,
         limit: int = 20,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, object]:
         """Resolve only exact IDs/keys/aliases and report alias ambiguity."""
 
+        self._assert_scope(umo)
         query = str(reference or "").strip()
         normalized = normalize_alias(query)
         safe_limit = max(1, min(100, int(limit)))
+        bounded = before_sent_at is not None or message_upper_bound is not None
+        alias_join = "a.participant_id = p.id AND a.is_active = 1"
+        visibility_sql = ""
+        parameters: list[object] = []
+        if before_sent_at is not None:
+            alias_join += " AND a.first_seen_at < ?"
+            parameters.append(int(before_sent_at))
+            visibility_sql += " AND p.first_seen_at < ?"
+        if bounded:
+            participant_visibility = [
+                "visible_mp.participant_id=p.id",
+                "visible_m.umo=p.umo",
+                "visible_m.is_deleted=0",
+            ]
+            if before_sent_at is not None:
+                participant_visibility.append("visible_m.sent_at<?")
+            if message_upper_bound is not None:
+                participant_visibility.append("visible_m.id<=?")
+            visibility_sql += (
+                " AND EXISTS (SELECT 1 FROM message_participants AS visible_mp "
+                "JOIN messages AS visible_m ON visible_m.id=visible_mp.message_id "
+                f"WHERE {' AND '.join(participant_visibility)})"
+            )
+        query_parameters: list[object] = [*parameters, umo, query, query, normalized]
+        if before_sent_at is not None:
+            query_parameters.append(int(before_sent_at))
+        if bounded and before_sent_at is not None:
+            query_parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            query_parameters.append(max(0, int(message_upper_bound)))
+        query_parameters.append(safe_limit)
         with self._lock:
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT DISTINCT p.id, p.canonical_key, p.platform_id,
                        p.account_id, p.account_type, p.current_display_name,
                        p.first_seen_at, p.last_seen_at
                 FROM participants AS p
                 LEFT JOIN participant_aliases AS a
-                  ON a.participant_id = p.id AND a.is_active = 1
+                  ON {alias_join}
                 WHERE p.umo = ? AND (
                     p.account_id = ? OR p.canonical_key = ?
                     OR a.normalized_alias = ?
                 )
+                {visibility_sql}
                 ORDER BY p.last_seen_at DESC, p.id
                 LIMIT ?
                 """,
-                (umo, query, query, normalized, safe_limit),
+                query_parameters,
             ).fetchall()
             result: list[dict[str, object]] = []
             for row in rows:
+                if bounded:
+                    participant_id = int(row["id"])
+                    visible_sql = ""
+                    visible_parameters: list[object] = [
+                        participant_id,
+                        participant_id,
+                        participant_id,
+                        umo,
+                    ]
+                    if before_sent_at is not None:
+                        visible_sql += " AND m.sent_at<?"
+                        visible_parameters.append(int(before_sent_at))
+                    if message_upper_bound is not None:
+                        visible_sql += " AND m.id<=?"
+                        visible_parameters.append(max(0, int(message_upper_bound)))
+                    visible_messages = self._connection.execute(
+                        f"""
+                        SELECT DISTINCT m.id, m.sent_at, m.sender_participant_id,
+                               m.sender_name, m.content_json
+                        FROM messages AS m
+                        LEFT JOIN message_participants AS mp
+                          ON mp.message_id=m.id AND mp.participant_id=?
+                        WHERE (m.sender_participant_id=? OR mp.participant_id=?)
+                          AND m.umo=? AND m.is_deleted=0{visible_sql}
+                        ORDER BY m.sent_at, m.id
+                        """,
+                        visible_parameters,
+                    ).fetchall()
+                    observed: dict[str, dict[str, object]] = {}
+                    latest_speaker: tuple[int, int, str] | None = None
+
+                    def observe(alias: str, seen_at: int, source_kind: str) -> None:
+                        display = str(alias or "").strip()
+                        alias_key = normalize_alias(display)
+                        if not alias_key:
+                            return
+                        current = observed.get(alias_key)
+                        if current is None:
+                            observed[alias_key] = {
+                                "alias": display,
+                                "first_seen_at": int(seen_at),
+                                "last_seen_at": int(seen_at),
+                                "source_kind": source_kind,
+                                "confidence": 1.0,
+                            }
+                            return
+                        current["first_seen_at"] = min(
+                            int(current["first_seen_at"]), int(seen_at)
+                        )
+                        if int(seen_at) >= int(current["last_seen_at"]):
+                            current["alias"] = display
+                            current["last_seen_at"] = int(seen_at)
+                            current["source_kind"] = source_kind
+
+                    account_id = str(row["account_id"])
+                    for message in visible_messages:
+                        sent_at = int(message["sent_at"])
+                        message_id = int(message["id"])
+                        if message["sender_participant_id"] == participant_id:
+                            sender_name = str(message["sender_name"] or "")
+                            observe(sender_name, sent_at, "observed")
+                            if sender_name and (
+                                latest_speaker is None
+                                or (sent_at, message_id) >= latest_speaker[:2]
+                            ):
+                                latest_speaker = (sent_at, message_id, sender_name)
+                        content = self._parse_content_json(message["content_json"])
+                        for mention in extract_mentions(content):
+                            if mention.account_id == account_id:
+                                observe(mention.display_name, sent_at, "mention")
+                        reply = extract_reply(content)
+                        if reply is not None and reply.sender_id == account_id:
+                            observe(reply.sender_name, sent_at, "reply")
+
+                    exact_identity = query in {
+                        str(row["account_id"]),
+                        str(row["canonical_key"]),
+                    }
+                    if not exact_identity and normalized not in observed:
+                        continue
+                    aliases = sorted(
+                        observed.values(),
+                        key=lambda item: (
+                            -int(item["last_seen_at"]),
+                            str(item["alias"]),
+                        ),
+                    )
+                    visible_times = [int(item["sent_at"]) for item in visible_messages]
+                    sanitized_row = dict(row)
+                    sanitized_row["current_display_name"] = (
+                        latest_speaker[2] if latest_speaker is not None else ""
+                    )
+                    sanitized_row["first_seen_at"] = min(visible_times)
+                    sanitized_row["last_seen_at"] = max(visible_times)
+                    result.append({**sanitized_row, "aliases": aliases})
+                    continue
+                alias_visibility = ""
+                alias_parameters: list[object] = [int(row["id"])]
+                if before_sent_at is not None:
+                    alias_visibility = " AND first_seen_at < ?"
+                    alias_parameters.append(int(before_sent_at))
                 aliases = self._connection.execute(
-                    """
+                    f"""
                     SELECT alias, first_seen_at, last_seen_at, source_kind,
                            confidence
                     FROM participant_aliases
                     WHERE participant_id = ? AND is_active = 1
+                    {alias_visibility}
                     ORDER BY last_seen_at DESC, alias
                     """,
-                    (int(row["id"]),),
+                    alias_parameters,
                 ).fetchall()
                 result.append(
                     {
@@ -3562,11 +4049,9 @@ class MemoryStorage:
                 """
                 SELECT e.id, e.statement, e.epistemic_state, e.uncertainty,
                        e.epistemic_confidence, e.utility,
-                       src.node_key AS source_node_key,
-                       src.node_kind AS source_kind,
+                       src.node_key AS source_key, src.node_kind AS source_kind,
                        src.label AS source_label,
-                       dst.node_key AS target_node_key,
-                       dst.node_kind AS target_kind,
+                       dst.node_key AS target_key, dst.node_kind AS target_kind,
                        dst.label AS target_label,
                        r.relation_key
                 FROM plastic_edges AS e
@@ -3927,6 +4412,12 @@ class MemoryStorage:
                     work_item.batch_key,
                 ),
             )
+            if success:
+                self._advance_revision_head_locked(
+                    umo=work_item.umo,
+                    revision_class="data",
+                    component="graph",
+                )
 
     @contextmanager
     def distillation_write(
@@ -4072,6 +4563,1170 @@ class MemoryStorage:
                     (umo, cutoff, umo, cutoff, umo, cutoff, umo, cutoff),
                 ).fetchone()
         return int(row[0])
+
+    @staticmethod
+    def _decode_layered_row(
+        row: sqlite3.Row | None, *, json_columns: Iterable[str]
+    ) -> dict[str, object] | None:
+        if row is None:
+            return None
+        value: dict[str, object] = dict(row)
+        for column in json_columns:
+            raw = value.get(column)
+            if raw is None:
+                continue
+            try:
+                value[column.removesuffix("_json")] = json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value[column.removesuffix("_json")] = None
+            value.pop(column, None)
+        return value
+
+    def _advance_revision_head_locked(
+        self,
+        *,
+        umo: str,
+        revision_class: str,
+        component: str,
+        revision: int | None = None,
+    ) -> int:
+        normalized_class = str(revision_class).strip().casefold()
+        normalized_component = str(component).strip().casefold()
+        if normalized_class not in {"data", "inference"}:
+            raise ValueError("revision_class must be data or inference")
+        if not normalized_component:
+            raise ValueError("revision component is required")
+        row = self._connection.execute(
+            """
+            SELECT revision FROM revision_heads
+            WHERE umo=? AND revision_class=? AND component=?
+            """,
+            (umo, normalized_class, normalized_component),
+        ).fetchone()
+        current = int(row["revision"] or 0) if row else 0
+        next_revision = current + 1 if revision is None else int(revision)
+        if next_revision < current or next_revision < 0:
+            raise ValueError("revision heads are monotonic non-negative integers")
+        self._connection.execute(
+            """
+            INSERT INTO revision_heads(
+                umo, revision_class, component, revision
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(umo, revision_class, component) DO UPDATE SET
+                revision=excluded.revision,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (umo, normalized_class, normalized_component, next_revision),
+        )
+        return next_revision
+
+    def advance_revision_head(
+        self,
+        *,
+        umo: str,
+        revision_class: str,
+        component: str,
+        revision: int | None = None,
+    ) -> int:
+        """Advance one monotonic component head used by request snapshots."""
+
+        self._assert_scope(umo)
+        normalized_class = str(revision_class).strip().casefold()
+        normalized_component = str(component).strip().casefold()
+        if normalized_class not in {"data", "inference"}:
+            raise ValueError("revision_class must be data or inference")
+        if not normalized_component:
+            raise ValueError("revision component is required")
+        with self._write_transaction(immediate=True):
+            next_revision = self._advance_revision_head_locked(
+                umo=umo,
+                revision_class=normalized_class,
+                component=normalized_component,
+                revision=revision,
+            )
+        return next_revision
+
+    def revision_vector(self, *, umo: str) -> dict[str, dict[str, int]]:
+        self._assert_scope(umo)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT revision_class, component, revision
+                FROM revision_heads WHERE umo=?
+                ORDER BY revision_class, component
+                """,
+                (umo,),
+            ).fetchall()
+        result: dict[str, dict[str, int]] = {"data": {}, "inference": {}}
+        for row in rows:
+            result[str(row["revision_class"])][str(row["component"])] = int(
+                row["revision"]
+            )
+        return result
+
+    def capture_request_snapshot(
+        self,
+        *,
+        umo: str,
+        cutoff_at: int,
+        query: str = "",
+        context: object = None,
+        context_sha256: str = "",
+        request_source_key: str = "",
+        sender_participant_key: str = "",
+        reply_source_key: str = "",
+        scope_snapshot: Mapping[str, object] | None = None,
+        identity_snapshot: Mapping[str, object] | None = None,
+        data_revision: Mapping[str, object] | None = None,
+        inference_revision: Mapping[str, object] | None = None,
+        snapshot_id: str = "",
+        expires_at: int | None = None,
+    ) -> dict[str, object]:
+        """Freeze the host-owned scope, cutoff, identity and revision vectors."""
+
+        self._assert_scope(umo)
+        cutoff = int(cutoff_at)
+        if cutoff <= 0:
+            raise ValueError("cutoff_at must be a positive Unix timestamp")
+        normalized_query = " ".join(str(query).casefold().split())
+        query_sha256 = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+        context_hash = str(context_sha256).strip().casefold() or stable_sha256(
+            {} if context is None else context
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", context_hash):
+            raise ValueError("context_sha256 must be a SHA-256 hex digest")
+        generated_id = str(snapshot_id).strip()
+        if not generated_id:
+            material = "\x1f".join(
+                (
+                    umo,
+                    str(cutoff),
+                    query_sha256,
+                    context_hash,
+                    str(request_source_key),
+                    str(sender_participant_key),
+                    str(reply_source_key),
+                    str(time.time_ns()),
+                )
+            )
+            generated_id = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        if expires_at is not None and int(expires_at) <= cutoff:
+            raise ValueError("snapshot expiry must be later than its cutoff")
+
+        with self._write_transaction(immediate=True):
+            heads: dict[str, dict[str, object]] = {"data": {}, "inference": {}}
+            for row in self._connection.execute(
+                """
+                SELECT revision_class, component, revision
+                FROM revision_heads WHERE umo=?
+                """,
+                (umo,),
+            ).fetchall():
+                heads[str(row["revision_class"])][str(row["component"])] = int(
+                    row["revision"]
+                )
+            frozen_data = {
+                field: heads["data"].get(field, 0)
+                for field in DataRevisionVector._FIELDS
+            }
+            frozen_data.update(dict(data_revision or {}))
+            data_vector = DataRevisionVector.from_value(frozen_data)
+            frozen_inference = {
+                field: heads["inference"].get(field, 0)
+                for field in InferenceRevisionVector._FIELDS
+            }
+            frozen_inference.update(dict(inference_revision or {}))
+            inference_vector = InferenceRevisionVector.from_value(frozen_inference)
+            bound_scope: Mapping[str, object] = scope_snapshot or (
+                self.get_scope_identity() or {"umo": umo}
+            )
+            if str(bound_scope.get("umo") or umo) != umo:
+                raise ValueError("scope snapshot crosses the database group boundary")
+            request_row = None
+            normalized_request_source = str(request_source_key).strip()
+            if normalized_request_source:
+                request_row = self._connection.execute(
+                    """
+                    SELECT id FROM messages
+                    WHERE umo=? AND source_key=? LIMIT 1
+                    """,
+                    (umo, normalized_request_source),
+                ).fetchone()
+            upper_parameters: list[object] = [umo, cutoff]
+            upper_sql = """
+                SELECT COALESCE(MAX(id), 0) AS upper_bound
+                FROM messages
+                WHERE umo=? AND is_deleted=0 AND sent_at<?
+            """
+            if request_row is not None:
+                upper_sql += " AND id<?"
+                upper_parameters.append(int(request_row["id"]))
+            upper_row = self._connection.execute(
+                upper_sql, upper_parameters
+            ).fetchone()
+            message_upper_bound = int(upper_row["upper_bound"] or 0)
+            captured_at = int(time.time())
+            snapshot_value = {
+                "snapshot_id": generated_id,
+                "umo": umo,
+                "scope_sha256": hashlib.sha256(umo.encode("utf-8")).hexdigest(),
+                "cutoff_at": cutoff,
+                "message_upper_bound": message_upper_bound,
+                "request_source_key": normalized_request_source,
+                "sender_participant_key": str(sender_participant_key).strip(),
+                "reply_source_key": str(reply_source_key).strip(),
+                "query_sha256": query_sha256,
+                "context_sha256": context_hash,
+                "data_revision": data_vector.as_dict(),
+                "inference_revision": inference_vector.as_dict(),
+                "captured_at": captured_at,
+            }
+            RequestSnapshot.from_value(snapshot_value)
+            self._connection.execute(
+                """
+                INSERT INTO request_snapshots(
+                    snapshot_id, umo, scope_sha256, cutoff_at,
+                    message_upper_bound, request_source_key,
+                    query_sha256, context_sha256,
+                    sender_participant_key, reply_source_key,
+                    scope_snapshot_json, identity_snapshot_json,
+                    data_revision_json, inference_revision_json, expires_at,
+                    captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    generated_id,
+                    umo,
+                    snapshot_value["scope_sha256"],
+                    cutoff,
+                    message_upper_bound,
+                    normalized_request_source,
+                    query_sha256,
+                    context_hash,
+                    str(sender_participant_key).strip(),
+                    str(reply_source_key).strip(),
+                    self._bounded_json(dict(bound_scope), max_chars=12000),
+                    self._bounded_json(dict(identity_snapshot or {}), max_chars=24000),
+                    self._bounded_json(data_vector.as_dict(), max_chars=12000),
+                    self._bounded_json(inference_vector.as_dict(), max_chars=12000),
+                    int(expires_at) if expires_at is not None else None,
+                    captured_at,
+                ),
+            )
+        value = self.request_snapshot(snapshot_id=generated_id, umo=umo)
+        assert value is not None
+        return value
+
+    def request_snapshot(
+        self, *, snapshot_id: str, umo: str
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM request_snapshots WHERE snapshot_id=? AND umo=?",
+                (str(snapshot_id).strip(), umo),
+            ).fetchone()
+        return self._decode_layered_row(
+            row,
+            json_columns=(
+                "scope_snapshot_json",
+                "identity_snapshot_json",
+                "data_revision_json",
+                "inference_revision_json",
+            ),
+        )
+
+    def audit_snapshot_sources(
+        self,
+        *,
+        snapshot_id: str,
+        umo: str,
+        source_keys: Iterable[str],
+        fail_closed: bool = False,
+    ) -> dict[str, object]:
+        """Verify that every cited raw source belongs to one immutable snapshot."""
+
+        self._assert_scope(umo)
+        snapshot_value = self.request_snapshot(snapshot_id=snapshot_id, umo=umo)
+        if snapshot_value is None:
+            raise ValueError("request snapshot does not exist in this group")
+        snapshot = RequestSnapshot.from_value(
+            {
+                key: snapshot_value[key]
+                for key in (
+                    "snapshot_id",
+                    "umo",
+                    "scope_sha256",
+                    "cutoff_at",
+                    "message_upper_bound",
+                    "request_source_key",
+                    "sender_participant_key",
+                    "reply_source_key",
+                    "query_sha256",
+                    "context_sha256",
+                    "data_revision",
+                    "inference_revision",
+                    "captured_at",
+                )
+            }
+        )
+        requested = tuple(
+            dict.fromkeys(
+                str(source_key).strip()
+                for source_key in source_keys
+                if str(source_key).strip()
+            )
+        )
+        accepted: list[str] = []
+        violations: list[dict[str, str]] = []
+        with self._lock:
+            for source_key in requested:
+                row = self._connection.execute(
+                    """
+                    SELECT id, umo, sent_at, source_key, is_deleted
+                    FROM messages WHERE source_key=? LIMIT 1
+                    """,
+                    (source_key,),
+                ).fetchone()
+                reason = ""
+                if row is None:
+                    reason = "SOURCE_NOT_FOUND"
+                elif int(row["is_deleted"]):
+                    reason = "SOURCE_DELETED"
+                elif str(row["umo"]) != umo:
+                    reason = "SCOPE_MISMATCH"
+                elif str(row["source_key"]) == snapshot.request_source_key:
+                    reason = "CURRENT_REQUEST_SOURCE"
+                elif int(row["sent_at"]) >= snapshot.cutoff_at:
+                    reason = "AT_OR_AFTER_CUTOFF"
+                elif int(row["id"]) > snapshot.message_upper_bound:
+                    reason = "AFTER_MESSAGE_UPPER_BOUND"
+                else:
+                    accepted.append(source_key)
+                if reason:
+                    violations.append({"source_key": source_key, "reason": reason})
+        result: dict[str, object] = {
+            "snapshot_id": snapshot.snapshot_id,
+            "umo": umo,
+            "valid": not violations,
+            "accepted_source_keys": accepted,
+            "violations": violations,
+        }
+        if violations and fail_closed:
+            raise ValueError(
+                "snapshot source audit failed: "
+                + ", ".join(
+                    f"{item['source_key']}={item['reason']}" for item in violations
+                )
+            )
+        return result
+
+    def put_evidence_pack_cache(
+        self,
+        *,
+        cache_key: str,
+        umo: str,
+        snapshot_id: str,
+        packet: Mapping[str, object],
+        packet_hash: str = "",
+        source_keys: Iterable[str] = (),
+        data_revision: Mapping[str, object] | None = None,
+        retrieval_revision: Mapping[str, object] | None = None,
+        expires_at: int | None = None,
+    ) -> dict[str, object]:
+        self._assert_scope(umo)
+        normalized_key = str(cache_key).strip()
+        if not normalized_key:
+            raise ValueError("cache_key is required")
+        snapshot = self.request_snapshot(snapshot_id=snapshot_id, umo=umo)
+        if snapshot is None:
+            raise ValueError("evidence pack references an unknown request snapshot")
+        packet_json = self._bounded_json(dict(packet), max_chars=500000)
+        normalized_hash = str(packet_hash).strip().casefold() or hashlib.sha256(
+            packet_json.encode("utf-8")
+        ).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+            raise ValueError("packet_hash must be a SHA-256 hex digest")
+        sources = sorted({str(item).strip() for item in source_keys if str(item).strip()})
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO evidence_pack_cache(
+                    cache_key, umo, snapshot_id, query_sha256, context_sha256,
+                    reply_source_key, packet_hash, packet_json, source_keys_json,
+                    data_revision_json, retrieval_revision_json, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(umo, cache_key) DO UPDATE SET
+                    snapshot_id=excluded.snapshot_id,
+                    query_sha256=excluded.query_sha256,
+                    context_sha256=excluded.context_sha256,
+                    reply_source_key=excluded.reply_source_key,
+                    packet_hash=excluded.packet_hash,
+                    packet_json=excluded.packet_json,
+                    source_keys_json=excluded.source_keys_json,
+                    data_revision_json=excluded.data_revision_json,
+                    retrieval_revision_json=excluded.retrieval_revision_json,
+                    cache_status='VALID',
+                    expires_at=excluded.expires_at,
+                    hit_count=0,
+                    last_hit_at=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    normalized_key,
+                    umo,
+                    str(snapshot_id).strip(),
+                    str(snapshot["query_sha256"]),
+                    str(snapshot["context_sha256"]),
+                    str(snapshot["reply_source_key"]),
+                    normalized_hash,
+                    packet_json,
+                    self._bounded_json(sources),
+                    self._bounded_json(dict(data_revision or snapshot["data_revision"])),
+                    self._bounded_json(dict(retrieval_revision or {})),
+                    int(expires_at) if expires_at is not None else None,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM evidence_pack_cache WHERE cache_key=? AND umo=?",
+                (normalized_key, umo),
+            ).fetchone()
+        value = self._decode_layered_row(
+            row,
+            json_columns=(
+                "packet_json",
+                "source_keys_json",
+                "data_revision_json",
+                "retrieval_revision_json",
+            ),
+        )
+        assert value is not None
+        return value
+
+    def get_evidence_pack_cache(
+        self, *, cache_key: str, umo: str, now: int | None = None
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        effective_now = int(now or time.time())
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT cache.* FROM evidence_pack_cache AS cache
+                JOIN request_snapshots AS snapshot
+                  ON snapshot.snapshot_id=cache.snapshot_id
+                 AND snapshot.umo=cache.umo
+                WHERE cache.cache_key=? AND cache.umo=?
+                  AND cache.cache_status='VALID'
+                  AND (cache.expires_at IS NULL OR cache.expires_at>?)
+                  AND snapshot.status='ACTIVE'
+                  AND (snapshot.expires_at IS NULL OR snapshot.expires_at>?)
+                """,
+                (str(cache_key).strip(), umo, effective_now, effective_now),
+            ).fetchone()
+            if row is not None:
+                self._connection.execute(
+                    """
+                    UPDATE evidence_pack_cache
+                    SET hit_count=hit_count+1, last_hit_at=CURRENT_TIMESTAMP
+                    WHERE cache_key=? AND umo=?
+                    """,
+                    (str(cache_key).strip(), umo),
+                )
+        return self._decode_layered_row(
+            row,
+            json_columns=(
+                "packet_json",
+                "source_keys_json",
+                "data_revision_json",
+                "retrieval_revision_json",
+            ),
+        )
+
+    def put_memory_certificate(
+        self,
+        *,
+        certificate_key: str,
+        umo: str,
+        snapshot_id: str,
+        packet_hash: str,
+        certificate_status: str,
+        certificate: Mapping[str, object],
+        dependencies: Iterable[Mapping[str, object]] = (),
+        data_revision: Mapping[str, object] | None = None,
+        inference_revision: Mapping[str, object] | None = None,
+        reader_model_revision: str = "",
+        reader_protocol_revision: str = "",
+        certificate_schema_revision: str = "",
+        surface_compiler_revision: str = "",
+        route_policy_revision: str = "",
+        open_frontier: bool = False,
+        expires_at: int | None = None,
+        certificate_id: str = "",
+    ) -> dict[str, object]:
+        self._assert_scope(umo)
+        normalized_key = str(certificate_key).strip()
+        if not normalized_key:
+            raise ValueError("certificate_key is required")
+        snapshot = self.request_snapshot(snapshot_id=snapshot_id, umo=umo)
+        if snapshot is None:
+            raise ValueError("certificate references an unknown request snapshot")
+        normalized_packet_hash = str(packet_hash).strip().casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_packet_hash):
+            raise ValueError("packet_hash must be a SHA-256 hex digest")
+        normalized_status = str(certificate_status).strip().upper()
+        if not normalized_status:
+            raise ValueError("certificate_status is required")
+        resolved_id = str(certificate_id).strip() or hashlib.sha256(
+            (umo + "\x1f" + normalized_key).encode("utf-8")
+        ).hexdigest()
+        normalized_dependencies: list[tuple[str, str, int]] = []
+        for item in dependencies:
+            dep_type = str(
+                item.get("type") or item.get("dependency_type") or ""
+            ).strip()
+            dep_key = str(item.get("key") or item.get("dependency_key") or "").strip()
+            dep_revision = int(
+                item.get("revision") or item.get("dependency_revision") or 0
+            )
+            if dep_type and dep_key:
+                normalized_dependencies.append((dep_type, dep_key, dep_revision))
+        normalized_dependencies = sorted(set(normalized_dependencies))
+        with self._write_transaction(immediate=True):
+            self._connection.execute(
+                """
+                INSERT INTO memory_certificates(
+                    certificate_id, certificate_key, umo, snapshot_id,
+                    packet_hash, certificate_status, certificate_json,
+                    data_revision_json, inference_revision_json,
+                    reader_model_revision, reader_protocol_revision,
+                    certificate_schema_revision, surface_compiler_revision,
+                    route_policy_revision, open_frontier, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(umo, certificate_key) DO UPDATE SET
+                    snapshot_id=excluded.snapshot_id,
+                    packet_hash=excluded.packet_hash,
+                    certificate_status=excluded.certificate_status,
+                    certificate_json=excluded.certificate_json,
+                    data_revision_json=excluded.data_revision_json,
+                    inference_revision_json=excluded.inference_revision_json,
+                    reader_model_revision=excluded.reader_model_revision,
+                    reader_protocol_revision=excluded.reader_protocol_revision,
+                    certificate_schema_revision=excluded.certificate_schema_revision,
+                    surface_compiler_revision=excluded.surface_compiler_revision,
+                    route_policy_revision=excluded.route_policy_revision,
+                    open_frontier=excluded.open_frontier,
+                    cache_status='VALID',
+                    expires_at=excluded.expires_at,
+                    hit_count=0,
+                    last_hit_at=NULL,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    resolved_id,
+                    normalized_key,
+                    umo,
+                    str(snapshot_id).strip(),
+                    normalized_packet_hash,
+                    normalized_status,
+                    self._bounded_json(dict(certificate), max_chars=250000),
+                    self._bounded_json(dict(data_revision or snapshot["data_revision"])),
+                    self._bounded_json(
+                        dict(inference_revision or snapshot["inference_revision"])
+                    ),
+                    str(reader_model_revision).strip(),
+                    str(reader_protocol_revision).strip(),
+                    str(certificate_schema_revision).strip(),
+                    str(surface_compiler_revision).strip(),
+                    str(route_policy_revision).strip(),
+                    int(bool(open_frontier)),
+                    int(expires_at) if expires_at is not None else None,
+                ),
+            )
+            id_row = self._connection.execute(
+                """
+                SELECT certificate_id FROM memory_certificates
+                WHERE umo=? AND certificate_key=?
+                """,
+                (umo, normalized_key),
+            ).fetchone()
+            assert id_row is not None
+            resolved_id = str(id_row["certificate_id"])
+            self._connection.execute(
+                "DELETE FROM certificate_dependencies WHERE certificate_id=?",
+                (resolved_id,),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO certificate_dependencies(
+                    certificate_id, dependency_type, dependency_key,
+                    dependency_revision
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [(resolved_id, *item) for item in normalized_dependencies],
+            )
+        value = self.get_memory_certificate(
+            umo=umo, certificate_id=resolved_id, count_hit=False
+        )
+        assert value is not None
+        return value
+
+    def get_memory_certificate(
+        self,
+        *,
+        umo: str,
+        certificate_key: str = "",
+        certificate_id: str = "",
+        now: int | None = None,
+        count_hit: bool = True,
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        if not certificate_key and not certificate_id:
+            raise ValueError("certificate_key or certificate_id is required")
+        effective_now = int(now or time.time())
+        selector = "certificate_id=?" if certificate_id else "certificate_key=?"
+        selector_value = certificate_id or certificate_key
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                f"""
+                SELECT certificate.* FROM memory_certificates AS certificate
+                JOIN request_snapshots AS snapshot
+                  ON snapshot.snapshot_id=certificate.snapshot_id
+                 AND snapshot.umo=certificate.umo
+                WHERE certificate.umo=?
+                  AND certificate.{selector} AND certificate.cache_status='VALID'
+                  AND (certificate.expires_at IS NULL OR certificate.expires_at>?)
+                  AND snapshot.status='ACTIVE'
+                  AND (snapshot.expires_at IS NULL OR snapshot.expires_at>?)
+                """,
+                (umo, str(selector_value).strip(), effective_now, effective_now),
+            ).fetchone()
+            dependencies: list[dict[str, object]] = []
+            if row is not None:
+                dependencies = [
+                    dict(item)
+                    for item in self._connection.execute(
+                        """
+                        SELECT dependency_type, dependency_key,
+                               dependency_revision
+                        FROM certificate_dependencies
+                        WHERE certificate_id=?
+                        ORDER BY dependency_type, dependency_key,
+                                 dependency_revision
+                        """,
+                        (str(row["certificate_id"]),),
+                    ).fetchall()
+                ]
+                if count_hit:
+                    self._connection.execute(
+                        """
+                        UPDATE memory_certificates
+                        SET hit_count=hit_count+1, last_hit_at=CURRENT_TIMESTAMP
+                        WHERE certificate_id=?
+                        """,
+                        (str(row["certificate_id"]),),
+                    )
+        value = self._decode_layered_row(
+            row,
+            json_columns=(
+                "certificate_json",
+                "data_revision_json",
+                "inference_revision_json",
+            ),
+        )
+        if value is not None:
+            value["dependencies"] = dependencies
+        return value
+
+    def invalidate_cached_memory(
+        self,
+        *,
+        umo: str,
+        dependency_type: str = "",
+        dependency_key: str = "",
+        revision: int = 0,
+        cache_key: str = "",
+        packet_hash: str = "",
+        certificate_id: str = "",
+        reason: str = "revision_changed",
+        payload: Mapping[str, object] | None = None,
+    ) -> dict[str, int]:
+        """Invalidate exact cache objects or dependency-matched certificates."""
+
+        self._assert_scope(umo)
+        dep_type = str(dependency_type).strip()
+        dep_key = str(dependency_key).strip()
+        if bool(dep_type) != bool(dep_key):
+            raise ValueError("dependency_type and dependency_key must be paired")
+        normalized_packet_hash = str(packet_hash).strip().casefold()
+        if normalized_packet_hash and not re.fullmatch(
+            r"[0-9a-f]{64}", normalized_packet_hash
+        ):
+            raise ValueError("packet_hash must be a SHA-256 hex digest")
+        with self._write_transaction(immediate=True):
+            evidence_parameters: list[object] = [umo]
+            evidence_clause = ""
+            if cache_key:
+                evidence_clause = " AND cache_key=?"
+                evidence_parameters.append(str(cache_key).strip())
+            elif normalized_packet_hash:
+                evidence_clause = " AND packet_hash=?"
+                evidence_parameters.append(normalized_packet_hash)
+            elif dep_type:
+                evidence_clause = " AND 0"
+            evidence_cursor = self._connection.execute(
+                """
+                UPDATE evidence_pack_cache SET cache_status='STALE',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND cache_status='VALID'
+                """
+                + evidence_clause,
+                evidence_parameters,
+            )
+
+            certificate_parameters: list[object] = [umo]
+            certificate_clause = ""
+            if certificate_id:
+                certificate_clause = " AND certificate_id=?"
+                certificate_parameters.append(str(certificate_id).strip())
+            elif normalized_packet_hash:
+                certificate_clause = " AND packet_hash=?"
+                certificate_parameters.append(normalized_packet_hash)
+            elif dep_type:
+                revision_clause = (
+                    "" if int(revision) <= 0 else " AND d.dependency_revision < ?"
+                )
+                certificate_clause = f"""
+                    AND certificate_id IN (
+                        SELECT d.certificate_id
+                        FROM certificate_dependencies AS d
+                        WHERE d.dependency_type=? AND d.dependency_key=?
+                        {revision_clause}
+                    )
+                """
+                certificate_parameters.extend((dep_type, dep_key))
+                if int(revision) > 0:
+                    certificate_parameters.append(int(revision))
+            certificate_cursor = self._connection.execute(
+                """
+                UPDATE memory_certificates SET cache_status='STALE',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND cache_status='VALID'
+                """
+                + certificate_clause,
+                certificate_parameters,
+            )
+            affected_packs = max(0, int(evidence_cursor.rowcount))
+            affected_certificates = max(0, int(certificate_cursor.rowcount))
+            event_type = (
+                "DEPENDENCY"
+                if dep_type
+                else "EXACT"
+                if (cache_key or normalized_packet_hash or certificate_id)
+                else "GLOBAL"
+            )
+            cursor = self._connection.execute(
+                """
+                INSERT INTO invalidation_events(
+                    umo, event_type, dependency_type, dependency_key, revision,
+                    reason, affected_evidence_packs, affected_certificates,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    umo,
+                    event_type,
+                    dep_type,
+                    dep_key,
+                    max(0, int(revision)),
+                    str(reason).strip()[:500],
+                    affected_packs,
+                    affected_certificates,
+                    self._bounded_json(dict(payload or {}), max_chars=12000),
+                ),
+            )
+        return {
+            "event_id": int(cursor.lastrowid),
+            "evidence_packs": affected_packs,
+            "certificates": affected_certificates,
+        }
+
+    def recover_layered_runtime(
+        self,
+        *,
+        umo: str,
+        now: int | None = None,
+    ) -> dict[str, int]:
+        """Recover interrupted layered jobs after this process owns the store.
+
+        This is deliberately explicit rather than part of ``_migrate``: opening
+        a database for inspection must never steal a live worker's lease.
+        """
+
+        self._assert_scope(umo)
+        effective_now = int(time.time() if now is None else now)
+        with self._write_transaction(immediate=True):
+            expired = self._connection.execute(
+                """
+                UPDATE request_snapshots SET status='EXPIRED'
+                WHERE umo=? AND status='ACTIVE'
+                  AND expires_at IS NOT NULL AND expires_at<=?
+                """,
+                (umo, effective_now),
+            )
+            interrupted = self._connection.execute(
+                """
+                UPDATE reconstruction_jobs
+                SET status='STALE_RESTART', lease_until=NULL,
+                    last_error='runtime interrupted; request-bound reconstruction is not resumable',
+                    finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND status IN ('PENDING', 'RETRY', 'RUNNING')
+                """,
+                (umo,),
+            )
+        return {
+            "expired_snapshots": max(0, int(expired.rowcount)),
+            "interrupted_jobs": max(0, int(interrupted.rowcount)),
+        }
+
+    def cleanup_layered_runtime(
+        self,
+        *,
+        umo: str,
+        now: int | None = None,
+        terminal_retention_seconds: int = 604800,
+    ) -> dict[str, int]:
+        """Remove expired caches and old terminal jobs without touching live work."""
+
+        self._assert_scope(umo)
+        effective_now = int(time.time() if now is None else now)
+        stale_before = effective_now - max(0, int(terminal_retention_seconds))
+        with self._write_transaction(immediate=True):
+            expired = self._connection.execute(
+                """
+                UPDATE request_snapshots SET status='EXPIRED'
+                WHERE umo=? AND status='ACTIVE'
+                  AND expires_at IS NOT NULL AND expires_at<=?
+                """,
+                (umo, effective_now),
+            )
+            cancelled = self._connection.execute(
+                """
+                UPDATE reconstruction_jobs
+                SET status='CANCELLED', lease_until=NULL,
+                    last_error='request snapshot unavailable or expired',
+                    finished_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE umo=? AND status IN ('PENDING', 'RETRY', 'RUNNING')
+                  AND (
+                    snapshot_id IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM request_snapshots AS snapshot
+                      WHERE snapshot.snapshot_id=reconstruction_jobs.snapshot_id
+                        AND snapshot.umo=reconstruction_jobs.umo
+                        AND snapshot.status='ACTIVE'
+                        AND (snapshot.expires_at IS NULL OR snapshot.expires_at>?)
+                    )
+                  )
+                """,
+                (umo, effective_now),
+            )
+            packs = self._connection.execute(
+                """
+                DELETE FROM evidence_pack_cache
+                WHERE umo=? AND (
+                  (expires_at IS NOT NULL AND expires_at<=?)
+                  OR (cache_status<>'VALID' AND unixepoch(updated_at)<=?)
+                  OR snapshot_id IS NULL
+                  OR NOT EXISTS (
+                    SELECT 1 FROM request_snapshots AS snapshot
+                    WHERE snapshot.snapshot_id=evidence_pack_cache.snapshot_id
+                      AND snapshot.umo=evidence_pack_cache.umo
+                      AND snapshot.status='ACTIVE'
+                      AND (snapshot.expires_at IS NULL OR snapshot.expires_at>?)
+                  )
+                )
+                """,
+                (umo, effective_now, stale_before, effective_now),
+            )
+            certificates = self._connection.execute(
+                """
+                DELETE FROM memory_certificates
+                WHERE umo=? AND (
+                  (expires_at IS NOT NULL AND expires_at<=?)
+                  OR (cache_status<>'VALID' AND unixepoch(updated_at)<=?)
+                  OR snapshot_id IS NULL
+                  OR NOT EXISTS (
+                    SELECT 1 FROM request_snapshots AS snapshot
+                    WHERE snapshot.snapshot_id=memory_certificates.snapshot_id
+                      AND snapshot.umo=memory_certificates.umo
+                      AND snapshot.status='ACTIVE'
+                      AND (snapshot.expires_at IS NULL OR snapshot.expires_at>?)
+                  )
+                )
+                """,
+                (umo, effective_now, stale_before, effective_now),
+            )
+            jobs = self._connection.execute(
+                """
+                DELETE FROM reconstruction_jobs
+                WHERE umo=? AND status NOT IN ('PENDING', 'RETRY', 'RUNNING')
+                  AND COALESCE(
+                    unixepoch(finished_at), unixepoch(updated_at), 0
+                  )<=?
+                """,
+                (umo, stale_before),
+            )
+            snapshots = self._connection.execute(
+                """
+                DELETE FROM request_snapshots
+                WHERE umo=? AND status<>'ACTIVE'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM evidence_pack_cache AS cache
+                    WHERE cache.snapshot_id=request_snapshots.snapshot_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_certificates AS certificate
+                    WHERE certificate.snapshot_id=request_snapshots.snapshot_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM reconstruction_jobs AS job
+                    WHERE job.snapshot_id=request_snapshots.snapshot_id
+                  )
+                """,
+                (umo,),
+            )
+        return {
+            "expired_snapshots": max(0, int(expired.rowcount)),
+            "cancelled_jobs": max(0, int(cancelled.rowcount)),
+            "evidence_packs": max(0, int(packs.rowcount)),
+            "certificates": max(0, int(certificates.rowcount)),
+            "terminal_jobs": max(0, int(jobs.rowcount)),
+            "snapshots": max(0, int(snapshots.rowcount)),
+        }
+
+    def enqueue_reconstruction_job(
+        self,
+        *,
+        job_key: str,
+        umo: str,
+        snapshot_id: str,
+        cache_key: str = "",
+        requested_level: str = "L2",
+        route_reason: str = "",
+        contract: Mapping[str, object] | None = None,
+        round_index: int = 0,
+        pending_actions: Iterable[Mapping[str, object]] = (),
+        budget: Mapping[str, object] | None = None,
+        available_at: int | None = None,
+        job_id: str = "",
+    ) -> dict[str, object]:
+        self._assert_scope(umo)
+        normalized_key = str(job_key).strip()
+        if not normalized_key:
+            raise ValueError("job_key is required")
+        if self.request_snapshot(snapshot_id=snapshot_id, umo=umo) is None:
+            raise ValueError("reconstruction job references an unknown snapshot")
+        resolved_id = str(job_id).strip() or hashlib.sha256(
+            (umo + "\x1f" + normalized_key).encode("utf-8")
+        ).hexdigest()
+        ready_at = int(time.time() if available_at is None else available_at)
+        retryable = (
+            "'FAILED', 'TIMEOUT', 'PROTOCOL_FAILED', 'PROVIDER_FAILED', "
+            "'STALE_RESTART', 'CANCELLED'"
+        )
+        with self._write_transaction(immediate=True):
+            self._connection.execute(
+                f"""
+                INSERT INTO reconstruction_jobs(
+                    job_id, job_key, umo, snapshot_id, cache_key,
+                    requested_level, route_reason, contract_json, round_index,
+                    pending_actions_json, budget_json, available_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(umo, job_key) DO UPDATE SET
+                    snapshot_id=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.snapshot_id ELSE reconstruction_jobs.snapshot_id END,
+                    cache_key=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.cache_key ELSE reconstruction_jobs.cache_key END,
+                    requested_level=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.requested_level
+                        ELSE reconstruction_jobs.requested_level END,
+                    route_reason=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.route_reason ELSE reconstruction_jobs.route_reason END,
+                    contract_json=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.contract_json ELSE reconstruction_jobs.contract_json END,
+                    round_index=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.round_index ELSE reconstruction_jobs.round_index END,
+                    pending_actions_json=CASE
+                        WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.pending_actions_json
+                        ELSE reconstruction_jobs.pending_actions_json END,
+                    budget_json=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.budget_json ELSE reconstruction_jobs.budget_json END,
+                    status=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN 'PENDING' ELSE reconstruction_jobs.status END,
+                    available_at=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN excluded.available_at ELSE reconstruction_jobs.available_at END,
+                    lease_until=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN NULL ELSE reconstruction_jobs.lease_until END,
+                    last_error=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN '' ELSE reconstruction_jobs.last_error END,
+                    finished_at=CASE WHEN reconstruction_jobs.status IN ({retryable})
+                        THEN NULL ELSE reconstruction_jobs.finished_at END,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    resolved_id,
+                    normalized_key,
+                    umo,
+                    str(snapshot_id).strip(),
+                    str(cache_key).strip(),
+                    str(requested_level).strip().upper() or "L2",
+                    str(route_reason).strip()[:1000],
+                    self._bounded_json(dict(contract or {}), max_chars=120000),
+                    max(0, int(round_index)),
+                    self._bounded_json(list(pending_actions), max_chars=60000),
+                    self._bounded_json(dict(budget or {}), max_chars=12000),
+                    ready_at,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM reconstruction_jobs WHERE umo=? AND job_key=?",
+                (umo, normalized_key),
+            ).fetchone()
+        value = self._decode_reconstruction_job(row)
+        assert value is not None
+        return value
+
+    def _decode_reconstruction_job(
+        self, row: sqlite3.Row | None
+    ) -> dict[str, object] | None:
+        return self._decode_layered_row(
+            row,
+            json_columns=("contract_json", "pending_actions_json", "budget_json"),
+        )
+
+    def reconstruction_job(
+        self, *, job_id: str, umo: str
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM reconstruction_jobs WHERE job_id=? AND umo=?",
+                (str(job_id).strip(), umo),
+            ).fetchone()
+        return self._decode_reconstruction_job(row)
+
+    def claim_reconstruction_job(
+        self,
+        *,
+        job_id: str,
+        umo: str,
+        now: int | None = None,
+        lease_seconds: int = 300,
+    ) -> dict[str, object] | None:
+        self._assert_scope(umo)
+        effective_now = int(now or time.time())
+        lease_until = effective_now + max(30, int(lease_seconds))
+        with self._write_transaction(immediate=True):
+            cursor = self._connection.execute(
+                """
+                UPDATE reconstruction_jobs
+                SET status='RUNNING', attempts=attempts+1, lease_until=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE job_id=? AND umo=? AND available_at<=?
+                  AND (
+                    status IN ('PENDING', 'RETRY')
+                    OR (status='RUNNING' AND lease_until IS NOT NULL
+                        AND lease_until<=?)
+                  )
+                """,
+                (
+                    lease_until,
+                    str(job_id).strip(),
+                    umo,
+                    effective_now,
+                    effective_now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = self._connection.execute(
+                "SELECT * FROM reconstruction_jobs WHERE job_id=? AND umo=?",
+                (str(job_id).strip(), umo),
+            ).fetchone()
+        return self._decode_reconstruction_job(row)
+
+    def update_reconstruction_job(
+        self,
+        *,
+        job_id: str,
+        umo: str,
+        status: str,
+        contract: Mapping[str, object] | None = None,
+        round_index: int | None = None,
+        pending_actions: Iterable[Mapping[str, object]] | None = None,
+        budget: Mapping[str, object] | None = None,
+        last_result_hash: str = "",
+        last_error: str = "",
+        available_at: int | None = None,
+    ) -> dict[str, object]:
+        self._assert_scope(umo)
+        normalized_status = str(status).strip().upper()
+        allowed = {
+            "PENDING", "RETRY", "RUNNING", "COMPLETED", "CERTIFIED",
+            "SEMANTIC_NONE", "PARTIAL", "SAFETY_ABSTAIN", "CACHE_STALE",
+            "SKIPPED_BUSY", "BUDGET_BLOCKED", "TIMEOUT", "PROTOCOL_FAILED",
+            "PROVIDER_FAILED", "STALE_RESTART", "FAILED", "CANCELLED",
+        }
+        if normalized_status not in allowed:
+            raise ValueError("unsupported reconstruction job status")
+        terminal = normalized_status not in {"PENDING", "RETRY", "RUNNING"}
+        updates = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
+        parameters: list[object] = [normalized_status]
+        if contract is not None:
+            updates.append("contract_json=?")
+            parameters.append(self._bounded_json(dict(contract), max_chars=120000))
+        if round_index is not None:
+            updates.append("round_index=?")
+            parameters.append(max(0, int(round_index)))
+        if pending_actions is not None:
+            updates.append("pending_actions_json=?")
+            parameters.append(self._bounded_json(list(pending_actions), max_chars=60000))
+        if budget is not None:
+            updates.append("budget_json=?")
+            parameters.append(self._bounded_json(dict(budget), max_chars=12000))
+        if last_result_hash:
+            normalized_hash = str(last_result_hash).strip().casefold()
+            if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+                raise ValueError("last_result_hash must be a SHA-256 hex digest")
+            updates.append("last_result_hash=?")
+            parameters.append(normalized_hash)
+        updates.append("last_error=?")
+        parameters.append(str(last_error).strip()[:4000])
+        if available_at is not None:
+            updates.append("available_at=?")
+            parameters.append(int(available_at))
+        if normalized_status != "RUNNING":
+            updates.append("lease_until=NULL")
+        updates.append("finished_at=CURRENT_TIMESTAMP" if terminal else "finished_at=NULL")
+        parameters.extend((str(job_id).strip(), umo))
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                f"UPDATE reconstruction_jobs SET {', '.join(updates)} "
+                "WHERE job_id=? AND umo=?",
+                parameters,
+            )
+            row = self._connection.execute(
+                "SELECT * FROM reconstruction_jobs WHERE job_id=? AND umo=?",
+                (str(job_id).strip(), umo),
+            ).fetchone()
+        if cursor.rowcount != 1 or row is None:
+            raise ValueError("unknown reconstruction job")
+        value = self._decode_reconstruction_job(row)
+        assert value is not None
+        return value
+
+    def finish_reconstruction_job(self, **kwargs: object) -> dict[str, object]:
+        return self.update_reconstruction_job(**kwargs)
 
     def start_experiment(
         self,
@@ -5074,12 +6729,9 @@ class MemoryStorage:
                 effective_since = max(effective_since, int(reset["reset_at"]))
                 minimum_usage_id = int(reset["usage_event_id"] or 0)
         phases = TOKEN_BUDGET_PHASES.get(normalized_class, ())
-        phase_clause = ""
+        phase_clause, phase_parameters = _token_phase_predicate("u.phase", phases)
         parameters: list[object] = [umo, effective_since, minimum_usage_id]
-        if phases:
-            placeholders = ",".join("?" for _ in phases)
-            phase_clause = f" AND u.phase IN ({placeholders})"
-            parameters.extend(phases)
+        parameters.extend(phase_parameters)
         with self._lock:
             row = self._connection.execute(
                 f"""
@@ -5110,16 +6762,16 @@ class MemoryStorage:
             raise ValueError("budget_class must be online, feedback, or backfill")
         reset_at = int(at or time.time())
         phases = TOKEN_BUDGET_PHASES[normalized_class]
-        placeholders = ",".join("?" for _ in phases)
+        phase_clause, phase_parameters = _token_phase_predicate("u.phase", phases)
         with self._lock, self._connection:
             watermark = self._connection.execute(
                 f"""
                 SELECT COALESCE(MAX(u.id), 0)
                 FROM llm_usage_events AS u
                 JOIN experiment_runs AS r ON r.run_id=u.run_id
-                WHERE r.umo=? AND u.phase IN ({placeholders})
+                WHERE r.umo=? {phase_clause}
                 """,
-                (umo, *phases),
+                (umo, *phase_parameters),
             ).fetchone()
             usage_event_id = int(watermark[0] or 0)
             cursor = self._connection.execute(
@@ -5199,7 +6851,7 @@ class MemoryStorage:
             since = max(since, int(reset["reset_at"]))
             minimum_usage_id = int(reset["usage_event_id"] or 0)
         phases = TOKEN_BUDGET_PHASES[normalized_class]
-        placeholders = ",".join("?" for _ in phases)
+        phase_clause, phase_parameters = _token_phase_predicate("u.phase", phases)
         with self._lock:
             rows = self._connection.execute(
                 f"""
@@ -5209,10 +6861,10 @@ class MemoryStorage:
                 JOIN experiment_runs AS r ON r.run_id=u.run_id
                 WHERE r.umo=? AND unixepoch(u.created_at)>=?
                   AND u.id>?
-                  AND u.phase IN ({placeholders})
+                  {phase_clause}
                 ORDER BY u.created_at, u.id
                 """,
-                [umo, since, minimum_usage_id, *phases],
+                [umo, since, minimum_usage_id, *phase_parameters],
             ).fetchall()
         remaining = sum(int(row["tokens"] or 0) for row in rows)
         if remaining + max(0, int(reserve)) <= int(budget):
@@ -6319,6 +7971,7 @@ class MemoryStorage:
         limit: int = 12,
         min_score: float = -1.0,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         if not owner_types:
             return []
@@ -6338,6 +7991,7 @@ class MemoryStorage:
                 umo=umo,
                 owner_types=owner_types,
                 before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
             )
         scored: list[dict[str, object]] = []
         for row in rows:
@@ -6395,6 +8049,7 @@ class MemoryStorage:
         umo: str,
         owner_types: tuple[str, ...],
         before_sent_at: int | None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, set[str]]:
         """Resolve embedding visibility in bounded bulk queries.
 
@@ -6408,6 +8063,11 @@ class MemoryStorage:
 
         requested = set(owner_types)
         cutoff = int(before_sent_at) if before_sent_at is not None else None
+        upper_bound = (
+            None
+            if message_upper_bound is None
+            else max(0, int(message_upper_bound))
+        )
         visible: dict[str, set[str]] = {owner_type: set() for owner_type in requested}
 
         def collect(owner_type: str, sql: str, parameters: tuple[object, ...]) -> None:
@@ -6426,6 +8086,23 @@ class MemoryStorage:
         episode_params: tuple[object, ...] = (umo,)
         if cutoff is not None:
             episode_params = (*episode_params, cutoff)
+        if cutoff is not None or upper_bound is not None:
+            rejected: list[str] = []
+            if cutoff is not None:
+                rejected.append("visible_m.sent_at >= ?")
+            if upper_bound is not None:
+                rejected.append("visible_m.id > ?")
+            episode_cutoff += (
+                " AND NOT EXISTS (SELECT 1 FROM episode_messages AS visible_em "
+                "JOIN messages AS visible_m ON visible_m.id=visible_em.message_id "
+                "WHERE visible_em.episode_id=episodes.id "
+                "AND visible_m.is_deleted=0 "
+                f"AND ({' OR '.join(rejected)}))"
+            )
+            if cutoff is not None:
+                episode_params = (*episode_params, cutoff)
+            if upper_bound is not None:
+                episode_params = (*episode_params, upper_bound)
         collect(
             "episode",
             "SELECT CAST(id AS TEXT) AS owner_key FROM episodes "
@@ -6437,6 +8114,9 @@ class MemoryStorage:
         semantic_params: tuple[object, ...] = (umo,)
         if cutoff is not None:
             semantic_params = (*semantic_params, cutoff)
+        if upper_bound is not None:
+            semantic_cutoff += " AND m.id <= ?"
+            semantic_params = (*semantic_params, upper_bound)
         collect(
             "semantic",
             """
@@ -6454,6 +8134,12 @@ class MemoryStorage:
         topic_params: tuple[object, ...] = (umo,)
         if cutoff is not None:
             topic_params = (*topic_params, cutoff)
+        if cutoff is not None:
+            topic_cutoff += " AND m.sent_at < ?"
+            topic_params = (*topic_params, cutoff)
+        if upper_bound is not None:
+            topic_cutoff += " AND m.id <= ?"
+            topic_params = (*topic_params, upper_bound)
         collect(
             "topic",
             """
@@ -6461,7 +8147,10 @@ class MemoryStorage:
             FROM topics AS t
             JOIN topic_episodes AS te ON te.topic_id=t.id
             JOIN episodes AS e ON e.id=te.episode_id
+            JOIN episode_messages AS em ON em.episode_id=e.id
+            JOIN messages AS m ON m.id=em.message_id
             WHERE t.umo=? AND e.umo=t.umo AND e.status='READY'
+              AND m.umo=t.umo AND m.is_deleted=0
             """ + topic_cutoff,
             topic_params,
         )
@@ -6472,16 +8161,27 @@ class MemoryStorage:
             cue_params: tuple[object, ...] = (umo,)
             if cutoff is not None:
                 cue_params = (*cue_params, cutoff)
+                cue_episode_cutoff += " AND em_m.sent_at < ?"
+                cue_params = (*cue_params, cutoff)
+            if upper_bound is not None:
+                cue_episode_cutoff += " AND em_m.id <= ?"
+                cue_params = (*cue_params, upper_bound)
             cue_params = (*cue_params, umo)
             if cutoff is not None:
                 cue_params = (*cue_params, cutoff)
+            if upper_bound is not None:
+                cue_semantic_cutoff += " AND m.id <= ?"
+                cue_params = (*cue_params, upper_bound)
             collect(
                 "cue",
                 """
                 SELECT lower(k.cue) AS owner_key
                 FROM episode_keywords AS k
                 JOIN episodes AS e ON e.id=k.episode_id
+                JOIN episode_messages AS em ON em.episode_id=e.id
+                JOIN messages AS em_m ON em_m.id=em.message_id
                 WHERE e.umo=? AND e.status='READY'
+                  AND em_m.umo=e.umo AND em_m.is_deleted=0
                 """
                 + cue_episode_cutoff
                 + """
@@ -6501,6 +8201,14 @@ class MemoryStorage:
         participant_params: tuple[object, ...] = (umo,)
         if cutoff is not None:
             participant_params = (*participant_params, cutoff)
+        if upper_bound is not None:
+            participant_cutoff += (
+                " AND EXISTS (SELECT 1 FROM messages AS visible_m "
+                "WHERE visible_m.umo=participants.umo "
+                "AND visible_m.sender_participant_id=participants.id "
+                "AND visible_m.is_deleted=0 AND visible_m.id<=?)"
+            )
+            participant_params = (*participant_params, upper_bound)
         collect(
             "participant",
             "SELECT CAST(id AS TEXT) AS owner_key FROM participants WHERE umo=?"
@@ -6510,14 +8218,25 @@ class MemoryStorage:
 
         plastic_cutoff = ""
         plastic_params: tuple[object, ...] = (umo,)
-        if cutoff is not None:
+        if cutoff is not None or upper_bound is not None:
+            visible_parts = [
+                "pe.edge_id=plastic_edges.id",
+                "m.umo=plastic_edges.umo",
+                "m.is_deleted=0",
+            ]
+            if cutoff is not None:
+                visible_parts.append("m.sent_at < ?")
+            if upper_bound is not None:
+                visible_parts.append("m.id <= ?")
             plastic_cutoff = (
                 " AND EXISTS (SELECT 1 FROM plastic_edge_evidence AS pe "
                 "JOIN messages AS m ON m.id=pe.message_id "
-                "WHERE pe.edge_id=plastic_edges.id AND m.umo=plastic_edges.umo "
-                "AND m.is_deleted=0 AND m.sent_at < ?)"
+                f"WHERE {' AND '.join(visible_parts)})"
             )
-            plastic_params = (*plastic_params, cutoff)
+            if cutoff is not None:
+                plastic_params = (*plastic_params, cutoff)
+            if upper_bound is not None:
+                plastic_params = (*plastic_params, upper_bound)
         collect(
             "plastic_edge",
             "SELECT CAST(id AS TEXT) AS owner_key FROM plastic_edges "
@@ -6654,12 +8373,30 @@ class MemoryStorage:
         cue: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         safe_limit = max(1, min(50, int(limit)))
-        cutoff_sql = " AND e.ended_at < ?" if before_sent_at is not None else ""
+        visibility_sql = ""
         parameters: list[object] = [umo, cue.strip()]
         if before_sent_at is not None:
+            visibility_sql += " AND e.ended_at < ?"
             parameters.append(int(before_sent_at))
+        if before_sent_at is not None or message_upper_bound is not None:
+            rejected: list[str] = []
+            if before_sent_at is not None:
+                rejected.append("visible_m.sent_at >= ?")
+            if message_upper_bound is not None:
+                rejected.append("visible_m.id > ?")
+            visibility_sql += (
+                " AND NOT EXISTS (SELECT 1 FROM episode_messages AS visible_em "
+                "JOIN messages AS visible_m ON visible_m.id=visible_em.message_id "
+                "WHERE visible_em.episode_id=e.id AND visible_m.is_deleted=0 "
+                f"AND ({' OR '.join(rejected)}))"
+            )
+            if before_sent_at is not None:
+                parameters.append(int(before_sent_at))
+            if message_upper_bound is not None:
+                parameters.append(max(0, int(message_upper_bound)))
         parameters.append(safe_limit)
         with self._lock:
             rows = self._connection.execute(
@@ -6669,7 +8406,7 @@ class MemoryStorage:
                 JOIN episodes AS e ON e.id = k.episode_id
                 WHERE e.umo = ? AND lower(k.cue) = lower(?)
                   AND e.status = 'READY'
-                {cutoff_sql}
+                {visibility_sql}
                 GROUP BY k.cue, k.tag
                 ORDER BY episode_count DESC, k.tag
                 LIMIT ?
@@ -6684,6 +8421,7 @@ class MemoryStorage:
         umo: str,
         matches: list[dict[str, object]],
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, list[dict[str, object]]]:
         result: dict[str, list[dict[str, object]]] = {
             "participants": [],
@@ -6708,26 +8446,50 @@ class MemoryStorage:
                         (umo, int(owner_key)),
                     ).fetchone()
                     if row:
-                        aliases = self._connection.execute(
-                            """
-                            SELECT alias FROM participant_aliases
-                            WHERE participant_id = ? AND is_active = 1
-                            ORDER BY last_seen_at DESC LIMIT 20
-                            """,
-                            (int(owner_key),),
-                        ).fetchall()
-                        result["participants"].append(
-                            {
-                                **dict(row),
-                                "aliases": [str(item["alias"]) for item in aliases],
-                                "score": score,
-                            }
-                        )
+                        if before_sent_at is not None or message_upper_bound is not None:
+                            resolved = self.resolve_participants(
+                                umo=umo,
+                                reference=str(row["canonical_key"]),
+                                limit=1,
+                                before_sent_at=before_sent_at,
+                                message_upper_bound=message_upper_bound,
+                            )
+                            visible = next(
+                                (
+                                    item
+                                    for item in resolved.get("participants", [])
+                                    if int(item.get("id") or 0) == int(owner_key)
+                                ),
+                                None,
+                            )
+                            if visible is not None:
+                                result["participants"].append(
+                                    {**dict(visible), "score": score}
+                                )
+                        else:
+                            aliases = self._connection.execute(
+                                """
+                                SELECT alias FROM participant_aliases
+                                WHERE participant_id = ? AND is_active = 1
+                                ORDER BY last_seen_at DESC LIMIT 20
+                                """,
+                                (int(owner_key),),
+                            ).fetchall()
+                            result["participants"].append(
+                                {
+                                    **dict(row),
+                                    "aliases": [
+                                        str(item["alias"]) for item in aliases
+                                    ],
+                                    "score": score,
+                                }
+                            )
                 elif owner_type == "cue":
                     tags = self.query_cue_tags(
                         umo=umo,
                         cue=owner_key,
                         before_sent_at=before_sent_at,
+                        message_upper_bound=message_upper_bound,
                     )
                     if not tags:
                         cutoff_sql = ""
@@ -6740,6 +8502,14 @@ class MemoryStorage:
                                 "AND m.sent_at < ? AND m.is_deleted = 0)"
                             )
                             parameters.append(int(before_sent_at))
+                        if message_upper_bound is not None:
+                            cutoff_sql += (
+                                " AND EXISTS (SELECT 1 FROM messages AS bounded_m "
+                                "WHERE bounded_m.id=semantic_memories.source_message_id "
+                                "AND bounded_m.umo=semantic_memories.umo "
+                                "AND bounded_m.id<=? AND bounded_m.is_deleted=0)"
+                            )
+                            parameters.append(max(0, int(message_upper_bound)))
                         semantic_rows = self._connection.execute(
                             f"""
                             SELECT DISTINCT aspect_tag AS tag,
@@ -6758,12 +8528,29 @@ class MemoryStorage:
                         {"cue": owner_key, "score": score, "tags": tags}
                     )
                 elif owner_type == "episode" and owner_key.isdigit():
-                    cutoff_sql = (
-                        " AND ended_at < ?" if before_sent_at is not None else ""
-                    )
+                    cutoff_sql = ""
                     parameters = [umo, int(owner_key)]
                     if before_sent_at is not None:
+                        cutoff_sql += " AND ended_at < ?"
                         parameters.append(int(before_sent_at))
+                    if before_sent_at is not None or message_upper_bound is not None:
+                        rejected: list[str] = []
+                        if before_sent_at is not None:
+                            rejected.append("visible_m.sent_at >= ?")
+                        if message_upper_bound is not None:
+                            rejected.append("visible_m.id > ?")
+                        cutoff_sql += (
+                            " AND NOT EXISTS (SELECT 1 FROM episode_messages AS visible_em "
+                            "JOIN messages AS visible_m "
+                            "ON visible_m.id=visible_em.message_id "
+                            "WHERE visible_em.episode_id=episodes.id "
+                            "AND visible_m.is_deleted=0 "
+                            f"AND ({' OR '.join(rejected)}))"
+                        )
+                        if before_sent_at is not None:
+                            parameters.append(int(before_sent_at))
+                        if message_upper_bound is not None:
+                            parameters.append(max(0, int(message_upper_bound)))
                     row = self._connection.execute(
                         f"""
                         SELECT id, started_at, ended_at, title, summary
@@ -6787,6 +8574,18 @@ class MemoryStorage:
                             "AND e.ended_at < ?)"
                         )
                         parameters.append(int(before_sent_at))
+                    if message_upper_bound is not None:
+                        cutoff_sql += (
+                            " AND EXISTS (SELECT 1 FROM topic_episodes AS bounded_te "
+                            "JOIN episode_messages AS bounded_em "
+                            "ON bounded_em.episode_id=bounded_te.episode_id "
+                            "JOIN messages AS bounded_m "
+                            "ON bounded_m.id=bounded_em.message_id "
+                            "WHERE bounded_te.topic_id=topics.id "
+                            "AND bounded_m.umo=topics.umo "
+                            "AND bounded_m.is_deleted=0 AND bounded_m.id<=?)"
+                        )
+                        parameters.append(max(0, int(message_upper_bound)))
                     row = self._connection.execute(
                         f"""
                         SELECT id, name, summary
@@ -6796,7 +8595,14 @@ class MemoryStorage:
                         parameters,
                     ).fetchone()
                     if row:
-                        result["topics"].append({**dict(row), "score": score})
+                        topic = dict(row)
+                        if before_sent_at is not None or message_upper_bound is not None:
+                            # ``topics.summary`` is a mutable aggregate without a
+                            # historical revision timestamp.  Bounded reads use
+                            # the topic only as a navigation seed and reconstruct
+                            # meaning from cutoff-safe episodes/raw messages.
+                            topic["summary"] = ""
+                        result["topics"].append({**topic, "score": score})
                 elif owner_type == "semantic" and owner_key.isdigit():
                     cutoff_sql = ""
                     parameters = [umo, int(owner_key)]
@@ -6808,6 +8614,14 @@ class MemoryStorage:
                             "AND m.sent_at < ? AND m.is_deleted = 0)"
                         )
                         parameters.append(int(before_sent_at))
+                    if message_upper_bound is not None:
+                        cutoff_sql += (
+                            " AND EXISTS (SELECT 1 FROM messages AS bounded_m "
+                            "WHERE bounded_m.id=semantic_memories.source_message_id "
+                            "AND bounded_m.umo=semantic_memories.umo "
+                            "AND bounded_m.id<=? AND bounded_m.is_deleted=0)"
+                        )
+                        parameters.append(max(0, int(message_upper_bound)))
                     row = self._connection.execute(
                         f"""
                         SELECT id, person_cue, aspect_tag, content, claim_type,
@@ -6827,6 +8641,7 @@ class MemoryStorage:
                         umo=umo,
                         limit=100,
                         before_sent_at=before_sent_at,
+                        message_upper_bound=message_upper_bound,
                     )
                     selected = next(
                         (
@@ -6848,6 +8663,8 @@ class MemoryStorage:
         max_episodes: int = 8,
         max_messages: int = 48,
         messages_per_episode: int = 12,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, object]:
         """Deterministically expand retrieval seeds to bounded raw evidence.
 
@@ -6859,11 +8676,67 @@ class MemoryStorage:
         episode_cap = max(1, min(24, int(max_episodes)))
         message_cap = max(1, min(160, int(max_messages)))
         per_episode = max(1, min(40, int(messages_per_episode)))
+        upper_bound = (
+            None
+            if message_upper_bound is None
+            else max(0, int(message_upper_bound))
+        )
 
         def rows(name: str) -> list[Mapping[str, object]]:
-            return [
-                item for item in candidates.get(name, []) if isinstance(item, Mapping)
-            ]
+            result: list[Mapping[str, object]] = []
+            for item in candidates.get(name, []):
+                if not isinstance(item, Mapping):
+                    continue
+                if before_sent_at is not None:
+                    candidate_times = (
+                        item.get("sent_at"),
+                        item.get("ended_at"),
+                        item.get("feedback_sent_at"),
+                        item.get("learned_at"),
+                    )
+                    if any(
+                        value is not None and int(value) >= int(before_sent_at)
+                        for value in candidate_times
+                    ):
+                        continue
+                candidate_message_id = item.get("message_row_id")
+                if candidate_message_id is None:
+                    candidate_message_id = item.get("source_message_id")
+                if (
+                    upper_bound is not None
+                    and candidate_message_id is not None
+                    and int(candidate_message_id) > upper_bound
+                ):
+                    continue
+                result.append(item)
+            return result
+
+        def episode_visibility(alias: str) -> tuple[str, list[object]]:
+            sql = ""
+            parameters: list[object] = []
+            if before_sent_at is not None:
+                sql += f" AND {alias}.ended_at < ?"
+                parameters.append(int(before_sent_at))
+            if before_sent_at is not None or upper_bound is not None:
+                rejected: list[str] = []
+                if before_sent_at is not None:
+                    rejected.append("visible_m.sent_at >= ?")
+                if upper_bound is not None:
+                    rejected.append("visible_m.id > ?")
+                sql += (
+                    " AND NOT EXISTS (SELECT 1 "
+                    "FROM episode_messages AS visible_em "
+                    "JOIN messages AS visible_m "
+                    "ON visible_m.id=visible_em.message_id "
+                    f"WHERE visible_em.episode_id={alias}.id "
+                    "AND visible_m.is_deleted=0 "
+                    f"AND ({' OR '.join(rejected)}))"
+                )
+                if before_sent_at is not None:
+                    parameters.append(int(before_sent_at))
+                if upper_bound is not None:
+                    parameters.append(upper_bound)
+            return sql, parameters
 
         episode_ids: list[int] = []
 
@@ -6883,14 +8756,16 @@ class MemoryStorage:
                 topic_id = int(topic.get("id") or 0)
                 if topic_id <= 0:
                     continue
+                visibility_sql, visibility_parameters = episode_visibility("e")
                 related = self._connection.execute(
-                    """
+                    f"""
                     SELECT e.id FROM topic_episodes AS te
                     JOIN episodes AS e ON e.id=te.episode_id
                     WHERE te.topic_id=? AND e.umo=? AND e.status='READY'
+                    {visibility_sql}
                     ORDER BY e.ended_at DESC, e.id DESC LIMIT 3
                     """,
-                    (topic_id, umo),
+                    (topic_id, umo, *visibility_parameters),
                 ).fetchall()
                 for row in related:
                     add_episode(row["id"])
@@ -6909,17 +8784,19 @@ class MemoryStorage:
                     tag_text = str(tag.get("tag") or "").strip()
                     if not tag_text:
                         continue
+                    visibility_sql, visibility_parameters = episode_visibility("e")
                     related = self._connection.execute(
-                        """
+                        f"""
                         SELECT DISTINCT e.id
                         FROM episode_keywords AS k
                         JOIN episodes AS e ON e.id=k.episode_id
                         WHERE e.umo=? AND e.status='READY'
                           AND lower(k.cue)=lower(?)
                           AND lower(k.tag)=lower(?)
+                        {visibility_sql}
                         ORDER BY e.ended_at DESC, e.id DESC LIMIT 2
                         """,
-                        (umo, cue_text, tag_text),
+                        (umo, cue_text, tag_text, *visibility_parameters),
                     ).fetchall()
                     for row in related:
                         add_episode(row["id"])
@@ -6929,13 +8806,15 @@ class MemoryStorage:
         total_messages = 0
         for episode_id in episode_ids[:episode_cap]:
             with self._lock:
+                visibility_sql, visibility_parameters = episode_visibility("episodes")
                 episode = self._connection.execute(
-                    """
+                    f"""
                     SELECT id, started_at, ended_at, title, summary
                     FROM episodes
                     WHERE id=? AND umo=? AND status='READY'
+                    {visibility_sql}
                     """,
-                    (episode_id, umo),
+                    (episode_id, umo, *visibility_parameters),
                 ).fetchone()
                 keywords = self._connection.execute(
                     """
@@ -6950,6 +8829,8 @@ class MemoryStorage:
                 umo=umo,
                 event_id=episode_id,
                 limit=min(per_episode, message_cap - total_messages),
+                before_sent_at=before_sent_at,
+                message_upper_bound=upper_bound,
             )
             unique_context: list[dict[str, object]] = []
             for message in context:
@@ -6977,8 +8858,16 @@ class MemoryStorage:
             if semantic_id <= 0:
                 continue
             with self._lock:
+                visibility_sql = ""
+                visibility_parameters: list[object] = []
+                if before_sent_at is not None:
+                    visibility_sql += " AND m.sent_at < ?"
+                    visibility_parameters.append(int(before_sent_at))
+                if upper_bound is not None:
+                    visibility_sql += " AND m.id <= ?"
+                    visibility_parameters.append(upper_bound)
                 evidence_rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT DISTINCT m.source_key, m.sent_at, m.sender_id,
                            m.sender_name, m.role, m.plain_text,
                            COALESCE(ss.evidence_role, 'SUPPORT') AS evidence_role,
@@ -6990,11 +8879,14 @@ class MemoryStorage:
                       ON m.id=COALESCE(ss.message_id, s.source_message_id)
                      AND m.umo=s.umo AND m.is_deleted=0
                     WHERE s.id=? AND s.umo=?
+                    {visibility_sql}
                     ORDER BY m.sent_at, m.id LIMIT 12
                     """,
-                    (semantic_id, umo),
+                    (semantic_id, umo, *visibility_parameters),
                 ).fetchall()
             evidence = [dict(item) for item in evidence_rows]
+            if (before_sent_at is not None or upper_bound is not None) and not evidence:
+                continue
             for item in evidence:
                 source_key = str(item.get("source_key") or "")
                 if source_key:
@@ -7012,8 +8904,16 @@ class MemoryStorage:
             if hypothesis_id <= 0:
                 continue
             with self._lock:
+                visibility_sql = ""
+                visibility_parameters = []
+                if before_sent_at is not None:
+                    visibility_sql += " AND m.sent_at < ?"
+                    visibility_parameters.append(int(before_sent_at))
+                if upper_bound is not None:
+                    visibility_sql += " AND m.id <= ?"
+                    visibility_parameters.append(upper_bound)
                 evidence_rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
                            m.role, m.plain_text, he.relation, he.valence,
                            he.confidence
@@ -7023,11 +8923,14 @@ class MemoryStorage:
                       ON m.source_key=he.feedback_source_key
                      AND m.umo=h.umo AND m.is_deleted=0
                     WHERE h.id=? AND h.umo=?
+                    {visibility_sql}
                     ORDER BY m.sent_at DESC, m.id DESC LIMIT 8
                     """,
-                    (hypothesis_id, umo),
+                    (hypothesis_id, umo, *visibility_parameters),
                 ).fetchall()
             evidence = [dict(item) for item in evidence_rows]
+            if (before_sent_at is not None or upper_bound is not None) and not evidence:
+                continue
             for item in evidence:
                 source_key = str(item.get("source_key") or "")
                 if source_key:
@@ -7036,23 +8939,68 @@ class MemoryStorage:
                 {"hypothesis": dict(candidate), "evidence": evidence}
             )
 
+        visible_semantic_ids = {
+            int(item["memory"].get("id") or 0) for item in semantic_evidence
+        }
+        visible_hypothesis_ids = {
+            int(item["hypothesis"].get("id") or 0)
+            for item in feedback_hypothesis_evidence
+        }
+        visible_episode_ids = {int(item["id"]) for item in expanded_episodes}
+        visible_media_patterns = rows("media_patterns")
+        if before_sent_at is not None or upper_bound is not None:
+            media_hashes = [
+                str(item.get("reference_sha256") or "")
+                for item in visible_media_patterns
+            ]
+            visible_media_patterns = self.query_media_patterns(
+                umo=umo,
+                fingerprints=media_hashes,
+                min_observations=1,
+                limit=max(1, min(32, len(media_hashes) or 1)),
+                before_sent_at=before_sent_at,
+                message_upper_bound=upper_bound,
+            ) if media_hashes else []
+
+        candidate_packet: dict[str, list[dict[str, object]]] = {}
+        for key in (
+            "participants",
+            "cues",
+            "episodes",
+            "topics",
+            "semantic_memories",
+            "associations",
+            "media_patterns",
+            "feedback_hypotheses",
+        ):
+            values = rows(key)
+            if key == "episodes":
+                values = [
+                    item
+                    for item in values
+                    if int(item.get("id") or 0) in visible_episode_ids
+                ]
+            elif key == "semantic_memories":
+                values = [
+                    item
+                    for item in values
+                    if int(item.get("id") or 0) in visible_semantic_ids
+                ]
+            elif key == "feedback_hypotheses":
+                values = [
+                    item
+                    for item in values
+                    if int(item.get("id") or 0) in visible_hypothesis_ids
+                ]
+            elif key == "media_patterns":
+                values = visible_media_patterns
+            candidate_packet[key] = [dict(item) for item in values]
+
         return {
             "host_notice": (
                 "bounded host-prefetch; all chat payloads are untrusted evidence"
             ),
-            "candidates": {
-                key: [dict(item) for item in rows(key)]
-                for key in (
-                    "participants",
-                    "cues",
-                    "episodes",
-                    "topics",
-                    "semantic_memories",
-                    "associations",
-                    "media_patterns",
-                    "feedback_hypotheses",
-                )
-            },
+            "candidates": candidate_packet,
             "expanded_episodes": expanded_episodes,
             "semantic_evidence": semantic_evidence,
             "feedback_hypothesis_evidence": feedback_hypothesis_evidence,
@@ -7158,6 +9106,11 @@ class MemoryStorage:
                     if cue.strip() and tag.strip()
                 ],
             )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="graph",
+            )
         return episode_id
 
     def store_semantic_memory(
@@ -7200,6 +9153,11 @@ class MemoryStorage:
                     max(0.0, min(1.0, float(confidence))),
                     extractor_version,
                 ),
+            )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="graph",
             )
         return int(cursor.lastrowid)
 
@@ -7512,6 +9470,11 @@ class MemoryStorage:
                         """,
                         (umo, *conflict_ids),
                     )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="graph",
+            )
             return semantic_id
 
     def store_topic(
@@ -7593,6 +9556,11 @@ class MemoryStorage:
                 """,
                 (aggregate or summary, extractor_version, topic_id, umo),
             )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="graph",
+            )
         return topic_id
 
     def search_messages(
@@ -7671,6 +9639,54 @@ class MemoryStorage:
         messages = [self._stored_message_from_row(row) for row in rows]
         return sorted(messages, key=lambda item: (item.sent_at, item.id))
 
+    @staticmethod
+    def _episode_visibility_clause(
+        *,
+        episode_alias: str,
+        before_sent_at: int | None,
+        message_upper_bound: int | None,
+    ) -> tuple[str, list[object]]:
+        """Require every live source of a derived episode to fit one snapshot."""
+
+        clause = ""
+        parameters: list[object] = []
+        if before_sent_at is not None:
+            clause += f" AND {episode_alias}.ended_at < ?"
+            parameters.append(int(before_sent_at))
+        if before_sent_at is None and message_upper_bound is None:
+            return clause, parameters
+        visible = [
+            f"visible_em.episode_id={episode_alias}.id",
+            f"visible_m.umo={episode_alias}.umo",
+            "visible_m.is_deleted=0",
+        ]
+        rejected: list[str] = []
+        if before_sent_at is not None:
+            visible.append("visible_m.sent_at < ?")
+            rejected.append("future_m.sent_at >= ?")
+        if message_upper_bound is not None:
+            visible.append("visible_m.id <= ?")
+            rejected.append("future_m.id > ?")
+        clause += (
+            " AND EXISTS (SELECT 1 FROM episode_messages AS visible_em "
+            "JOIN messages AS visible_m ON visible_m.id=visible_em.message_id "
+            f"WHERE {' AND '.join(visible)})"
+            " AND NOT EXISTS (SELECT 1 FROM episode_messages AS future_em "
+            "JOIN messages AS future_m ON future_m.id=future_em.message_id "
+            f"WHERE future_em.episode_id={episode_alias}.id "
+            f"AND future_m.umo={episode_alias}.umo AND future_m.is_deleted=0 "
+            f"AND ({' OR '.join(rejected)}))"
+        )
+        if before_sent_at is not None:
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            parameters.append(max(0, int(message_upper_bound)))
+        if before_sent_at is not None:
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            parameters.append(max(0, int(message_upper_bound)))
+        return clause, parameters
+
     def query_tag_events(
         self,
         *,
@@ -7679,13 +9695,17 @@ class MemoryStorage:
         tag: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_(cue,tag)->event."""
         safe_limit = max(1, min(50, int(limit)))
-        cutoff_sql = " AND e.ended_at < ?" if before_sent_at is not None else ""
+        cutoff_sql, cutoff_parameters = self._episode_visibility_clause(
+            episode_alias="e",
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
         parameters: list[object] = [umo, cue.strip(), tag.strip()]
-        if before_sent_at is not None:
-            parameters.append(int(before_sent_at))
+        parameters.extend(cutoff_parameters)
         parameters.append(safe_limit)
         with self._lock:
             rows = self._connection.execute(
@@ -7711,18 +9731,22 @@ class MemoryStorage:
         umo: str,
         event_id: int,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, object] | None:
         """Paper mapping phi_event->time."""
-        cutoff_sql = " AND ended_at < ?" if before_sent_at is not None else ""
+        cutoff_sql, cutoff_parameters = self._episode_visibility_clause(
+            episode_alias="e",
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
         parameters: list[object] = [umo, int(event_id)]
-        if before_sent_at is not None:
-            parameters.append(int(before_sent_at))
+        parameters.extend(cutoff_parameters)
         with self._lock:
             row = self._connection.execute(
                 f"""
-                SELECT id, started_at, ended_at
-                FROM episodes
-                WHERE umo = ? AND id = ? AND status = 'READY'
+                SELECT e.id, e.started_at, e.ended_at
+                FROM episodes AS e
+                WHERE e.umo = ? AND e.id = ? AND e.status = 'READY'
                 {cutoff_sql}
                 """,
                 parameters,
@@ -7735,12 +9759,16 @@ class MemoryStorage:
         umo: str,
         event_id: int,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper reverse mapping phi_event->(cue,tag)."""
-        cutoff_sql = " AND e.ended_at < ?" if before_sent_at is not None else ""
+        cutoff_sql, cutoff_parameters = self._episode_visibility_clause(
+            episode_alias="e",
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
         parameters: list[object] = [umo, int(event_id)]
-        if before_sent_at is not None:
-            parameters.append(int(before_sent_at))
+        parameters.extend(cutoff_parameters)
         with self._lock:
             rows = self._connection.execute(
                 f"""
@@ -7762,6 +9790,7 @@ class MemoryStorage:
         event_id: int,
         limit: int = 50,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_event->context, grounded in raw messages."""
         safe_limit = max(1, min(100, int(limit)))
@@ -7770,6 +9799,9 @@ class MemoryStorage:
         if before_sent_at is not None:
             cutoff_sql = " AND e.ended_at < ? AND m.sent_at < ?"
             parameters.extend((int(before_sent_at), int(before_sent_at)))
+        if message_upper_bound is not None:
+            cutoff_sql += " AND m.id <= ?"
+            parameters.append(max(0, int(message_upper_bound)))
         parameters.append(safe_limit)
         with self._lock:
             rows = self._connection.execute(
@@ -7807,16 +9839,155 @@ class MemoryStorage:
             for message in messages
         ]
 
+    def reply_source_for_message(
+        self,
+        *,
+        umo: str,
+        source_key: str,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+    ) -> str:
+        """Resolve a request's reply target without admitting post-snapshot data."""
+
+        self._assert_scope(umo)
+        visibility_sql = ""
+        parameters: list[object] = [umo, str(source_key).strip()]
+        if before_sent_at is not None:
+            visibility_sql += " AND target.sent_at<?"
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            visibility_sql += " AND target.id<=?"
+            parameters.append(max(0, int(message_upper_bound)))
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT target.source_key
+                FROM messages AS source
+                JOIN message_relations AS relation
+                  ON relation.source_message_id=source.id
+                 AND relation.umo=source.umo
+                 AND relation.relation IN ('REPLY_TO', 'RESPONDS_TO')
+                JOIN messages AS target ON target.id=relation.target_message_id
+                WHERE source.umo=? AND source.source_key=?
+                  AND source.is_deleted=0 AND target.umo=source.umo
+                  AND target.is_deleted=0{visibility_sql}
+                ORDER BY relation.id LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        return str(row["source_key"]) if row is not None else ""
+
+    def message_for_source(
+        self,
+        *,
+        umo: str,
+        source_key: str,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+    ) -> dict[str, object] | None:
+        """Return one raw message only when it belongs to the frozen snapshot."""
+
+        self._assert_scope(umo)
+        normalized_source = str(source_key).strip()
+        if not normalized_source:
+            return None
+        visibility_sql = ""
+        parameters: list[object] = [umo, normalized_source]
+        if before_sent_at is not None:
+            visibility_sql += " AND sent_at<?"
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            visibility_sql += " AND id<=?"
+            parameters.append(max(0, int(message_upper_bound)))
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT * FROM messages
+                WHERE umo=? AND source_key=? AND is_deleted=0
+                {visibility_sql}
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+            if row is None:
+                return None
+            message = self._stored_message_from_row(row)
+        return {
+            "source_key": message.source_key,
+            "sent_at": message.sent_at,
+            "sender_id": message.sender_id,
+            "sender_name": message.sender_name,
+            "sender_participant_key": message.sender_participant_key,
+            "role": message.role,
+            "plain_text": message.plain_text,
+            "reply_to_source_key": message.reply_to_source_key,
+            "mentions": list(message.mentions),
+            "components": message.content,
+            "revision_no": message.revision_no,
+        }
+
+    @staticmethod
+    def _semantic_source_visibility_clause(
+        *,
+        memory_alias: str,
+        before_sent_at: int | None,
+        message_upper_bound: int | None,
+    ) -> tuple[str, list[object]]:
+        if before_sent_at is None and message_upper_bound is None:
+            return "", []
+        source_ids = (
+            f"SELECT source.message_id FROM semantic_memory_sources AS source "
+            f"WHERE source.semantic_memory_id={memory_alias}.id "
+            f"UNION SELECT {memory_alias}.source_message_id "
+            f"WHERE {memory_alias}.source_message_id IS NOT NULL"
+        )
+        visible = [
+            f"visible_m.id IN ({source_ids})",
+            f"visible_m.umo={memory_alias}.umo",
+            "visible_m.is_deleted=0",
+        ]
+        rejected: list[str] = []
+        if before_sent_at is not None:
+            visible.append("visible_m.sent_at < ?")
+            rejected.append("future_m.sent_at >= ?")
+        if message_upper_bound is not None:
+            visible.append("visible_m.id <= ?")
+            rejected.append("future_m.id > ?")
+        clause = (
+            " AND EXISTS (SELECT 1 FROM messages AS visible_m "
+            f"WHERE {' AND '.join(visible)})"
+            " AND NOT EXISTS (SELECT 1 FROM messages AS future_m "
+            f"WHERE future_m.id IN ({source_ids}) "
+            f"AND future_m.umo={memory_alias}.umo AND future_m.is_deleted=0 "
+            f"AND ({' OR '.join(rejected)}))"
+        )
+        parameters: list[object] = []
+        if before_sent_at is not None:
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            parameters.append(max(0, int(message_upper_bound)))
+        if before_sent_at is not None:
+            parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            parameters.append(max(0, int(message_upper_bound)))
+        return clause, parameters
+
     def query_personal_information(
         self,
         *,
         umo: str,
         person: str,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_person->semantic-aspects."""
         with self._lock:
-            resolved = self.resolve_participants(umo=umo, reference=person)
+            resolved = self.resolve_participants(
+                umo=umo,
+                reference=person,
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
             participants = resolved["participants"]
             assert isinstance(participants, list)
             if resolved["ambiguous"]:
@@ -7851,28 +10022,27 @@ class MemoryStorage:
                     "AND lower(s.person_cue) = lower(?)"
                 )
                 parameters.append(person.strip())
-            cutoff_sql = ""
-            if before_sent_at is not None:
-                cutoff_sql = (
-                    " AND EXISTS (SELECT 1 "
-                    "FROM semantic_memory_sources AS ss "
-                    "JOIN messages AS m ON m.id = ss.message_id "
-                    "WHERE ss.semantic_memory_id = s.id AND m.umo = s.umo "
-                    "AND m.sent_at < ? AND m.is_deleted = 0)"
-                )
-                parameters.append(int(before_sent_at))
+            cutoff_sql, cutoff_parameters = self._semantic_source_visibility_clause(
+                memory_alias="s",
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
+            parameters.extend(cutoff_parameters)
             rows = self._connection.execute(
                 f"""
                 SELECT s.subject_participant_id, p.canonical_key,
                        COALESCE(p.current_display_name, s.subject_text,
                                 s.person_cue) AS subject_display_name,
                        s.aspect_tag,
-                       COUNT(DISTINCT ss.message_id) AS evidence_count,
+                       COUNT(DISTINCT m.id) AS evidence_count,
                        GROUP_CONCAT(DISTINCT s.status) AS statuses
                 FROM semantic_memories AS s
                 LEFT JOIN participants AS p ON p.id = s.subject_participant_id
                 LEFT JOIN semantic_memory_sources AS ss
                   ON ss.semantic_memory_id = s.id
+                LEFT JOIN messages AS m
+                  ON m.id=COALESCE(ss.message_id, s.source_message_id)
+                 AND m.umo=s.umo AND m.is_deleted=0
                 WHERE s.umo = ? AND ({identity_sql})
                   AND s.status IN ('ACTIVE', 'CONFLICTED')
                 {cutoff_sql}
@@ -7882,13 +10052,24 @@ class MemoryStorage:
                 """,
                 parameters,
             ).fetchall()
-        return [
-            {
-                **dict(row),
-                "identity_ambiguous": bool(resolved["ambiguous"]),
-            }
-            for row in rows
-        ]
+        participant_names = {
+            int(item["id"]): str(item["current_display_name"] or "")
+            for item in participants
+        }
+        result = []
+        for row in rows:
+            value = dict(row)
+            participant_id = value.get("subject_participant_id")
+            if (
+                (before_sent_at is not None or message_upper_bound is not None)
+                and participant_id is not None
+            ):
+                value["subject_display_name"] = participant_names.get(
+                    int(participant_id), ""
+                )
+            value["identity_ambiguous"] = bool(resolved["ambiguous"])
+            result.append(value)
+        return result
 
     def query_personal_aspect(
         self,
@@ -7898,11 +10079,17 @@ class MemoryStorage:
         aspect: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_(person,aspect)->semantic-content."""
         safe_limit = max(1, min(50, int(limit)))
         with self._lock:
-            resolved = self.resolve_participants(umo=umo, reference=person)
+            resolved = self.resolve_participants(
+                umo=umo,
+                reference=person,
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
             participants = resolved["participants"]
             assert isinstance(participants, list)
             if resolved["ambiguous"]:
@@ -7938,30 +10125,27 @@ class MemoryStorage:
                 )
                 parameters.append(person.strip())
             parameters.append(aspect.strip())
-            cutoff_sql = ""
-            if before_sent_at is not None:
-                cutoff_sql = (
-                    " AND EXISTS (SELECT 1 "
-                    "FROM semantic_memory_sources AS sx "
-                    "JOIN messages AS mx ON mx.id = sx.message_id "
-                    "WHERE sx.semantic_memory_id = s.id AND mx.umo = s.umo "
-                    "AND mx.sent_at < ? AND mx.is_deleted = 0)"
-                )
-                parameters.append(int(before_sent_at))
+            cutoff_sql, cutoff_parameters = self._semantic_source_visibility_clause(
+                memory_alias="s",
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
+            parameters.extend(cutoff_parameters)
             parameters.append(safe_limit)
             rows = self._connection.execute(
                 f"""
                 SELECT s.id, s.person_cue, p.canonical_key,
                        s.aspect_tag, s.content, s.claim_type,
                        s.epistemic_status, s.status, s.confidence,
-                       COUNT(DISTINCT ss.message_id) AS evidence_count,
+                       COUNT(DISTINCT m.id) AS evidence_count,
                        GROUP_CONCAT(DISTINCT m.source_key) AS source_keys_csv
                 FROM semantic_memories AS s
                 LEFT JOIN participants AS p ON p.id = s.subject_participant_id
                 LEFT JOIN semantic_memory_sources AS ss
                   ON ss.semantic_memory_id = s.id
                 LEFT JOIN messages AS m
-                  ON m.id = ss.message_id AND m.is_deleted = 0
+                  ON m.id=COALESCE(ss.message_id, s.source_message_id)
+                 AND m.umo=s.umo AND m.is_deleted=0
                 WHERE s.umo = ? AND ({identity_sql})
                   AND lower(s.aspect_tag) = lower(?)
                   AND s.status IN ('ACTIVE', 'CONFLICTED')
@@ -7996,13 +10180,17 @@ class MemoryStorage:
         topic: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Paper mapping phi_topic->event."""
         safe_limit = max(1, min(50, int(limit)))
-        cutoff_sql = " AND e.ended_at < ?" if before_sent_at is not None else ""
+        cutoff_sql, cutoff_parameters = self._episode_visibility_clause(
+            episode_alias="e",
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
         parameters: list[object] = [umo, topic.strip()]
-        if before_sent_at is not None:
-            parameters.append(int(before_sent_at))
+        parameters.extend(cutoff_parameters)
         parameters.append(safe_limit)
         with self._lock:
             rows = self._connection.execute(
@@ -8755,6 +10943,21 @@ class MemoryStorage:
                 """,
                 (target_type, target_id, mutation_id, umo),
             )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="graph",
+            )
+            if mutation.operation in {
+                "upsert_edge",
+                "revise_relation",
+                "deprecate_relation",
+            }:
+                self._advance_revision_head_locked(
+                    umo=umo,
+                    revision_class="data",
+                    component="relation",
+                )
         return {
             "mutation_id": mutation_id,
             "status": "COMMITTED",
@@ -8773,6 +10976,8 @@ class MemoryStorage:
         media_type: str = "image",
         min_observations: int = 2,
         limit: int = 12,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Return frequent opaque media anchors plus bounded nearby text.
 
@@ -8790,66 +10995,126 @@ class MemoryStorage:
                 if re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "").strip())
             )
         )
-        clauses = ["umo=?", "media_type=?", "observation_count>=?"]
-        parameters: list[object] = [
-            umo,
-            normalized_type,
-            max(1, int(min_observations)),
-        ]
-        if hashes:
-            placeholders = ",".join("?" for _ in hashes)
-            clauses.append(f"reference_sha256 IN ({placeholders})")
-            parameters.extend(hashes)
         safe_limit = max(1, min(32, int(limit)))
-        parameters.append(safe_limit)
+        observation_floor = max(1, int(min_observations))
+        upper_bound = (
+            None
+            if message_upper_bound is None
+            else max(0, int(message_upper_bound))
+        )
         with self._lock:
-            rows = self._connection.execute(
-                f"""
-                SELECT media_type, reference_sha256, observation_count,
-                       unique_sender_count, first_seen_at, last_seen_at,
-                       sample_source_keys_json
-                FROM media_fingerprints
-                WHERE {' AND '.join(clauses)}
-                ORDER BY observation_count DESC, unique_sender_count DESC,
-                         last_seen_at DESC, reference_sha256
-                LIMIT ?
-                """,
-                parameters,
-            ).fetchall()
+            if before_sent_at is None and upper_bound is None:
+                clauses = ["umo=?", "media_type=?", "observation_count>=?"]
+                parameters: list[object] = [umo, normalized_type, observation_floor]
+                if hashes:
+                    placeholders = ",".join("?" for _ in hashes)
+                    clauses.append(f"reference_sha256 IN ({placeholders})")
+                    parameters.extend(hashes)
+                parameters.append(safe_limit)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT media_type, reference_sha256, observation_count,
+                           unique_sender_count, first_seen_at, last_seen_at,
+                           sample_source_keys_json
+                    FROM media_fingerprints
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY observation_count DESC, unique_sender_count DESC,
+                             last_seen_at DESC, reference_sha256
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
+            else:
+                clauses = [
+                    "m.umo=?",
+                    "m.is_deleted=0",
+                    "a.attachment_type=?",
+                    "a.reference_sha256<>''",
+                ]
+                parameters = [umo, normalized_type]
+                if before_sent_at is not None:
+                    clauses.append("m.sent_at<?")
+                    parameters.append(int(before_sent_at))
+                if upper_bound is not None:
+                    clauses.append("m.id<=?")
+                    parameters.append(upper_bound)
+                if hashes:
+                    placeholders = ",".join("?" for _ in hashes)
+                    clauses.append(f"a.reference_sha256 IN ({placeholders})")
+                    parameters.extend(hashes)
+                parameters.extend((observation_floor, safe_limit))
+                rows = self._connection.execute(
+                    f"""
+                    SELECT a.attachment_type AS media_type,
+                           a.reference_sha256,
+                           COUNT(*) AS observation_count,
+                           COUNT(DISTINCT m.sender_id) AS unique_sender_count,
+                           MIN(m.sent_at) AS first_seen_at,
+                           MAX(m.sent_at) AS last_seen_at,
+                           '[]' AS sample_source_keys_json
+                    FROM message_attachments AS a
+                    JOIN messages AS m ON m.id=a.message_id
+                    WHERE {' AND '.join(clauses)}
+                    GROUP BY a.attachment_type, a.reference_sha256
+                    HAVING COUNT(*)>=?
+                    ORDER BY observation_count DESC, unique_sender_count DESC,
+                             last_seen_at DESC, a.reference_sha256
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
             results: list[dict[str, object]] = []
             for row in rows:
+                direct_visibility = ""
+                direct_parameters: list[object] = [
+                    umo,
+                    str(row["media_type"]),
+                    str(row["reference_sha256"]),
+                ]
+                if before_sent_at is not None:
+                    direct_visibility += " AND m.sent_at<?"
+                    direct_parameters.append(int(before_sent_at))
+                if upper_bound is not None:
+                    direct_visibility += " AND m.id<=?"
+                    direct_parameters.append(upper_bound)
                 direct = self._connection.execute(
-                    """
+                    f"""
                     SELECT DISTINCT m.id, m.source_key, m.sent_at, m.sender_id,
                            m.sender_name, m.plain_text
                     FROM message_attachments AS a
                     JOIN messages AS m ON m.id=a.message_id
                     WHERE m.umo=? AND m.is_deleted=0
                       AND a.attachment_type=? AND a.reference_sha256=?
+                      {direct_visibility}
                     ORDER BY m.sent_at DESC, m.id DESC LIMIT 4
                     """,
-                    (
-                        umo,
-                        str(row["media_type"]),
-                        str(row["reference_sha256"]),
-                    ),
+                    direct_parameters,
                 ).fetchall()
                 context_by_id: dict[int, dict[str, object]] = {}
                 for observation in direct[:2]:
+                    context_visibility = ""
+                    context_parameters: list[object] = [
+                        umo,
+                        int(observation["sent_at"]) - 120,
+                        int(observation["sent_at"]) + 120,
+                    ]
+                    if before_sent_at is not None:
+                        context_visibility += " AND sent_at<?"
+                        context_parameters.append(int(before_sent_at))
+                    if upper_bound is not None:
+                        context_visibility += " AND id<=?"
+                        context_parameters.append(upper_bound)
                     context_rows = self._connection.execute(
-                        """
+                        f"""
                         SELECT id, source_key, sent_at, sender_id,
                                sender_name, plain_text, role
                         FROM messages
                         WHERE umo=? AND is_deleted=0
                           AND sent_at BETWEEN ? AND ?
+                          {context_visibility}
                         ORDER BY sent_at, id LIMIT 8
                         """,
-                        (
-                            umo,
-                            int(observation["sent_at"]) - 120,
-                            int(observation["sent_at"]) + 120,
-                        ),
+                        context_parameters,
                     ).fetchall()
                     for context in context_rows:
                         if len(context_by_id) >= 12:
@@ -8867,8 +11132,10 @@ class MemoryStorage:
                         "unique_sender_count": int(row["unique_sender_count"]),
                         "first_seen_at": int(row["first_seen_at"]),
                         "last_seen_at": int(row["last_seen_at"]),
-                        "sample_source_keys": json.loads(
-                            str(row["sample_source_keys_json"])
+                        "sample_source_keys": (
+                            [str(item["source_key"]) for item in direct]
+                            if before_sent_at is not None or upper_bound is not None
+                            else json.loads(str(row["sample_source_keys_json"]))
                         ),
                         "observations": [dict(item) for item in direct],
                         "nearby_messages": sorted(
@@ -8893,6 +11160,7 @@ class MemoryStorage:
         limit: int = 20,
         include_dormant: bool = False,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         """Traverse the learned graph through one generic, versioned relation API."""
 
@@ -8937,13 +11205,58 @@ class MemoryStorage:
             )
             parameters.extend([normalized_query] * 7)
         if before_sent_at is not None:
+            # Plastic rows are mutable heads.  Their current statement, node
+            # labels and relation definition are safe only if every head already
+            # existed at the frozen cutoff; otherwise a historical read would
+            # time-travel through a later graph revision.
+            clauses.extend(
+                (
+                    "unixepoch(e.updated_at) < ?",
+                    "unixepoch(src.updated_at) < ?",
+                    "unixepoch(dst.updated_at) < ?",
+                    "unixepoch(r.updated_at) < ?",
+                )
+            )
+            parameters.extend([int(before_sent_at)] * 4)
+        if before_sent_at is not None or message_upper_bound is not None:
+            visible_conditions = [
+                "visible_pe.edge_id=e.id",
+                "visible_m.umo=e.umo",
+                "visible_m.is_deleted=0",
+            ]
+            if before_sent_at is not None:
+                visible_conditions.append("visible_m.sent_at < ?")
+            if message_upper_bound is not None:
+                visible_conditions.append("visible_m.id <= ?")
             clauses.append(
                 "EXISTS (SELECT 1 FROM plastic_edge_evidence AS visible_pe "
                 "JOIN messages AS visible_m ON visible_m.id=visible_pe.message_id "
-                "WHERE visible_pe.edge_id=e.id AND visible_m.umo=e.umo "
-                "AND visible_m.is_deleted=0 AND visible_m.sent_at < ?)"
+                f"WHERE {' AND '.join(visible_conditions)})"
             )
-            parameters.append(int(before_sent_at))
+            if before_sent_at is not None:
+                parameters.append(int(before_sent_at))
+            if message_upper_bound is not None:
+                parameters.append(max(0, int(message_upper_bound)))
+            rejected_conditions = [
+                "future_pe.edge_id=e.id",
+                "future_m.umo=e.umo",
+                "future_m.is_deleted=0",
+            ]
+            rejected_bounds: list[str] = []
+            if before_sent_at is not None:
+                rejected_bounds.append("future_m.sent_at >= ?")
+            if message_upper_bound is not None:
+                rejected_bounds.append("future_m.id > ?")
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM plastic_edge_evidence AS future_pe "
+                "JOIN messages AS future_m ON future_m.id=future_pe.message_id "
+                f"WHERE {' AND '.join(rejected_conditions)} "
+                f"AND ({' OR '.join(rejected_bounds)}))"
+            )
+            if before_sent_at is not None:
+                parameters.append(int(before_sent_at))
+            if message_upper_bound is not None:
+                parameters.append(max(0, int(message_upper_bound)))
         safe_limit = max(1, min(100, int(limit)))
         parameters.append(safe_limit)
         with self._lock:
@@ -8953,10 +11266,12 @@ class MemoryStorage:
                        e.epistemic_confidence, e.epistemic_state,
                        e.uncertainty, e.utility, e.activation_count,
                        e.support_count, e.contradict_count, e.status,
-                       src.node_key AS source_key, src.node_kind AS source_kind,
+                       src.node_key AS source_node_key,
+                       src.node_kind AS source_kind,
                        src.label AS source_label,
                        src.description AS source_description,
-                       dst.node_key AS target_key, dst.node_kind AS target_kind,
+                       dst.node_key AS target_node_key,
+                       dst.node_kind AS target_kind,
                        dst.label AS target_label,
                        dst.description AS target_description,
                        r.relation_key, r.version AS relation_version,
@@ -8979,8 +11294,11 @@ class MemoryStorage:
                 evidence_parameters: list[object] = [int(row["id"]), umo]
                 cutoff = ""
                 if before_sent_at is not None:
-                    cutoff = " AND m.sent_at < ?"
+                    cutoff += " AND m.sent_at < ?"
                     evidence_parameters.append(int(before_sent_at))
+                if message_upper_bound is not None:
+                    cutoff += " AND m.id <= ?"
+                    evidence_parameters.append(max(0, int(message_upper_bound)))
                 evidence_rows = self._connection.execute(
                     f"""
                     SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
@@ -10379,14 +12697,37 @@ class MemoryStorage:
         sender_id: str,
         at: int,
         limit: int = 16,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
-        """Bounded active view for semantic selection by the private agent."""
+        """Bounded active view for semantic selection by the private agent.
+
+        Feedback hypotheses are mutable heads rather than bitemporal revisions.
+        When a historical/request snapshot is requested, exposing a head that was
+        reinforced or contradicted by later evidence would leak the future state.
+        Therefore a bounded view only admits hypotheses whose complete evidence
+        set is visible inside the snapshot.  A future evidence row excludes the
+        whole hypothesis until revisioned hypothesis heads are implemented.
+        """
 
         self._assert_scope(umo)
         cutoff = int(at)
+        upper_bound = (
+            None
+            if message_upper_bound is None
+            else max(0, int(message_upper_bound))
+        )
+        visible_clauses = ["visible_m.sent_at < ?", "visible_m.is_deleted = 0"]
+        visible_parameters: list[object] = [cutoff]
+        outside_clauses = ["all_m.sent_at >= ?"]
+        outside_parameters: list[object] = [cutoff]
+        if upper_bound is not None:
+            visible_clauses.append("visible_m.id <= ?")
+            visible_parameters.append(upper_bound)
+            outside_clauses.append("all_m.id > ?")
+            outside_parameters.append(upper_bound)
         with self._lock:
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT id, scope_type, scope_key, aspect, statement,
                        prospective_cue, trigger_cues_json, activation_mode,
                        evidence_confidence, utility, support_count,
@@ -10396,6 +12737,24 @@ class MemoryStorage:
                   AND (expires_at IS NULL OR expires_at > ?)
                   AND (scope_type = 'group'
                        OR (scope_type = 'sender' AND scope_key = ?))
+                  AND EXISTS (
+                      SELECT 1
+                      FROM hypothesis_evidence AS visible_he
+                      JOIN messages AS visible_m
+                        ON visible_m.umo = feedback_hypotheses.umo
+                       AND visible_m.source_key = visible_he.feedback_source_key
+                      WHERE visible_he.hypothesis_id = feedback_hypotheses.id
+                        AND {' AND '.join(visible_clauses)}
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM hypothesis_evidence AS all_he
+                      JOIN messages AS all_m
+                        ON all_m.umo = feedback_hypotheses.umo
+                       AND all_m.source_key = all_he.feedback_source_key
+                      WHERE all_he.hypothesis_id = feedback_hypotheses.id
+                        AND ({' OR '.join(outside_clauses)})
+                  )
                 ORDER BY utility DESC, evidence_confidence DESC,
                          COALESCE(last_activated_at, learned_at) DESC, id DESC
                 LIMIT ?
@@ -10405,6 +12764,8 @@ class MemoryStorage:
                     cutoff,
                     cutoff,
                     sender_id,
+                    *visible_parameters,
+                    *outside_parameters,
                     max(1, min(50, int(limit))),
                 ),
             ).fetchall()
@@ -11058,6 +13419,17 @@ class MemoryStorage:
                     umo,
                 ),
             )
+            self._advance_revision_head_locked(
+                umo=umo,
+                revision_class="data",
+                component="feedback",
+            )
+            if plastic_activation_rows:
+                self._advance_revision_head_locked(
+                    umo=umo,
+                    revision_class="data",
+                    component="graph",
+                )
         return {
             "status": "COMMITTED",
             "proposal_id": int(proposal_id),

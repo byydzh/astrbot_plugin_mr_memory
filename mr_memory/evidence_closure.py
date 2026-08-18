@@ -25,6 +25,7 @@ INTERPRETATION_STATUSES = {
     "CONTESTED",
     "UNRESOLVED",
 }
+INTERPRETATION_ORIGINS = {"COMPILE", "AUDIT_DISCOVERY"}
 UNCERTAINTY_STATUSES = {"OPEN", "PRESERVED", "RESOLVED"}
 BINDING_MODES = {
     "HOST",
@@ -267,6 +268,13 @@ class SubjectBinding:
         if not set(candidates).issubset(allowed_participants):
             raise ValueError(f"{field} contains a non-authorized identity candidate")
         if mode in {"HOST", "STRUCTURED_REF", "UNIQUE_ALIAS"}:
+            # Some structured-output models redundantly echo the already selected
+            # identity as the sole candidate.  This carries exactly the same
+            # binding as an empty candidate list, so canonicalize it before the
+            # strict resolved/ambiguous invariant.  Multiple or mismatched
+            # candidates remain a hard failure.
+            if candidates == (participant_key,):
+                candidates = ()
             if not participant_key or candidates:
                 raise ValueError(
                     f"{field} resolved modes require exactly one participant_key"
@@ -351,8 +359,12 @@ class EvidenceObligation:
         )
         if status == "SUPPORTED" and not support:
             raise ValueError(f"{field} cannot be supported without evidence")
+        if status == "SUPPORTED" and counter:
+            raise ValueError(f"{field} supported status cannot retain counterevidence")
         if status == "REFUTED" and not counter:
             raise ValueError(f"{field} cannot be refuted without counterevidence")
+        if status == "REFUTED" and support:
+            raise ValueError(f"{field} refuted status cannot retain supporting evidence")
         if status == "CONTESTED" and (not support or not counter):
             raise ValueError(f"{field} contested status needs both evidence sides")
         return cls(
@@ -395,6 +407,8 @@ class CompetingInterpretation:
     support_keys: tuple[str, ...]
     counter_keys: tuple[str, ...]
     uncertainty: str
+    origin: str = "COMPILE"
+    discriminates_interpretation_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_value(
@@ -409,6 +423,9 @@ class CompetingInterpretation:
         status = str(value.get("status") or "").strip().upper()
         if status not in INTERPRETATION_STATUSES:
             raise ValueError(f"{field}.status is unsupported")
+        origin = str(value.get("origin") or "COMPILE").strip().upper()
+        if origin not in INTERPRETATION_ORIGINS:
+            raise ValueError(f"{field}.origin is unsupported")
         support = _source_tuple(
             value.get("support_keys"),
             f"{field}.support_keys",
@@ -421,8 +438,12 @@ class CompetingInterpretation:
         )
         if status == "SUPPORTED" and not support:
             raise ValueError(f"{field} supported status needs evidence")
+        if status == "SUPPORTED" and counter:
+            raise ValueError(f"{field} supported status cannot retain counterevidence")
         if status == "REFUTED" and not counter:
             raise ValueError(f"{field} refuted status needs counterevidence")
+        if status == "REFUTED" and support:
+            raise ValueError(f"{field} refuted status cannot retain supporting evidence")
         if status == "CONTESTED" and (not support or not counter):
             raise ValueError(f"{field} contested status needs both evidence sides")
         return cls(
@@ -441,6 +462,13 @@ class CompetingInterpretation:
                 f"{field}.uncertainty",
                 limit=800,
             ),
+            origin=origin,
+            discriminates_interpretation_ids=_string_tuple(
+                value.get("discriminates_interpretation_ids"),
+                f"{field}.discriminates_interpretation_ids",
+                limit=16,
+                item_limit=80,
+            ),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -451,6 +479,10 @@ class CompetingInterpretation:
             "support_keys": list(self.support_keys),
             "counter_keys": list(self.counter_keys),
             "uncertainty": self.uncertainty,
+            "origin": self.origin,
+            "discriminates_interpretation_ids": list(
+                self.discriminates_interpretation_ids
+            ),
         }
 
 
@@ -460,6 +492,8 @@ class UncertaintyConstraint:
     statement: str
     status: str
     source_keys: tuple[str, ...]
+    origin: str = "COMPILE"
+    discriminates_interpretation_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_value(
@@ -474,6 +508,9 @@ class UncertaintyConstraint:
         status = str(value.get("status") or "").strip().upper()
         if status not in UNCERTAINTY_STATUSES:
             raise ValueError(f"{field}.status is unsupported")
+        origin = str(value.get("origin") or "COMPILE").strip().upper()
+        if origin not in INTERPRETATION_ORIGINS:
+            raise ValueError(f"{field}.origin is unsupported")
         sources = _source_tuple(
             value.get("source_keys"),
             f"{field}.source_keys",
@@ -491,6 +528,13 @@ class UncertaintyConstraint:
             ),
             status=status,
             source_keys=sources,
+            origin=origin,
+            discriminates_interpretation_ids=_string_tuple(
+                value.get("discriminates_interpretation_ids"),
+                f"{field}.discriminates_interpretation_ids",
+                limit=16,
+                item_limit=80,
+            ),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -499,6 +543,10 @@ class UncertaintyConstraint:
             "statement": self.statement,
             "status": self.status,
             "source_keys": list(self.source_keys),
+            "origin": self.origin,
+            "discriminates_interpretation_ids": list(
+                self.discriminates_interpretation_ids
+            ),
         }
 
 
@@ -698,7 +746,8 @@ class BudgetState:
         return any(
             (
                 self.model_calls >= self.max_model_calls,
-                self.retrieval_rounds >= self.max_retrieval_rounds,
+                self.max_retrieval_rounds > 0
+                and self.retrieval_rounds >= self.max_retrieval_rounds,
                 self.deadline_ms > 0 and self.elapsed_ms >= self.deadline_ms,
                 self.max_measured_tokens > 0
                 and self.measured_tokens >= self.max_measured_tokens,
@@ -898,12 +947,119 @@ def _binding_signature(binding: SubjectBinding) -> tuple[object, ...]:
         binding.participant_key,
         binding.candidate_participant_keys,
         binding.source_keys,
+        binding.valid_at,
+    )
+
+
+def _validate_current_visible_evidence(
+    current: ReconstructionContract,
+    *,
+    previous: ReconstructionContract | None,
+    current_visible_source_keys: set[str] | None,
+) -> None:
+    """Reject evidence first attached without its record being in this call.
+
+    ``allowed_source_keys`` is the snapshot-wide authorization boundary.  It is
+    deliberately broader than the records serialized into any one bounded ECCR
+    prompt.  This second, host-owned boundary prevents a model from using a key it
+    merely saw in the global allowlist as if it had inspected that source.  Evidence
+    already validated on the preceding contract may be retained without being
+    serialized again.
+    """
+
+    if current_visible_source_keys is None:
+        return
+    visible = set(current_visible_source_keys)
+
+    def require_new_visible(
+        field: str,
+        values: Iterable[str],
+        previous_values: Iterable[str] = (),
+    ) -> None:
+        additions = set(values) - set(previous_values)
+        missing = sorted(additions - visible)
+        if missing:
+            sample = ", ".join(missing[:4])
+            suffix = " ..." if len(missing) > 4 else ""
+            raise ValueError(
+                f"{field} attached evidence not visible in this call: "
+                f"{sample}{suffix}"
+            )
+
+    old_subjects = (
+        {item.reference.casefold(): item for item in previous.subjects}
+        if previous is not None
+        else {}
+    )
+    for item in current.subjects:
+        old = old_subjects.get(item.reference.casefold())
+        require_new_visible(
+            f"subject binding {item.reference}.source_keys",
+            item.source_keys,
+            old.source_keys if old is not None else (),
+        )
+
+    old_obligations = (
+        {item.obligation_id: item for item in previous.obligations}
+        if previous is not None
+        else {}
+    )
+    for item in current.obligations:
+        old = old_obligations.get(item.obligation_id)
+        require_new_visible(
+            f"obligation {item.obligation_id}.support_keys",
+            item.support_keys,
+            old.support_keys if old is not None else (),
+        )
+        require_new_visible(
+            f"obligation {item.obligation_id}.counter_keys",
+            item.counter_keys,
+            old.counter_keys if old is not None else (),
+        )
+
+    old_interpretations = (
+        {item.interpretation_id: item for item in previous.interpretations}
+        if previous is not None
+        else {}
+    )
+    for item in current.interpretations:
+        old = old_interpretations.get(item.interpretation_id)
+        require_new_visible(
+            f"interpretation {item.interpretation_id}.support_keys",
+            item.support_keys,
+            old.support_keys if old is not None else (),
+        )
+        require_new_visible(
+            f"interpretation {item.interpretation_id}.counter_keys",
+            item.counter_keys,
+            old.counter_keys if old is not None else (),
+        )
+
+    old_uncertainties = (
+        {item.constraint_id: item for item in previous.uncertainties}
+        if previous is not None
+        else {}
+    )
+    for item in current.uncertainties:
+        old = old_uncertainties.get(item.constraint_id)
+        require_new_visible(
+            f"uncertainty {item.constraint_id}.source_keys",
+            item.source_keys,
+            old.source_keys if old is not None else (),
+        )
+
+    require_new_visible(
+        "contract.visited_source_keys",
+        current.visited_source_keys,
+        previous.visited_source_keys if previous is not None else (),
     )
 
 
 def _validate_transition(
     previous: ReconstructionContract,
     current: ReconstructionContract,
+    *,
+    current_visible_source_keys: set[str] | None = None,
 ) -> None:
     immutable = (
         ("contract_id", previous.contract_id, current.contract_id),
@@ -924,22 +1080,16 @@ def _validate_transition(
     ):
         raise ValueError("contract transition removed tried action signatures")
 
+    _validate_current_visible_evidence(
+        current,
+        previous=previous,
+        current_visible_source_keys=current_visible_source_keys,
+    )
+
     old_obligations = {item.obligation_id: item for item in previous.obligations}
     new_obligations = {item.obligation_id: item for item in current.obligations}
     if old_obligations.keys() != new_obligations.keys():
         raise ValueError("contract transition changed the obligation set")
-    binding_changed = {
-        item.reference.casefold(): _binding_signature(item)
-        for item in previous.subjects
-    } != {
-        item.reference.casefold(): _binding_signature(item) for item in current.subjects
-    }
-    frontier_progress = bool(
-        set(current.exhausted_discriminators)
-        - set(previous.exhausted_discriminators)
-        or set(current.tried_action_signatures)
-        - set(previous.tried_action_signatures)
-    )
     old_subjects = {item.reference.casefold(): item for item in previous.subjects}
     new_subjects = {item.reference.casefold(): item for item in current.subjects}
     if old_subjects.keys() != new_subjects.keys():
@@ -948,23 +1098,17 @@ def _validate_transition(
         new_subject = new_subjects[reference]
         if not set(old_subject.source_keys).issubset(new_subject.source_keys):
             raise ValueError(f"subject binding {reference} removed evidence")
-        if old_subject.mode in {"HOST", "STRUCTURED_REF"} and (
+        if old_subject.mode in {"HOST", "STRUCTURED_REF", "UNIQUE_ALIAS"} and (
             new_subject.mode != old_subject.mode
             or new_subject.participant_key != old_subject.participant_key
+            or new_subject.valid_at != old_subject.valid_at
         ):
             raise ValueError(
-                f"subject binding {reference} attempted to rewrite host identity"
+                f"subject binding {reference} attempted to rewrite host identity "
+                "or resolved binding"
             )
         if _binding_signature(old_subject) != _binding_signature(new_subject):
-            if not (
-                set(new_subject.source_keys) - set(old_subject.source_keys)
-                or new_subject.mode in {"HOST", "STRUCTURED_REF"}
-                or (
-                    new_subject.mode == "AMBIGUOUS"
-                    and new_subject.candidate_participant_keys
-                    != old_subject.candidate_participant_keys
-                )
-            ):
+            if not set(new_subject.source_keys) - set(old_subject.source_keys):
                 raise ValueError(
                     f"subject binding {reference} changed without host evidence"
                 )
@@ -980,38 +1124,27 @@ def _validate_transition(
             old.counter_keys
         ).issubset(new.counter_keys):
             raise ValueError(f"obligation {obligation_id} removed evidence")
-        if old.status != new.status:
+        if old.status == new.status:
+            if new.last_changed_step != old.last_changed_step:
+                raise ValueError(
+                    f"obligation {obligation_id} changed last_changed_step "
+                    "without a status transition"
+                )
+        else:
             has_new_evidence = bool(
                 set(new.support_keys) - set(old.support_keys)
                 or set(new.counter_keys) - set(old.counter_keys)
             )
-            existing_evidence_supports_target = bool(
-                (new.status == "SUPPORTED" and new.support_keys)
-                or (new.status == "REFUTED" and new.counter_keys)
-                or (
-                    new.status == "CONTESTED"
-                    and new.support_keys
-                    and new.counter_keys
-                )
-                or (
-                    new.status in {"OPEN", "AMBIGUOUS"}
-                    and (new.support_keys or new.counter_keys)
-                )
-            )
-            if new.status == "EXHAUSTED":
-                transition_is_grounded = frontier_progress
-            elif new.status == "AMBIGUOUS":
-                transition_is_grounded = has_new_evidence or (
-                    binding_changed and old.kind == "identity"
-                ) or (frontier_progress and existing_evidence_supports_target)
-            else:
-                transition_is_grounded = has_new_evidence or (
-                    binding_changed and old.kind == "identity"
-                ) or (frontier_progress and existing_evidence_supports_target)
-            if not transition_is_grounded:
+            # The current contract stores tried/exhausted discriminators globally,
+            # not per obligation.  They therefore cannot prove that an unrelated
+            # retrieval exhausted this obligation.  Until the schema carries that
+            # association, every status transition needs evidence newly attached
+            # to this obligation; evidence union from an earlier turn must not
+            # make a model-only reclassification look grounded.
+            if not has_new_evidence:
                 raise ValueError(
                     f"obligation {obligation_id} changed status without new evidence "
-                    "or a host-observable frontier/binding transition"
+                    "bound to that obligation"
                 )
             if new.last_changed_step != current.step_index:
                 raise ValueError(
@@ -1024,38 +1157,75 @@ def _validate_transition(
     new_interpretations = {
         item.interpretation_id: item for item in current.interpretations
     }
-    if old_interpretations.keys() != new_interpretations.keys():
-        raise ValueError("contract transition changed the interpretation set")
+    if not old_interpretations.keys() <= new_interpretations.keys():
+        raise ValueError("contract transition removed an interpretation")
+    newly_visited_sources = set(current.visited_source_keys) - set(
+        previous.visited_source_keys
+    )
+    discovery_grounding_sources = (
+        newly_visited_sources
+        if current_visible_source_keys is None
+        else newly_visited_sources & current_visible_source_keys
+    )
+    discovery_grounding_label = (
+        "newly visited evidence"
+        if current_visible_source_keys is None
+        else "newly visited evidence visible in its discovery call"
+    )
+    for item_id in new_interpretations.keys() - old_interpretations.keys():
+        new_item = new_interpretations[item_id]
+        cited = set(new_item.support_keys) | set(new_item.counter_keys)
+        if new_item.origin != "AUDIT_DISCOVERY":
+            raise ValueError(
+                f"new interpretation {item_id} must originate from AUDIT_DISCOVERY"
+            )
+        if new_item.status not in {"CANDIDATE", "CONTESTED", "UNRESOLVED"}:
+            raise ValueError(
+                f"audit interpretation {item_id} cannot be promoted in its discovery round"
+            )
+        if not cited.intersection(discovery_grounding_sources):
+            raise ValueError(
+                f"audit interpretation {item_id} must cite "
+                f"{discovery_grounding_label}"
+            )
+        if not new_item.discriminates_interpretation_ids or not set(
+            new_item.discriminates_interpretation_ids
+        ).issubset(old_interpretations):
+            raise ValueError(
+                f"audit interpretation {item_id} must discriminate an existing interpretation"
+            )
+        if not new_item.uncertainty:
+            raise ValueError(
+                f"audit interpretation {item_id} must preserve explicit uncertainty"
+            )
     for item_id, old_item in old_interpretations.items():
         new_item = new_interpretations[item_id]
-        if old_item.statement != new_item.statement:
+        if (
+            old_item.statement != new_item.statement
+            or old_item.origin != new_item.origin
+            or old_item.discriminates_interpretation_ids
+            != new_item.discriminates_interpretation_ids
+        ):
             raise ValueError(f"contract transition rewrote interpretation {item_id}")
         if not set(old_item.support_keys).issubset(new_item.support_keys) or not set(
             old_item.counter_keys
         ).issubset(new_item.counter_keys):
             raise ValueError(f"interpretation {item_id} removed evidence")
-        if (
-            old_item.status != new_item.status
-            or old_item.uncertainty != new_item.uncertainty
-        ) and not (
+        new_interpretation_evidence = bool(
             set(new_item.support_keys) - set(old_item.support_keys)
             or set(new_item.counter_keys) - set(old_item.counter_keys)
-            or (new_item.status == "UNRESOLVED" and frontier_progress)
-            or (
-                frontier_progress
-                and (
-                    (new_item.status == "SUPPORTED" and new_item.support_keys)
-                    or (new_item.status == "REFUTED" and new_item.counter_keys)
-                    or (
-                        new_item.status == "CONTESTED"
-                        and new_item.support_keys
-                        and new_item.counter_keys
-                    )
-                )
+        )
+        if old_item.status != new_item.status and not new_interpretation_evidence:
+            raise ValueError(
+                f"interpretation {item_id} changed without new evidence bound to it"
             )
+        if (
+            old_item.uncertainty != new_item.uncertainty
+            and old_item.status == new_item.status
+            and not new_interpretation_evidence
         ):
             raise ValueError(
-                f"interpretation {item_id} changed without new evidence"
+                f"interpretation {item_id} changed uncertainty without new evidence"
             )
 
     old_uncertainties = {
@@ -1064,17 +1234,42 @@ def _validate_transition(
     new_uncertainties = {
         item.constraint_id: item for item in current.uncertainties
     }
-    if old_uncertainties.keys() != new_uncertainties.keys():
-        raise ValueError("contract transition changed the uncertainty set")
+    if not old_uncertainties.keys() <= new_uncertainties.keys():
+        raise ValueError("contract transition removed an uncertainty")
+    for item_id in new_uncertainties.keys() - old_uncertainties.keys():
+        new_item = new_uncertainties[item_id]
+        if new_item.origin != "AUDIT_DISCOVERY":
+            raise ValueError(
+                f"new uncertainty {item_id} must originate from AUDIT_DISCOVERY"
+            )
+        if new_item.status not in {"OPEN", "PRESERVED"}:
+            raise ValueError(
+                f"audit uncertainty {item_id} cannot be resolved in its discovery round"
+            )
+        if not set(new_item.source_keys).intersection(discovery_grounding_sources):
+            raise ValueError(
+                f"audit uncertainty {item_id} must cite "
+                f"{discovery_grounding_label}"
+            )
+        if not new_item.discriminates_interpretation_ids or not set(
+            new_item.discriminates_interpretation_ids
+        ).issubset(old_interpretations):
+            raise ValueError(
+                f"audit uncertainty {item_id} must discriminate an existing interpretation"
+            )
     for item_id, old_item in old_uncertainties.items():
         new_item = new_uncertainties[item_id]
-        if old_item.statement != new_item.statement:
+        if (
+            old_item.statement != new_item.statement
+            or old_item.origin != new_item.origin
+            or old_item.discriminates_interpretation_ids
+            != new_item.discriminates_interpretation_ids
+        ):
             raise ValueError(f"contract transition rewrote uncertainty {item_id}")
         if not set(old_item.source_keys).issubset(new_item.source_keys):
             raise ValueError(f"uncertainty {item_id} removed evidence")
         if old_item.status != new_item.status and not (
             set(new_item.source_keys) - set(old_item.source_keys)
-            or (new_item.status == "PRESERVED" and frontier_progress)
         ):
             raise ValueError(f"uncertainty {item_id} changed without new evidence")
     if previous.guarded_claims != current.guarded_claims:
@@ -1125,6 +1320,7 @@ def parse_contract_turn(
     allowed_tool_names: Iterable[str] = (),
     previous: ReconstructionContract | None = None,
     tried_action_signatures: Iterable[str] = (),
+    current_visible_source_keys: Iterable[str] | None = None,
     max_actions: int = 3,
 ) -> ContractTurn:
     raw = _extract_object(value)
@@ -1140,8 +1336,27 @@ def parse_contract_turn(
             int(item) for item in allowed_hypothesis_ids if int(item) > 0
         },
     )
-    if previous is not None:
-        _validate_transition(previous, contract)
+    visible_sources = (
+        None
+        if current_visible_source_keys is None
+        else {
+            str(item) for item in current_visible_source_keys if str(item)
+        }
+    )
+    if visible_sources is not None and not visible_sources.issubset(allowed_sources):
+        raise ValueError("current visible evidence exceeds the source allowlist")
+    if previous is None:
+        _validate_current_visible_evidence(
+            contract,
+            previous=None,
+            current_visible_source_keys=visible_sources,
+        )
+    else:
+        _validate_transition(
+            previous,
+            contract,
+            current_visible_source_keys=visible_sources,
+        )
     required_tried = {str(item) for item in tried_action_signatures if str(item)}
     if not required_tried.issubset(contract.tried_action_signatures):
         raise ValueError("contract omitted a host-recorded tried action signature")
@@ -1206,6 +1421,30 @@ def parse_contract_turn(
             raise ValueError(
                 "terminal closure requires an explicit unresolved brief for every "
                 "critical conflict or uncertainty"
+            )
+        audit_sources = {
+            source
+            for item in contract.interpretations
+            if item.origin == "AUDIT_DISCOVERY"
+            for source in (*item.support_keys, *item.counter_keys)
+        } | {
+            source
+            for item in contract.uncertainties
+            if item.origin == "AUDIT_DISCOVERY"
+            for source in item.source_keys
+        }
+        qualification_sources = (
+            {
+                source
+                for item in (*brief.conflicts, *brief.unresolved)
+                for source in item.source_keys
+            }
+            if brief is not None
+            else set()
+        )
+        if audit_sources and not audit_sources.intersection(qualification_sources):
+            raise ValueError(
+                "terminal audit discovery must remain explicit in conflicts or unresolved"
             )
     return turn
 

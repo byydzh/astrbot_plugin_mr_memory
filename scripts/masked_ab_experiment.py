@@ -3267,12 +3267,27 @@ def _validate_base_provenance(
     }
 
 
+def _load_pilot_gold(
+    path: str | Path | None, *, generation_only: bool
+) -> dict[str, Any] | None:
+    """Open the evaluation reference only outside provider-generation mode."""
+
+    if generation_only:
+        return None
+    if path is None:
+        raise ValueError("gold path is required for post-generation evaluation")
+    return _load_json(path)
+
+
 def pilot(args: argparse.Namespace) -> dict[str, Any]:
     """Run a resumable, provenance-bound reconstruction pilot."""
 
+    generation_only = bool(getattr(args, "generation_only", False))
+    if not generation_only and not getattr(args, "gold", None):
+        raise ValueError("--gold is required unless --generation-only is set")
     call = _load_json(args.call)
     candidates = _load_json(args.candidates)
-    gold = _load_json(args.gold)
+    gold = _load_pilot_gold(args.gold, generation_only=generation_only)
     records = list(iter_jsonl(args.messages))
     umo = str(call["umo"])
     cutoff_at = int(call["cutoff_at"])
@@ -3334,19 +3349,30 @@ def pilot(args: argparse.Namespace) -> dict[str, Any]:
         )
     if int(base_audit["cutoff_audit"]["messages"]) != int(record_audit["messages"]):
         raise ValueError("messages fixture and masked database counts differ")
-    gold_audit = _validate_gold_sources(
-        base_v15,
-        umo=umo,
-        cutoff_at=cutoff_at,
-        gold=gold,
-    )
-    base_provenance = _validate_base_provenance(
-        gold=gold,
-        source_sha256=str(base_audit["source_sha256"]),
-        messages_sha256=_file_sha256(args.messages),
-        candidates_sha256=_file_sha256(args.candidates),
-        cutoff_audit=dict(base_audit["cutoff_audit"]),
-    )
+    if generation_only:
+        gold_audit = None
+        base_provenance = {
+            "status": "GENERATION_INPUTS_FROZEN_GOLD_NOT_OPENED",
+            "source_sha256": str(base_audit["source_sha256"]),
+            "messages_sha256": _file_sha256(args.messages),
+            "candidates_sha256": _file_sha256(args.candidates),
+            "cutoff_audit_sha256": _stable_json_hash(base_audit["cutoff_audit"]),
+        }
+    else:
+        assert isinstance(gold, dict)
+        gold_audit = _validate_gold_sources(
+            base_v15,
+            umo=umo,
+            cutoff_at=cutoff_at,
+            gold=gold,
+        )
+        base_provenance = _validate_base_provenance(
+            gold=gold,
+            source_sha256=str(base_audit["source_sha256"]),
+            messages_sha256=_file_sha256(args.messages),
+            candidates_sha256=_file_sha256(args.candidates),
+            cutoff_audit=dict(base_audit["cutoff_audit"]),
+        )
     client = None
     model = ""
     provider_extra_body: dict[str, Any] = {}
@@ -3374,18 +3400,27 @@ def pilot(args: argparse.Namespace) -> dict[str, Any]:
         "arms": list(arms),
         "repetitions": repetitions,
         "candidate_sha256": _stable_json_hash(candidates),
-        "gold_sha256": _stable_json_hash(gold),
+        "evaluation_status": (
+            "NOT_EVALUATED_GOLD_NOT_OPENED"
+            if generation_only
+            else "POST_GENERATION_GOLD_ATTACHED"
+        ),
+        "gold_sha256": None if generation_only else _stable_json_hash(gold),
         "input_sha256": {
             "call": _file_sha256(args.call),
             "messages": _file_sha256(args.messages),
             "base_db": str(base_audit["source_sha256"]),
             "candidates": _file_sha256(args.candidates),
-            "gold": _file_sha256(args.gold),
+            **({} if generation_only else {"gold": _file_sha256(args.gold)}),
         },
         "base": base_audit,
         "records": record_audit,
         "gold_audit": gold_audit,
         "base_provenance": base_provenance,
+        "gold_access": {
+            "status": "NOT_OPENED" if generation_only else "OPENED",
+            "generation_only": generation_only,
+        },
         "provider": {
             "provider_id": args.subconscious_provider_id,
             "model": model,
@@ -3414,8 +3449,10 @@ def pilot(args: argparse.Namespace) -> dict[str, Any]:
             "cutoff_at",
             "query_sha256",
             "candidate_sha256",
+            "evaluation_status",
             "gold_sha256",
             "input_sha256",
+            "gold_access",
         )
         changed = [
             field
@@ -3632,10 +3669,19 @@ def pilot(args: argparse.Namespace) -> dict[str, Any]:
                     "packet_sha256": current_packet_hash,
                     **value,
                     "source_audit": source_audit,
-                    "gold_score": _score_pilot_gold(
-                        brief=brief,
-                        visited_source_keys=visited,
-                        gold=gold,
+                    "gold_score": (
+                        None
+                        if generation_only
+                        else _score_pilot_gold(
+                            brief=brief,
+                            visited_source_keys=visited,
+                            gold=gold,
+                        )
+                    ),
+                    "evaluation_status": (
+                        "NOT_EVALUATED_GOLD_NOT_OPENED"
+                        if generation_only
+                        else "POST_GENERATION_GOLD_ATTACHED"
                     ),
                     "usage": _pilot_run_usage(ledger_path, run_id),
                 }
@@ -3646,6 +3692,11 @@ def pilot(args: argparse.Namespace) -> dict[str, Any]:
                     "arm": arm,
                     "repetition": repetition,
                     "status": "FAILED",
+                    "evaluation_status": (
+                        "NOT_EVALUATED_GOLD_NOT_OPENED"
+                        if generation_only
+                        else "POST_GENERATION_EVALUATION_NOT_AVAILABLE"
+                    ),
                     "error_type": type(exc).__name__,
                     "error_detail": str(exc)[:1000],
                     "usage": run_usage,
@@ -3762,7 +3813,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pilot_parser.add_argument("--messages", required=True)
     pilot_parser.add_argument("--base-db", required=True)
     pilot_parser.add_argument("--candidates", required=True)
-    pilot_parser.add_argument("--gold", required=True)
+    pilot_parser.add_argument("--gold")
+    pilot_parser.add_argument(
+        "--generation-only",
+        action="store_true",
+        help="Do not open or score against gold during provider generation.",
+    )
     pilot_parser.add_argument("--config", required=True)
     pilot_parser.add_argument("--output-dir", required=True)
     pilot_parser.add_argument(

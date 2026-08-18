@@ -523,6 +523,85 @@ class FeedbackMemoryTests(unittest.TestCase):
             [],
         )
 
+    def test_snapshot_excludes_a_hypothesis_revised_by_future_evidence(self) -> None:
+        self.open_trace(
+            "trace-historical-1",
+            request_id="req-historical-1",
+            query="继续",
+            sender_id="user-a",
+            sent_at=100,
+            response="要不要继续？",
+        )
+        first = self.learn(
+            trace_id="trace-historical-1",
+            feedback_id="feedback-historical-1",
+            feedback_text="不要反问",
+            feedback_at=110,
+            cue="直接完成回答，不要反问是否继续。",
+            sender_id="user-a",
+        )
+        hypothesis_id = int(first["hypothesis_id"])
+        frozen_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo = ?",
+                (self.umo,),
+            ).fetchone()[0]
+        )
+        before_revision = self.storage.feedback_hypothesis_candidates(
+            umo=self.umo,
+            sender_id="user-a",
+            at=150,
+            message_upper_bound=frozen_upper_bound,
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in before_revision],
+            [hypothesis_id],
+        )
+
+        self.open_trace(
+            "trace-historical-2",
+            request_id="req-historical-2",
+            query="继续",
+            sender_id="user-a",
+            sent_at=200,
+            response="还是要不要继续？",
+        )
+        second = self.learn(
+            trace_id="trace-historical-2",
+            feedback_id="feedback-historical-2",
+            feedback_text="不要反问",
+            feedback_at=210,
+            cue="直接完成回答，不要反问是否继续。",
+            sender_id="user-a",
+        )
+        self.assertEqual(int(second["hypothesis_id"]), hypothesis_id)
+        self.assertEqual(
+            self.storage.feedback_hypothesis_candidates(
+                umo=self.umo,
+                sender_id="user-a",
+                at=150,
+                message_upper_bound=frozen_upper_bound,
+            ),
+            [],
+            "a mutable head revised after the snapshot must not time-travel",
+        )
+        self.assertEqual(
+            self.storage.feedback_hypothesis_candidates(
+                umo=self.umo,
+                sender_id="user-a",
+                at=250,
+                message_upper_bound=frozen_upper_bound,
+            ),
+            [],
+            "the row upper bound must also reject late evidence with old time",
+        )
+        current = self.storage.feedback_hypothesis_candidates(
+            umo=self.umo,
+            sender_id="user-a",
+            at=250,
+        )
+        self.assertEqual([int(row["id"]) for row in current], [hypothesis_id])
+
     def test_inspection_redacts_media_urls_and_merge_is_reversible(self) -> None:
         self.open_trace(
             "trace-1",

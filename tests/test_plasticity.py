@@ -177,6 +177,44 @@ class PlasticGraphTests(unittest.TestCase):
             [(1, "群内用法")],
         )
 
+    def test_snapshot_bound_edge_rejects_future_reinforcement(self) -> None:
+        now = int(time.time())
+        cutoff = now + 60
+        old = self.message("old-edge", "旧证据", sent_at=now - 60)
+        future = self.message("future-edge", "未来补强", sent_at=cutoff + 60)
+        self.storage.upsert_message(old)
+        self.storage.upsert_message(future)
+        self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(
+                self.edge_payload(old.resolved_source_key())
+            ),
+        )
+        self.assertEqual(
+            len(
+                self.storage.query_plastic_associations(
+                    umo=self.umo,
+                    query="好女孩",
+                    before_sent_at=cutoff,
+                )
+            ),
+            1,
+        )
+        repeated = self.edge_payload(future.resolved_source_key())
+        repeated["statement"] = "未来时点才形成的新解释。"
+        self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(repeated),
+        )
+        self.assertEqual(
+            self.storage.query_plastic_associations(
+                umo=self.umo,
+                query="好女孩",
+                before_sent_at=cutoff,
+            ),
+            [],
+        )
+
     def test_competing_meanings_keep_doubt_until_evidence_revision(self) -> None:
         first = self.message("e-1", "鉴定为好女孩", sent_at=100)
         second = self.message("e-2", "这里的好女孩是不是反话？", sent_at=110)

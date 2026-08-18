@@ -43,13 +43,17 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertEqual(self.schema["maintenance_interval_minutes"]["default"], 1440)
         self.assertEqual(self.schema["maintenance_interval_seconds"]["default"], 86400)
 
-    def test_every_request_contract_requires_the_private_semantic_model(self) -> None:
+    def test_layered_runtime_exposes_host_owned_routing(self) -> None:
         wake_hint = str(self.schema["runtime_wake_mode"]["hint"])
         budget_hint = str(self.schema["private_daily_token_budget"]["hint"])
         main_source = (Path.cwd() / "main.py").read_text(encoding="utf-8")
-        self.assertIn("独立记忆模型完整判断", wake_hint)
-        self.assertIn("每次回答前的记忆判断", budget_hint)
-        self.assertIn("self._run_fast_reconstruction_with_ledger(", main_source)
+        self.assertIn("low_latency", wake_hint)
+        self.assertIn("balanced", wake_hint)
+        self.assertIn("research", wake_hint)
+        self.assertIn("manual_only", wake_hint)
+        self.assertTrue(budget_hint)
+        self.assertIn("self._execute_layered_reconstruction(", main_source)
+        self.assertIn("RoutePolicy(", main_source)
         self.assertNotIn("materialize_reconstruction_packet(", main_source)
 
     def test_umo_guidance_uses_platform_instance_id(self) -> None:

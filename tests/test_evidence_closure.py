@@ -150,6 +150,193 @@ class EvidenceClosureTests(unittest.TestCase):
             allowed_tool_names=self.allowed_tools,
         )
 
+    def test_resolved_subject_canonicalizes_a_redundant_single_candidate(self) -> None:
+        contract = self.contract()
+        contract["subjects"][0]["candidate_participant_keys"] = ["participant:a"]
+        parsed = parse_contract_turn(
+            self.turn(contract, actions=[self.action()]),
+            allowed_source_keys={"source-1"},
+            allowed_participant_keys={"participant:a", "participant:b"},
+            allowed_tool_names=self.allowed_tools,
+        )
+        self.assertEqual(parsed.contract.subjects[0].participant_key, "participant:a")
+        self.assertEqual(parsed.contract.subjects[0].candidate_participant_keys, ())
+
+        unsafe = self.contract()
+        unsafe["subjects"][0]["candidate_participant_keys"] = [
+            "participant:a",
+            "participant:b",
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly one participant_key"):
+            parse_contract_turn(
+                self.turn(unsafe, actions=[self.action()]),
+                allowed_source_keys={"source-1"},
+                allowed_participant_keys={"participant:a", "participant:b"},
+                allowed_tool_names=self.allowed_tools,
+            )
+
+    def test_status_direction_must_match_each_items_evidence_sides(self) -> None:
+        invalid_obligations = (
+            ("SUPPORTED", ["source-1"], ["source-2"], "retain counterevidence"),
+            ("REFUTED", ["source-1"], ["source-2"], "retain supporting evidence"),
+            ("CONTESTED", ["source-1"], [], "both evidence sides"),
+        )
+        for status, support, counter, message in invalid_obligations:
+            with self.subTest(kind="obligation", status=status):
+                contract = self.contract(
+                    obligation_status=status,
+                    support_keys=support,
+                    counter_keys=counter,
+                    visited=["source-1", "source-2"],
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_contract_turn(
+                        self.turn(contract),
+                        allowed_source_keys={"source-1", "source-2"},
+                        allowed_participant_keys={"participant:a"},
+                        allowed_tool_names=self.allowed_tools,
+                    )
+
+        invalid_interpretations = (
+            ("SUPPORTED", ["source-1"], ["source-2"], "retain counterevidence"),
+            ("REFUTED", ["source-1"], ["source-2"], "retain supporting evidence"),
+            ("CONTESTED", ["source-1"], [], "both evidence sides"),
+        )
+        for status, support, counter, message in invalid_interpretations:
+            with self.subTest(kind="interpretation", status=status):
+                contract = self.contract(visited=["source-1", "source-2"])
+                contract["interpretations"][0].update(
+                    {
+                        "status": status,
+                        "support_keys": support,
+                        "counter_keys": counter,
+                    }
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_contract_turn(
+                        self.turn(contract),
+                        allowed_source_keys={"source-1", "source-2"},
+                        allowed_participant_keys={"participant:a"},
+                        allowed_tool_names=self.allowed_tools,
+                    )
+
+    def test_resolved_subject_modes_freeze_identity_mode_and_valid_time(self) -> None:
+        for mode in ("HOST", "STRUCTURED_REF", "UNIQUE_ALIAS"):
+            with self.subTest(mode=mode):
+                initial_contract = self.contract()
+                initial_contract["subjects"][0]["mode"] = mode
+                initial = parse_contract_turn(
+                    self.turn(initial_contract),
+                    allowed_source_keys={"source-identity"},
+                    allowed_participant_keys={"participant:a", "participant:b"},
+                    allowed_tool_names=self.allowed_tools,
+                )
+
+                augmented = self.contract(step=1, visited=["source-identity"])
+                augmented["subjects"][0].update(
+                    {"mode": mode, "source_keys": ["source-identity"]}
+                )
+                parsed = parse_contract_turn(
+                    self.turn(augmented),
+                    allowed_source_keys={"source-identity"},
+                    allowed_participant_keys={"participant:a", "participant:b"},
+                    allowed_tool_names=self.allowed_tools,
+                    previous=initial.contract,
+                )
+                self.assertEqual(parsed.contract.subjects[0].mode, mode)
+
+                mutations = (
+                    {"participant_key": "participant:b"},
+                    {"mode": "HOST" if mode != "HOST" else "UNIQUE_ALIAS"},
+                    {"valid_at": 123401},
+                )
+                for mutation in mutations:
+                    rewritten = copy.deepcopy(augmented)
+                    rewritten["subjects"][0].update(mutation)
+                    with self.assertRaisesRegex(ValueError, "resolved binding"):
+                        parse_contract_turn(
+                            self.turn(rewritten),
+                            allowed_source_keys={"source-identity"},
+                            allowed_participant_keys={
+                                "participant:a",
+                                "participant:b",
+                            },
+                            allowed_tool_names=self.allowed_tools,
+                            previous=initial.contract,
+                        )
+
+    def test_ambiguous_candidate_changes_require_new_binding_evidence(self) -> None:
+        subject = {
+            "reference": "群内称呼",
+            "participant_key": "",
+            "mode": "AMBIGUOUS",
+            "candidate_participant_keys": ["participant:a", "participant:b"],
+            "source_keys": ["source-old"],
+            "valid_at": 123400,
+        }
+        initial_contract = self.contract(
+            subject=subject,
+            visited=["source-old"],
+        )
+        initial = parse_contract_turn(
+            self.turn(initial_contract),
+            allowed_source_keys={"source-old", "source-new"},
+            allowed_participant_keys={
+                "participant:a",
+                "participant:b",
+                "participant:c",
+            },
+            allowed_tool_names=self.allowed_tools,
+        )
+        changed = copy.deepcopy(initial_contract)
+        changed["step_index"] = 1
+        changed["subjects"][0]["candidate_participant_keys"] = [
+            "participant:b",
+            "participant:c",
+        ]
+        with self.assertRaisesRegex(ValueError, "without host evidence"):
+            parse_contract_turn(
+                self.turn(changed),
+                allowed_source_keys={"source-old", "source-new"},
+                allowed_participant_keys={
+                    "participant:a",
+                    "participant:b",
+                    "participant:c",
+                },
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+            )
+
+        changed["subjects"][0]["source_keys"] = ["source-old", "source-new"]
+        changed["visited_source_keys"] = ["source-old", "source-new"]
+        parsed = parse_contract_turn(
+            self.turn(changed),
+            allowed_source_keys={"source-old", "source-new"},
+            allowed_participant_keys={
+                "participant:a",
+                "participant:b",
+                "participant:c",
+            },
+            allowed_tool_names=self.allowed_tools,
+            previous=initial.contract,
+        )
+        self.assertEqual(
+            parsed.contract.subjects[0].candidate_participant_keys,
+            ("participant:b", "participant:c"),
+        )
+
+    def test_unchanged_obligation_cannot_drift_last_changed_step(self) -> None:
+        initial = self.parse_initial()
+        drifted = self.contract(step=1, last_changed_step=1)
+        with self.assertRaisesRegex(ValueError, "without a status transition"):
+            parse_contract_turn(
+                self.turn(drifted),
+                allowed_source_keys={"source-1", "source-2"},
+                allowed_participant_keys={"participant:a", "participant:b"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+            )
+
     def test_grounded_transition_closes_with_auditable_uncertainty(self) -> None:
         initial = self.parse_initial()
         signature = initial.actions[0].signature()
@@ -192,7 +379,7 @@ class EvidenceClosureTests(unittest.TestCase):
         self.assertTrue(final.terminal)
         self.assertEqual(final.contract.obligations[0].status, "SUPPORTED")
 
-    def test_frontier_progress_can_close_on_already_selected_evidence(self) -> None:
+    def test_frontier_progress_cannot_reclassify_already_selected_evidence(self) -> None:
         initial_contract = self.contract(
             support_keys=["source-1"],
             visited=["source-1"],
@@ -214,44 +401,15 @@ class EvidenceClosureTests(unittest.TestCase):
             tried=[signature],
             frontier=[],
         )
-        final = compile_or_update_contract(
-            self.turn(
-                final_contract,
-                brief={
-                    "claims": [
-                        {
-                            "statement": "桥接检索验证了已选证据的归属。",
-                            "source_keys": ["source-1"],
-                            "confidence": 0.7,
-                        }
-                    ],
-                    "conflicts": [],
-                    "unresolved": [
-                        {
-                            "statement": "桥接本身没有产生新的原始消息。",
-                            "source_keys": ["source-1"],
-                        }
-                    ],
-                },
-                terminal=True,
-            ),
-            allowed_source_keys={"source-1"},
-            allowed_participant_keys={"participant:a"},
-            allowed_tool_names=self.allowed_tools,
-            previous=initial.contract,
-            tried_action_signatures={signature},
-        )
-        self.assertEqual(final.contract.obligations[0].status, "SUPPORTED")
-        self.assertEqual(final.contract.interpretations[0].status, "SUPPORTED")
-        self.assertEqual(final.contract.tried_action_signatures, (signature,))
-        self.assertIsNotNone(final.brief)
-        stop = should_stop(
-            final.contract,
-            actions=final.actions,
-            budget=BudgetState(2, 3, 1, 2),
-        )
-        self.assertEqual(stop.reason, "CERTIFIED_CLOSE")
-        self.assertFalse(stop.force_unresolved)
+        with self.assertRaisesRegex(ValueError, "without new evidence"):
+            compile_or_update_contract(
+                self.turn(final_contract, terminal=True),
+                allowed_source_keys={"source-1"},
+                allowed_participant_keys={"participant:a"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+                tried_action_signatures={signature},
+            )
 
     def test_terminal_turn_cannot_silently_drop_preserved_uncertainty(self) -> None:
         initial = self.parse_initial()
@@ -358,7 +516,9 @@ class EvidenceClosureTests(unittest.TestCase):
                 allowed_tool_names=self.allowed_tools,
             )
 
-    def test_open_to_exhausted_is_grounded_by_frontier_exhaustion_not_source(self) -> None:
+    def test_global_frontier_does_not_ground_exhaustion_without_bound_evidence(
+        self,
+    ) -> None:
         initial_contract = self.contract(
             visited=["source-context"],
             with_uncertainty=False,
@@ -383,22 +543,35 @@ class EvidenceClosureTests(unittest.TestCase):
             visited=["source-context"],
             with_uncertainty=False,
         )
+        with self.assertRaisesRegex(ValueError, "bound to that obligation"):
+            parse_contract_turn(
+                self.turn(exhausted, terminal=True),
+                allowed_source_keys={"source-context"},
+                allowed_participant_keys={"participant:a"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+                tried_action_signatures={signature},
+            )
+
+        grounded = copy.deepcopy(exhausted)
+        grounded["obligations"][0]["support_keys"] = ["source-exhaustion"]
+        grounded["visited_source_keys"] = ["source-context", "source-exhaustion"]
         final = parse_contract_turn(
             self.turn(
-                exhausted,
+                grounded,
                 brief={
                     "claims": [],
                     "conflicts": [],
                     "unresolved": [
                         {
-                            "statement": "现有证据不足以闭合目标语义。",
-                            "source_keys": ["source-context"],
+                            "statement": "新返回证据仍不足以闭合目标语义。",
+                            "source_keys": ["source-exhaustion"],
                         }
                     ],
                 },
                 terminal=True,
             ),
-            allowed_source_keys={"source-context"},
+            allowed_source_keys={"source-context", "source-exhaustion"},
             allowed_participant_keys={"participant:a"},
             allowed_tool_names=self.allowed_tools,
             previous=initial.contract,
@@ -410,7 +583,7 @@ class EvidenceClosureTests(unittest.TestCase):
         ungrounded = copy.deepcopy(exhausted)
         ungrounded["tried_action_signatures"] = []
         ungrounded["exhausted_discriminators"] = []
-        with self.assertRaisesRegex(ValueError, "frontier/binding transition"):
+        with self.assertRaisesRegex(ValueError, "bound to that obligation"):
             parse_contract_turn(
                 self.turn(ungrounded, terminal=True),
                 allowed_source_keys={"source-context"},
@@ -418,6 +591,56 @@ class EvidenceClosureTests(unittest.TestCase):
                 allowed_tool_names=self.allowed_tools,
                 previous=initial.contract,
             )
+
+    def test_global_frontier_cannot_mark_unrelated_interpretation_unresolved(
+        self,
+    ) -> None:
+        initial_contract = self.contract(visited=["source-old"])
+        initial_contract["interpretations"][0]["support_keys"] = ["source-old"]
+        initial = parse_contract_turn(
+            self.turn(initial_contract, actions=[self.action()]),
+            allowed_source_keys={"source-old", "source-new"},
+            allowed_participant_keys={"participant:a"},
+            allowed_tool_names=self.allowed_tools,
+        )
+        signature = initial.actions[0].signature()
+
+        unrelated = copy.deepcopy(initial_contract)
+        unrelated["step_index"] = 1
+        unrelated["tried_action_signatures"] = [signature]
+        unrelated["exhausted_discriminators"] = [
+            "查找后续实际参与证据"
+        ]
+        unrelated["frontier_discriminators"] = []
+        unrelated["interpretations"][0]["status"] = "UNRESOLVED"
+        with self.assertRaisesRegex(ValueError, "evidence bound to it"):
+            parse_contract_turn(
+                self.turn(unrelated),
+                allowed_source_keys={"source-old", "source-new"},
+                allowed_participant_keys={"participant:a"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+                tried_action_signatures={signature},
+            )
+
+        grounded = copy.deepcopy(unrelated)
+        grounded["visited_source_keys"] = ["source-old", "source-new"]
+        grounded["interpretations"][0]["support_keys"] = [
+            "source-old",
+            "source-new",
+        ]
+        parsed = parse_contract_turn(
+            self.turn(grounded),
+            allowed_source_keys={"source-old", "source-new"},
+            allowed_participant_keys={"participant:a"},
+            allowed_tool_names=self.allowed_tools,
+            previous=initial.contract,
+            tried_action_signatures={signature},
+        )
+        self.assertEqual(
+            parsed.contract.interpretations[0].status,
+            "UNRESOLVED",
+        )
 
     def test_identity_ambiguity_is_a_safe_terminal_state(self) -> None:
         unbound = {
@@ -450,10 +673,15 @@ class EvidenceClosureTests(unittest.TestCase):
                     "participant:a",
                     "participant:b",
                 ],
+                "source_keys": ["source-identity"],
             }
         )
         ambiguous["obligations"][0].update(
-            {"status": "AMBIGUOUS", "last_changed_step": 1}
+            {
+                "status": "AMBIGUOUS",
+                "counter_keys": ["source-identity"],
+                "last_changed_step": 1,
+            }
         )
         final = parse_contract_turn(
             self.turn(
@@ -554,11 +782,26 @@ class EvidenceClosureTests(unittest.TestCase):
             "查找后续实际参与证据"
         ]
         exhausted["frontier_discriminators"] = []
+        exhausted["visited_source_keys"] = ["source-context", "source-exhaustion"]
         exhausted["obligations"][0].update(
-            {"status": "EXHAUSTED", "last_changed_step": 1}
+            {
+                "status": "EXHAUSTED",
+                "support_keys": ["source-exhaustion"],
+                "last_changed_step": 1,
+            }
         )
-        exhausted["interpretations"][0]["status"] = "UNRESOLVED"
-        exhausted["uncertainties"][0]["status"] = "PRESERVED"
+        exhausted["interpretations"][0].update(
+            {
+                "status": "UNRESOLVED",
+                "support_keys": ["source-context", "source-exhaustion"],
+            }
+        )
+        exhausted["uncertainties"][0].update(
+            {
+                "status": "PRESERVED",
+                "source_keys": ["source-context", "source-exhaustion"],
+            }
+        )
         final = parse_contract_turn(
             self.turn(
                 exhausted,
@@ -568,13 +811,13 @@ class EvidenceClosureTests(unittest.TestCase):
                     "unresolved": [
                         {
                             "statement": "空结果不能消除原有语义疑虑。",
-                            "source_keys": ["source-context"],
+                            "source_keys": ["source-context", "source-exhaustion"],
                         }
                     ],
                 },
                 terminal=True,
             ),
-            allowed_source_keys={"source-context"},
+            allowed_source_keys={"source-context", "source-exhaustion"},
             allowed_participant_keys={"participant:a"},
             allowed_tool_names=self.allowed_tools,
             previous=initial.contract,
@@ -665,6 +908,81 @@ class EvidenceClosureTests(unittest.TestCase):
         )
         self.assertEqual(exhausted.reason, "BUDGET_EXHAUSTED")
         self.assertTrue(exhausted.force_unresolved)
+
+    def test_audit_discovery_can_add_only_grounded_unpromoted_hypothesis(self) -> None:
+        initial = self.parse_initial()
+        discovered = self.contract(step=1, visited=["source-audit"])
+        discovered["interpretations"].append(
+            {
+                "id": "reading-audit",
+                "statement": "新证据提示侮辱性讳称与后续二次戏仿的竞争解释。",
+                "status": "CANDIDATE",
+                "support_keys": ["source-audit"],
+                "counter_keys": [],
+                "uncertainty": "邻接并非显式共指，只能保留为候选。",
+                "origin": "AUDIT_DISCOVERY",
+                "discriminates_interpretation_ids": ["reading-a"],
+            }
+        )
+        discovered["uncertainties"].append(
+            {
+                "id": "u-audit-link",
+                "statement": "尚未证明两段玩笑由同一隐义连接。",
+                "status": "OPEN",
+                "source_keys": ["source-audit"],
+                "origin": "AUDIT_DISCOVERY",
+                "discriminates_interpretation_ids": ["reading-a"],
+            }
+        )
+        turn = parse_contract_turn(
+            self.turn(discovered),
+            allowed_source_keys={"source-audit"},
+            allowed_participant_keys={"participant:a"},
+            allowed_tool_names=self.allowed_tools,
+            previous=initial.contract,
+        )
+        self.assertEqual(turn.contract.interpretations[-1].origin, "AUDIT_DISCOVERY")
+
+        promoted = copy.deepcopy(discovered)
+        promoted["interpretations"][-1]["status"] = "SUPPORTED"
+        with self.assertRaisesRegex(ValueError, "cannot be promoted"):
+            parse_contract_turn(
+                self.turn(promoted),
+                allowed_source_keys={"source-audit"},
+                allowed_participant_keys={"participant:a"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+            )
+
+    def test_audit_discovery_must_cite_new_source_and_discriminate_existing(self) -> None:
+        initial_contract = self.contract(visited=["source-old"])
+        initial = parse_contract_turn(
+            self.turn(initial_contract),
+            allowed_source_keys={"source-old"},
+            allowed_participant_keys={"participant:a"},
+            allowed_tool_names=self.allowed_tools,
+        )
+        invalid = self.contract(step=1, visited=["source-old"])
+        invalid["interpretations"].append(
+            {
+                "id": "reading-audit",
+                "statement": "没有新增来源的候选。",
+                "status": "CANDIDATE",
+                "support_keys": ["source-old"],
+                "counter_keys": [],
+                "uncertainty": "仍不确定。",
+                "origin": "AUDIT_DISCOVERY",
+                "discriminates_interpretation_ids": ["reading-a"],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "newly visited evidence"):
+            parse_contract_turn(
+                self.turn(invalid),
+                allowed_source_keys={"source-old"},
+                allowed_participant_keys={"participant:a"},
+                allowed_tool_names=self.allowed_tools,
+                previous=initial.contract,
+            )
 
 
 if __name__ == "__main__":
