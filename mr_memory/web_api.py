@@ -29,7 +29,7 @@ class WebConsoleMixin:
             "scopes/<scope_id>/runs/<run_id>",
             self._api_memory_run_detail,
             ["GET"],
-            "读取一次实时记忆调用的结果与证据子图",
+            "读取一次实时记忆调用的结果与证据追溯链路",
         )
         self._register_memory_web_api(
             "scopes/<scope_id>/participants",
