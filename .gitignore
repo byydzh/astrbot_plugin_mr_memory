@@ -8,6 +8,9 @@ __pycache__/
 .ruff_cache/
 .venv/
 .dev/
+.test-artifacts/
+/pytest-cache-files-*/
+/tmp*/
 dist/
 build/
 *.egg-info/

@@ -22,6 +22,109 @@ class MemoryService:
     def __init__(self, storage: MemoryStorage):
         self.storage = storage
 
+    async def advance_revision_head(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(self.storage.advance_revision_head, **kwargs)
+
+    async def revision_vector(self, *, umo: str) -> dict[str, dict[str, int]]:
+        return await asyncio.to_thread(self.storage.revision_vector, umo=umo)
+
+    async def capture_request_snapshot(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.capture_request_snapshot, **kwargs
+        )
+
+    async def request_snapshot(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(self.storage.request_snapshot, **kwargs)
+
+    async def audit_snapshot_sources(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.audit_snapshot_sources, **kwargs
+        )
+
+    async def put_evidence_pack_cache(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.put_evidence_pack_cache, **kwargs
+        )
+
+    async def get_evidence_pack_cache(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.get_evidence_pack_cache, **kwargs
+        )
+
+    async def put_memory_certificate(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.put_memory_certificate, **kwargs
+        )
+
+    async def get_memory_certificate(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.get_memory_certificate, **kwargs
+        )
+
+    async def invalidate_cached_memory(
+        self, **kwargs: object
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.invalidate_cached_memory, **kwargs
+        )
+
+    async def recover_layered_runtime(self, **kwargs: object) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.recover_layered_runtime, **kwargs
+        )
+
+    async def cleanup_layered_runtime(self, **kwargs: object) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.cleanup_layered_runtime, **kwargs
+        )
+
+    async def enqueue_reconstruction_job(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.enqueue_reconstruction_job, **kwargs
+        )
+
+    async def reconstruction_job(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(self.storage.reconstruction_job, **kwargs)
+
+    async def claim_reconstruction_job(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(
+            self.storage.claim_reconstruction_job, **kwargs
+        )
+
+    async def update_reconstruction_job(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.update_reconstruction_job, **kwargs
+        )
+
+    async def finish_reconstruction_job(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.finish_reconstruction_job, **kwargs
+        )
+
     async def ingest(
         self,
         message: NormalizedMessage,
@@ -343,6 +446,7 @@ class MemoryService:
         limit: int = 12,
         min_score: float = -1.0,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, list[dict[str, object]]]:
         query_vector = await embedding_backend.embed_query(query)
         matches = await asyncio.to_thread(
@@ -353,12 +457,14 @@ class MemoryService:
             limit=limit,
             min_score=min_score,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
         return await asyncio.to_thread(
             self.storage.expand_seed_candidates,
             umo=umo,
             matches=matches,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def reconstruction_evidence_packet(
@@ -376,6 +482,7 @@ class MemoryService:
         cue: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_cue_tags,
@@ -383,6 +490,7 @@ class MemoryService:
             cue=cue,
             limit=limit,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_tag_events(
@@ -393,6 +501,7 @@ class MemoryService:
         tag: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_tag_events,
@@ -401,6 +510,7 @@ class MemoryService:
             tag=tag,
             limit=limit,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_conversation_time(
@@ -409,12 +519,14 @@ class MemoryService:
         umo: str,
         event_id: int,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> dict[str, object] | None:
         return await asyncio.to_thread(
             self.storage.query_conversation_time,
             umo=umo,
             event_id=event_id,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_event_keywords(
@@ -423,12 +535,14 @@ class MemoryService:
         umo: str,
         event_id: int,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_event_keywords,
             umo=umo,
             event_id=event_id,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_event_context(
@@ -438,6 +552,7 @@ class MemoryService:
         event_id: int,
         limit: int = 50,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_event_context,
@@ -445,7 +560,18 @@ class MemoryService:
             event_id=event_id,
             limit=limit,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
+
+    async def reply_source_for_message(self, **kwargs: object) -> str:
+        return await asyncio.to_thread(
+            self.storage.reply_source_for_message, **kwargs
+        )
+
+    async def message_for_source(
+        self, **kwargs: object
+    ) -> dict[str, object] | None:
+        return await asyncio.to_thread(self.storage.message_for_source, **kwargs)
 
     async def query_personal_information(
         self,
@@ -453,12 +579,14 @@ class MemoryService:
         umo: str,
         person: str,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_personal_information,
             umo=umo,
             person=person,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_personal_aspect(
@@ -469,6 +597,7 @@ class MemoryService:
         aspect: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_personal_aspect,
@@ -477,6 +606,7 @@ class MemoryService:
             aspect=aspect,
             limit=limit,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def query_topic_events(
@@ -486,6 +616,7 @@ class MemoryService:
         topic: str,
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(
             self.storage.query_topic_events,
@@ -493,6 +624,7 @@ class MemoryService:
             topic=topic,
             limit=limit,
             before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
         )
 
     async def apply_graph_mutation(

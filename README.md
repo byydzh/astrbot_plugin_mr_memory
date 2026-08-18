@@ -3,7 +3,9 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.17.1 让增量整理与真实反馈都能维护按群隔离的可塑关联图。局部梗义、反话和委婉语
+0.18.0 把回答时记忆升级为分层运行时：每次请求固定 `RequestSnapshot`，先复用 L1a
+证据包和 L1b 语义证书，再由宿主在 L2 单次证据读取与 L3 有界 ECCR 重建之间路由；
+最终只把经过验证的 `EvidenceCertificateV2` 编译成表层提示。局部梗义、反话和委婉语
 可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
 或 `CONFIRMED`；embedding 只生成候选，图的语义状态与回答前相关性均由独立潜意识 LLM
 判断，宿主只执行证据、身份和作用域约束。
@@ -28,9 +30,9 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
 - `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
 - `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
-- `runtime_wake_mode=every_request`：有图记忆后，每次主 LLM 请求都会先由独立潜意识模型
-  对宿主预取证据做完整语义判断；只有模型明确认为缺少关键图遍历时才进入多步深挖。
-  可切换为 `manual_only`，仅保留主 Agent 主动咨询。
+- `runtime_wake_mode=low_latency`：同步复用仍有效的语义证书；未命中时在后台执行 L2，
+  不把超时、额度拒绝或 Provider 故障伪装成“没有记忆”。`balanced` 可短暂等待 L2，
+  `research` 还允许宿主在强歧义时批准有界 L3 ECCR，`manual_only` 仅保留主动咨询。
 - 新消息达到 `auto_distillation_min_pending=150` 时立即整理；不足 150 条时，最迟由
   `maintenance_interval_minutes=1440`（一天）的后台轮询触发。
 - 回答前记忆判断、主动潜意识深挖和新消息整理使用 `private_daily_token_budget`。反馈学习使用独立的
@@ -65,18 +67,25 @@ SQLite truth store + FTS5 + layered memory graph
         +-- Plastic Node--Versioned Learned Relation--Plastic Node
         |
         v
-embedding candidate initialization (Cue / Episode / Semantic / Topic)
+L0 RequestSnapshot (scope / cutoff / row bound / revision vectors)
         |
         v
-LLM-composable bounded traversal toolkit
-        |
-        +-- host-prefetched, source-key-bounded evidence packet
+L1a exact evidence-pack cache + L1b semantic-certificate cache
         |
         v
-private provider semantic gate (DeepSeek by default, full reasoning)
+host-owned route policy
         |
-        +-- relevant / none -> grounded brief or no memory
-        +-- essential missing traversal -> bounded private tool loop
+        +-- L2 one-pass Evidence Reader
+        +-- L3 bounded ECCR (compile / discriminate / audit)
+        |
+        v
+EvidenceCertificateV2 (claims / attribution / uncertainty / provenance)
+        |
+        v
+surface compiler + answer verifier
+        |
+        v
+bounded memory context for the main AstrBot LLM
         |
         +-- bounded feedback maintenance and prospective activation
         +-- persistent bounded operational state and resumable maintenance jobs
@@ -90,13 +99,24 @@ private provider semantic gate (DeepSeek by default, full reasoning)
 `mr_consult_subconscious` 请求一次更聚焦的重建。
 
 插件调用自己配置的 provider，不继承当前会话主 LLM。后台增量整理与反馈学习由该独立模型
-维护情节、人物事实、竞争释义和行为通路；普通回答前先由本群 SQLite 与本地 embedding 生成
-有界候选及原始证据包，再由独立潜意识模型完整判断相关性并生成带证据键的简报。只有模型
-明确判断缺少关键遍历时才升级为多步图工具循环；管理员/主模型主动咨询则直接执行深挖。若当前群
-还没有任何图记忆，自动唤醒会直接跳过。embedding 只提供候选先验，不用固定相似度裁决
-语义。最终 claim、conflict 与 unresolved
-项都必须引用本轮实际访问的 source key，否则整份简报被宿主拒绝，而不是把未验证自由文本
-交给主 LLM。每次调用单独记录首块延迟、总耗时、Token、路径与结果。
+维护情节、人物事实、竞争释义和行为通路；普通回答先在一个不可变 `RequestSnapshot` 下由
+本群 SQLite 与本地 embedding 生成有界证据包。L1a 只按精确查询、上下文、回复目标、cutoff
+和依赖修订复用证据，L1b 只复用重新审计后仍有效的语义证书；相似查询不会直接复用旧答案。
+L2 Evidence Reader 一次读取证据包，必要时只能申请 L3，是否升级仍由宿主策略、预算和风险
+门禁决定。L3 复用生产 `EccrOrchestrator`，最多进行配置上限内的 compile、discriminate 和
+audit/retrieval，不把临时论证图直接写成长期事实。并发相同工作由 snapshot-bound
+singleflight 合并，等待者不会重复预占 Provider 预算。
+
+embedding 只提供候选先验，不用固定相似度裁决语义。L2/L3 产出的
+`EvidenceCertificateV2` 必须携带主体绑定、逐原子的来源与归因、未决义务、禁止升级项和停止
+原因；表层编译器只释放证书允许的内容，回答后验证器保留缺失必含项和错误升级的审计结果。
+语义状态与运行状态分开记录，因此 Provider 超时、额度不足或后台仍在运行都不会变成
+`SEMANTIC_NONE`。每次调用单独记录首块延迟、总耗时、Token、路由、证书与表层结果。
+
+schema 16 新增请求快照、证据包缓存、语义证书、证书依赖和重建任务的持久化生命周期；
+升级只迁移插件自己的按群 SQLite。0.18.0 没有新增 Python 依赖，线上仍使用
+`requirements.txt`，Harrier 部署才额外使用 `requirements-harrier.txt`。可部署文件边界见
+[运行时文件清单](docs/RUNTIME_FILES.md)。
 
 消息按 per-message checkpoint 增量整理：批次只选择最早的 `PENDING/FAILED` 消息，附带
 只读重叠上下文，成功后逐条推进；编辑或撤回会使派生图失效并重新排队。达到消息阈值或

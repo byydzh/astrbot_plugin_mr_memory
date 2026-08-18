@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.18.0
+
+- Freeze every recall request into a host-owned `RequestSnapshot` with scope,
+  strict cutoff, message row upper bound, reply target, and data/inference
+  revision vectors; all layered reads are audited against that same view.
+- Add an exact L1a evidence-pack cache and a dependency-revalidated L1b semantic
+  certificate cache. Similar text alone never authorizes reuse, and invalidation
+  follows message, deletion, identity, graph, relation, feedback, model, protocol,
+  and route-policy revisions.
+- Replace the implicit 0.16 gate with an explicit host route: deterministic L0/L1,
+  one-pass L2 Evidence Reader, and host-approved bounded L3 ECCR using the shared
+  production `EccrOrchestrator` for compile, discriminate, and discovery audit.
+- Introduce `EvidenceCertificateV2` with subject binding, per-atom attribution and
+  provenance, unresolved obligations, `must_include`, `must_not_upgrade`, and
+  explicit stop reasons. A bounded surface compiler and answer verifier prevent
+  uncertain evidence from being promoted silently.
+- Coalesce duplicate request work with snapshot-bound async singleflight, charge
+  only the producer, separate semantic outcomes from operational failures, and
+  drain in-flight layered tasks during plugin hot reload.
+- Migrate per-group SQLite stores to schema 16 for request snapshots, evidence-pack
+  cache, certificates and dependencies, and reconstruction-job lifecycle,
+  including bounded recovery and cleanup of interrupted or expired state.
+- Add no Python dependency. The trial-deployment boundary is one plugin hot reload
+  plus per-group schema 15-to-16 migration; it does not require restarting AstrBot
+  or NapCat and does not by itself claim semantic quality for the three-case study.
+
 ## 0.17.1
 
 - Restore the 0.16 answer-time inference structure as a deliberately weak,

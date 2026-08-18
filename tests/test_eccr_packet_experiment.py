@@ -721,7 +721,7 @@ class EccrPacketExperimentTests(unittest.TestCase):
         review_without_uncertainty["contract"]["uncertainties"] = []
         variants.append(
             (
-                "uncertainty set",
+                "removed an uncertainty",
                 original_compile,
                 json.dumps(review_without_uncertainty, ensure_ascii=False),
             )

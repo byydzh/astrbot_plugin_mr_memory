@@ -95,6 +95,27 @@ class CaseBundle:
         return str(self.case["case_id"])
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationBundle:
+    """Provider-visible inputs for one fixed-packet run.
+
+    This type deliberately has no ``gold`` or ``gold_path`` member.  Keeping a
+    separate type makes it possible to prove that the generation command never
+    opens the post-run human reference file.
+    """
+
+    case_dir: Path
+    case_path: Path
+    packet_path: Path
+    case: dict[str, Any]
+    packet: dict[str, Any]
+    hashes: dict[str, str]
+
+    @property
+    def case_id(self) -> str:
+        return str(self.case["case_id"])
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -167,34 +188,26 @@ def _gold_source_keys(gold: dict[str, Any]) -> set[str]:
     }
 
 
-def load_case_bundle(case_dir: str | Path) -> CaseBundle:
+def load_generation_bundle(case_dir: str | Path) -> GenerationBundle:
     root = Path(case_dir).resolve()
     case_path = root / "case.json"
     packet_path = root / "evidence_packet.json"
-    gold_path = root / "gold.json"
-    paths = (case_path, packet_path, gold_path)
+    paths = (case_path, packet_path)
     missing = [str(path) for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(
-            "missing packet diagnostic inputs: " + ", ".join(missing)
+            "missing packet generation inputs: " + ", ".join(missing)
         )
-    if len({path.resolve() for path in paths}) != 3:
-        raise ValueError(
-            "case, evidence packet and gold must be physically separate files"
-        )
+    if case_path.resolve() == packet_path.resolve():
+        raise ValueError("case and evidence packet must be physically separate files")
 
     case = _load_object(case_path)
     packet = _load_object(packet_path)
-    gold = _load_object(gold_path)
     if _CASE_GOLD_KEYS & {str(key).casefold() for key in case}:
         raise ValueError("case.json contains evaluation-only gold fields")
     if str(case.get("schema_version") or CASE_SCHEMA_VERSION) != CASE_SCHEMA_VERSION:
         raise ValueError("unsupported packet case schema_version")
-    if str(gold.get("schema_version") or GOLD_SCHEMA_VERSION) != GOLD_SCHEMA_VERSION:
-        raise ValueError("unsupported packet gold schema_version")
     case_id = _bounded_text(case.get("case_id"), field="case.case_id", limit=120)
-    if str(gold.get("case_id") or case_id) != case_id:
-        raise ValueError("case and gold case_id differ")
     _bounded_text(case.get("query"), field="case.query", limit=4000)
     umo = _bounded_text(case.get("umo"), field="case.umo", limit=500)
     cutoff_at = int(case.get("cutoff_at") or 0)
@@ -205,21 +218,48 @@ def load_case_bundle(case_dir: str | Path) -> CaseBundle:
         raise ValueError(f"case.layer must be {DIAGNOSTIC_LAYER!r}")
     packet_audit = _validate_packet_cutoff(packet, umo=umo, cutoff_at=cutoff_at)
     delivered, _, _ = reconstruction_packet_allowlist(packet)
-    gold_sources = _gold_source_keys(gold)
-    missing_gold = sorted(gold_sources - delivered)
+    hashes = {
+        "case_sha256": _file_sha256(case_path),
+        "evidence_packet_sha256": _file_sha256(packet_path),
+        "delivered_source_allowlist_sha256": _stable_json_hash(sorted(delivered)),
+        "packet_cutoff_audit_sha256": _stable_json_hash(packet_audit),
+    }
+    return GenerationBundle(root, case_path, packet_path, case, packet, hashes)
+
+
+def load_case_bundle(case_dir: str | Path) -> CaseBundle:
+    generation = load_generation_bundle(case_dir)
+    gold_path = generation.case_dir / "gold.json"
+    if not gold_path.is_file():
+        raise FileNotFoundError(f"missing packet diagnostic input: {gold_path}")
+    if gold_path.resolve() in {
+        generation.case_path.resolve(),
+        generation.packet_path.resolve(),
+    }:
+        raise ValueError(
+            "case, evidence packet and gold must be physically separate files"
+        )
+    gold = _load_object(gold_path)
+    if str(gold.get("schema_version") or GOLD_SCHEMA_VERSION) != GOLD_SCHEMA_VERSION:
+        raise ValueError("unsupported packet gold schema_version")
+    if str(gold.get("case_id") or generation.case_id) != generation.case_id:
+        raise ValueError("case and gold case_id differ")
+    delivered, _, _ = reconstruction_packet_allowlist(generation.packet)
+    missing_gold = sorted(_gold_source_keys(gold) - delivered)
     if missing_gold:
         raise ValueError(
             "oracle packet omits gold evidence source keys: " + ", ".join(missing_gold)
         )
-    hashes = {
-        "case_sha256": _file_sha256(case_path),
-        "evidence_packet_sha256": _file_sha256(packet_path),
-        "gold_sha256": _file_sha256(gold_path),
-        "delivered_source_allowlist_sha256": _stable_json_hash(sorted(delivered)),
-        "packet_cutoff_audit_sha256": _stable_json_hash(packet_audit),
-    }
+    hashes = {**generation.hashes, "gold_sha256": _file_sha256(gold_path)}
     return CaseBundle(
-        root, case_path, packet_path, gold_path, case, packet, gold, hashes
+        generation.case_dir,
+        generation.case_path,
+        generation.packet_path,
+        gold_path,
+        generation.case,
+        generation.packet,
+        gold,
+        hashes,
     )
 
 
@@ -1824,7 +1864,7 @@ def _run_arm(
 
 def run_case_arm(
     *,
-    bundle: CaseBundle,
+    bundle: CaseBundle | GenerationBundle,
     arm: str,
     repetition: int,
     output_dir: Path,
@@ -1838,6 +1878,7 @@ def run_case_arm(
     max_output_tokens: int,
     thinking_mode: str,
     deadline_seconds: float,
+    evaluate_after_generation: bool = True,
 ) -> dict[str, Any]:
     if arm not in ARMS:
         raise ValueError(f"unsupported arm: {arm}")
@@ -1854,6 +1895,17 @@ def run_case_arm(
         existing = _load_object(result_path)
         if str(existing.get("run_id") or "") != run_id:
             raise ValueError(f"result path contains a different run: {result_path}")
+        expected_evaluation = (
+            "POST_GENERATION_GOLD_ATTACHED"
+            if evaluate_after_generation
+            else "NOT_EVALUATED_GOLD_NOT_OPENED"
+        )
+        observed_evaluation = str(existing.get("evaluation_status") or "")
+        if observed_evaluation and observed_evaluation != expected_evaluation:
+            raise ValueError(
+                "result path mixes generation-only and gold-attached runs: "
+                f"{result_path}"
+            )
         return existing
     base = {
         "schema_version": SCHEMA_VERSION,
@@ -1893,8 +1945,15 @@ def run_case_arm(
                 else None
             ),
         )
-        # Gold crosses the boundary only here, after the provider result is fixed.
-        evaluation = score_result(arm_result, bundle.gold)
+        if evaluate_after_generation:
+            if not isinstance(bundle, CaseBundle):
+                raise TypeError("post-generation evaluation requires a CaseBundle")
+            # Gold crosses the model boundary only here, after the response is fixed.
+            evaluation = score_result(arm_result, bundle.gold)
+            evaluation_status = "POST_GENERATION_GOLD_ATTACHED"
+        else:
+            evaluation = None
+            evaluation_status = "NOT_EVALUATED_GOLD_NOT_OPENED"
         final = {
             **base,
             "status": "COMPLETED",
@@ -1902,6 +1961,7 @@ def run_case_arm(
             "result": arm_result,
             "usage": _pilot_run_usage(ledger_path, run_id),
             "evaluation": evaluation,
+            "evaluation_status": evaluation_status,
         }
     except Exception as exc:
         final = {
@@ -1912,6 +1972,11 @@ def run_case_arm(
             "error_detail": str(exc)[:2000],
             "usage": _pilot_run_usage(ledger_path, run_id),
             "evaluation": None,
+            "evaluation_status": (
+                "NOT_EVALUATED_GOLD_NOT_OPENED"
+                if not evaluate_after_generation
+                else "POST_GENERATION_EVALUATION_FAILED"
+            ),
         }
     _atomic_write_json(result_path, final)
     return final
@@ -2204,6 +2269,119 @@ def run_command(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def generate_command(args: argparse.Namespace) -> dict[str, Any]:
+    """Run packet synthesis without opening any post-run gold file."""
+
+    if not bool(args.authorize_provider_calls):
+        raise PermissionError(
+            "generation is billable; pass --authorize-provider-calls explicitly"
+        )
+    bundles = [load_generation_bundle(path) for path in _resolve_case_dirs(args)]
+    arms = _parse_arms(args.arms)
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = output_dir / "usage.jsonl"
+    existing = _usage_ledger_audit(ledger_path)
+    _assert_usage_resumable(existing)
+    budget = PilotBudget(
+        max_calls=int(args.max_provider_calls),
+        soft_token_limit=int(args.soft_token_limit),
+        calls=int(existing["attempted_calls"]),
+        tokens=int(existing["provider_tokens_measured_lower_bound"]),
+    )
+    provider_fingerprint = _provider_fingerprint(args.config, args.provider_id)
+    needs_provider = any(arm != "deterministic" for arm in arms)
+    if needs_provider:
+        client, model, provider_extra_body = _provider_config(
+            args.config, args.provider_id
+        )
+    else:
+        client, model, provider_extra_body = None, "deterministic-host", {}
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": _utc_now(),
+        "phase": "generation_only",
+        "diagnostic_layer": DIAGNOSTIC_LAYER,
+        "end_to_end_retrieval_evaluated": False,
+        "candidate_generation_evaluated": False,
+        "arms": arms,
+        "repetitions": int(args.repetitions),
+        "provider": provider_fingerprint,
+        "model": model,
+        "case_hashes": {bundle.case_id: bundle.hashes for bundle in bundles},
+        "experiment_parameters": {
+            "max_provider_calls": int(args.max_provider_calls),
+            "soft_token_limit": int(args.soft_token_limit),
+            "max_output_tokens": int(args.max_output_tokens),
+            "thinking_mode": str(args.thinking_mode),
+            "deadline_seconds": float(args.deadline_seconds),
+            "eccr_max_model_calls": 1,
+            "eccr_audit_model_calls": 2,
+            "retrieval_rounds": 0,
+        },
+        "gold_access": {
+            "status": "NOT_OPENED",
+            "files_required": False,
+            "loader": "load_generation_bundle",
+        },
+    }
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.exists():
+        old = _load_object(manifest_path)
+        for field in (
+            "schema_version",
+            "phase",
+            "arms",
+            "repetitions",
+            "case_hashes",
+            "provider",
+            "model",
+            "experiment_parameters",
+            "gold_access",
+        ):
+            if old.get(field) != manifest.get(field):
+                raise ValueError(f"output resume manifest mismatch: {field}")
+    else:
+        _atomic_write_json(manifest_path, manifest)
+
+    results: list[dict[str, Any]] = []
+    for bundle in bundles:
+        for arm in arms:
+            if arm == "deterministic" and not bundle.case.get("host_subject_bindings"):
+                continue
+            for repetition in range(1, int(args.repetitions) + 1):
+                results.append(
+                    run_case_arm(
+                        bundle=bundle,
+                        arm=arm,
+                        repetition=repetition,
+                        output_dir=output_dir,
+                        ledger_path=ledger_path,
+                        budget=budget,
+                        client=client,
+                        provider_id=args.provider_id,
+                        model=model,
+                        provider_extra_body=provider_extra_body,
+                        provider_fingerprint=provider_fingerprint,
+                        max_output_tokens=int(args.max_output_tokens),
+                        thinking_mode=args.thinking_mode,
+                        deadline_seconds=float(args.deadline_seconds),
+                        evaluate_after_generation=False,
+                    )
+                )
+    summary = build_summary(results, ledger_path)
+    summary.update(
+        {
+            "phase": "generation_only",
+            "evaluation_status": "NOT_EVALUATED_GOLD_NOT_OPENED",
+            "gold_files_opened": 0,
+        }
+    )
+    _atomic_write_json(output_dir / "summary.json", summary)
+    return summary
+
+
 def _add_cases(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--case-dir", action="append", default=[])
     parser.add_argument("--cases-root")
@@ -2236,6 +2414,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--deadline-seconds", type=float, default=180.0)
     run_parser.set_defaults(handler=run_command)
+
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="Billable provider generation that never opens gold.json.",
+    )
+    _add_cases(generate_parser)
+    generate_parser.add_argument("--config", required=True)
+    generate_parser.add_argument("--provider-id", required=True)
+    generate_parser.add_argument("--output-dir", required=True)
+    generate_parser.add_argument("--arms", default="one-pass,eccr")
+    generate_parser.add_argument("--repetitions", type=int, default=1)
+    generate_parser.add_argument("--max-provider-calls", type=int, default=4)
+    generate_parser.add_argument("--soft-token-limit", type=int, default=0)
+    generate_parser.add_argument("--max-output-tokens", type=int, default=384000)
+    generate_parser.add_argument(
+        "--thinking-mode", choices=("enabled", "disabled"), default="enabled"
+    )
+    generate_parser.add_argument("--deadline-seconds", type=float, default=180.0)
+    generate_parser.add_argument(
+        "--authorize-provider-calls",
+        action="store_true",
+        help="Required acknowledgement for billable provider calls.",
+    )
+    generate_parser.set_defaults(handler=generate_command)
     return parser
 
 
