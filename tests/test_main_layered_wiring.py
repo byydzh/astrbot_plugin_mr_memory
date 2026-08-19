@@ -41,6 +41,54 @@ class MainLayeredWiringTests(unittest.TestCase):
             "self._runtime_singleflight.start(certificate_key, factory", body
         )
 
+    def test_layered_run_uses_only_the_request_bound_interaction_trace(self) -> None:
+        method = self._method("_run_layered_subconscious")
+        body = ast.unparse(method)
+        self.assertIn("request_source_key = normalized.resolved_source_key()", body)
+        self.assertIn("self._active_interaction_traces.get(id(event))", body)
+        self.assertIn("active_trace[0] == scope.key", body)
+        self.assertIn("active_trace[2] == request_source_key", body)
+        self.assertGreaterEqual(
+            body.count("interaction_trace_id=interaction_trace_id"),
+            2,
+        )
+
+        producer = self._method("_execute_layered_reconstruction")
+        producer_body = ast.unparse(producer)
+        self.assertIn(
+            "interaction_trace_id",
+            [arg.arg for arg in producer.args.kwonlyargs],
+        )
+        self.assertIn(
+            "interaction_trace_id=interaction_trace_id",
+            producer_body,
+        )
+
+    def test_layered_run_persists_trace_id_in_all_terminal_shapes(self) -> None:
+        producer = self._method("_execute_layered_reconstruction_started")
+        producer_body = ast.unparse(producer)
+        self.assertIn(
+            "interaction_trace_id",
+            [arg.arg for arg in producer.args.kwonlyargs],
+        )
+        self.assertGreaterEqual(
+            producer_body.count("'trace_id': interaction_trace_id"),
+            3,
+            "start metadata plus completed and failed results must remain linked",
+        )
+
+        budget = self._method("_record_layered_budget_block")
+        budget_body = ast.unparse(budget)
+        self.assertIn(
+            "interaction_trace_id",
+            [arg.arg for arg in budget.args.kwonlyargs],
+        )
+        self.assertEqual(
+            budget_body.count("'trace_id': interaction_trace_id"),
+            2,
+            "budget-blocked metadata and result must use the same trace",
+        )
+
     def test_only_singleflight_producer_runs_budget_preflight(self) -> None:
         method = self._method("_run_layered_subconscious")
         outer_budget_calls = 0

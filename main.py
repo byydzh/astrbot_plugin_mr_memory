@@ -4592,6 +4592,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         route_level: str,
         policy: RoutePolicy,
         cache_layer: str,
+        interaction_trace_id: str,
     ) -> _LayeredMemoryOutcome:
         """Fail visibly even when durable-job setup itself cannot start."""
 
@@ -4610,6 +4611,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 route_level=route_level,
                 policy=policy,
                 cache_layer=cache_layer,
+                interaction_trace_id=interaction_trace_id,
             )
         except asyncio.CancelledError:
             raise
@@ -4645,6 +4647,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         route_level: str,
         policy: RoutePolicy,
         cache_layer: str,
+        interaction_trace_id: str,
     ) -> _LayeredMemoryOutcome:
         run_id = _runtime_run_id("layered")
         started = time.perf_counter()
@@ -4710,6 +4713,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "route": route_level,
                 "route_policy": policy.revision,
                 "cache_layer": cache_layer,
+                "trace_id": interaction_trace_id,
             },
         )
         trace_value: dict[str, object] = {}
@@ -4865,6 +4869,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "source_keys": certificate_sources[:160],
                 "selected_edge_ids": list(selected_edge_ids),
                 "selected_hypothesis_ids": list(selected_hypothesis_ids),
+                "trace_id": interaction_trace_id,
                 "trace": trace_value,
                 "repair_attempted": repair_attempted,
                 "response_source": response_source,
@@ -4937,6 +4942,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "snapshot_id": snapshot.snapshot_id,
                         "snapshot_sha256": snapshot.digest,
                         "packet_sha256": packet_sha256,
+                        "trace_id": interaction_trace_id,
                         "error_type": type(exc).__name__,
                         "error_detail": str(exc)[:1000],
                         "elapsed_ms": (time.perf_counter() - started) * 1000,
@@ -4968,6 +4974,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         scope: GroupMemoryScope,
         service: MemoryService,
         snapshot: RequestSnapshot,
+        interaction_trace_id: str,
     ) -> _LayeredMemoryOutcome:
         run_id = _runtime_run_id("budget-blocked")
         job_key = stable_sha256(
@@ -5002,6 +5009,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "scope_id": scope.storage_id,
                 "snapshot_id": snapshot.snapshot_id,
                 "route": "L2",
+                "trace_id": interaction_trace_id,
             },
         )
         await service.finish_experiment(
@@ -5013,6 +5021,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "route": "L2",
                 "snapshot_id": snapshot.snapshot_id,
                 "snapshot_sha256": snapshot.digest,
+                "trace_id": interaction_trace_id,
             },
         )
         return _LayeredMemoryOutcome(
@@ -5074,6 +5083,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         scope = self._group_scope(event)
         service = self._service_for_scope(scope)
         normalized = self._normalize_event(event)
+        request_source_key = normalized.resolved_source_key()
+        active_trace = self._active_interaction_traces.get(id(event))
+        interaction_trace_id = (
+            active_trace[1]
+            if active_trace is not None
+            and active_trace[0] == scope.key
+            and active_trace[2] == request_source_key
+            else ""
+        )
         policy = self._runtime_route_policy(force=force)
         try:
             snapshot = await self._capture_layered_snapshot(
@@ -5233,6 +5251,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     scope=scope,
                     service=service,
                     snapshot=snapshot,
+                    interaction_trace_id=interaction_trace_id,
                 )
             return await self._execute_layered_reconstruction(
                 scope=scope,
@@ -5248,6 +5267,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 route_level=route_level,
                 policy=policy,
                 cache_layer=pack_cache_layer,
+                interaction_trace_id=interaction_trace_id,
             )
 
         task, created = await self._runtime_singleflight.start(

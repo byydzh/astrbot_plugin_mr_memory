@@ -67,7 +67,7 @@ class ConfigSurfaceTests(unittest.TestCase):
             Path.cwd() / "pages" / "console" / "index.html"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            '<script type="module" src="./script.js?v=0.18.0-trace-label"></script>',
+            '<script type="module" src="./script.js?v=0.18.1-conservative-effects"></script>',
             html,
         )
 
@@ -77,7 +77,7 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertIn("async function waitForPluginBridge", script)
         self.assertIn("await waitForPluginBridge()", script)
 
-    def test_recent_calls_open_a_provenance_trace_not_a_memory_graph(self) -> None:
+    def test_recent_calls_show_persisted_memory_effects_and_fold_the_ledger(self) -> None:
         html = (Path.cwd() / "pages" / "console" / "index.html").read_text(
             encoding="utf-8"
         )
@@ -88,25 +88,57 @@ class ConfigSurfaceTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('id="run-detail-dialog"', html)
-        self.assertIn("本次调用追溯链路", html)
-        self.assertIn("输入证据 → 处理步骤 → 输出或反馈结果", html)
-        self.assertIn("重置链路视图", html)
-        self.assertIn("调用证据与处理追溯链路", html)
-        self.assertNotIn("本次记忆子图", html)
-        self.assertNotIn("调用记忆子图", html)
+        self.assertIn("本次实际读取或改变的记忆", html)
+        self.assertIn('aria-label="本次调用实际读取或改变的持久记忆关系图"', html)
+        for access, label in (
+            ("read", "读取"),
+            ("write", "写入"),
+            ("upsert", "写入或更新"),
+            ("modify", "修改"),
+            ("context", "结构端点"),
+        ):
+            self.assertIn(f'<span data-access="{access}">{label}</span>', html)
+        self.assertIn('<details class="run-detail-ledger">', html)
+        self.assertIn("调用处理账本", html)
+        self.assertIn('<details class="run-detail-result">', html)
+        self.assertNotIn('<details class="run-detail-ledger" open', html)
+        self.assertNotIn('<details class="run-detail-result" open', html)
         self.assertIn("function openRunDetail", script)
-        self.assertIn("function runDetailTraceSummary", script)
-        self.assertIn('run: "处理运行"', script)
-        self.assertIn("detail?.graph?.exact_memory_brief", script)
-        self.assertIn('"包含本次反馈处理结果"', script)
-        self.assertIn('"仅显示已落盘的证据与结果"', script)
-        self.assertNotIn("旧记录仅还原证据", script)
-        self.assertIn('"这次反馈学习处理了什么"', script)
-        self.assertIn('"这次回答前实际读取了什么证据"', script)
-        self.assertNotIn('"这次反馈修改了什么记忆"', script)
+        self.assertIn("function renderRunDetailMemoryEffects", script)
+        self.assertIn("function renderRunDetailLedger", script)
+        self.assertIn("const value = detail?.memory_effects", script)
+        self.assertIn("memoryEffectsEmptyState", script)
+        self.assertIn("effects?.empty_reason", script)
+        self.assertIn("copy: reason", script)
+        self.assertIn("UNAVAILABLE_LEGACY", script)
+        self.assertIn('return "未记录"', script)
+        self.assertIn("provided[access] === null", script)
+        self.assertIn('"记忆节点 / 连接"', script)
+        self.assertIn("effects?.identity_exact", script)
+        self.assertIn('return "账本确认身份"', script)
+        self.assertIn("effects?.payload_as_of", script)
+        self.assertIn('return "当前状态解析"', script)
+        self.assertIn('RECORDED: "已记录"', script)
+        self.assertIn('PARTIAL: "部分记录"', script)
+        self.assertIn("memoryEffectsAreTruncated", script)
+        self.assertIn('return metric.value > 0 ? `至少 ${formatNumber(metric.value)}` : "未知"', script)
+        self.assertNotIn("精确记录", script)
+        self.assertIn('read: "读取"', script)
+        self.assertIn('write: "写入"', script)
+        self.assertIn('upsert: "写入或更新"', script)
+        self.assertIn('modify: "修改"', script)
+        self.assertIn('context: "结构端点"', script)
+        self.assertNotIn("function renderRunDetailGraph", script)
+        self.assertNotIn("state.runDetail?.graph || {}", script)
+        self.assertIn("function selectRunDetailMemoryEdge", script)
+        self.assertIn('["陈述", edge.statement]', script)
+        self.assertIn('["认知状态", edge.epistemic_state]', script)
+        self.assertIn('["不确定性", edge.uncertainty]', script)
+        self.assertIn('["效用", edge.utility]', script)
+        self.assertIn('"这次反馈实际改了哪些记忆"', script)
+        self.assertIn('"这次回答实际激活了哪些记忆"', script)
         self.assertIn('"scopes/<scope_id>/runs/<run_id>"', web_api)
-        self.assertIn("结果与证据追溯链路", web_api)
-        self.assertNotIn("结果与证据子图", web_api)
+        self.assertIn("实际激活或改变的记忆子图与处理账本", web_api)
 
 
 if __name__ == "__main__":

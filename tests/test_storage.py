@@ -6,6 +6,7 @@ from pathlib import Path
 
 from mr_memory.feedback import FeedbackDecision
 from mr_memory.models import NormalizedMessage
+from mr_memory.plasticity import parse_graph_mutation
 from mr_memory.storage import MemoryStorage
 
 
@@ -551,6 +552,573 @@ class MemoryStorageTests(unittest.TestCase):
                 umo="shadow:GroupMessage:group-b",
             )
 
+    def test_experiment_detail_projects_only_verified_memory_activations(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("memory-request", "这次应该怎么回答？", sent_at=100)
+        feedback = self.message(
+            "memory-feedback",
+            "下次直接给结论，不要反问。",
+            sent_at=110,
+        )
+        graph_evidence = self.message(
+            "memory-edge-evidence",
+            "群内把这个称呼当作反话。",
+            sent_at=90,
+        )
+        for message in (request, feedback, graph_evidence):
+            self.storage.upsert_message(message)
+
+        source_trace_id = "memory-source-trace"
+        self.storage.start_interaction_trace(
+            trace_id=source_trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=source_trace_id,
+            umo=umo,
+            response_text="你可以直接给结论。",
+            response_at=101,
+        )
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        learned = self.storage.apply_feedback_decision(
+            umo=umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id=source_trace_id,
+                mutation="upsert",
+                feedback_valence=1.0,
+                confidence=0.92,
+                scope_type="sender",
+                scope_key=request.sender_id,
+                aspect="answer_style",
+                statement="用户希望回答直接给结论。",
+                prospective_cue="直接给出结论，不要用反问拖延。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        hypothesis_id = int(learned["hypothesis_id"])
+
+        edge_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=parse_graph_mutation(
+                {
+                    "operation": "upsert_edge",
+                    "evidence_source_keys": [
+                        graph_evidence.resolved_source_key()
+                    ],
+                    "confidence": 0.87,
+                    "utility_delta": 0.6,
+                    "statement": "该称呼在这段群聊里是反话。",
+                    "source": {
+                        "kind": "symbol",
+                        "label": "该称呼",
+                        "description": "群内表达",
+                    },
+                    "relation": {
+                        "key": "local_pragmatic_sense",
+                        "name": "群内语用",
+                        "description": "表达在本群上下文中的非字面含义",
+                        "source_kinds": ["symbol"],
+                        "target_kinds": ["concept"],
+                    },
+                    "target": {
+                        "kind": "concept",
+                        "label": "反话",
+                        "description": "非字面解释",
+                    },
+                }
+            ),
+        )
+        edge_id = int(edge_result["target_id"])
+
+        target_trace_id = "memory-target-trace"
+        self.storage.start_interaction_trace(
+            trace_id=target_trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=120,
+            query="现在怎么回答？",
+        )
+        self.storage.activate_feedback_hypotheses(
+            umo=umo,
+            sender_id=request.sender_id,
+            query="现在怎么回答？",
+            at=120,
+            trace_id=target_trace_id,
+            selected=[{"id": hypothesis_id, "activation_score": 0.88}],
+            activation_method="layered_certificate_surface",
+        )
+        self.storage.activate_plastic_edges(
+            umo=umo,
+            edge_ids=[edge_id],
+            at=120,
+            trace_id=target_trace_id,
+            relevance=0.77,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=target_trace_id,
+            umo=umo,
+            response_text="直接回答。",
+            response_at=121,
+        )
+        run_id = "layered-memory-effects"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+            metadata={"trace_id": target_trace_id},
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "trace_id": target_trace_id,
+                "selected_edge_ids": [edge_id],
+                "selected_hypothesis_ids": [hypothesis_id],
+            },
+        )
+
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert detail is not None
+        effects = detail["memory_effects"]
+        self.assertEqual(effects["state"], "RECORDED")
+        self.assertFalse(effects["exact"])
+        self.assertTrue(effects["identity_exact"])
+        self.assertEqual(effects["payload_as_of"], "current_resolution")
+        self.assertEqual(effects["counts"]["nodes"], 3)
+        self.assertEqual(effects["counts"]["edges"], 1)
+        self.assertEqual(
+            {node["type"] for node in effects["nodes"]},
+            {"hypothesis", "plastic"},
+        )
+        self.assertFalse(
+            {"run", "request", "response", "evidence", "feedback_proposal"}
+            & {node["type"] for node in effects["nodes"]}
+        )
+        hypothesis = next(
+            node for node in effects["nodes"] if node["type"] == "hypothesis"
+        )
+        self.assertEqual(hypothesis["access"], ["read"])
+        self.assertAlmostEqual(hypothesis["activation"]["score"], 0.88)
+        self.assertEqual(effects["edges"][0]["access"], ["read"])
+        self.assertAlmostEqual(
+            effects["edges"][0]["activation"]["score"],
+            0.77,
+        )
+        self.assertTrue(
+            all(
+                node["access"] == ["context"]
+                for node in effects["nodes"]
+                if node["type"] == "plastic"
+            )
+        )
+        self.assertEqual(
+            len({node["id"] for node in effects["nodes"]}),
+            len(effects["nodes"]),
+        )
+        self.assertEqual(
+            len({edge["id"] for edge in effects["edges"]}),
+            len(effects["edges"]),
+        )
+
+        # Corrupt current display metadata must not turn a historical-detail
+        # read into a 500; identity still comes from the activation ledger.
+        with self.storage._lock, self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE feedback_hypotheses SET trigger_cues_json='{' WHERE id=?",
+                (hypothesis_id,),
+            )
+        corrupt_detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert corrupt_detail is not None
+        corrupt_hypothesis = next(
+            node
+            for node in corrupt_detail["memory_effects"]["nodes"]
+            if node["type"] == "hypothesis"
+        )
+        self.assertEqual(corrupt_hypothesis["trigger_cues"], [])
+
+    def test_experiment_detail_does_not_promote_selected_memory_to_activation(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("selected-request", "给个短答案", sent_at=100)
+        feedback = self.message(
+            "selected-feedback", "下次直接给结论，不要反问。", sent_at=110
+        )
+        graph_evidence = self.message(
+            "selected-edge-evidence", "这个代号表示测试环境", sent_at=90
+        )
+        for message in (request, feedback, graph_evidence):
+            self.storage.upsert_message(message)
+        source_trace_id = "selected-source-trace"
+        self.storage.start_interaction_trace(
+            trace_id=source_trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=source_trace_id,
+            umo=umo,
+            response_text="短答案。",
+            response_at=101,
+        )
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        learned = self.storage.apply_feedback_decision(
+            umo=umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id=source_trace_id,
+                mutation="upsert",
+                feedback_valence=1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key=request.sender_id,
+                aspect="brevity",
+                statement="用户希望答案简短。",
+                prospective_cue="回答时保持简短。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        hypothesis_id = int(learned["hypothesis_id"])
+        edge_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=parse_graph_mutation(
+                {
+                    "operation": "upsert_edge",
+                    "evidence_source_keys": [
+                        graph_evidence.resolved_source_key()
+                    ],
+                    "confidence": 0.8,
+                    "utility_delta": 0.4,
+                    "statement": "该代号表示测试环境。",
+                    "source": {"kind": "symbol", "label": "该代号"},
+                    "relation": {
+                        "key": "denotes_environment",
+                        "name": "表示环境",
+                        "description": "符号表示的运行环境",
+                        "source_kinds": ["symbol"],
+                        "target_kinds": ["concept"],
+                    },
+                    "target": {"kind": "concept", "label": "测试环境"},
+                }
+            ),
+        )
+        edge_id = int(edge_result["target_id"])
+        run_id = "selected-without-activation"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "selected_edge_ids": [edge_id],
+                "presented_edge_ids": [edge_id],
+                "activated_edge_ids": [edge_id],
+                "selected_hypothesis_ids": [hypothesis_id],
+                "presented_hypothesis_ids": [hypothesis_id],
+            },
+        )
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert detail is not None
+        effects = detail["memory_effects"]
+        self.assertEqual(effects["nodes"], [])
+        self.assertEqual(effects["edges"], [])
+        self.assertEqual(effects["state"], "UNAVAILABLE_LEGACY")
+        self.assertEqual(
+            effects["selected_not_activated"],
+            {"edge_ids": [edge_id], "hypothesis_ids": [hypothesis_id]},
+        )
+
+    def test_ignored_feedback_has_no_memory_graph(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("ignored-request", "先给一个方案", sent_at=100)
+        feedback = self.message(
+            "ignored-feedback", "不是这样，下次不要反问，直接给方案。", sent_at=110
+        )
+        self.storage.upsert_message(request)
+        self.storage.upsert_message(feedback)
+        trace_id = "ignored-feedback-trace"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            response_text="这是方案。",
+            response_at=101,
+        )
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        ignored = self.storage.apply_feedback_decision(
+            umo=umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="",
+                mutation="ignore",
+                feedback_valence=0.0,
+                confidence=0.0,
+                scope_type="sender",
+                scope_key="",
+                aspect="",
+                statement="",
+                prospective_cue="",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        run_id = "ignored-feedback-memory-effects"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_feedback_maintenance",
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "outcomes": [
+                    {
+                        "proposal_id": int(proposal_id or 0),
+                        "proposal_status": ignored["status"],
+                        "commit_score": 0.0,
+                        "trace_id": "",
+                        "hypothesis_id": 0,
+                        "graph_mutation_results": [],
+                    }
+                ]
+            },
+        )
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert detail is not None
+        effects = detail["memory_effects"]
+        self.assertEqual(effects["state"], "NOT_APPLICABLE")
+        self.assertTrue(effects["exact"])
+        self.assertEqual(effects["nodes"], [])
+        self.assertEqual(effects["edges"], [])
+        self.assertEqual(effects["counts"]["nodes"], 0)
+        self.assertIn("忽略", effects["empty_reason"])
+
+    def test_unverified_empty_results_are_not_exact_zero(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        self.storage.start_experiment(
+            run_id="unverified-ignore",
+            umo=umo,
+            experiment_type="runtime_feedback_maintenance",
+        )
+        self.storage.finish_experiment(
+            run_id="unverified-ignore",
+            status="completed",
+            result={
+                "outcomes": [
+                    {"proposal_id": 94, "proposal_status": "IGNORED"}
+                ]
+            },
+        )
+        ignored_detail = self.storage.experiment_detail(
+            run_id="unverified-ignore", umo=umo
+        )
+        assert ignored_detail is not None
+        ignored_effects = ignored_detail["memory_effects"]
+        self.assertEqual(ignored_effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertFalse(ignored_effects["exact"])
+        self.assertTrue(
+            all(value is None for value in ignored_effects["counts"].values())
+        )
+
+        self.storage.start_experiment(
+            run_id="unverified-no-relevant",
+            umo=umo,
+            experiment_type="runtime_reconstruction",
+        )
+        self.storage.finish_experiment(
+            run_id="unverified-no-relevant",
+            status="completed",
+            result={"no_relevant_memory": True},
+        )
+        no_relevant_detail = self.storage.experiment_detail(
+            run_id="unverified-no-relevant", umo=umo
+        )
+        assert no_relevant_detail is not None
+        no_relevant_effects = no_relevant_detail["memory_effects"]
+        self.assertEqual(no_relevant_effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertFalse(no_relevant_effects["identity_exact"])
+        self.assertTrue(
+            all(value is None for value in no_relevant_effects["counts"].values())
+        )
+
+    def test_modern_capture_can_verify_no_activation(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("zero-request", "没有相关记忆吗", sent_at=100)
+        self.storage.upsert_message(request)
+        trace_id = "zero-capture-trace"
+        run_id = "zero-capture-run"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            response_text="没有。",
+            response_at=101,
+        )
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_reconstruction",
+            metadata={"trace_id": trace_id},
+        )
+        self.storage.record_memory_brief_trace(
+            trace_id=trace_id,
+            umo=umo,
+            run_id=run_id,
+            memory_brief=None,
+            presented_edge_ids=(),
+            presented_hypothesis_ids=(),
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "trace_id": trace_id,
+                "no_relevant_memory": True,
+                "presented_edge_ids": [],
+                "presented_hypothesis_ids": [],
+            },
+        )
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert detail is not None
+        effects = detail["memory_effects"]
+        self.assertEqual(effects["state"], "NO_ACTIVATION")
+        self.assertTrue(effects["exact"])
+        self.assertTrue(effects["identity_exact"])
+        self.assertTrue(all(value == 0 for value in effects["counts"].values()))
+
+    def test_experiment_trace_association_is_scope_checked_and_not_union_merged(
+        self,
+    ) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        for trace_id in ("association-a", "association-b"):
+            self.storage.start_interaction_trace(
+                trace_id=trace_id,
+                umo=umo,
+                sender_id="user-a",
+                request_source_key="",
+                request_sent_at=100,
+                query=trace_id,
+            )
+            self.storage.finish_interaction_trace(
+                trace_id=trace_id,
+                umo=umo,
+                response_text="ok",
+                response_at=101,
+            )
+        self.storage.start_experiment(
+            run_id="trace-mismatch-run",
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+            metadata={"trace_id": "association-a"},
+        )
+        self.storage.finish_experiment(
+            run_id="trace-mismatch-run",
+            status="completed",
+            result={"trace_id": "association-b"},
+        )
+        mismatch = self.storage.experiment_detail(
+            run_id="trace-mismatch-run", umo=umo
+        )
+        assert mismatch is not None
+        mismatch_effects = mismatch["memory_effects"]
+        self.assertEqual(mismatch_effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertIn("run_trace_id:mismatch", mismatch_effects["integrity_errors"])
+        self.assertEqual(mismatch_effects["nodes"], [])
+
+        foreign_umo = "shadow:GroupMessage:group-b"
+        self.storage.start_interaction_trace(
+            trace_id="foreign-trace",
+            umo=foreign_umo,
+            sender_id="user-b",
+            request_source_key="",
+            request_sent_at=100,
+            query="foreign",
+        )
+        self.storage.start_experiment(
+            run_id="foreign-trace-run",
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+            metadata={"trace_id": "foreign-trace"},
+        )
+        self.storage.finish_experiment(
+            run_id="foreign-trace-run",
+            status="completed",
+            result={},
+        )
+        foreign = self.storage.experiment_detail(
+            run_id="foreign-trace-run", umo=umo
+        )
+        assert foreign is not None
+        foreign_effects = foreign["memory_effects"]
+        self.assertEqual(foreign_effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertTrue(
+            any(
+                "outside_scope" in item
+                for item in foreign_effects["integrity_errors"]
+            )
+        )
+
+    def test_memory_effect_id_caps_and_types_fail_closed(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        run_id = "bounded-memory-effect-ids"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "selected_edge_ids": [*range(1, 100), True, 1.5, 1 << 80],
+            },
+        )
+        detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+        assert detail is not None
+        effects = detail["memory_effects"]
+        self.assertTrue(effects["truncated"])
+        self.assertEqual(effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertLessEqual(len(effects["selected_not_activated"]["edge_ids"]), 80)
+        self.assertTrue(all(value is None for value in effects["counts"].values()))
+
     def test_experiment_detail_recovers_legacy_feedback_provenance(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         request = self.message("legacy-request", "帮我画一张海报", sent_at=100)
@@ -598,13 +1166,37 @@ class MemoryStorageTests(unittest.TestCase):
                 activation_mode="semantic",
             ),
         )
+        graph_mutation = parse_graph_mutation(
+            {
+                "operation": "upsert_edge",
+                "evidence_source_keys": [feedback.resolved_source_key()],
+                "confidence": 0.85,
+                "utility_delta": 0.5,
+                "statement": "生图回答应减少画面元素。",
+                "source": {"kind": "behavior", "label": "生图回答"},
+                "relation": {
+                    "key": "prefers_composition",
+                    "name": "偏好构图",
+                    "description": "任务对应的构图偏好",
+                    "source_kinds": ["behavior"],
+                    "target_kinds": ["preference"],
+                },
+                "target": {"kind": "preference", "label": "减少元素"},
+            }
+        )
+        graph_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=graph_mutation,
+            feedback_proposal_id=int(proposal_id or 0),
+        )
         run_id = "legacy-feedback-run"
         self.storage.start_experiment(
             run_id=run_id,
             umo=umo,
             experiment_type="runtime_feedback_maintenance",
         )
-        # Version 0.16.x only persisted this shallow outcome in the run ledger.
+        # The hypothesis identity is recovered from durable feedback evidence;
+        # the graph effect is accepted only after its mutation receipt matches.
         self.storage.finish_experiment(
             run_id=run_id,
             status="completed",
@@ -614,6 +1206,9 @@ class MemoryStorageTests(unittest.TestCase):
                         "proposal_id": int(proposal_id or 0),
                         "proposal_status": learned["status"],
                         "commit_score": learned["commit_score"],
+                        "graph_mutation_results": [
+                            {**graph_result, "proposal": graph_mutation.as_dict()}
+                        ],
                     }
                 ],
                 "path": "one_pass_feedback_learning",
@@ -640,6 +1235,377 @@ class MemoryStorageTests(unittest.TestCase):
             proposal_node["content"]["decision"]["target_trace_id"],
             trace_id,
         )
+        effects = detail["memory_effects"]
+        written = next(
+            item for item in effects["nodes"] if item["type"] == "hypothesis"
+        )
+        self.assertEqual(written["access"], ["upsert"])
+        upserted_edge = next(
+            edge for edge in effects["edges"] if edge["type"] == "plastic_relation"
+        )
+        self.assertEqual(upserted_edge["access"], ["upsert"])
+        self.assertTrue(effects["identity_exact"])
+        self.assertFalse(effects["exact"])
+
+        relation_revision = parse_graph_mutation(
+            {
+                "operation": "revise_relation",
+                "evidence_source_keys": [feedback.resolved_source_key()],
+                "confidence": 0.9,
+                "utility_delta": 0.0,
+                "relation": {
+                    "key": "prefers_composition",
+                    "name": "偏好留白构图",
+                    "description": "任务对应的留白构图偏好",
+                    "source_kinds": ["behavior"],
+                    "target_kinds": ["preference"],
+                },
+            }
+        )
+        revision_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=relation_revision,
+            feedback_proposal_id=int(proposal_id or 0),
+        )
+        revision_run_id = "relation-revision-effects"
+        self.storage.start_experiment(
+            run_id=revision_run_id,
+            umo=umo,
+            experiment_type="runtime_feedback_maintenance",
+        )
+        self.storage.finish_experiment(
+            run_id=revision_run_id,
+            status="completed",
+            result={
+                "outcomes": [
+                    {
+                        "proposal_id": int(proposal_id or 0),
+                        "proposal_status": learned["status"],
+                        "trace_id": trace_id,
+                        "hypothesis_id": learned["hypothesis_id"],
+                        "graph_mutation_results": [
+                            {
+                                **revision_result,
+                                "proposal": relation_revision.as_dict(),
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        revision_detail = self.storage.experiment_detail(
+            run_id=revision_run_id, umo=umo
+        )
+        assert revision_detail is not None
+        revision_effects = revision_detail["memory_effects"]
+        self.assertEqual(revision_effects["state"], "PARTIAL")
+        self.assertEqual(revision_effects["edges"], [])
+        self.assertTrue(revision_effects["unsupported_refs"])
+
+        other_trace_id = "mismatched-feedback-trace"
+        self.storage.start_interaction_trace(
+            trace_id=other_trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key="",
+            request_sent_at=120,
+            query="other",
+        )
+        mismatch_run_id = "feedback-outcome-trace-mismatch"
+        self.storage.start_experiment(
+            run_id=mismatch_run_id,
+            umo=umo,
+            experiment_type="runtime_feedback_maintenance",
+        )
+        self.storage.finish_experiment(
+            run_id=mismatch_run_id,
+            status="completed",
+            result={
+                "outcomes": [
+                    {
+                        "proposal_id": int(proposal_id or 0),
+                        "proposal_status": learned["status"],
+                        "trace_id": other_trace_id,
+                        "hypothesis_id": learned["hypothesis_id"],
+                    }
+                ]
+            },
+        )
+        mismatch_detail = self.storage.experiment_detail(
+            run_id=mismatch_run_id, umo=umo
+        )
+        assert mismatch_detail is not None
+        mismatch_effects = mismatch_detail["memory_effects"]
+        self.assertEqual(mismatch_effects["state"], "INCOMPLETE_CAPTURE")
+        self.assertEqual(mismatch_effects["nodes"], [])
+        self.assertTrue(
+            any(
+                item.endswith("trace_id:mismatch")
+                for item in mismatch_effects["integrity_errors"]
+            )
+        )
+
+    def test_committed_memory_effect_receipts_reject_tampered_run_outcomes(
+        self,
+    ) -> None:
+        umo = "shadow:GroupMessage:group-a"
+
+        def committed_feedback(
+            prefix: str, *, request_at: int, feedback_at: int
+        ) -> tuple[str, int, dict[str, object], NormalizedMessage]:
+            request = self.message(
+                f"{prefix}-request", "请直接给方案", sent_at=request_at
+            )
+            feedback = self.message(
+                f"{prefix}-feedback",
+                "不是这样，下次不要反问，直接给结论。",
+                sent_at=feedback_at,
+            )
+            self.storage.upsert_message(request)
+            self.storage.upsert_message(feedback)
+            trace_id = f"{prefix}-trace"
+            self.storage.start_interaction_trace(
+                trace_id=trace_id,
+                umo=umo,
+                sender_id=request.sender_id,
+                request_source_key=request.resolved_source_key(),
+                request_sent_at=request.sent_at,
+                query=request.plain_text,
+            )
+            self.storage.finish_interaction_trace(
+                trace_id=trace_id,
+                umo=umo,
+                response_text="这是方案。",
+                response_at=request_at + 1,
+            )
+            proposal_id = self.storage.enqueue_feedback_candidate(
+                umo=umo,
+                feedback_source_key=feedback.resolved_source_key(),
+            )
+            self.assertIsNotNone(proposal_id)
+            learned = self.storage.apply_feedback_decision(
+                umo=umo,
+                proposal_id=int(proposal_id or 0),
+                decision=FeedbackDecision(
+                    target_trace_id=trace_id,
+                    mutation="upsert",
+                    feedback_valence=-1.0,
+                    confidence=0.92,
+                    scope_type="sender",
+                    scope_key=request.sender_id,
+                    aspect=f"{prefix}_answer_style",
+                    statement="用户要求直接给出结论。",
+                    prospective_cue=f"{prefix} 场景直接给出结论。",
+                    trigger_cues=(),
+                    activation_mode="always",
+                ),
+            )
+            return trace_id, int(proposal_id or 0), learned, feedback
+
+        trace_id, proposal_id, learned, feedback = committed_feedback(
+            "receipt-primary", request_at=100, feedback_at=110
+        )
+        decoy_trace_id, _, decoy_learned, decoy_feedback = committed_feedback(
+            "receipt-decoy", request_at=200, feedback_at=210
+        )
+
+        mutation = parse_graph_mutation(
+            {
+                "operation": "upsert_edge",
+                "evidence_source_keys": [feedback.resolved_source_key()],
+                "confidence": 0.88,
+                "utility_delta": 0.5,
+                "statement": "回答应直接给出结论。",
+                "source": {"kind": "behavior", "label": "回答方案"},
+                "relation": {
+                    "key": "prefers_directness",
+                    "name": "偏好直接",
+                    "description": "回答方式的直接程度偏好",
+                    "source_kinds": ["behavior"],
+                    "target_kinds": ["preference"],
+                },
+                "target": {"kind": "preference", "label": "直接结论"},
+            }
+        )
+        mutation_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=mutation,
+            feedback_proposal_id=proposal_id,
+        )
+        decoy_mutation = parse_graph_mutation(
+            {
+                "operation": "upsert_edge",
+                "evidence_source_keys": [decoy_feedback.resolved_source_key()],
+                "confidence": 0.86,
+                "utility_delta": 0.4,
+                "statement": "回答应保留推导过程。",
+                "source": {"kind": "behavior", "label": "解释方案"},
+                "relation": {
+                    "key": "prefers_explanation",
+                    "name": "偏好解释",
+                    "description": "回答方式的解释程度偏好",
+                    "source_kinds": ["behavior"],
+                    "target_kinds": ["preference"],
+                },
+                "target": {"kind": "preference", "label": "保留推导"},
+            }
+        )
+        decoy_mutation_result = self.storage.apply_graph_mutation(
+            umo=umo,
+            mutation=decoy_mutation,
+        )
+        decoy_hypothesis_id = int(decoy_learned["hypothesis_id"])
+        decoy_edge_id = int(decoy_mutation_result["target_id"])
+        base_outcome = {
+            "proposal_id": proposal_id,
+            "proposal_status": learned["status"],
+            "trace_id": trace_id,
+            "hypothesis_id": learned["hypothesis_id"],
+            "graph_mutation_results": [
+                {**mutation_result, "proposal": mutation.as_dict()}
+            ],
+        }
+        variants = (
+            (
+                "proposal-status",
+                {**base_outcome, "proposal_status": "IGNORED"},
+                "proposal_status:mismatch",
+                "all",
+            ),
+            (
+                "trace-id",
+                {**base_outcome, "trace_id": decoy_trace_id},
+                "trace_id:mismatch",
+                "all",
+            ),
+            (
+                "hypothesis-id",
+                {**base_outcome, "hypothesis_id": decoy_hypothesis_id},
+                "hypothesis_id:mismatch",
+                "hypothesis",
+            ),
+            (
+                "mutation-target",
+                {
+                    **base_outcome,
+                    "graph_mutation_results": [
+                        {
+                            **mutation_result,
+                            "target_id": decoy_edge_id,
+                            "proposal": mutation.as_dict(),
+                        }
+                    ],
+                },
+                "receipt_mismatch",
+                "edge",
+            ),
+        )
+        for suffix, outcome, expected_error, fake_kind in variants:
+            with self.subTest(suffix=suffix):
+                run_id = f"tampered-committed-{suffix}"
+                self.storage.start_experiment(
+                    run_id=run_id,
+                    umo=umo,
+                    experiment_type="runtime_feedback_maintenance",
+                )
+                self.storage.finish_experiment(
+                    run_id=run_id,
+                    status="completed",
+                    result={"outcomes": [outcome]},
+                )
+                detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+                assert detail is not None
+                effects = detail["memory_effects"]
+                self.assertIn(effects["state"], {"PARTIAL", "INCOMPLETE_CAPTURE"})
+                self.assertFalse(effects["exact"])
+                self.assertTrue(
+                    any(
+                        expected_error in item
+                        for item in effects["integrity_errors"]
+                    )
+                )
+                if fake_kind == "all":
+                    self.assertEqual(effects["nodes"], [])
+                    self.assertEqual(effects["edges"], [])
+                elif fake_kind == "hypothesis":
+                    self.assertNotIn(
+                        f"hypothesis:{decoy_hypothesis_id}",
+                        {node["id"] for node in effects["nodes"]},
+                    )
+                else:
+                    self.assertNotIn(
+                        f"plastic_edge:{decoy_edge_id}",
+                        {edge["id"] for edge in effects["edges"]},
+                    )
+
+    def test_pending_and_rejected_feedback_are_not_exact_zero(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("nonterminal-request", "给一个方案", sent_at=100)
+        self.storage.upsert_message(request)
+        trace_id = "nonterminal-trace"
+        self.storage.start_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id=trace_id,
+            umo=umo,
+            response_text="这是方案。",
+            response_at=101,
+        )
+        proposals: list[tuple[int, str]] = []
+        for suffix, sent_at in (("pending", 110), ("rejected", 120)):
+            feedback = self.message(
+                f"{suffix}-feedback",
+                "不是这样，下次不要反问，直接给方案。",
+                sent_at=sent_at,
+            )
+            self.storage.upsert_message(feedback)
+            proposal_id = self.storage.enqueue_feedback_candidate(
+                umo=umo,
+                feedback_source_key=feedback.resolved_source_key(),
+            )
+            self.assertIsNotNone(proposal_id)
+            proposals.append((int(proposal_id or 0), suffix.upper()))
+        self.storage.reject_feedback_proposal(
+            umo=umo,
+            proposal_id=proposals[1][0],
+            error="fixture rejection",
+        )
+        statuses = ((proposals[0][0], "PENDING"), (proposals[1][0], "REJECTED"))
+        for proposal_id, status in statuses:
+            with self.subTest(status=status):
+                run_id = f"completed-{status.casefold()}-feedback"
+                self.storage.start_experiment(
+                    run_id=run_id,
+                    umo=umo,
+                    experiment_type="runtime_feedback_maintenance",
+                )
+                self.storage.finish_experiment(
+                    run_id=run_id,
+                    status="completed",
+                    result={
+                        "outcomes": [
+                            {
+                                "proposal_id": proposal_id,
+                                "proposal_status": status,
+                            }
+                        ]
+                    },
+                )
+                detail = self.storage.experiment_detail(run_id=run_id, umo=umo)
+                assert detail is not None
+                effects = detail["memory_effects"]
+                self.assertNotIn(effects["state"], {"NO_ACTIVATION", "NOT_APPLICABLE"})
+                self.assertFalse(effects["exact"])
+                self.assertFalse(effects["identity_exact"])
+                self.assertTrue(
+                    all(value is None for value in effects["counts"].values())
+                )
 
     def test_interrupted_experiment_is_closed_on_reopen(self) -> None:
         umo = "shadow:GroupMessage:group-a"

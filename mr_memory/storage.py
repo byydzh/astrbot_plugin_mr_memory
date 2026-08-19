@@ -5928,13 +5928,919 @@ class MemoryStorage:
             ],
         }
 
+    def _experiment_memory_effects(
+        self,
+        *,
+        umo: str,
+        run: Mapping[str, object],
+        result: Mapping[str, object],
+        metadata: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Project only verified persistent-memory reads and writes for one run.
+
+        The provenance graph below is useful for debugging, but it is not a
+        memory graph.  This projection deliberately ignores evidence, prompts,
+        briefs, requests, responses, and feedback proposals.  A read is shown
+        only when the durable activation ledger confirms it.  Feedback writes
+        are taken from committed outcomes and graph-mutation receipts.
+        """
+
+        max_trace_ids = 16
+        max_outcomes = 64
+        max_mutation_receipts = 128
+        max_entity_refs = 400
+        max_selected_ids = 80
+        sqlite_int_max = (1 << 63) - 1
+
+        warnings: list[str] = []
+        missing_refs: list[str] = []
+        unsupported_refs: list[str] = []
+        integrity_errors: list[str] = []
+        truncated = False
+
+        def integrity_error(value: str) -> None:
+            if value not in integrity_errors:
+                integrity_errors.append(value)
+
+        def positive_int(value: object, *, field: str) -> int:
+            if value in (None, ""):
+                return 0
+            parsed = 0
+            if isinstance(value, bool):
+                integrity_error(f"{field}:invalid_integer")
+                return 0
+            if isinstance(value, int):
+                parsed = value
+            elif isinstance(value, str):
+                normalized = value.strip()
+                if not re.fullmatch(r"[1-9][0-9]{0,18}", normalized):
+                    integrity_error(f"{field}:invalid_integer")
+                    return 0
+                parsed = int(normalized)
+            else:
+                integrity_error(f"{field}:invalid_integer")
+                return 0
+            if parsed <= 0 or parsed > sqlite_int_max:
+                integrity_error(f"{field}:out_of_range")
+                return 0
+            return parsed
+
+        def integer_ids(value: object, *, field: str) -> set[int]:
+            nonlocal truncated
+            if value in (None, ()):
+                return set()
+            if not isinstance(value, (list, tuple)):
+                integrity_error(f"{field}:invalid_array")
+                return set()
+            parsed: set[int] = set()
+            for index, item in enumerate(value):
+                entity_id = positive_int(item, field=f"{field}[{index}]")
+                if entity_id:
+                    parsed.add(entity_id)
+            if len(parsed) > max_selected_ids:
+                truncated = True
+                integrity_error(f"{field}:too_many_ids")
+                return set(sorted(parsed)[:max_selected_ids])
+            return parsed
+
+        def trace_id_value(value: object, *, field: str) -> str:
+            if value in (None, ""):
+                return ""
+            if not isinstance(value, str):
+                integrity_error(f"{field}:invalid_trace_id")
+                return ""
+            normalized = value.strip()
+            if (
+                not normalized
+                or len(normalized) > 200
+                or any(ord(character) < 32 for character in normalized)
+            ):
+                integrity_error(f"{field}:invalid_trace_id")
+                return ""
+            return normalized
+
+        access_order = {
+            "read": 0,
+            "upsert": 1,
+            "write": 2,
+            "modify": 3,
+            "context": 4,
+        }
+
+        def ordered_access(values: Iterable[str]) -> list[str]:
+            normalized = {str(item) for item in values if str(item)}
+            if normalized - {"context"}:
+                normalized.discard("context")
+            return sorted(normalized, key=lambda item: access_order.get(item, 99))
+
+        experiment_type = str(run.get("experiment_type") or "")
+        run_status = str(run.get("status") or "").upper()
+        outcomes_value = result.get("outcomes")
+        outcomes: list[dict[str, object]] = []
+        if outcomes_value not in (None, []):
+            if not isinstance(outcomes_value, list):
+                integrity_error("outcomes:invalid_array")
+            else:
+                if len(outcomes_value) > max_outcomes:
+                    truncated = True
+                    integrity_error("outcomes:too_many_items")
+                for index, item in enumerate(outcomes_value[:max_outcomes]):
+                    if not isinstance(item, dict):
+                        integrity_error(f"outcomes[{index}]:invalid_object")
+                        continue
+                    outcomes.append(item)
+
+        trace_ids: set[str] = set()
+        root_trace_ids: set[str] = set()
+        trace_scope_cache: dict[str, bool] = {}
+
+        def trace_belongs_to_scope(trace_id: str, *, field: str) -> bool:
+            if trace_id in trace_scope_cache:
+                belongs = trace_scope_cache[trace_id]
+            else:
+                with self._lock:
+                    row = self._connection.execute(
+                        """
+                        SELECT 1 FROM interaction_traces
+                        WHERE trace_id=? AND umo=?
+                        """,
+                        (trace_id, umo),
+                    ).fetchone()
+                belongs = row is not None
+                trace_scope_cache[trace_id] = belongs
+            if not belongs:
+                integrity_error(f"{field}:trace_outside_scope_or_missing")
+            return belongs
+
+        result_trace_id = trace_id_value(
+            result.get("trace_id"), field="result.trace_id"
+        )
+        metadata_trace_id = trace_id_value(
+            metadata.get("trace_id"), field="metadata.trace_id"
+        )
+        if (
+            result_trace_id
+            and metadata_trace_id
+            and result_trace_id != metadata_trace_id
+        ):
+            integrity_error("run_trace_id:mismatch")
+        else:
+            root_trace_id = result_trace_id or metadata_trace_id
+            if root_trace_id and trace_belongs_to_scope(
+                root_trace_id, field="run_trace_id"
+            ):
+                root_trace_ids.add(root_trace_id)
+                trace_ids.add(root_trace_id)
+
+        feedback_target_trace_ids: set[str] = set()
+        hypothesis_access: dict[int, set[str]] = {}
+        edge_access: dict[int, set[str]] = {}
+        activation_hypotheses: dict[int, list[dict[str, object]]] = {}
+        activation_edges: dict[int, list[dict[str, object]]] = {}
+        verified_feedback_statuses: list[str] = []
+        processed_mutation_receipts = 0
+
+        def mark(
+            target: dict[int, set[str]],
+            entity_id: int,
+            access: str,
+        ) -> None:
+            if entity_id > 0:
+                target.setdefault(entity_id, set()).add(access)
+
+        feedback_outcomes = outcomes
+        if outcomes and experiment_type != "runtime_feedback_maintenance":
+            integrity_error("outcomes:unexpected_for_experiment_type")
+            feedback_outcomes = []
+
+        # A feedback result is only an index into durable receipts.  Never use
+        # a run-result status, target trace, hypothesis, or graph mutation until
+        # the group-scoped proposal/mutation ledger confirms the same identity.
+        for outcome_index, outcome in enumerate(feedback_outcomes):
+            proposal_id = positive_int(
+                outcome.get("proposal_id"),
+                field=f"outcomes[{outcome_index}].proposal_id",
+            )
+            outcome_status_value = outcome.get("proposal_status")
+            if not isinstance(outcome_status_value, str):
+                integrity_error(
+                    f"outcomes[{outcome_index}].proposal_status:invalid_status"
+                )
+                continue
+            outcome_status = outcome_status_value.strip().upper()
+            if outcome_status not in {"COMMITTED", "IGNORED", "REJECTED", "PENDING"}:
+                integrity_error(
+                    f"outcomes[{outcome_index}].proposal_status:unknown_status"
+                )
+                continue
+            if not proposal_id:
+                continue
+            with self._lock:
+                proposal = self._connection.execute(
+                    """
+                    SELECT feedback_source_key, decision_json, status
+                    FROM feedback_proposals WHERE id=? AND umo=?
+                    """,
+                    (proposal_id, umo),
+                ).fetchone()
+            if proposal is None:
+                integrity_error(
+                    f"outcomes[{outcome_index}].proposal_id:missing_or_outside_scope"
+                )
+                continue
+            persisted_status = str(proposal["status"] or "").strip().upper()
+            if outcome_status != persisted_status:
+                integrity_error(
+                    f"outcomes[{outcome_index}].proposal_status:mismatch"
+                )
+                continue
+            verified_feedback_statuses.append(persisted_status)
+            if persisted_status != "COMMITTED":
+                continue
+
+            try:
+                decoded = json.loads(str(proposal["decision_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                decoded = None
+            if not isinstance(decoded, dict):
+                integrity_error(
+                    f"outcomes[{outcome_index}].decision:invalid_json"
+                )
+                continue
+            decision = decoded
+            mutation = str(decision.get("mutation") or "").strip().casefold()
+            if mutation not in {"upsert", "reinforce", "contradict"}:
+                integrity_error(
+                    f"outcomes[{outcome_index}].decision:invalid_mutation"
+                )
+                continue
+            decision_trace_id = trace_id_value(
+                decision.get("target_trace_id"),
+                field=f"outcomes[{outcome_index}].decision.target_trace_id",
+            )
+            outcome_trace_id = trace_id_value(
+                outcome.get("trace_id"),
+                field=f"outcomes[{outcome_index}].trace_id",
+            )
+            if not decision_trace_id:
+                integrity_error(
+                    f"outcomes[{outcome_index}].decision.target_trace_id:missing"
+                )
+                continue
+            if outcome_trace_id and outcome_trace_id != decision_trace_id:
+                integrity_error(f"outcomes[{outcome_index}].trace_id:mismatch")
+                continue
+            if not trace_belongs_to_scope(
+                decision_trace_id,
+                field=f"outcomes[{outcome_index}].decision.target_trace_id",
+            ):
+                continue
+            trace_ids.add(decision_trace_id)
+            feedback_target_trace_ids.add(decision_trace_id)
+
+            feedback_source_key = str(proposal["feedback_source_key"] or "")
+            with self._lock:
+                hypothesis_rows = self._connection.execute(
+                    """
+                    SELECT DISTINCT he.hypothesis_id
+                    FROM hypothesis_evidence AS he
+                    JOIN feedback_hypotheses AS h
+                      ON h.id=he.hypothesis_id AND h.umo=?
+                    WHERE he.feedback_source_key=? AND he.trace_id=?
+                    ORDER BY he.hypothesis_id
+                    LIMIT 3
+                    """,
+                    (umo, feedback_source_key, decision_trace_id),
+                ).fetchall()
+            persisted_hypothesis_ids = {
+                int(row["hypothesis_id"]) for row in hypothesis_rows
+            }
+            if len(persisted_hypothesis_ids) != 1:
+                integrity_error(
+                    f"outcomes[{outcome_index}].hypothesis_id:ambiguous_or_missing_receipt"
+                )
+            else:
+                hypothesis_id = next(iter(persisted_hypothesis_ids))
+                outcome_hypothesis_id = positive_int(
+                    outcome.get("hypothesis_id"),
+                    field=f"outcomes[{outcome_index}].hypothesis_id",
+                )
+                decision_hypothesis_id = positive_int(
+                    decision.get("target_hypothesis_id"),
+                    field=(
+                        f"outcomes[{outcome_index}].decision.target_hypothesis_id"
+                    ),
+                )
+                if (
+                    outcome_hypothesis_id
+                    and outcome_hypothesis_id != hypothesis_id
+                ) or (
+                    decision_hypothesis_id
+                    and decision_hypothesis_id != hypothesis_id
+                ):
+                    integrity_error(
+                        f"outcomes[{outcome_index}].hypothesis_id:mismatch"
+                    )
+                else:
+                    mark(
+                        hypothesis_access,
+                        hypothesis_id,
+                        "upsert" if mutation == "upsert" else "modify",
+                    )
+
+            mutation_results = outcome.get("graph_mutation_results")
+            if mutation_results in (None, []):
+                mutation_results = []
+            elif not isinstance(mutation_results, list):
+                integrity_error(
+                    f"outcomes[{outcome_index}].graph_mutation_results:invalid_array"
+                )
+                mutation_results = []
+            for mutation_index, mutation_result in enumerate(mutation_results):
+                if processed_mutation_receipts >= max_mutation_receipts:
+                    truncated = True
+                    integrity_error("graph_mutation_results:too_many_items")
+                    break
+                processed_mutation_receipts += 1
+                field = (
+                    f"outcomes[{outcome_index}].graph_mutation_results"
+                    f"[{mutation_index}]"
+                )
+                if not isinstance(mutation_result, dict):
+                    integrity_error(f"{field}:invalid_object")
+                    continue
+                mutation_id = positive_int(
+                    mutation_result.get("mutation_id"), field=f"{field}.mutation_id"
+                )
+                if not mutation_id:
+                    continue
+                with self._lock:
+                    mutation_row = self._connection.execute(
+                        """
+                        SELECT status, operation, target_type, target_id, payload_json
+                        FROM graph_mutations WHERE id=? AND umo=?
+                        """,
+                        (mutation_id, umo),
+                    ).fetchone()
+                if mutation_row is None:
+                    integrity_error(f"{field}.mutation_id:missing_or_outside_scope")
+                    continue
+                receipt_status = str(mutation_row["status"] or "").strip().upper()
+                result_status = str(mutation_result.get("status") or "").strip().upper()
+                if receipt_status != "COMMITTED" or result_status != receipt_status:
+                    integrity_error(f"{field}.status:mismatch")
+                    continue
+                operation = str(mutation_row["operation"] or "").strip().casefold()
+                target_type = str(mutation_row["target_type"] or "").strip().casefold()
+                target_id = positive_int(
+                    mutation_row["target_id"], field=f"{field}.receipt.target_id"
+                )
+                result_operation = str(
+                    mutation_result.get("operation") or ""
+                ).strip().casefold()
+                result_target_type = str(
+                    mutation_result.get("target_type") or ""
+                ).strip().casefold()
+                result_target_id = positive_int(
+                    mutation_result.get("target_id"), field=f"{field}.target_id"
+                )
+                if (
+                    (result_operation and result_operation != operation)
+                    or (result_target_type and result_target_type != target_type)
+                    or (result_target_id and result_target_id != target_id)
+                ):
+                    integrity_error(f"{field}:receipt_mismatch")
+                    continue
+                proposal_value = mutation_result.get("proposal")
+                if proposal_value is not None:
+                    if not isinstance(proposal_value, dict):
+                        integrity_error(f"{field}.proposal:invalid_object")
+                        continue
+                    try:
+                        persisted_payload = json.loads(
+                            str(mutation_row["payload_json"] or "{}")
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        persisted_payload = None
+                    if persisted_payload != proposal_value:
+                        integrity_error(f"{field}.proposal:receipt_mismatch")
+                        continue
+                idempotent = mutation_result.get("idempotent")
+                if not isinstance(idempotent, bool):
+                    integrity_error(f"{field}.idempotent:invalid_boolean")
+                    continue
+                if idempotent:
+                    continue
+                if target_type == "edge" and target_id:
+                    mark(
+                        edge_access,
+                        target_id,
+                        "upsert" if operation == "upsert_edge" else "modify",
+                    )
+                elif target_type in {"relation", "node"} and target_id:
+                    unsupported_refs.append(
+                        f"graph_mutation:{mutation_id}:{target_type}:{target_id}"
+                    )
+
+        if experiment_type == "runtime_feedback_maintenance" and root_trace_ids:
+            unrelated_root_traces = root_trace_ids - feedback_target_trace_ids
+            if unrelated_root_traces:
+                integrity_error("run_trace_id:not_confirmed_by_feedback_decision")
+                trace_ids.difference_update(unrelated_root_traces)
+
+        if len(trace_ids) > max_trace_ids:
+            truncated = True
+            integrity_error("trace_ids:too_many_items")
+        bounded_trace_ids = sorted(trace_ids)[:max_trace_ids]
+        if bounded_trace_ids:
+            placeholders = ",".join("?" for _ in bounded_trace_ids)
+            with self._lock:
+                hypothesis_rows = self._connection.execute(
+                    f"""
+                    SELECT a.trace_id, a.hypothesis_id, a.activation_score,
+                           a.contribution, a.credit, a.activation_method
+                    FROM hypothesis_activations AS a
+                    JOIN feedback_hypotheses AS h ON h.id=a.hypothesis_id
+                    JOIN interaction_traces AS t
+                      ON t.trace_id=a.trace_id AND t.umo=h.umo
+                    WHERE h.umo=? AND a.trace_id IN ({placeholders})
+                    ORDER BY a.trace_id, a.hypothesis_id
+                    LIMIT 321
+                    """,
+                    (umo, *bounded_trace_ids),
+                ).fetchall()
+                plastic_rows = self._connection.execute(
+                    f"""
+                    SELECT e.trace_id, selected.node_key,
+                           selected.activation, e.contribution, e.eligibility,
+                           e.credit
+                    FROM trace_edges AS e
+                    JOIN interaction_traces AS t
+                      ON t.trace_id=e.trace_id AND t.umo=e.umo
+                    JOIN trace_nodes AS selected
+                      ON selected.id=e.target_node_id
+                     AND selected.trace_id=e.trace_id
+                     AND selected.umo=e.umo
+                    WHERE e.umo=? AND e.trace_id IN ({placeholders})
+                      AND e.relation='ACTIVATES'
+                      AND selected.node_type='plastic_edge'
+                      AND substr(selected.node_key, 1, 13)='plastic_edge:'
+                    ORDER BY e.trace_id, e.id
+                    LIMIT 321
+                    """,
+                    (umo, *bounded_trace_ids),
+                ).fetchall()
+            if len(hypothesis_rows) > 320:
+                truncated = True
+                integrity_error("hypothesis_activations:too_many_rows")
+            if len(plastic_rows) > 320:
+                truncated = True
+                integrity_error("plastic_activations:too_many_rows")
+            for row in hypothesis_rows[:320]:
+                hypothesis_id = int(row["hypothesis_id"])
+                activation_hypotheses.setdefault(hypothesis_id, []).append(dict(row))
+                mark(
+                    hypothesis_access,
+                    hypothesis_id,
+                    (
+                        "modify"
+                        if str(row["trace_id"]) in feedback_target_trace_ids
+                        else "read"
+                    ),
+                )
+            for row_index, row in enumerate(plastic_rows[:320]):
+                node_key = str(row["node_key"] or "")
+                match = re.fullmatch(r"plastic_edge:([1-9][0-9]{0,18})", node_key)
+                if match is None:
+                    integrity_error(
+                        f"plastic_activations[{row_index}].node_key:invalid"
+                    )
+                    continue
+                edge_id = positive_int(
+                    match.group(1),
+                    field=f"plastic_activations[{row_index}].edge_id",
+                )
+                if not edge_id:
+                    continue
+                activation_edges.setdefault(edge_id, []).append(dict(row))
+                mark(
+                    edge_access,
+                    edge_id,
+                    (
+                        "modify"
+                        if str(row["trace_id"]) in feedback_target_trace_ids
+                        else "read"
+                    ),
+                )
+
+        # A relation revision or node merge does not persist the exact edge IDs
+        # it changed.  Expanding the *current* adjacency would put later edges in
+        # an older run, so keep those receipts visible only as unsupported refs.
+
+        def cap_access_map(
+            target: dict[int, set[str]], *, field: str
+        ) -> dict[int, set[str]]:
+            nonlocal truncated
+            if len(target) <= max_entity_refs:
+                return target
+            truncated = True
+            integrity_error(f"{field}:too_many_entities")
+            retained = set(sorted(target)[:max_entity_refs])
+            return {entity_id: target[entity_id] for entity_id in retained}
+
+        hypothesis_access = cap_access_map(
+            hypothesis_access, field="hypothesis_effects"
+        )
+        edge_access = cap_access_map(edge_access, field="plastic_edge_effects")
+
+        nodes: dict[str, dict[str, object]] = {}
+        edges: list[dict[str, object]] = []
+        requested_hypothesis_ids = set(hypothesis_access)
+        requested_edge_ids = set(edge_access)
+
+        if requested_hypothesis_ids:
+            placeholders = ",".join("?" for _ in requested_hypothesis_ids)
+            with self._lock:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT id, scope_type, scope_key, aspect, statement,
+                           prospective_cue, trigger_cues_json, activation_mode,
+                           evidence_confidence, utility, support_count,
+                           contradict_count, status, learned_at
+                    FROM feedback_hypotheses
+                    WHERE umo=? AND id IN ({placeholders})
+                    ORDER BY id
+                    """,
+                    (umo, *sorted(requested_hypothesis_ids)),
+                ).fetchall()
+            found = {int(row["id"]) for row in rows}
+            missing_refs.extend(
+                f"hypothesis:{item}"
+                for item in sorted(requested_hypothesis_ids - found)
+            )
+            for row in rows:
+                hypothesis_id = int(row["id"])
+                activations = activation_hypotheses.get(hypothesis_id, [])
+                try:
+                    trigger_cues = json.loads(str(row["trigger_cues_json"] or "[]"))
+                except (TypeError, json.JSONDecodeError):
+                    trigger_cues = []
+                    warnings.append(
+                        f"记忆假设 {hypothesis_id} 的当前触发词数据损坏，已按空列表展示。"
+                    )
+                if not isinstance(trigger_cues, list):
+                    trigger_cues = []
+                    warnings.append(
+                        f"记忆假设 {hypothesis_id} 的当前触发词格式无效，已按空列表展示。"
+                    )
+                nodes[f"hypothesis:{hypothesis_id}"] = {
+                    "id": f"hypothesis:{hypothesis_id}",
+                    "type": "hypothesis",
+                    "entity_id": hypothesis_id,
+                    "label": str(row["aspect"] or row["prospective_cue"]),
+                    "detail": str(row["prospective_cue"] or row["statement"]),
+                    "statement": str(row["statement"]),
+                    "scope_type": str(row["scope_type"]),
+                    "scope_key": str(row["scope_key"]),
+                    "activation_mode": str(row["activation_mode"]),
+                    "trigger_cues": trigger_cues,
+                    "confidence": float(row["evidence_confidence"]),
+                    "utility": float(row["utility"]),
+                    "status": str(row["status"]),
+                    "learned_at": int(row["learned_at"]),
+                    "support_count": int(row["support_count"]),
+                    "contradict_count": int(row["contradict_count"]),
+                    "access": ordered_access(hypothesis_access[hypothesis_id]),
+                    "state_source": "current_resolution",
+                    "activation": {
+                        "score": max(
+                            (float(item["activation_score"]) for item in activations),
+                            default=0.0,
+                        ),
+                        "methods": sorted(
+                            {
+                                str(item["activation_method"])
+                                for item in activations
+                                if str(item["activation_method"])
+                            }
+                        ),
+                        "contribution": sum(
+                            float(item["contribution"]) for item in activations
+                        ),
+                        "credit": sum(float(item["credit"]) for item in activations),
+                    },
+                }
+
+        plastic_node_rows: dict[int, dict[str, object]] = {}
+        if requested_edge_ids:
+            placeholders = ",".join("?" for _ in requested_edge_ids)
+            with self._lock:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT e.id, e.statement, e.epistemic_confidence,
+                           e.epistemic_state, e.uncertainty, e.utility,
+                           e.support_count, e.contradict_count, e.status,
+                           src.id AS source_id, src.node_key AS source_key,
+                           src.node_kind AS source_kind, src.label AS source_label,
+                           src.description AS source_description,
+                           dst.id AS target_id, dst.node_key AS target_key,
+                           dst.node_kind AS target_kind, dst.label AS target_label,
+                           dst.description AS target_description,
+                           r.relation_key, r.version AS relation_version,
+                           r.canonical_name AS relation_name,
+                           GROUP_CONCAT(DISTINCT m.source_key) AS evidence_keys
+                    FROM plastic_edges AS e
+                    JOIN plastic_nodes AS src ON src.id=e.source_node_id
+                    JOIN plastic_nodes AS dst ON dst.id=e.target_node_id
+                    JOIN relation_types AS r ON r.id=e.relation_type_id
+                    LEFT JOIN plastic_edge_evidence AS pe ON pe.edge_id=e.id
+                    LEFT JOIN messages AS m
+                      ON m.id=pe.message_id AND m.umo=e.umo AND m.is_deleted=0
+                    WHERE e.umo=? AND e.id IN ({placeholders})
+                    GROUP BY e.id ORDER BY e.id
+                    """,
+                    (umo, *sorted(requested_edge_ids)),
+                ).fetchall()
+            found = {int(row["id"]) for row in rows}
+            missing_refs.extend(
+                f"plastic_edge:{item}" for item in sorted(requested_edge_ids - found)
+            )
+            for row in rows:
+                edge_id = int(row["id"])
+                source_id = int(row["source_id"])
+                target_id = int(row["target_id"])
+                plastic_node_rows.setdefault(
+                    source_id,
+                    {
+                        "id": f"plastic_node:{source_id}",
+                        "type": "plastic",
+                        "entity_id": source_id,
+                        "node_key": str(row["source_key"]),
+                        "node_kind": str(row["source_kind"]),
+                        "label": str(row["source_label"]),
+                        "detail": str(row["source_description"]),
+                    },
+                )
+                plastic_node_rows.setdefault(
+                    target_id,
+                    {
+                        "id": f"plastic_node:{target_id}",
+                        "type": "plastic",
+                        "entity_id": target_id,
+                        "node_key": str(row["target_key"]),
+                        "node_kind": str(row["target_kind"]),
+                        "label": str(row["target_label"]),
+                        "detail": str(row["target_description"]),
+                    },
+                )
+                activations = activation_edges.get(edge_id, [])
+                edges.append(
+                    {
+                        "id": f"plastic_edge:{edge_id}",
+                        "source": f"plastic_node:{source_id}",
+                        "target": f"plastic_node:{target_id}",
+                        "relation": str(row["relation_name"]),
+                        "relation_key": str(row["relation_key"]),
+                        "relation_version": int(row["relation_version"]),
+                        "type": "plastic_relation",
+                        "statement": str(row["statement"]),
+                        "confidence": float(row["epistemic_confidence"]),
+                        "epistemic_state": str(row["epistemic_state"]),
+                        "uncertainty": str(row["uncertainty"]),
+                        "utility": float(row["utility"]),
+                        "support_count": int(row["support_count"]),
+                        "contradict_count": int(row["contradict_count"]),
+                        "status": str(row["status"]),
+                        "source_keys": [
+                            key
+                            for key in str(row["evidence_keys"] or "").split(",")
+                            if key
+                        ],
+                        "access": ordered_access(edge_access[edge_id]),
+                        "state_source": "current_resolution",
+                        "activation": {
+                            "score": max(
+                                (
+                                    float(item["activation"])
+                                    for item in activations
+                                ),
+                                default=0.0,
+                            ),
+                            "contribution": sum(
+                                float(item["contribution"]) for item in activations
+                            ),
+                            "eligibility": max(
+                                (
+                                    float(item["eligibility"])
+                                    for item in activations
+                                ),
+                                default=0.0,
+                            ),
+                            "credit": sum(
+                                float(item["credit"]) for item in activations
+                            ),
+                        },
+                    }
+                )
+
+        for node_id, node in plastic_node_rows.items():
+            nodes[str(node["id"])] = {
+                **node,
+                "access": ["context"],
+                "state_source": "current_resolution",
+            }
+
+        selected_edge_ids = set().union(
+            integer_ids(
+                result.get("selected_edge_ids"), field="selected_edge_ids"
+            ),
+            integer_ids(
+                result.get("presented_edge_ids"), field="presented_edge_ids"
+            ),
+            integer_ids(
+                result.get("activated_edge_ids"), field="activated_edge_ids"
+            ),
+        )
+        selected_hypothesis_ids = set().union(
+            integer_ids(
+                result.get("selected_hypothesis_ids"),
+                field="selected_hypothesis_ids",
+            ),
+            integer_ids(
+                result.get("presented_hypothesis_ids"),
+                field="presented_hypothesis_ids",
+            ),
+        )
+        selected_not_activated = {
+            "edge_ids": sorted(selected_edge_ids - set(activation_edges)),
+            "hypothesis_ids": sorted(
+                selected_hypothesis_ids - set(activation_hypotheses)
+            ),
+        }
+        if any(selected_not_activated.values()):
+            warnings.append(
+                "部分候选记忆只有选择记录，没有最终激活账本，因此未画入记忆图。"
+            )
+        if nodes or edges:
+            warnings.append(
+                "本次读写身份来自调用账本；节点文字和状态按当前持久图解析。"
+            )
+        if missing_refs:
+            warnings.append(
+                f"有 {len(missing_refs)} 个账本引用当前无法在本群持久图中定位。"
+            )
+        if unsupported_refs:
+            warnings.append(
+                "关系版本或节点合并回执未保存当时受影响的连接 ID；"
+                "不会用当前邻接边替代历史结果。"
+            )
+        modern_zero_capture = False
+        run_id = str(run.get("run_id") or "").strip()
+        if (
+            run_status == "COMPLETED"
+            and result.get("no_relevant_memory") is True
+            and len(root_trace_ids) == 1
+            and run_id
+            and len(f"memory_brief:{run_id}") <= 200
+        ):
+            root_trace_id = next(iter(root_trace_ids))
+            with self._lock:
+                capture_row = self._connection.execute(
+                    """
+                    SELECT content_json FROM trace_nodes
+                    WHERE trace_id=? AND umo=? AND node_key=?
+                      AND node_type='memory_brief'
+                    """,
+                    (root_trace_id, umo, f"memory_brief:{run_id}"),
+                ).fetchone()
+            if capture_row is not None:
+                try:
+                    capture = json.loads(str(capture_row["content_json"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    capture = None
+                if not isinstance(capture, dict):
+                    integrity_error("modern_capture:invalid_json")
+                else:
+                    captured_edges = integer_ids(
+                        capture.get("presented_edge_ids"),
+                        field="modern_capture.presented_edge_ids",
+                    )
+                    captured_hypotheses = integer_ids(
+                        capture.get("presented_hypothesis_ids"),
+                        field="modern_capture.presented_hypothesis_ids",
+                    )
+                    modern_zero_capture = (
+                        str(capture.get("run_id") or "") == run_id
+                        and "memory_brief" in capture
+                        and capture.get("memory_brief") is None
+                        and not captured_edges
+                        and not captured_hypotheses
+                        and not selected_edge_ids
+                        and not selected_hypothesis_ids
+                        and not activation_edges
+                        and not activation_hypotheses
+                    )
+
+        if integrity_errors:
+            warnings.append(
+                f"有 {len(integrity_errors)} 个调用关联或账本字段未通过一致性校验。"
+            )
+        if truncated:
+            warnings.append("记忆效果超过安全展示上限；当前只返回已核验的有界子集。")
+
+        accesses = [
+            access
+            for item in [*nodes.values(), *edges]
+            for access in item.get("access", [])
+        ]
+        counts: dict[str, int | None] = {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "read": accesses.count("read"),
+            "upsert": accesses.count("upsert"),
+            "write": accesses.count("write"),
+            "modify": accesses.count("modify"),
+            "context": accesses.count("context"),
+        }
+        null_counts: dict[str, int | None] = {
+            "nodes": None,
+            "edges": None,
+            "read": None,
+            "upsert": None,
+            "write": None,
+            "modify": None,
+            "context": None,
+        }
+        association_incomplete = bool(
+            missing_refs or unsupported_refs or integrity_errors or truncated
+        )
+        if nodes or edges:
+            state = (
+                "PARTIAL"
+                if association_incomplete or run_status != "COMPLETED"
+                else "RECORDED"
+            )
+            empty_reason = ""
+        elif (
+            experiment_type == "runtime_feedback_maintenance"
+            and run_status == "COMPLETED"
+            and outcomes
+            and len(verified_feedback_statuses) == len(outcomes)
+            and set(verified_feedback_statuses) == {"IGNORED"}
+            and not association_incomplete
+        ):
+            state = "NOT_APPLICABLE"
+            empty_reason = "持久反馈账本确认所有候选均被忽略，本次没有记忆变更。"
+        elif modern_zero_capture and not association_incomplete:
+            state = "NO_ACTIVATION"
+            empty_reason = "现代调用账本明确记录本次没有呈现或激活持久记忆。"
+        elif run_status != "COMPLETED":
+            state = "INCOMPLETE_CAPTURE"
+            empty_reason = "调用未完成，没有可确认的记忆读写。"
+            counts = null_counts
+        elif association_incomplete or trace_ids or result.get("no_relevant_memory") is True:
+            state = "INCOMPLETE_CAPTURE"
+            empty_reason = (
+                "该调用缺少完整且一致的记忆激活或变更回执，不能把未知当作零。"
+            )
+            counts = null_counts
+        else:
+            state = "UNAVAILABLE_LEGACY"
+            empty_reason = (
+                "该记录未保存可定位的记忆激活明细；不会用当前记忆图替代历史结果。"
+            )
+            counts = null_counts
+
+        identity_exact = state in {"RECORDED", "NO_ACTIVATION", "NOT_APPLICABLE"}
+
+        return {
+            "schema_version": 2,
+            "state": state,
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "counts": counts,
+            # Payload text/status comes from the current durable graph.  Even
+            # when the activated identities are exact, this is not an as-of
+            # historical snapshot and must not be labelled an exact record.
+            "exact": identity_exact and not (nodes or edges),
+            "identity_exact": identity_exact,
+            "payload_as_of": "current_resolution" if nodes or edges else None,
+            "truncated": truncated,
+            "missing_refs": missing_refs,
+            "unsupported_refs": unsupported_refs,
+            "integrity_errors": integrity_errors,
+            "selected_not_activated": selected_not_activated,
+            "empty_reason": empty_reason,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+
     def experiment_detail(
         self,
         *,
         run_id: str,
         umo: str,
     ) -> dict[str, object] | None:
-        """Return one run plus a bounded, human-inspectable provenance graph."""
+        """Return one run, its verified memory effects, and an audit trace."""
 
         self._assert_scope(umo)
         report = self.experiment_report(run_id=run_id)
@@ -6393,8 +7299,15 @@ class MemoryStorage:
             )
         if result.get("no_relevant_memory") is True:
             warnings.append("该次调用明确判断为没有相关记忆。")
+        memory_effects = self._experiment_memory_effects(
+            umo=umo,
+            run=run,
+            result=result,
+            metadata=metadata,
+        )
         return {
             **report,
+            "memory_effects": memory_effects,
             "graph": {
                 "nodes": list(nodes.values()),
                 "edges": edges,

@@ -441,9 +441,9 @@
         <article class="run-detail-shell">
           <header class="run-detail-header">
             <div>
-              <p class="section-kicker">调用追溯</p>
-              <h2 id="run-detail-title">本次调用读取和产生了什么</h2>
-              <p id="run-detail-subtitle" class="panel-note">正在读取调用账本与证据追溯记录。</p>
+              <p class="section-kicker">记忆读写</p>
+              <h2 id="run-detail-title">本次实际激活或改变了哪些记忆</h2>
+              <p id="run-detail-subtitle" class="panel-note">正在读取持久记忆激活与写入账本。</p>
             </div>
             <button id="run-detail-close" class="icon-button" type="button" aria-label="关闭调用详情">×</button>
           </header>
@@ -453,13 +453,25 @@
             <section class="run-detail-graph-panel">
               <div class="run-detail-graph-heading">
                 <div>
-                  <strong>本次调用追溯链路</strong>
-                  <small id="run-detail-graph-caption">输入证据 → 处理步骤 → 输出或反馈结果</small>
+                  <strong>本次实际读取或改变的记忆</strong>
+                  <small id="run-detail-graph-caption">只显示有持久记忆身份的实际读写结果</small>
+                  <div class="run-detail-access-legend" aria-label="本次记忆操作图例">
+                    <span data-access="read">读取</span>
+                    <span data-access="write">写入</span>
+                    <span data-access="upsert">写入或更新</span>
+                    <span data-access="modify">修改</span>
+                    <span data-access="context">结构端点</span>
+                  </div>
+                  <div class="run-detail-memory-provenance" aria-label="记忆记录口径">
+                    <span id="run-detail-memory-state">记录状态未读取</span>
+                    <span id="run-detail-identity-basis">身份确认未记录</span>
+                    <span id="run-detail-payload-basis">载荷解析时间未记录</span>
+                  </div>
                 </div>
-                <button id="run-detail-fit" class="button ghost" type="button">重置链路视图</button>
+                <button id="run-detail-fit" class="button ghost" type="button">适合画布</button>
               </div>
               <div id="run-detail-graph-stage" class="run-detail-graph-stage">
-                <svg id="run-detail-graph" viewBox="0 0 1040 620" role="img" aria-label="调用证据与处理追溯链路">
+                <svg id="run-detail-graph" viewBox="0 0 1040 620" role="img" aria-label="本次调用实际读取或改变的持久记忆关系图">
                   <defs>
                     <marker id="run-detail-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
                       <path d="M 0 0 L 10 5 L 0 10 z"></path>
@@ -472,34 +484,41 @@
                 </svg>
                 <div id="run-detail-loading" class="loading-layer hidden">
                   <span class="spinner"></span>
-                  <p>正在还原调用追溯链路…</p>
+                  <p>正在读取本次记忆读写记录…</p>
                 </div>
                 <div id="run-detail-empty" class="empty-state hidden">
-                  <strong>这条记录没有可还原的追溯数据</strong>
-                  <p>旧调用可能只保存了耗时与 Token 账本。</p>
+                  <strong id="run-detail-empty-title">本次没有可显示的持久记忆读写</strong>
+                  <p id="run-detail-empty-copy">展开调用处理账本可查看证据与处理过程。</p>
                 </div>
               </div>
             </section>
             <aside class="run-detail-inspector">
-              <p class="section-kicker">节点详情</p>
-              <h3 id="run-detail-inspector-title">选择一个节点</h3>
+              <p class="section-kicker">记忆条目</p>
+              <h3 id="run-detail-inspector-title">选择一个记忆节点</h3>
               <div id="run-detail-inspector-content" class="run-detail-inspector-content">
-                <p class="panel-note">点击链路中的证据、处理步骤或结果，查看完整公开内容。</p>
+                <p class="panel-note">点击节点可查看本次读取、写入或修改状态及公开内容。</p>
               </div>
             </aside>
           </div>
-          <section class="run-detail-result">
-            <div>
-              <p class="section-kicker">公开结果</p>
-              <h3>该次调用最终落盘的结果</h3>
-            </div>
+          <details class="run-detail-ledger">
+            <summary>
+              <span>调用处理账本</span>
+              <small id="run-detail-ledger-summary">证据、处理步骤与输出结果</small>
+            </summary>
+            <pre id="run-detail-ledger-json">—</pre>
+          </details>
+          <details class="run-detail-result">
+            <summary>
+              <span>原始落盘结果</span>
+              <small>供开发与审计使用</small>
+            </summary>
             <pre id="run-detail-result-json">—</pre>
-          </section>
+          </details>
         </article>
       </dialog>
 
       <div id="toast-region" class="toast-region" aria-live="polite"></div>
     </main>
-    <script type="module" src="./script.js?v=0.18.0-trace-label"></script>
+    <script type="module" src="./script.js?v=0.18.1-conservative-effects"></script>
   </body>
 </html>
