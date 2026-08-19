@@ -2,32 +2,34 @@
 
 ## 0.18.0
 
-- Freeze every recall request into a host-owned `RequestSnapshot` with scope,
-  strict cutoff, message row upper bound, reply target, and data/inference
-  revision vectors; all layered reads are audited against that same view.
-- Add an exact L1a evidence-pack cache and a dependency-revalidated L1b semantic
-  certificate cache. Similar text alone never authorizes reuse, and invalidation
-  follows message, deletion, identity, graph, relation, feedback, model, protocol,
-  and route-policy revisions.
-- Replace the implicit 0.16 gate with an explicit host route: deterministic L0/L1,
-  one-pass L2 Evidence Reader, and host-approved bounded L3 ECCR using the shared
-  production `EccrOrchestrator` for compile, discriminate, and discovery audit.
-- Introduce `EvidenceCertificateV2` with subject binding, per-atom attribution and
-  provenance, unresolved obligations, `must_include`, `must_not_upgrade`, and
-  explicit stop reasons. A bounded surface compiler and answer verifier prevent
-  uncertain evidence from being promoted silently.
-- Coalesce duplicate request work with snapshot-bound async singleflight, charge
-  only the producer, separate semantic outcomes from operational failures, and
-  drain in-flight layered tasks during plugin hot reload.
-- Migrate per-group SQLite stores to schema 16 for request snapshots, evidence-pack
-  cache, certificates and dependencies, and reconstruction-job lifecycle,
-  including bounded recovery and cleanup of interrupted or expired state.
-- Add no Python dependency. The trial-deployment boundary is one plugin hot reload
-  plus per-group schema 15-to-16 migration; it does not require restarting AstrBot
-  or NapCat and does not by itself claim semantic quality for the three-case study.
-- Label the per-run provenance view as a call trace rather than a memory subgraph;
-  feedback runs now describe their processing result without implying that every
-  proposal already mutated the persistent memory graph.
+- 在线请求固定群范围、时间截止与来源快照，执行本地检索和一次 Resident Reader；
+  回答入口不再调用旧 L3 工具循环。失败与有效空结果分别记录。
+- `memory-answer-context.v2` 保留人物、作品、实体、主题、独立说话者及不确定性；
+  内部证书、原文摘录与持久来源键不进入主模型简报。
+- 宿主推导重复的身份绑定模式、必需事实清单和缺省原文引用；未获来源支持的身份、
+  伪引文及缺少必需事实的认证结果仍被拒绝，不通过放宽校验伪造成功。
+- 修复整理中允许的未绑定人物被空 ID 校验拒绝，以及固定失败任务阻止后续批次的问题。
+  预算不足的任务延期检查，已失败任务的历史状态保留。
+- 人物历史采用精确计数和索引读取；保留来源快照过滤，避免对全部原文排序。
+- 作息统计由宿主在完整可见时间窗口内计算，并保留独立的范围、计数和修订摘要；
+  原文样本不再代替全窗口统计。发言时间不作为醒来或入睡时间的证明。
+- 有限证据包优先保留查询中的稀有字面，包含字母与中文交界的词项；
+  保留原有来源数量上限，不把召回子集称为完整历史。
+- Reader 的临时人物标签避让原始输入中的同名标签；历史派生摘要与原文证据
+  分别标注，旧摘要缺失的身份映射不自动猜测或重建。
+- schema 19 按正文哈希及字符位置保存新派生字段的身份映射，支持跨批次拼接与
+  下划线内的临时代号；投递视图抑制无法映射的旧派生字段，保留原因及原始来源。
+- 主体来源关系包含经原始元数据核实的提及与引用目标；独立说话者来源仍只认作者。
+- 反馈任务冻结提案版本；失败只终结实际处理过的同版本提案，后续提案可另起任务。
+  相同失败批次保留错误并暂停自动重试，取消和未知用量仍显式记录。
+- 反馈上下文改为截止该消息前的最近有界片段，提供宿主计算的时间间隔；反馈思考
+  模式与整理独立配置，保持原有归因、来源与提交约束。
+- 流式失败保留已观察到的用量和异常链；未知用量明确标记，截断输出仍是失败。
+- 简报与反馈追踪元数据分别限制长度；失败请求的证书随请求缓存释放。
+- 清除公开目录中的个人案例、内嵌人工答案和旧专用实验脚本；真实回放输入、
+  数据库及结果只存放于私有目录。工作树清理不代表旧 Git 历史已改写。
+- 语义效果需由真实请求的检索、Reader、注入和最终回答共同验收；字面匹配和
+  协议测试均不作为语义准确率。此次修复不新增生产 Python 依赖。
 
 ## 0.17.1
 

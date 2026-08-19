@@ -121,8 +121,15 @@ const elements = {
   runDetailNodes: document.getElementById("run-detail-nodes"),
   runDetailLoading: document.getElementById("run-detail-loading"),
   runDetailEmpty: document.getElementById("run-detail-empty"),
+  runDetailEmptyTitle: document.getElementById("run-detail-empty-title"),
+  runDetailEmptyCopy: document.getElementById("run-detail-empty-copy"),
+  runDetailMemoryState: document.getElementById("run-detail-memory-state"),
+  runDetailIdentityBasis: document.getElementById("run-detail-identity-basis"),
+  runDetailPayloadBasis: document.getElementById("run-detail-payload-basis"),
   runDetailInspectorTitle: document.getElementById("run-detail-inspector-title"),
   runDetailInspectorContent: document.getElementById("run-detail-inspector-content"),
+  runDetailLedgerSummary: document.getElementById("run-detail-ledger-summary"),
+  runDetailLedgerJson: document.getElementById("run-detail-ledger-json"),
   runDetailResultJson: document.getElementById("run-detail-result-json"),
   queuePending: document.getElementById("queue-pending"),
   queueProvisional: document.getElementById("queue-provisional"),
@@ -514,205 +521,563 @@ function renderRuntimeCalls(calls) {
   });
 }
 
-const runDetailTypeNames = {
-  ...typeNames,
-  run: "处理运行",
-  request: "请求",
-  response: "主模型回答",
-  evidence: "原始证据",
-  memory_evidence: "回忆证据",
-  memory_brief: "记忆简报",
-  memory_claim: "记忆结论",
-  memory_conflict: "冲突解释",
-  memory_unresolved: "待确认解释",
-  feedback_proposal: "反馈候选",
-  graph_mutation: "图修改",
-  tool_call: "工具调用",
-  tool_result: "工具结果",
+const memoryAccessNames = {
+  read: "读取",
+  write: "写入",
+  upsert: "写入或更新",
+  modify: "修改",
+  context: "结构端点",
 };
 
-function runDetailRank(node) {
-  const type = String(node.type || "");
-  if (["evidence", "memory_evidence", "request", "participant"].includes(type)) return 0;
-  if ([
-    "memory_claim", "memory_conflict", "memory_unresolved", "semantic",
-    "episode", "plastic", "hypothesis",
-  ].includes(type)) return 1;
-  if (["run", "memory_brief", "tool_call", "tool_result", "graph_mutation"].includes(type)) return 2;
-  return 3;
+const memoryAccessOrder = ["read", "write", "upsert", "modify", "context"];
+
+const memoryEffectStateNames = {
+  RECORDED: "已记录",
+  PARTIAL: "部分记录",
+  NOT_APPLICABLE: "不适用",
+  NO_ACTIVATION: "未激活记忆",
+  INCOMPLETE_CAPTURE: "记录不完整",
+  UNAVAILABLE_LEGACY: "旧记录不可还原",
+};
+
+function normalizedMemoryAccess(item) {
+  const raw = Array.isArray(item?.access) ? item.access : [];
+  const values = new Set(
+    raw.map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => Object.hasOwn(memoryAccessNames, value)),
+  );
+  return memoryAccessOrder.filter((value) => values.has(value));
 }
 
-function layoutRunDetailGraph(nodes) {
-  const columns = [[], [], [], []];
-  nodes.forEach((node) => columns[runDetailRank(node)].push(node));
-  columns.forEach((column) => column.sort((a, b) => (
-    String(a.type).localeCompare(String(b.type), "zh-CN")
-    || String(a.label).localeCompare(String(b.label), "zh-CN")
-  )));
-  const maxColumn = Math.max(1, ...columns.map((column) => column.length));
-  const height = Math.max(620, maxColumn * 92 + 80);
-  const xValues = [125, 390, 665, 930];
+function memoryAccessText(item) {
+  const values = normalizedMemoryAccess(item);
+  return values.length ? values.map((value) => memoryAccessNames[value]).join("、") : "未标记";
+}
+
+function memoryEffects(detail = state.runDetail) {
+  const value = detail?.memory_effects;
+  return value && typeof value === "object" ? value : {};
+}
+
+function memoryEffectCounts(effects, nodes, edges) {
+  const provided = effects?.counts && typeof effects.counts === "object" ? effects.counts : {};
+  const items = [...nodes, ...edges];
+  const computed = Object.fromEntries(
+    memoryAccessOrder.map((access) => [
+      access,
+      items.filter((item) => normalizedMemoryAccess(item).includes(access)).length,
+    ]),
+  );
+  return Object.fromEntries(memoryAccessOrder.map((access) => {
+    if (Object.hasOwn(provided, access) && provided[access] === null) return [access, null];
+    const value = Number(provided[access]);
+    return [access, Number.isFinite(value) && value >= 0 ? value : computed[access]];
+  }));
+}
+
+function memoryEffectsAreTruncated(effects) {
+  return effects?.truncated === true || effects?.counts?.truncated === true;
+}
+
+function formatMemoryEffectCount(value, effects) {
+  if (value === null) return "未记录";
+  if (memoryEffectsAreTruncated(effects)) {
+    return Number(value) > 0 ? `至少 ${formatNumber(value)}` : "未知（已截断）";
+  }
+  return formatNumber(value);
+}
+
+function memoryEntityCount(effects, key, visibleCount) {
+  const stateName = String(effects?.state || "").toUpperCase();
+  const counts = effects?.counts && typeof effects.counts === "object" ? effects.counts : {};
+  const totalKeys = [`total_${key}`, `${key}_total`];
+  for (const totalKey of totalKeys) {
+    const candidates = [effects?.[totalKey], counts?.[totalKey]];
+    for (const candidate of candidates) {
+      if (candidate === null) return { value: null, exactTotal: false };
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed) && parsed >= 0) return { value: parsed, exactTotal: true };
+    }
+  }
+  if (Object.hasOwn(counts, key)) {
+    if (counts[key] === null) return { value: null, exactTotal: false };
+    const parsed = Number(counts[key]);
+    return Number.isFinite(parsed) && parsed >= 0
+      ? { value: parsed, exactTotal: !memoryEffectsAreTruncated(effects) }
+      : { value: null, exactTotal: false };
+  }
+  if (["INCOMPLETE_CAPTURE", "UNAVAILABLE_LEGACY"].includes(stateName)) {
+    return { value: null, exactTotal: false };
+  }
+  const collection = effects?.[key];
+  if (!Array.isArray(collection)) return { value: null, exactTotal: false };
+  return { value: visibleCount, exactTotal: !memoryEffectsAreTruncated(effects) };
+}
+
+function formatMemoryEntityCount(metric, effects) {
+  if (metric.value === null) return "未记录";
+  if (metric.exactTotal) return formatNumber(metric.value);
+  if (memoryEffectsAreTruncated(effects)) {
+    return metric.value > 0 ? `至少 ${formatNumber(metric.value)}` : "未知";
+  }
+  return formatNumber(metric.value);
+}
+
+function memoryEffectsMetricValue(effects, nodes, edges) {
+  const stateName = String(effects?.state || "").toUpperCase();
+  const nodeCount = memoryEntityCount(effects, "nodes", nodes.length);
+  const edgeCount = memoryEntityCount(effects, "edges", edges.length);
+  if (
+    ["INCOMPLETE_CAPTURE", "UNAVAILABLE_LEGACY"].includes(stateName)
+    && nodeCount.value === null
+    && edgeCount.value === null
+  ) return "未记录";
+  return `${formatMemoryEntityCount(nodeCount, effects)} / ${formatMemoryEntityCount(edgeCount, effects)}`;
+}
+
+function memoryIdentityBasisText(effects) {
+  if (effects?.identity_exact === true) return "账本确认身份";
+  if (effects?.identity_exact === false) return "身份记录不完整";
+  return "身份确认未记录";
+}
+
+function memoryPayloadBasisText(effects) {
+  const value = effects?.payload_as_of;
+  if (value === null || value === undefined || value === "") return "载荷解析时间未记录";
+  if (typeof value === "object") {
+    const mode = String(value.mode || value.source || "").toUpperCase();
+    const at = value.at || value.timestamp;
+    if (mode.includes("CURRENT")) return at ? `当前状态解析 · ${formatTime(at)}` : "当前状态解析";
+    return at ? `状态解析截至 ${formatTime(at)}` : "载荷解析口径已记录";
+  }
+  const normalized = String(value).toUpperCase();
+  if (normalized.includes("CURRENT")) return "当前状态解析";
+  return `状态解析截至 ${formatTime(value)}`;
+}
+
+function renderMemoryEffectsBasis(effects) {
+  const stateName = String(effects?.state || "").toUpperCase();
+  elements.runDetailMemoryState.textContent = memoryEffectStateNames[stateName] || "记录状态未记录";
+  elements.runDetailMemoryState.dataset.state = stateName || "UNKNOWN";
+  elements.runDetailIdentityBasis.textContent = memoryIdentityBasisText(effects);
+  elements.runDetailPayloadBasis.textContent = memoryPayloadBasisText(effects);
+}
+
+function memoryEffectsEmptyState(effects, run) {
+  const reason = String(effects?.empty_reason || "").trim();
+  const stateName = String(effects?.state || "").toUpperCase();
+  const stateTitles = {
+    PARTIAL: "仅能定位部分记忆操作",
+    NO_ACTIVATION: "本次没有激活持久记忆",
+    NOT_APPLICABLE: "本次不产生记忆读写",
+    INCOMPLETE_CAPTURE: "本次记忆操作记录不完整",
+    UNAVAILABLE_LEGACY: "旧记录未保存可定位的记忆条目",
+  };
+  const known = {
+    no_activation: [
+      "本次没有激活持久记忆",
+      "模型可能只使用了当前对话或原始证据；展开调用处理账本可查看依据。",
+    ],
+    no_changes: [
+      "本次没有写入或修改记忆",
+      "反馈未形成已提交的持久记忆变更；展开调用处理账本可查看判定。",
+    ],
+    legacy_identity_missing: [
+      "旧记录无法定位具体记忆条目",
+      "当时未保存稳定的节点或连接 ID；不会用当前记忆图替代历史结果。",
+    ],
+    failed: [
+      "调用未完成",
+      "没有可确认的持久记忆读取、写入或修改记录。",
+    ],
+  };
+  if (known[reason]) return { title: known[reason][0], copy: known[reason][1] };
+  if (reason) {
+    return {
+      title: run?.status === "failed"
+        ? "调用未完成"
+        : stateTitles[stateName] || "本次没有可显示的持久记忆读写",
+      copy: reason,
+    };
+  }
+  return {
+    title: stateTitles[stateName] || "本次没有可显示的持久记忆读写",
+    copy: "该调用尚未保存可定位的持久记忆操作；展开调用处理账本可查看过程。",
+  };
+}
+
+function layoutRunMemoryGraph(nodes, edges) {
+  const width = 1040;
+  const height = Math.max(540, 420 + Math.ceil(Math.max(0, nodes.length - 12) / 12) * 120);
+  const center = { x: width / 2, y: height / 2 };
   const positions = new Map();
-  columns.forEach((column, rank) => {
-    const span = Math.max(1, column.length - 1) * 92;
-    const start = Math.max(52, (height - span) / 2);
-    column.forEach((node, index) => {
-      positions.set(node.id, { x: xValues[rank], y: start + index * 92 });
+  const velocity = new Map();
+  if (nodes.length === 1) {
+    positions.set(nodes[0].id, center);
+    return { width, height, positions };
+  }
+  const radius = Math.min(width, height) * Math.min(0.38, 0.2 + nodes.length * 0.012);
+  [...nodes]
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
+    .forEach((node, index) => {
+      const angle = (Math.PI * 2 * index) / Math.max(1, nodes.length) - Math.PI / 2;
+      positions.set(node.id, {
+        x: center.x + Math.cos(angle) * radius,
+        y: center.y + Math.sin(angle) * radius,
+      });
+      velocity.set(node.id, { x: 0, y: 0 });
     });
-  });
-  return { positions, width: 1060, height };
-}
-
-function fitRunDetailGraph() {
-  elements.runDetailGraphStage.scrollTo({
-    top: 0,
-    left: 0,
-    behavior: "smooth",
-  });
-}
-
-function runDetailNodeLabel(node) {
-  const label = String(node.label || node.id || "未命名节点");
-  return [truncate(label, 25), label.length > 25 ? truncate(label.slice(24), 25) : ""];
-}
-
-function runDetailTraceSummary(detail) {
-  if (detail?.run?.experiment_type === "runtime_feedback_maintenance") {
-    return "包含本次反馈处理结果";
+  const pairs = edges
+    .map((edge) => [String(edge.source), String(edge.target)])
+    .filter(([source, target]) => positions.has(source) && positions.has(target));
+  const iterations = nodes.length > 80 ? 30 : 48;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    for (let left = 0; left < nodes.length; left += 1) {
+      for (let right = left + 1; right < nodes.length; right += 1) {
+        const a = nodes[left];
+        const b = nodes[right];
+        const pa = positions.get(a.id);
+        const pb = positions.get(b.id);
+        const va = velocity.get(a.id);
+        const vb = velocity.get(b.id);
+        let dx = pa.x - pb.x;
+        let dy = pa.y - pb.y;
+        const distanceSquared = Math.max(225, dx * dx + dy * dy);
+        const distance = Math.sqrt(distanceSquared);
+        const force = Math.min(2.1, 8200 / distanceSquared);
+        dx /= distance;
+        dy /= distance;
+        va.x += dx * force;
+        va.y += dy * force;
+        vb.x -= dx * force;
+        vb.y -= dy * force;
+      }
+    }
+    pairs.forEach(([source, target]) => {
+      const sourcePosition = positions.get(source);
+      const targetPosition = positions.get(target);
+      const sourceVelocity = velocity.get(source);
+      const targetVelocity = velocity.get(target);
+      const dx = targetPosition.x - sourcePosition.x;
+      const dy = targetPosition.y - sourcePosition.y;
+      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const force = (distance - 190) * 0.0032;
+      sourceVelocity.x += (dx / distance) * force;
+      sourceVelocity.y += (dy / distance) * force;
+      targetVelocity.x -= (dx / distance) * force;
+      targetVelocity.y -= (dy / distance) * force;
+    });
+    nodes.forEach((node) => {
+      const position = positions.get(node.id);
+      const nodeVelocity = velocity.get(node.id);
+      nodeVelocity.x += (center.x - position.x) * 0.001;
+      nodeVelocity.y += (center.y - position.y) * 0.001;
+      nodeVelocity.x *= 0.8;
+      nodeVelocity.y *= 0.8;
+      position.x = Math.max(72, Math.min(width - 72, position.x + nodeVelocity.x));
+      position.y = Math.max(72, Math.min(height - 72, position.y + nodeVelocity.y));
+    });
   }
-  if (detail?.graph?.exact_memory_brief) {
-    return "包含当时实际生成的记忆简报";
-  }
-  return "仅显示已落盘的证据与结果";
+  return { width, height, positions };
 }
 
-function renderRunDetailGraph() {
+function fitRunDetailMemoryGraph() {
+  elements.runDetailGraphStage.scrollTo({ top: 0, left: 0, behavior: "smooth" });
+}
+
+function memoryNodeLabelLines(node) {
+  const label = String(node?.label || node?.title || node?.id || "未命名记忆").trim();
+  if (label.length <= 18) return [label];
+  return [`${label.slice(0, 18)}…`];
+}
+
+function runDetailMemoryItems() {
+  const effects = memoryEffects();
+  const seen = new Set();
+  const nodes = (Array.isArray(effects.nodes) ? effects.nodes : [])
+    .filter((item) => item && typeof item === "object" && String(item.id || "").trim())
+    .map((item) => ({ ...item, id: String(item.id) }))
+    .filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = (Array.isArray(effects.edges) ? effects.edges : [])
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      ...item,
+      source: String(item.source || ""),
+      target: String(item.target || ""),
+    }))
+    .filter((item) => nodeIds.has(item.source) && nodeIds.has(item.target));
+  return { effects, nodes, edges };
+}
+
+function renderRunDetailMemoryEffects() {
   elements.runDetailEdges.replaceChildren();
   elements.runDetailNodes.replaceChildren();
-  const graph = state.runDetail?.graph || {};
-  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
-  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  const { effects, nodes, edges } = runDetailMemoryItems();
   elements.runDetailEmpty.classList.toggle("hidden", nodes.length > 0);
   if (!nodes.length) {
+    const empty = memoryEffectsEmptyState(effects, state.runDetail?.run || {});
+    elements.runDetailEmptyTitle.textContent = empty.title;
+    elements.runDetailEmptyCopy.textContent = empty.copy;
     elements.runDetailGraph.style.height = "100%";
-    elements.runDetailGraphCaption.textContent = "没有可还原的追溯节点";
+    elements.runDetailGraphCaption.textContent = empty.title;
+    elements.runDetailInspectorTitle.textContent = "没有可定位的记忆条目";
+    elements.runDetailInspectorContent.replaceChildren(
+      textElement("p", empty.copy, "panel-note"),
+    );
     return;
   }
-  const layout = layoutRunDetailGraph(nodes);
+
+  const layout = layoutRunMemoryGraph(nodes, edges);
   elements.runDetailGraph.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
   elements.runDetailGraph.style.height = `${layout.height}px`;
 
-  edges.forEach((edge) => {
+  edges.forEach((edge, index) => {
     const source = layout.positions.get(edge.source);
     const target = layout.positions.get(edge.target);
     if (!source || !target) return;
-    const forward = target.x >= source.x;
-    const startX = source.x + (forward ? 102 : -102);
-    const endX = target.x + (forward ? -102 : 102);
-    const middleX = (startX + endX) / 2;
+    const access = normalizedMemoryAccess(edge);
+    const pathId = `run-detail-memory-edge-${index}`;
+    const relation = String(edge.relation || edge.type || "关联");
+    let d;
+    if (edge.source === edge.target) {
+      d = `M ${source.x + 19} ${source.y - 12} C ${source.x + 82} ${source.y - 82}, ${source.x - 82} ${source.y - 82}, ${source.x - 19} ${source.y - 12}`;
+    } else {
+      const dx = target.x - source.x;
+      const dy = target.y - source.y;
+      const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const startX = source.x + (dx / distance) * 28;
+      const startY = source.y + (dy / distance) * 28;
+      const endX = target.x - (dx / distance) * 31;
+      const endY = target.y - (dy / distance) * 31;
+      const bend = ((hashString(`${edge.source}:${edge.target}:${relation}`) % 3) - 1) * 18;
+      const controlX = (startX + endX) / 2 - (dy / distance) * bend;
+      const controlY = (startY + endY) / 2 + (dx / distance) * bend;
+      d = `M ${startX} ${startY} Q ${controlX} ${controlY}, ${endX} ${endY}`;
+    }
     const path = svgElement("path", {
-      d: `M ${startX} ${source.y} C ${middleX} ${source.y}, ${middleX} ${target.y}, ${endX} ${target.y}`,
-      class: "run-detail-edge",
+      id: pathId,
+      d,
+      class: "run-detail-memory-edge",
+      "data-edge-index": index,
       "data-source": edge.source,
       "data-target": edge.target,
+      "data-access": access.join(" "),
       "marker-end": "url(#run-detail-arrow)",
+      tabindex: "0",
+      role: "button",
+      "aria-label": `${relation}；本次操作：${memoryAccessText(edge)}`,
     });
     const edgeTitle = svgElement("title");
-    edgeTitle.textContent = String(edge.relation || "RELATED");
+    edgeTitle.textContent = `${relation} · ${memoryAccessText(edge)}`;
     path.append(edgeTitle);
+    path.addEventListener("click", () => selectRunDetailMemoryEdge(index, edge));
+    path.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectRunDetailMemoryEdge(index, edge);
+      }
+    });
     elements.runDetailEdges.append(path);
+    if (edges.length <= 40 && relation) {
+      const label = svgElement("text", {
+        class: "run-detail-memory-edge-label",
+        "data-edge-index": index,
+        "data-source": edge.source,
+        "data-target": edge.target,
+        "data-access": access.join(" "),
+      });
+      const textPath = svgElement("textPath", { href: `#${pathId}`, startOffset: "50%" });
+      const edgeLabel = `${relation} · ${memoryAccessText(edge)}`;
+      textPath.textContent = edgeLabel.length > 26 ? `${edgeLabel.slice(0, 26)}…` : edgeLabel;
+      label.append(textPath);
+      elements.runDetailEdges.append(label);
+    }
   });
 
   nodes.forEach((node) => {
     const position = layout.positions.get(node.id);
     if (!position) return;
+    const access = normalizedMemoryAccess(node);
     const group = svgElement("g", {
-      class: "run-detail-node",
+      class: "run-detail-memory-node",
       transform: `translate(${position.x} ${position.y})`,
       tabindex: "0",
       role: "button",
       "data-node-id": node.id,
-      "data-type": node.type || "action",
-      "aria-label": `${runDetailTypeNames[node.type] || node.type}: ${node.label}`,
+      "data-type": node.type || "semantic",
+      "data-access": access.join(" "),
+      "aria-label": `${typeNames[node.type] || node.type || "记忆节点"}：${node.label || node.id}；本次操作：${memoryAccessText(node)}`,
     });
-    group.append(svgElement("rect", { x: -102, y: -32, width: 204, height: 64, rx: 13 }));
-    const badge = svgElement("text", { x: -88, y: -14, class: "run-detail-node-type" });
-    badge.textContent = runDetailTypeNames[node.type] || node.type || "节点";
-    group.append(badge);
-    const label = svgElement("text", { x: -88, y: 7, class: "run-detail-node-label" });
-    const [firstLine, secondLine] = runDetailNodeLabel(node);
-    const first = svgElement("tspan", { x: -88, dy: 0 });
-    first.textContent = firstLine;
-    label.append(first);
-    if (secondLine) {
-      const second = svgElement("tspan", { x: -88, dy: 16 });
-      second.textContent = secondLine;
-      label.append(second);
-    }
+    group.append(svgElement("circle", {
+      r: 29,
+      class: "run-detail-memory-access-ring",
+    }));
+    group.append(svgElement("circle", {
+      r: 21,
+      class: "run-detail-memory-node-core",
+    }));
+    const operation = svgElement("text", {
+      y: -36,
+      class: "run-detail-memory-access-label",
+      "text-anchor": "middle",
+    });
+    operation.textContent = memoryAccessText(node);
+    group.append(operation);
+    const label = svgElement("text", {
+      y: 43,
+      class: "run-detail-memory-node-label",
+      "text-anchor": "middle",
+    });
+    const lines = memoryNodeLabelLines(node);
+    lines.forEach((line, index) => {
+      const span = svgElement("tspan", { x: 0, dy: index ? 14 : 0 });
+      span.textContent = line;
+      label.append(span);
+    });
     group.append(label);
-    group.addEventListener("click", () => selectRunDetailNode(node.id));
+    group.addEventListener("click", () => selectRunDetailMemoryNode(node.id));
     group.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        selectRunDetailNode(node.id);
+        selectRunDetailMemoryNode(node.id);
       }
     });
     elements.runDetailNodes.append(group);
   });
+
+  const counts = memoryEffectCounts(effects, nodes, edges);
+  const nodeCount = memoryEntityCount(effects, "nodes", nodes.length);
+  const edgeCount = memoryEntityCount(effects, "edges", edges.length);
+  const effectState = memoryEffectStateNames[String(effects.state || "").toUpperCase()]
+    || "记录状态未记录";
   elements.runDetailGraphCaption.textContent = [
-    `${formatNumber(nodes.length)} 个节点`,
-    `${formatNumber(edges.length)} 条可追溯连接`,
-    runDetailTraceSummary(state.runDetail),
+    `记忆节点 ${formatMemoryEntityCount(nodeCount, effects)}`,
+    `连接 ${formatMemoryEntityCount(edgeCount, effects)}`,
+    `读取 ${formatMemoryEffectCount(counts.read, effects)}`,
+    `写入 ${formatMemoryEffectCount(counts.write, effects)}`,
+    `写入或更新 ${formatMemoryEffectCount(counts.upsert, effects)}`,
+    `修改 ${formatMemoryEffectCount(counts.modify, effects)}`,
+    `结构端点 ${formatMemoryEffectCount(counts.context, effects)}`,
+    effectState,
   ].join(" · ");
-  selectRunDetailNode(nodes.find((node) => node.type === "run")?.id || nodes[0].id);
+  const firstActive = nodes.find((node) => !normalizedMemoryAccess(node).includes("context"));
+  selectRunDetailMemoryNode(firstActive?.id || nodes[0].id);
 }
 
-function selectRunDetailNode(nodeId) {
-  const graph = state.runDetail?.graph;
-  const node = (graph?.nodes || []).find((item) => item.id === nodeId);
+function selectRunDetailMemoryNode(nodeId) {
+  const { nodes, edges } = runDetailMemoryItems();
+  const selectedId = String(nodeId);
+  const node = nodes.find((item) => item.id === selectedId);
   if (!node) return;
-  state.runDetailNodeId = nodeId;
-  const connected = new Set([nodeId]);
-  (graph.edges || []).forEach((edge) => {
-    if (edge.source === nodeId || edge.target === nodeId) {
+  state.runDetailNodeId = selectedId;
+  const connected = new Set([selectedId]);
+  edges.forEach((edge) => {
+    if (edge.source === selectedId || edge.target === selectedId) {
       connected.add(edge.source);
       connected.add(edge.target);
     }
   });
-  elements.runDetailNodes.querySelectorAll(".run-detail-node").forEach((item) => {
+  elements.runDetailNodes.querySelectorAll(".run-detail-memory-node").forEach((item) => {
     const id = item.getAttribute("data-node-id");
-    item.classList.toggle("is-selected", id === nodeId);
+    item.classList.toggle("is-selected", id === selectedId);
     item.classList.toggle("is-muted", !connected.has(id));
   });
-  elements.runDetailEdges.querySelectorAll(".run-detail-edge").forEach((item) => {
-    const active = item.getAttribute("data-source") === nodeId
-      || item.getAttribute("data-target") === nodeId;
+  elements.runDetailEdges.querySelectorAll(".run-detail-memory-edge, .run-detail-memory-edge-label").forEach((item) => {
+    const active = item.getAttribute("data-source") === selectedId
+      || item.getAttribute("data-target") === selectedId;
     item.classList.toggle("is-active", active);
     item.classList.toggle("is-muted", !active);
   });
-  renderRunDetailInspector(node);
+  renderRunDetailMemoryInspector(node);
 }
 
-function renderRunDetailInspector(node) {
-  elements.runDetailInspectorTitle.textContent = node.label || "节点详情";
+function selectRunDetailMemoryEdge(edgeIndex, edge) {
+  const sourceId = String(edge.source);
+  const targetId = String(edge.target);
+  state.runDetailNodeId = "";
+  elements.runDetailNodes.querySelectorAll(".run-detail-memory-node").forEach((item) => {
+    const id = item.getAttribute("data-node-id");
+    const endpoint = id === sourceId || id === targetId;
+    item.classList.remove("is-selected");
+    item.classList.toggle("is-muted", !endpoint);
+  });
+  elements.runDetailEdges.querySelectorAll(".run-detail-memory-edge, .run-detail-memory-edge-label").forEach((item) => {
+    const active = item.getAttribute("data-edge-index") === String(edgeIndex);
+    item.classList.toggle("is-active", active);
+    item.classList.toggle("is-muted", !active);
+  });
+  renderRunDetailMemoryEdgeInspector(edge);
+}
+
+function renderRunDetailMemoryInspector(node) {
+  elements.runDetailInspectorTitle.textContent = node.label || node.id || "记忆条目";
   elements.runDetailInspectorContent.replaceChildren();
-  elements.runDetailInspectorContent.append(
-    textElement("span", runDetailTypeNames[node.type] || node.type || "节点", "node-type-badge"),
-  );
+  const badges = document.createElement("div");
+  badges.className = "run-detail-memory-badges";
+  badges.append(textElement("span", typeNames[node.type] || node.type || "记忆节点", "node-type-badge"));
+  normalizedMemoryAccess(node).forEach((access) => {
+    const chip = textElement("span", memoryAccessNames[access], "memory-access-chip");
+    chip.dataset.access = access;
+    badges.append(chip);
+  });
+  elements.runDetailInspectorContent.append(badges);
   appendDetailList(elements.runDetailInspectorContent, [
-    ["节点类型", runDetailTypeNames[node.type] || node.type],
+    ["本次操作", memoryAccessText(node)],
+    ["节点类型", typeNames[node.type] || node.type],
+    ["状态来源", node.state_source],
     ["状态", node.status],
     ["说明", node.detail],
-    ["证据键", node.source_key],
     ["节点 ID", node.id],
   ]);
-  const content = node.content;
-  if (content && Object.keys(content).length) {
-    const pre = document.createElement("pre");
-    pre.className = "run-detail-node-json";
-    pre.textContent = JSON.stringify(content, null, 2);
-    elements.runDetailInspectorContent.append(pre);
-  }
+  const pre = document.createElement("pre");
+  pre.className = "run-detail-node-json";
+  pre.textContent = JSON.stringify(node, null, 2);
+  elements.runDetailInspectorContent.append(pre);
+}
+
+function renderRunDetailMemoryEdgeInspector(edge) {
+  const relation = String(edge.relation || edge.type || "记忆连接");
+  elements.runDetailInspectorTitle.textContent = relation;
+  elements.runDetailInspectorContent.replaceChildren();
+  const badges = document.createElement("div");
+  badges.className = "run-detail-memory-badges";
+  badges.append(textElement("span", "记忆连接", "node-type-badge"));
+  normalizedMemoryAccess(edge).forEach((access) => {
+    const chip = textElement("span", memoryAccessNames[access], "memory-access-chip");
+    chip.dataset.access = access;
+    badges.append(chip);
+  });
+  elements.runDetailInspectorContent.append(badges);
+  appendDetailList(elements.runDetailInspectorContent, [
+    ["关系", relation],
+    ["本次操作", memoryAccessText(edge)],
+    ["陈述", edge.statement],
+    ["认知状态", edge.epistemic_state],
+    ["不确定性", edge.uncertainty],
+    ["效用", edge.utility],
+    ["状态来源", edge.state_source],
+    ["起点", edge.source],
+    ["终点", edge.target],
+  ]);
+  const pre = document.createElement("pre");
+  pre.className = "run-detail-node-json";
+  pre.textContent = JSON.stringify(edge, null, 2);
+  elements.runDetailInspectorContent.append(pre);
+}
+
+function renderRunDetailLedger(detail) {
+  const ledger = detail?.graph && typeof detail.graph === "object" ? detail.graph : {};
+  const nodes = Array.isArray(ledger.nodes) ? ledger.nodes : [];
+  const edges = Array.isArray(ledger.edges) ? ledger.edges : [];
+  elements.runDetailLedgerSummary.textContent = nodes.length || edges.length
+    ? `${formatNumber(nodes.length)} 个处理节点 · ${formatNumber(edges.length)} 条处理关系`
+    : "没有已保存的处理流程";
+  elements.runDetailLedgerJson.textContent = JSON.stringify(ledger, null, 2);
 }
 
 function renderRunDetail(detail) {
@@ -722,28 +1087,39 @@ function renderRunDetail(detail) {
   const usage = Array.isArray(detail.usage) ? detail.usage : [];
   const tokens = usage.reduce((sum, item) => sum + Number(item.total || 0), 0);
   const modelMs = usage.reduce((sum, item) => sum + Number(item.elapsed_ms || 0), 0);
+  const effects = memoryEffects(detail);
+  const memoryNodes = Array.isArray(effects.nodes) ? effects.nodes : [];
+  const memoryEdges = Array.isArray(effects.edges) ? effects.edges : [];
   const title = run.experiment_type === "runtime_feedback_maintenance"
-    ? "这次反馈学习处理了什么"
-    : "这次回答前实际读取了什么证据";
+    ? "这次反馈实际改了哪些记忆"
+    : "这次回答实际激活了哪些记忆";
   elements.runDetailTitle.textContent = title;
   elements.runDetailSubtitle.textContent = `${run.run_id || ""} · ${formatTime(run.started_at)} · ${result.path || metadata.path || "未记录路径"}`;
+  renderMemoryEffectsBasis(effects);
   elements.runDetailMetrics.replaceChildren();
   [
     ["状态", run.status || "—"],
     ["模型耗时", formatDuration(modelMs)],
     ["Token", formatNumber(tokens)],
-    ["证据", `${formatNumber(detail.graph?.source_count)} 条`],
+    ["记忆节点 / 连接", memoryEffectsMetricValue(effects, memoryNodes, memoryEdges)],
   ].forEach(([label, value]) => {
     const card = document.createElement("article");
     card.append(textElement("span", label), textElement("strong", value));
     elements.runDetailMetrics.append(card);
   });
-  const warnings = detail.graph?.warnings || [];
+  const warnings = [
+    ...(Array.isArray(effects.warnings) ? effects.warnings : []),
+    ...(Array.isArray(detail.graph?.warnings) ? detail.graph.warnings : []),
+  ];
+  const missingRefs = Array.isArray(effects.missing_refs) ? effects.missing_refs : [];
+  if (missingRefs.length) warnings.push(`${missingRefs.length} 个记忆引用无法定位，主画布未显示这些条目。`);
+  const uniqueWarnings = [...new Set(warnings.map((warning) => String(warning || "").trim()).filter(Boolean))];
   elements.runDetailWarning.replaceChildren();
-  elements.runDetailWarning.classList.toggle("hidden", !warnings.length);
-  warnings.forEach((warning) => elements.runDetailWarning.append(textElement("p", warning)));
+  elements.runDetailWarning.classList.toggle("hidden", !uniqueWarnings.length);
+  uniqueWarnings.forEach((warning) => elements.runDetailWarning.append(textElement("p", warning)));
+  renderRunDetailLedger(detail);
   elements.runDetailResultJson.textContent = JSON.stringify(result, null, 2);
-  renderRunDetailGraph();
+  renderRunDetailMemoryEffects();
 }
 
 async function openRunDetail(runId) {
@@ -756,6 +1132,14 @@ async function openRunDetail(runId) {
   elements.runDetailNodes.replaceChildren();
   elements.runDetailMetrics.replaceChildren();
   elements.runDetailWarning.classList.add("hidden");
+  elements.runDetailMemoryState.textContent = "记录状态未读取";
+  elements.runDetailMemoryState.dataset.state = "UNKNOWN";
+  elements.runDetailIdentityBasis.textContent = "身份确认未记录";
+  elements.runDetailPayloadBasis.textContent = "载荷解析时间未记录";
+  elements.runDetailEmptyTitle.textContent = "本次没有可显示的持久记忆读写";
+  elements.runDetailEmptyCopy.textContent = "展开调用处理账本可查看证据与处理过程。";
+  elements.runDetailLedgerSummary.textContent = "正在读取调用处理账本";
+  elements.runDetailLedgerJson.textContent = "正在读取…";
   elements.runDetailResultJson.textContent = "正在读取…";
   if (!elements.runDetailDialog.open) elements.runDetailDialog.showModal();
   try {
@@ -767,6 +1151,9 @@ async function openRunDetail(runId) {
     renderRunDetail(detail);
   } catch (error) {
     elements.runDetailEmpty.classList.remove("hidden");
+    elements.runDetailEmptyTitle.textContent = "调用详情读取失败";
+    elements.runDetailEmptyCopy.textContent = error?.message || "无法读取本次记忆操作。";
+    elements.runDetailLedgerJson.textContent = error?.message || "调用详情读取失败";
     elements.runDetailResultJson.textContent = error?.message || "调用详情读取失败";
     showToast(error?.message || "调用详情读取失败", "error");
   } finally {
@@ -1908,7 +2295,7 @@ async function reloadGraphFromControls(errorMessage = "图分析加载失败") {
 function bindEvents() {
   elements.refreshBtn.addEventListener("click", () => refreshOverview());
   elements.runDetailClose.addEventListener("click", () => elements.runDetailDialog.close());
-  elements.runDetailFit.addEventListener("click", fitRunDetailGraph);
+  elements.runDetailFit.addEventListener("click", fitRunDetailMemoryGraph);
   elements.resetBudgetBtn.addEventListener("click", () => resetBudget("online"));
   elements.resetFeedbackBudgetBtn.addEventListener("click", () => resetBudget("feedback"));
   document.querySelectorAll("[data-section]").forEach((tab) => {
