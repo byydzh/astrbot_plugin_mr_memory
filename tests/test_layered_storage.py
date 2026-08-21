@@ -126,7 +126,7 @@ class LayeredStorageTests(unittest.TestCase):
         self.storage.upsert_message(original)
         heads = self.storage.revision_vector(umo=self.UMO)["data"]
         self.assertEqual(heads["message"], 1)
-        self.assertEqual(heads["identity"], 1)
+        self.assertEqual(heads.get("identity", 0), 0)
 
         renamed = NormalizedMessage(
             platform=original.platform,
@@ -143,10 +143,12 @@ class LayeredStorageTests(unittest.TestCase):
         self.storage.upsert_message(renamed)
         heads = self.storage.revision_vector(umo=self.UMO)["data"]
         self.assertEqual(heads["message"], 1)
-        self.assertEqual(heads["identity"], 2)
+        self.assertEqual(heads["identity"], 1)
 
         second = self.message("two", "第二条", sent_at=110)
         self.storage.upsert_message(second)
+        heads = self.storage.revision_vector(umo=self.UMO)["data"]
+        self.assertEqual(heads["identity"], 1)
         self.storage.store_episode(
             umo=self.UMO,
             started_at=100,
@@ -167,6 +169,59 @@ class LayeredStorageTests(unittest.TestCase):
         heads = self.storage.revision_vector(umo=self.UMO)["data"]
         self.assertEqual(heads["deletion"], 1)
         self.assertEqual(heads["message"], 3)
+
+    def test_future_append_does_not_stale_identity_but_history_edit_does(self) -> None:
+        target = self.message(
+            "target-old",
+            "旧消息",
+            sent_at=100,
+            sender_id="target",
+        )
+        request = self.message(
+            "request",
+            "/chat @target 她是谁，是不是我",
+            sent_at=110,
+            sender_id="speaker",
+            content=[
+                {"type": "mention", "account_id": "target", "display_name": "目标"},
+                {"type": "plain", "text": "她是谁，是不是我"},
+            ],
+        )
+        self.storage.upsert_message(target)
+        self.storage.upsert_message(request)
+        snapshot = self.capture(request=request, cutoff_at=111)
+
+        self.storage.upsert_message(
+            self.message(
+                "target-future",
+                "[图片]",
+                sent_at=112,
+                sender_id="target",
+                content=[{"type": "image", "reference_sha256": "a" * 64}],
+            )
+        )
+        self.assertEqual(
+            self.storage.revision_vector(umo=self.UMO)["data"].get("identity", 0),
+            int(snapshot["data_revision"]["identity"]),
+        )
+
+        edited_target = NormalizedMessage(
+            platform=target.platform,
+            platform_id=target.platform_id,
+            umo=target.umo,
+            group_id=target.group_id,
+            message_id=target.message_id,
+            sender_id=target.sender_id,
+            sender_name="目标的新名",
+            sent_at=target.sent_at,
+            plain_text=target.plain_text,
+            content=target.content,
+        )
+        self.storage.upsert_message(edited_target)
+        self.assertNotEqual(
+            self.storage.revision_vector(umo=self.UMO)["data"]["identity"],
+            int(snapshot["data_revision"]["identity"]),
+        )
 
     def test_snapshot_excludes_current_source_with_same_second_timestamp(self) -> None:
         previous = self.message("previous", "上一条", sent_at=200)

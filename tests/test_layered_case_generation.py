@@ -16,7 +16,7 @@ from mr_memory.snapshot import RequestSnapshot
 from mr_memory.snapshot import stable_sha256
 from mr_memory.surface import compile_surface_packet, validate_surface_packet
 from mr_memory.usage import TokenUsageRecord
-from mr_memory.orchestrator import ECCR_TOOL_ACTION_CATALOG
+from mr_memory.orchestrator import ECCR_TOOL_ACTION_CATALOG, EccrProtocolError
 from scripts.layered_case_generation import (
     _READ_TOOLS,
     _completed_case_import,
@@ -35,7 +35,7 @@ from scripts.layered_case_generation import (
     generate,
 )
 from tests.test_certificate_v2 import _raw_certificate
-from tests.test_orchestrator import EccrOrchestratorTests
+from tests import test_orchestrator
 
 
 @contextmanager
@@ -109,7 +109,7 @@ def _certificate_value(snapshot, packet) -> dict[str, object]:
 
 
 class LayeredGenerationBoundaryTests(unittest.TestCase):
-    def test_real_v7_completed_case_preflight_is_zero_call_and_answer_tamper_fails(
+    def test_real_v7_completed_case_with_legacy_stop_reason_is_rejected(
         self,
     ) -> None:
         source_suite = (
@@ -192,83 +192,8 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
                 side_effect=provider_fingerprint,
             ),
         ):
-            result = _completed_case_import(args)
-            self.assertEqual(result["provider_calls"], 0)
-            self.assertEqual(
-                result["provenance"]["logical_imported_calls"], 4
-            )
-            self.assertEqual(
-                result["provenance"]["logical_imported_tokens"], 112_094
-            )
-            wrong_identity = copy.copy(args)
-            wrong_identity.source_attempt_id = "wrong-attempt@0000000000000000"
-            with self.assertRaisesRegex(ValueError, "attempt identity mismatch"):
-                _completed_case_import(wrong_identity)
-
-            wrong_manifest_hash = copy.copy(args)
-            wrong_manifest_hash.source_attempt_manifest_sha256 = "0" * 64
-            with self.assertRaisesRegex(ValueError, "manifest hash mismatch"):
-                _completed_case_import(wrong_manifest_hash)
-
-            with _workspace_tempdir() as root:
-                attempt_tamper_suite = root / "attempt-tamper"
-                shutil.copytree(source_suite, attempt_tamper_suite)
-                attempt_plan = json.loads(
-                    (attempt_tamper_suite / "run-plan.json").read_text("utf-8")
-                )
-                attempt_plan["tampered_after_parent_plan"] = True
-                _write_json(attempt_tamper_suite / "run-plan.json", attempt_plan)
-                manifest_tampered = copy.copy(args)
-                manifest_tampered.source_result = str(
-                    attempt_tamper_suite
-                    / "cases"
-                    / "call-726"
-                    / "result.private.json"
-                )
-                manifest_tampered.source_attempt_manifest = str(
-                    attempt_tamper_suite / "run-plan.json"
-                )
-                manifest_tampered.source_attempt_id = (
-                    f"{attempt_tamper_suite.name}@{source_attempt_sha256[:16]}"
-                )
-                manifest_tampered.evidence_packet = str(
-                    attempt_tamper_suite
-                    / "prepared-input"
-                    / "call-726"
-                    / "evidence_packet.json"
-                )
-                manifest_tampered.database = str(
-                    attempt_tamper_suite
-                    / "prepared-input"
-                    / "call-726"
-                    / "scope.db"
-                )
-                with self.assertRaisesRegex(ValueError, "manifest hash mismatch"):
-                    _completed_case_import(manifest_tampered)
-
-                copied_suite = root / "source"
-                shutil.copytree(source_suite, copied_suite)
-                surface_path = (
-                    copied_suite / "cases" / "call-726" / "surface" / "result.private.json"
-                )
-                surface = json.loads(surface_path.read_text("utf-8"))
-                surface["answer_sha256"] = "0" * 64
-                _write_json(surface_path, surface)
-                tampered = copy.copy(args)
-                tampered.source_result = str(
-                    copied_suite / "cases" / "call-726" / "result.private.json"
-                )
-                tampered.source_attempt_manifest = str(
-                    copied_suite / "run-plan.json"
-                )
-                tampered.source_attempt_id = (
-                    f"{copied_suite.name}@{source_attempt_sha256[:16]}"
-                )
-                tampered.evidence_packet = str(
-                    copied_suite / "prepared-input" / "call-726" / "evidence_packet.json"
-                )
-                with self.assertRaisesRegex(ValueError, "answer hash mismatch"):
-                    _completed_case_import(tampered)
+            with self.assertRaisesRegex(ValueError, "stop_reason is unsupported"):
+                _completed_case_import(args)
 
     def test_generation_requires_explicit_authorization_before_file_access(self) -> None:
         args = Namespace(authorize_provider_calls=False)
@@ -809,7 +734,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
                 memory_provider_extra={},
             )
 
-    async def test_real_v6_provider_stages_replay_without_a_provider_and_tamper_fails(
+    async def test_real_v6_provider_stages_with_invalid_audit_are_rejected(
         self,
     ) -> None:
         source = (
@@ -829,49 +754,20 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         case = dict(effective_case)
         case.pop("recent_context", None)
         packet = json.loads((source / "evidence.input.json").read_text("utf-8"))
-        provenance, memory, rows, _stages_path = await _prepare_provider_stage_import(
-            source / "memory.private.json",
-            target_manifest=target_manifest,
-            case=case,
-            packet=packet,
-            snapshot=RequestSnapshot.from_value(manifest["snapshot"]),
-            source_keys=_source_keys(packet),
-            participant_keys=_participant_keys(case, packet),
-            memory_provider_extra={},
-        )
-        self.assertEqual(provenance["provider_calls_replayed"], 0)
-        self.assertEqual(provenance["logical_imported_calls"], 3)
-        self.assertEqual(provenance["logical_imported_tokens"], 143_917)
-        self.assertEqual(provenance["mandatory_surface_chars"], 14_584)
-        self.assertEqual(len(memory["certificate"]["unresolved"]), 21)
-        self.assertEqual(len(rows), 6)
-
-        with _workspace_tempdir() as root:
-            tampered = root / "good-girl"
-            shutil.copytree(source, tampered)
-            ledger_path = tampered / "usage.jsonl"
-            ledger_rows = [
-                json.loads(line)
-                for line in ledger_path.read_text("utf-8").splitlines()
-                if line.strip()
-            ]
-            ledger_rows[0]["payload_sha256"] = "0" * 64
-            ledger_rows[1]["payload_sha256"] = "0" * 64
-            ledger_path.write_text(
-                "".join(json.dumps(row) + "\n" for row in ledger_rows),
-                encoding="utf-8",
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "must cite newly visited evidence",
+        ):
+            await _prepare_provider_stage_import(
+                source / "memory.private.json",
+                target_manifest=target_manifest,
+                case=case,
+                packet=packet,
+                snapshot=RequestSnapshot.from_value(manifest["snapshot"]),
+                source_keys=_source_keys(packet),
+                participant_keys=_participant_keys(case, packet),
+                memory_provider_extra={},
             )
-            with self.assertRaisesRegex(ValueError, "payload hash mismatch"):
-                await _prepare_provider_stage_import(
-                    tampered / "memory.private.json",
-                    target_manifest=target_manifest,
-                    case=case,
-                    packet=packet,
-                    snapshot=RequestSnapshot.from_value(manifest["snapshot"]),
-                    source_keys=_source_keys(packet),
-                    participant_keys=_participant_keys(case, packet),
-                    memory_provider_extra={},
-                )
 
     async def test_l2_repair_yields_certificate_v2_and_compiled_surface_packet(self) -> None:
         case = _case()
@@ -1011,7 +907,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
             route="l3",
             recent_context=[],
         )
-        fixture = EccrOrchestratorTests()
+        fixture = test_orchestrator.EccrOrchestratorTests()
         fixture.setUp()
         fixture.host = {
             "scope_sha256": snapshot.scope_sha256,
@@ -1095,7 +991,6 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["route"], "L3")
         self.assertEqual(detail["model_calls"], 3)
         self.assertFalse(detail["repair_attempted"])
-        self.assertFalse(detail["degraded"])
         self.assertEqual(detail["protocol_failures"], [])
         self.assertEqual(len(stages), 3)
         self.assertIn(certificate.status, {"CERTIFIED", "PARTIAL", "SAFETY_ABSTAIN"})

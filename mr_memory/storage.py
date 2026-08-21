@@ -2511,8 +2511,14 @@ class MemoryStorage:
                 or timestamp_changed
                 or int(existing["is_deleted"] or 0) != 0
             )
-            identity_changed = existing is None or (
-                str(existing["sender_name"] or "") != message.sender_name
+            # The identity head is an append-tolerant freshness sentinel.  New
+            # messages are excluded from an existing snapshot by its row upper
+            # bound and must not invalidate an in-flight reconstruction.  A
+            # mutation of an already-observed row can change historical sender,
+            # mention or reply identity and therefore remains fail-closed.
+            historical_identity_mutation = existing is not None and (
+                changed
+                or str(existing["sender_name"] or "") != message.sender_name
             )
             revision_no = 1
             if existing is not None:
@@ -2673,7 +2679,7 @@ class MemoryStorage:
                     revision_class="data",
                     component="message",
                 )
-            if identity_changed:
+            if historical_identity_mutation:
                 self._advance_revision_head_locked(
                     umo=message.umo,
                     revision_class="data",
@@ -7383,6 +7389,7 @@ class MemoryStorage:
                 WHERE r.umo=? AND unixepoch(r.started_at)>=?
                   AND r.experiment_type IN (
                     'runtime_reconstruction',
+                    'runtime_layered_reconstruction',
                     'runtime_feedback_maintenance'
                   )
                 GROUP BY r.run_id
@@ -9327,6 +9334,133 @@ class MemoryStorage:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def query_matching_cues(
+        self,
+        *,
+        umo: str,
+        query: str,
+        limit: int = 12,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Return grouped exact stored cues that occur in the current query.
+
+        This is the cheap lexical seed for an explicit memory lookup.  It does
+        not infer meaning and it never treats a substring score as evidence;
+        callers still expand the matched cue/tag pairs to source-bound episodes.
+        A leading AstrBot ``/chat`` command is transport syntax, not query
+        content, and command-like stored cues are never retrieval candidates.
+        ``limit`` applies to normalized cue groups; each group retains at most
+        two of its strongest tags so one noisy cue cannot consume the budget.
+        Snapshot bounds are applied to the complete episode, matching
+        :meth:`query_cue_tags` and preventing a later message from making an old
+        cue visible through a mixed episode.
+        """
+
+        self._assert_scope(umo)
+        normalized_query = " ".join(str(query or "").casefold().split())
+        normalized_query = re.sub(
+            r"^/chat(?:@\S+)?(?=\s|$)\s*",
+            "",
+            normalized_query,
+            count=1,
+        ).strip()
+        if not normalized_query:
+            return []
+        safe_limit = max(1, min(50, int(limit)))
+        tag_limit = 2
+        cutoff_sql, cutoff_parameters = self._episode_visibility_clause(
+            episode_alias="e",
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
+        parameters: list[object] = [umo, normalized_query]
+        parameters.extend(cutoff_parameters)
+        parameters.extend((tag_limit, safe_limit))
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                WITH matched AS (
+                    SELECT trim(k.cue) AS cue,
+                           lower(trim(k.cue)) AS normalized_cue,
+                           trim(k.tag) AS tag,
+                           lower(trim(k.tag)) AS normalized_tag,
+                           e.id AS episode_id
+                    FROM episode_keywords AS k
+                    JOIN episodes AS e ON e.id = k.episode_id
+                    WHERE e.umo = ? AND e.status = 'READY'
+                      AND length(trim(k.cue)) >= 2
+                      AND length(trim(k.tag)) >= 1
+                      AND substr(ltrim(k.cue), 1, 1) <> '/'
+                      AND instr(?, lower(trim(k.cue))) > 0
+                      {cutoff_sql}
+                ),
+                tag_counts AS (
+                    SELECT normalized_cue, normalized_tag,
+                           MIN(cue) AS cue, MIN(tag) AS tag,
+                           COUNT(DISTINCT episode_id) AS episode_count
+                    FROM matched
+                    GROUP BY normalized_cue, normalized_tag
+                ),
+                cue_counts AS (
+                    SELECT normalized_cue, MIN(cue) AS cue,
+                           COUNT(DISTINCT episode_id) AS episode_count
+                    FROM matched
+                    GROUP BY normalized_cue
+                ),
+                ranked_tags AS (
+                    SELECT t.normalized_cue, c.cue, t.tag,
+                           t.episode_count,
+                           c.episode_count AS cue_episode_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY t.normalized_cue
+                               ORDER BY t.episode_count DESC,
+                                        t.normalized_tag
+                           ) AS tag_rank
+                    FROM tag_counts AS t
+                    JOIN cue_counts AS c USING (normalized_cue)
+                ),
+                ranked_cues AS (
+                    SELECT normalized_cue,
+                           ROW_NUMBER() OVER (
+                               ORDER BY length(normalized_cue) DESC,
+                                        episode_count DESC,
+                                        normalized_cue
+                           ) AS cue_rank
+                    FROM cue_counts
+                )
+                SELECT t.normalized_cue, t.cue, t.tag,
+                       t.episode_count, t.cue_episode_count
+                FROM ranked_tags AS t
+                JOIN ranked_cues AS c USING (normalized_cue)
+                WHERE t.tag_rank <= ? AND c.cue_rank <= ?
+                ORDER BY c.cue_rank, t.tag_rank
+                """,
+                parameters,
+            ).fetchall()
+        grouped: list[dict[str, object]] = []
+        by_cue: dict[str, dict[str, object]] = {}
+        for row in rows:
+            normalized_cue = str(row["normalized_cue"])
+            group = by_cue.get(normalized_cue)
+            if group is None:
+                group = {
+                    "cue": str(row["cue"]),
+                    "episode_count": int(row["cue_episode_count"]),
+                    "tags": [],
+                }
+                by_cue[normalized_cue] = group
+                grouped.append(group)
+            tags = group["tags"]
+            assert isinstance(tags, list)
+            tags.append(
+                {
+                    "tag": str(row["tag"]),
+                    "episode_count": int(row["episode_count"]),
+                }
+            )
+        return grouped
 
     def expand_seed_candidates(
         self,

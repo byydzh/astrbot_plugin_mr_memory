@@ -41,12 +41,19 @@ class RoutePolicyTests(unittest.TestCase):
                 self.assertEqual(decision.semantic_status, "UNKNOWN")
                 self.assertEqual(decision.operational_status, status)
 
-    def test_normal_chat_runs_l2_async_but_memory_query_is_bounded_sync(self) -> None:
-        policy = RoutePolicy(l2_deadline_ms=1750)
+    def test_balanced_chat_and_memory_query_are_bounded_sync(self) -> None:
+        policy = RoutePolicy(mode="BALANCED", l2_deadline_ms=1750)
         chat = policy.decide(RouteFeatures(request_kind="CHAT"))
         query = policy.decide(RouteFeatures(request_kind="MEMORY_QUERY"))
-        self.assertEqual((chat.level, chat.execution, chat.deadline_ms), ("L2", "ASYNC", 0))
+        low_latency = RoutePolicy(mode="LOW_LATENCY", l2_deadline_ms=1750).decide(
+            RouteFeatures(request_kind="CHAT")
+        )
+        self.assertEqual((chat.level, chat.execution, chat.deadline_ms), ("L2", "SYNC", 1750))
         self.assertEqual((query.level, query.execution, query.deadline_ms), ("L2", "SYNC", 1750))
+        self.assertEqual(
+            (low_latency.level, low_latency.execution, low_latency.deadline_ms),
+            ("L2", "ASYNC", 0),
+        )
 
     def test_singleflight_joins_instead_of_starting_duplicate_work(self) -> None:
         decision = RoutePolicy().decide(

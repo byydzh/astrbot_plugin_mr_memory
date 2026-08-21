@@ -26,7 +26,7 @@ from .snapshot import RequestSnapshot, canonical_json, stable_sha256
 
 
 L2_READER_PROTOCOL = "evidence-reader.v2"
-L2_PROVIDER_STOP_REASONS = STOP_REASONS - {"PROTOCOL_DEGRADED"}
+L2_PROVIDER_STOP_REASONS = frozenset(STOP_REASONS)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -528,16 +528,34 @@ def build_l2_reader_prompt(
 def normalize_l2_reader_response(
     response: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Apply the two narrow, host-owned L2 compatibility rules.
+    """Apply narrow, host-owned L2 compatibility rules.
 
-    The singleton rewrite is representation-only.  The status rewrite is not:
-    it is an authority-monotone downgrade which preserves every subject, atom,
-    conflict and unresolved item while preventing an identity-ambiguous result
-    from claiming CERTIFIED authority.
+    The singleton and ``must_include`` rewrites are representation-only.  The
+    status rewrite is not: it is an authority-monotone downgrade which preserves
+    every subject, atom, conflict and unresolved item while preventing an
+    identity-ambiguous result from claiming CERTIFIED authority.
     """
 
     normalized = copy.deepcopy(dict(response))
     audit: list[dict[str, Any]] = []
+    atoms = normalized.get("atoms")
+    if isinstance(atoms, list):
+        required_atom_ids = [
+            str(atom.get("id") or "").strip()
+            for atom in atoms
+            if isinstance(atom, Mapping)
+            and str(atom.get("importance") or "").strip().upper() == "REQUIRED"
+        ]
+        if normalized.get("must_include") != required_atom_ids:
+            normalized["must_include"] = required_atom_ids
+            audit.append(
+                {
+                    "action": "canonicalize_must_include_from_atoms",
+                    "classification": "semantic_preserving_canonicalization",
+                    "changed_paths": ["must_include"],
+                    "required_atom_ids": list(required_atom_ids),
+                }
+            )
     subjects = normalized.get("subjects")
     if not isinstance(subjects, list):
         return normalized, audit
@@ -598,9 +616,6 @@ def parse_l2_reader_response(
     *,
     normalization_audit: list[dict[str, Any]] | None = None,
 ) -> EvidenceCertificateV2:
-    # PROTOCOL_DEGRADED is assigned only by the host after a later ECCR turn
-    # fails.  Reject a Provider trying to self-assign it before generic
-    # certificate invariants can mask the more important trust-boundary error.
     declared: Mapping[str, Any] | None = None
     if isinstance(response, Mapping):
         declared = response
@@ -615,12 +630,6 @@ def parse_l2_reader_response(
             candidate = None
         if isinstance(candidate, Mapping):
             declared = candidate
-    if (
-        declared is not None
-        and str(declared.get("stop_reason") or "").strip().upper()
-        == "PROTOCOL_DEGRADED"
-    ):
-        raise ValueError("L2 reader returned a host-only certificate stop_reason")
     normalized_response: str | Mapping[str, Any] = response
     if declared is not None:
         normalized_response, audit = normalize_l2_reader_response(declared)
@@ -725,9 +734,10 @@ def certificate_from_contract_turn(
 ) -> EvidenceCertificateV2:
     """Adapt one bounded ECCR result without weakening host boundaries.
 
-    A certified close is necessarily terminal.  Budget, frontier and saturation
-    stops are durable partial results and deliberately retain the nonterminal
-    contract so callers can inspect or resume its unresolved obligations.
+    A certified close is necessarily terminal.  Frontier and saturation stops
+    are durable partial results and deliberately retain the nonterminal contract
+    so callers can inspect or resume its unresolved obligations.  Runtime budget
+    exhaustion is an operational failure and must not reach this adapter.
     """
 
     normalized_stop = str(stop_reason or "").strip().upper()
@@ -736,8 +746,6 @@ def certificate_from_contract_turn(
         "SAFETY_ABSTAIN",
         "FRONTIER_EXHAUSTED",
         "SATURATED",
-        "BUDGET_EXHAUSTED",
-        "PROTOCOL_DEGRADED",
     }:
         raise ValueError("ECCR stop_reason cannot produce a certificate")
     if normalized_stop == "CERTIFIED_CLOSE" and not turn.terminal:

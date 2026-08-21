@@ -1624,6 +1624,7 @@ class MemoryStorageTests(unittest.TestCase):
             "InterruptedError",
         )
 
+
     def test_online_and_history_budgets_are_physically_separate(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         for run_id, phase, tokens in (

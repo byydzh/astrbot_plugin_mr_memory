@@ -1,7 +1,7 @@
 name: astrbot_plugin_mr_memory
 author: byydzh
 desc: 按群隔离、证据可追溯，并能从后续反馈持续修正的群聊记忆插件
-version: 0.18.0
+version: unversioned
 repo: https://github.com/byydzh/astrbot_plugin_mr_memory
 display_name: MR Memory 群聊记忆
 short_desc: 独立模型驱动、按群隔离、可从反馈持续修正

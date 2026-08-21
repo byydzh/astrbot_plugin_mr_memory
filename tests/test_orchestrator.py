@@ -9,8 +9,10 @@ from collections.abc import Callable
 from mr_memory.evidence_closure import RetrievalAction
 from mr_memory.orchestrator import (
     ECCR_TOOL_ACTION_CATALOG,
+    EccrBudgetExhaustedError,
     EccrLimits,
     EccrOrchestrator,
+    EccrProtocolError,
     validate_tool_action_arguments,
 )
 
@@ -87,6 +89,8 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         first_contract: dict[str, object],
         second_contract: dict[str, object],
     ):
+        terminal_contract = copy.deepcopy(second_contract)
+        terminal_contract["step_index"] = 2
         responses = [
             {
                 "contract": first_contract,
@@ -99,6 +103,18 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "actions": [],
                 "memory_brief": None,
                 "terminal": False,
+            },
+            {
+                "contract": terminal_contract,
+                "actions": [],
+                "memory_brief": {
+                    "claims": [],
+                    "conflicts": [],
+                    "unresolved": [
+                        {"statement": "仍保留证据约束", "source_keys": ["s1"]}
+                    ],
+                },
+                "terminal": True,
             },
         ]
 
@@ -115,7 +131,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         return await EccrOrchestrator(
             limits=EccrLimits(
-                max_model_calls=2,
+                max_model_calls=3,
                 max_retrieval_rounds=0,
                 audit_discovery=True,
             )
@@ -537,31 +553,29 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("a final-budget repair cannot schedule retrieval")
 
-        result = await EccrOrchestrator(
-            limits=EccrLimits(
-                max_model_calls=2,
-                max_retrieval_rounds=1,
-                audit_discovery=False,
+        with self.assertRaises(EccrBudgetExhaustedError) as raised:
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=2,
+                    max_retrieval_rounds=1,
+                    audit_discovery=False,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names={"mr_query_event_context"},
             )
-        ).run(
-            query="问题",
-            host_contract_fields=self.host,
-            evidence_packet=self.packet,
-            complete=complete,
-            execute_action=execute,
-            allowed_tool_names={"mr_query_event_context"},
-        )
 
         self.assertEqual([item[:2] for item in calls], [(0, "COMPILE"), (1, "COMPILE")])
-        self.assertEqual(result.model_calls, 2)
-        self.assertEqual(len(result.trace), 1)
-        self.assertEqual(result.trace[0].call_index, 1)
-        self.assertEqual(result.status, "PARTIAL")
-        self.assertEqual(result.stop_reason, "BUDGET_EXHAUSTED")
-        self.assertTrue(result.repair_attempted)
-        self.assertFalse(result.degraded)
-        self.assertEqual(len(result.protocol_failures), 1)
-        self.assertEqual(result.protocol_failures[0].attempt, 0)
+        error = raised.exception
+        self.assertEqual(error.limit_kind, "model_calls")
+        self.assertEqual(error.model_calls, 2)
+        self.assertTrue(error.repair_attempted)
+        self.assertEqual(len(error.protocol_failures), 1)
+        self.assertEqual(error.protocol_failures[0].attempt, 0)
         repair_payload = calls[1][2]
         self.assertEqual(repair_payload["protocol_repair"]["attempt"], 1)
         self.assertEqual(repair_payload["action_catalog"], {})
@@ -569,6 +583,40 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             repair_payload["output_schema"]["properties"]["actions"]["maxItems"],
             0,
         )
+
+    async def test_model_call_budget_exhaustion_is_operational_failure(self) -> None:
+        async def complete(_system: str, _prompt: str, _index: int, _phase: str):
+            return {
+                "contract": self.contract(0),
+                "actions": [],
+                "memory_brief": None,
+                "terminal": False,
+            }
+
+        async def execute(_action: RetrievalAction):
+            self.fail("budget exhaustion cannot schedule retrieval")
+
+        with self.assertRaisesRegex(
+            EccrBudgetExhaustedError,
+            "operational budget exhausted.*model_calls",
+        ) as raised:
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=1,
+                    max_retrieval_rounds=1,
+                    audit_discovery=False,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
+            )
+
+        self.assertEqual(raised.exception.limit_kind, "model_calls")
+        self.assertEqual(raised.exception.model_calls, 1)
 
     async def test_protocol_repair_is_attempted_only_once(self) -> None:
         calls: list[int] = []
@@ -580,7 +628,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        with self.assertRaisesRegex(ValueError, "exactly one JSON object"):
+        with self.assertRaisesRegex(EccrProtocolError, "exactly one JSON object"):
             await EccrOrchestrator(
                 limits=EccrLimits(
                     max_model_calls=3,
@@ -597,7 +645,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(calls, [0, 1])
 
-    async def test_later_protocol_failure_repairs_once_then_returns_last_valid_turn(
+    async def test_later_protocol_failure_repairs_once_then_raises_protocol_error(
         self,
     ) -> None:
         first_contract = self.contract(0)
@@ -625,45 +673,44 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        result = await EccrOrchestrator(
-            limits=EccrLimits(
-                max_model_calls=3,
-                max_retrieval_rounds=0,
-                audit_discovery=True,
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "single protocol repair failed",
+        ) as caught:
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=3,
+                    max_retrieval_rounds=0,
+                    audit_discovery=True,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
             )
-        ).run(
-            query="问题",
-            host_contract_fields=self.host,
-            evidence_packet=self.packet,
-            complete=complete,
-            execute_action=execute,
-            allowed_tool_names=set(),
-        )
 
         self.assertEqual(calls, [0, 1, 2])
-        self.assertEqual(result.status, "PARTIAL")
-        self.assertEqual(result.stop_reason, "PROTOCOL_DEGRADED")
-        self.assertTrue(result.degraded)
-        self.assertTrue(result.repair_attempted)
-        self.assertEqual(result.model_calls, 3)
-        self.assertEqual(len(result.trace), 1)
-        self.assertEqual(result.final_turn.contract.as_dict(), first_contract)
-        self.assertEqual(len(result.protocol_failures), 2)
+        error = caught.exception
+        self.assertTrue(error.repair_attempted)
+        self.assertEqual(len(error.protocol_failures), 2)
         self.assertEqual(
-            [item.attempt for item in result.protocol_failures],
+            [item.attempt for item in error.protocol_failures],
             [0, 1],
         )
         self.assertEqual(
-            [item.call_index for item in result.protocol_failures],
+            [item.call_index for item in error.protocol_failures],
             [1, 2],
         )
-        for failure in result.protocol_failures:
+        for failure in error.protocol_failures:
             self.assertEqual(failure.error_type, "ValueError")
             self.assertRegex(failure.response_sha256, r"^[0-9a-f]{64}$")
             self.assertGreater(failure.response_chars, 0)
             self.assertLessEqual(len(failure.message), 1000)
 
-    async def test_later_protocol_failure_without_repair_budget_degrades(
+    async def test_later_protocol_failure_without_repair_budget_raises(
         self,
     ) -> None:
         first_contract = self.contract(0)
@@ -683,32 +730,36 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         invalid["contract"]["step_index"] = 1
         invalid["contract"]["scope_sha256"] = hashlib.sha256(b"other").hexdigest()
 
+        calls: list[int] = []
+
         async def complete(_system: str, _prompt: str, index: int, _phase: str):
+            calls.append(index)
             return first if index == 0 else invalid
 
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        result = await EccrOrchestrator(
-            limits=EccrLimits(
-                max_model_calls=2,
-                max_retrieval_rounds=0,
-                audit_discovery=True,
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "model-call budget has no repair slot",
+        ) as caught:
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=2,
+                    max_retrieval_rounds=0,
+                    audit_discovery=True,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
             )
-        ).run(
-            query="问题",
-            host_contract_fields=self.host,
-            evidence_packet=self.packet,
-            complete=complete,
-            execute_action=execute,
-            allowed_tool_names=set(),
-        )
-        self.assertEqual(result.stop_reason, "PROTOCOL_DEGRADED")
-        self.assertFalse(result.repair_attempted)
-        self.assertTrue(result.degraded)
-        self.assertEqual(result.model_calls, 2)
-        self.assertEqual(len(result.protocol_failures), 1)
-        self.assertEqual(len(result.trace), 1)
+        self.assertEqual(calls, [0, 1])
+        self.assertFalse(caught.exception.repair_attempted)
+        self.assertEqual(len(caught.exception.protocol_failures), 1)
 
     async def test_later_invalid_turn_without_previous_brief_still_fails(self) -> None:
         first = {
@@ -783,7 +834,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 allowed_tool_names=set(),
             )
 
-    async def test_resolved_identity_mutation_only_returns_previous_turn(self) -> None:
+    async def test_resolved_identity_mutation_raises_without_repair_slot(self) -> None:
         first_contract = self.contract(0)
         first = {
             "contract": first_contract,
@@ -807,28 +858,26 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        result = await EccrOrchestrator(
-            limits=EccrLimits(
-                max_model_calls=2,
-                max_retrieval_rounds=0,
-                audit_discovery=True,
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "model-call budget has no repair slot",
+        ):
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=2,
+                    max_retrieval_rounds=0,
+                    audit_discovery=True,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
             )
-        ).run(
-            query="问题",
-            host_contract_fields=self.host,
-            evidence_packet=self.packet,
-            complete=complete,
-            execute_action=execute,
-            allowed_tool_names=set(),
-        )
-        self.assertEqual(result.stop_reason, "PROTOCOL_DEGRADED")
-        self.assertEqual(
-            result.final_turn.contract.subjects[0].participant_key,
-            "p1",
-        )
-        self.assertEqual(len(result.trace), 1)
 
-    async def test_invalid_audit_after_terminal_turn_degrades_exact_terminal_turn(
+    async def test_invalid_audit_after_terminal_turn_raises_protocol_error(
         self,
     ) -> None:
         first_contract = self.contract(0)
@@ -884,25 +933,24 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        result = await EccrOrchestrator(
-            limits=EccrLimits(
-                max_model_calls=3,
-                max_retrieval_rounds=0,
-                audit_discovery=True,
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "model-call budget has no repair slot",
+        ):
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=3,
+                    max_retrieval_rounds=0,
+                    audit_discovery=True,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=self.packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
             )
-        ).run(
-            query="问题",
-            host_contract_fields=self.host,
-            evidence_packet=self.packet,
-            complete=complete,
-            execute_action=execute,
-            allowed_tool_names=set(),
-        )
-        self.assertEqual(result.status, "PARTIAL")
-        self.assertEqual(result.stop_reason, "PROTOCOL_DEGRADED")
-        self.assertTrue(result.final_turn.terminal)
-        self.assertEqual(result.final_turn.contract.as_dict(), terminal_contract)
-        self.assertEqual(len(result.trace), 2)
 
     async def test_later_guarded_claim_mutations_are_host_canonicalized(self) -> None:
         variants = {
@@ -929,6 +977,23 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         for name, variant in variants.items():
             with self.subTest(name=name):
                 first_contract = self.contract(0)
+                first_contract["obligations"][0].update(
+                    {
+                        "status": "CONTESTED",
+                        "support_keys": ["s1"],
+                        "counter_keys": ["s1"],
+                    }
+                )
+                first_contract["interpretations"][0].update(
+                    {
+                        "status": "CONTESTED",
+                        "support_keys": ["s1"],
+                        "counter_keys": ["s1"],
+                    }
+                )
+                first_contract["uncertainties"][0].update(
+                    {"status": "PRESERVED", "source_keys": ["s1"]}
+                )
                 second_contract = copy.deepcopy(first_contract)
                 second_contract["step_index"] = 1
                 second_contract["guarded_claims"] = variant["value"]
@@ -945,6 +1010,24 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                         "memory_brief": None,
                         "terminal": False,
                     },
+                    {
+                        "contract": {
+                            **copy.deepcopy(second_contract),
+                            "step_index": 2,
+                        },
+                        "actions": [],
+                        "memory_brief": {
+                            "claims": [],
+                            "conflicts": [],
+                            "unresolved": [
+                                {
+                                    "statement": "仍保留安全约束",
+                                    "source_keys": ["s1"],
+                                }
+                            ],
+                        },
+                        "terminal": True,
+                    },
                 ]
 
                 async def complete(
@@ -960,7 +1043,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
                 result = await EccrOrchestrator(
                     limits=EccrLimits(
-                        max_model_calls=2,
+                        max_model_calls=3,
                         max_retrieval_rounds=0,
                         audit_discovery=True,
                     )
@@ -1079,17 +1162,109 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             {
                 "id": "u2",
                 "statement": "新证据仍不能排除另一解释",
-                "status": "OPEN",
+                "status": "PRESERVED",
                 "source_keys": ["s2"],
                 "origin": "AUDIT_DISCOVERY",
                 "discriminates_interpretation_ids": ["i1"],
             }
         )
+        second["obligations"][0].update(
+            {"status": "CONTESTED", "last_changed_step": 1}
+        )
+        second["interpretations"][0].update(
+            {"status": "CONTESTED", "uncertainty": "支持与反例并存"}
+        )
+        second["uncertainties"][0]["status"] = "PRESERVED"
+        action_raw = {
+            "obligation_id": "o1",
+            "tool_name": "mr_query_event_context",
+            "arguments": {"event_id": 7, "limit": 20},
+            "discriminator": "读取新证据",
+            "expected_delta": "让 s2 对当前调用可见",
+        }
+        action_signature = RetrievalAction.from_value(
+            action_raw,
+            field="action",
+        ).signature()
+        terminal = copy.deepcopy(second)
+        terminal["step_index"] = 2
+        terminal["visited_source_keys"] = ["s2", "s1"]
+        for values in (
+            terminal["subjects"],
+            terminal["obligations"],
+            terminal["interpretations"][:1],
+            terminal["uncertainties"][:1],
+        ):
+            item = values[0]
+            for field in ("source_keys", "support_keys", "counter_keys"):
+                if field in item:
+                    item[field] = ["s2", "s1"]
+        terminal["tried_action_signatures"] = [action_signature]
+        responses = [
+            {
+                "contract": first,
+                "actions": [action_raw],
+                "memory_brief": None,
+                "terminal": False,
+            },
+            {
+                "contract": second,
+                "actions": [],
+                "memory_brief": None,
+                "terminal": False,
+            },
+            {
+                "contract": terminal,
+                "actions": [],
+                "memory_brief": {
+                    "claims": [],
+                    "conflicts": [
+                        {"statement": "支持与反例并存", "source_keys": ["s1", "s2"]}
+                    ],
+                    "unresolved": [
+                        {"statement": "仍不可升级", "source_keys": ["s1", "s2"]}
+                    ],
+                },
+                "terminal": True,
+            },
+        ]
 
-        result = await self.run_contract_pair(first, second)
+        async def complete(
+            _system: str,
+            _prompt: str,
+            index: int,
+            _phase: str,
+        ):
+            return responses[index]
+
+        async def execute(_action: RetrievalAction):
+            return {
+                "messages": [
+                    {
+                        "source_key": "s2",
+                        "participant_key": "p1",
+                        "plain_text": "新证据",
+                    }
+                ]
+            }
+
+        result = await EccrOrchestrator(
+            limits=EccrLimits(
+                max_model_calls=3,
+                max_retrieval_rounds=2,
+                audit_discovery=True,
+            )
+        ).run(
+            query="问题",
+            host_contract_fields=self.host,
+            evidence_packet=self.packet,
+            complete=complete,
+            execute_action=execute,
+            allowed_tool_names={"mr_query_event_context"},
+        )
         contract = result.final_turn.contract
         self.assertEqual(contract.visited_source_keys, ("s2", "s1"))
-        self.assertEqual(contract.tried_action_signatures, ())
+        self.assertEqual(contract.tried_action_signatures, (action_signature,))
         self.assertEqual(contract.subjects[0].source_keys, ("s2", "s1"))
         self.assertEqual(contract.obligations[0].support_keys, ("s2", "s1"))
         self.assertEqual(contract.obligations[0].counter_keys, ("s2", "s1"))
@@ -1149,6 +1324,23 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         ).signature()
         first = self.contract(0)
         first["tried_action_signatures"] = [fake_first]
+        first["obligations"][0].update(
+            {
+                "status": "CONTESTED",
+                "support_keys": ["s1"],
+                "counter_keys": ["s1"],
+            }
+        )
+        first["interpretations"][0].update(
+            {
+                "status": "CONTESTED",
+                "support_keys": ["s1"],
+                "counter_keys": ["s1"],
+            }
+        )
+        first["uncertainties"][0].update(
+            {"status": "PRESERVED", "source_keys": ["s1"]}
+        )
         second = copy.deepcopy(first)
         second["step_index"] = 1
         second["tried_action_signatures"] = [fake_second]
@@ -1164,6 +1356,22 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "actions": [],
                 "memory_brief": None,
                 "terminal": False,
+            },
+            {
+                "contract": {
+                    **copy.deepcopy(second),
+                    "step_index": 2,
+                    "tried_action_signatures": [action_signature],
+                },
+                "actions": [],
+                "memory_brief": {
+                    "claims": [],
+                    "conflicts": [],
+                    "unresolved": [
+                        {"statement": "仍需保留约束", "source_keys": ["s1"]}
+                    ],
+                },
+                "terminal": True,
             },
         ]
         executed: list[RetrievalAction] = []
@@ -1182,8 +1390,8 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await EccrOrchestrator(
             limits=EccrLimits(
-                max_model_calls=2,
-                max_retrieval_rounds=1,
+                max_model_calls=3,
+                max_retrieval_rounds=2,
                 audit_discovery=True,
             )
         ).run(

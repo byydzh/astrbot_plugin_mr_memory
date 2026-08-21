@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
+
+
+class ProviderCompatibilityError(RuntimeError):
+    """The provider cannot preserve the private request option contract."""
 
 
 def _supports_private_call(
@@ -37,8 +41,6 @@ def _supports_private_call(
 async def generate_with_enforced_options(
     *,
     provider: Any,
-    fallback_generate: Callable[..., Awaitable[Any]],
-    chat_provider_id: str,
     prompt: str,
     system_prompt: str,
     options: Mapping[str, Any],
@@ -57,20 +59,23 @@ async def generate_with_enforced_options(
     prepare = getattr(provider, "_prepare_chat_payload", None)
     query = getattr(provider, "_query", None)
     query_stream = getattr(provider, "_query_stream", None)
-    private_api_compatible = _supports_private_call(
+    prepare_compatible = _supports_private_call(
         prepare,
         keywords=("prompt", "system_prompt"),
-    ) and _supports_private_call(
+    )
+    query_compatible = stream or _supports_private_call(
         query,
         positional=2,
         keywords=("request_max_retries",),
     )
-    if stream:
-        private_api_compatible = private_api_compatible and _supports_private_call(
-            query_stream,
-            positional=2,
-            keywords=("request_max_retries",),
-        )
+    stream_compatible = not stream or _supports_private_call(
+        query_stream,
+        positional=2,
+        keywords=("request_max_retries",),
+    )
+    private_api_compatible = (
+        prepare_compatible and query_compatible and stream_compatible
+    )
     if private_api_compatible:
         payload, _ = await prepare(
             prompt=prompt,
@@ -98,9 +103,15 @@ async def generate_with_enforced_options(
             return final_response
         return await query(payload, None, request_max_retries=1)
 
-    return await fallback_generate(
-        chat_provider_id=chat_provider_id,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        **dict(options),
+    incompatible = []
+    if not prepare_compatible:
+        incompatible.append("_prepare_chat_payload(prompt=, system_prompt=)")
+    if not query_compatible:
+        incompatible.append("_query(payload, tools, request_max_retries=)")
+    if not stream_compatible:
+        incompatible.append("_query_stream(payload, tools, request_max_retries=)")
+    raise ProviderCompatibilityError(
+        "provider private API is incompatible with enforced request options; "
+        "public fallback is forbidden because it may drop those options; "
+        "missing or drifted: " + ", ".join(incompatible)
     )

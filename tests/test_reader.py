@@ -167,10 +167,11 @@ class L2ReaderPromptTests(unittest.TestCase):
             schema["properties"]["packet_sha256"]["const"],
             request.packet_sha256,
         )
-        self.assertNotIn(
-            "PROTOCOL_DEGRADED",
-            schema["properties"]["stop_reason"]["enum"],
-        )
+        for host_failure in ("PROTOCOL_DEGRADED", "BUDGET_EXHAUSTED"):
+            self.assertNotIn(
+                host_failure,
+                schema["properties"]["stop_reason"]["enum"],
+            )
         self.assertEqual(
             schema["properties"]["subjects"]["items"]["properties"]
             ["source_keys"]["maxItems"],
@@ -236,7 +237,7 @@ class L2ReaderPromptTests(unittest.TestCase):
         provider_degraded = copy.deepcopy(raw)
         provider_degraded["status"] = "PARTIAL"
         provider_degraded["stop_reason"] = "PROTOCOL_DEGRADED"
-        with self.assertRaisesRegex(ValueError, "host-only"):
+        with self.assertRaisesRegex(ValueError, "stop_reason is unsupported"):
             parse_l2_reader_response(provider_degraded, request)
         raw["atoms"][0]["source_keys"] = ["outside"]
         with self.assertRaisesRegex(ValueError, "allowlist"):
@@ -320,6 +321,49 @@ class L2ReaderPromptTests(unittest.TestCase):
         multiple["subjects"][0]["candidate_participant_keys"] = ["p1", "p2"]
         with self.assertRaisesRegex(ValueError, "resolved mode requires"):
             parse_l2_reader_response(multiple, request)
+
+    def test_l2_host_rebuilds_must_include_from_required_atoms_in_atom_order(
+        self,
+    ) -> None:
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet={"sources": ["s1", "s2"]},
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1"},
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw["packet_sha256"] = request.packet_sha256
+        raw["atoms"][1]["importance"] = "REQUIRED"
+        raw["must_include"] = ["a2", "a1"]
+        frozen_atoms = copy.deepcopy(raw["atoms"])
+        audit: list[dict[str, object]] = []
+
+        certificate = parse_l2_reader_response(
+            raw,
+            request,
+            normalization_audit=audit,
+        )
+
+        self.assertEqual(certificate.must_include, ("a1", "a2"))
+        self.assertEqual(raw["atoms"], frozen_atoms)
+        self.assertEqual(
+            audit,
+            [
+                {
+                    "action": "canonicalize_must_include_from_atoms",
+                    "classification": "semantic_preserving_canonicalization",
+                    "changed_paths": ["must_include"],
+                    "required_atom_ids": ["a1", "a2"],
+                }
+            ],
+        )
+
+        invalid_atom = copy.deepcopy(raw)
+        invalid_atom["atoms"][0]["id"] = "invalid atom id"
+        with self.assertRaisesRegex(ValueError, "bounded identifier"):
+            parse_l2_reader_response(invalid_atom, request)
 
     def test_repair_prompt_is_available_exactly_once(self) -> None:
         request = build_l2_reader_prompt(
@@ -434,7 +478,6 @@ class EccrCertificateAdapterTests(unittest.TestCase):
     def test_nonterminal_bounded_stops_map_to_partial_certificates(self) -> None:
         turn = replace(_terminal_turn(), terminal=False)
         for stop_reason in (
-            "BUDGET_EXHAUSTED",
             "FRONTIER_EXHAUSTED",
             "SATURATED",
         ):
@@ -453,25 +496,29 @@ class EccrCertificateAdapterTests(unittest.TestCase):
                 self.assertTrue(
                     certificate.unresolved or certificate.open_obligations
                 )
+        with self.assertRaisesRegex(ValueError, "cannot produce a certificate"):
+            certificate_from_contract_turn(
+                turn,
+                snapshot=_eccr_snapshot(),
+                packet_sha256="b" * 64,
+                allowed_source_keys={"source-1"},
+                allowed_participant_keys={"participant:a"},
+                stop_reason="BUDGET_EXHAUSTED",
+                pack_read_complete=True,
+            )
 
-    def test_host_protocol_degradation_maps_exact_turn_to_qualified_partial(self) -> None:
+    def test_protocol_degradation_cannot_produce_a_certificate(self) -> None:
         turn = _terminal_turn()
-        certificate = certificate_from_contract_turn(
-            turn,
-            snapshot=_eccr_snapshot(),
-            packet_sha256="b" * 64,
-            allowed_source_keys={"source-1"},
-            allowed_participant_keys={"participant:a"},
-            stop_reason="PROTOCOL_DEGRADED",
-            pack_read_complete=True,
-        )
-        self.assertTrue(turn.terminal)
-        self.assertEqual(certificate.status, "PARTIAL")
-        self.assertEqual(certificate.stop_reason, "PROTOCOL_DEGRADED")
-        self.assertTrue(certificate.unresolved or certificate.open_obligations)
-        surface = compile_surface_packet(certificate)
-        validate_surface_packet(surface, certificate)
-        self.assertIn("PROTOCOL_DEGRADED", surface.text)
+        with self.assertRaisesRegex(ValueError, "cannot produce a certificate"):
+            certificate_from_contract_turn(
+                turn,
+                snapshot=_eccr_snapshot(),
+                packet_sha256="b" * 64,
+                allowed_source_keys={"source-1"},
+                allowed_participant_keys={"participant:a"},
+                stop_reason="PROTOCOL_DEGRADED",
+                pack_read_complete=True,
+            )
 
 
 if __name__ == "__main__":
