@@ -8,7 +8,11 @@ from pathlib import Path
 from mr_memory.brief import parse_evidence_brief, render_evidence_brief
 from mr_memory.distillation import parse_distillation_response, persist_distillation
 from mr_memory.feedback import feedback_surface_score
-from mr_memory.identity import sanitize_components
+from mr_memory.identity import (
+    build_request_identity_context,
+    canonical_participant_key,
+    sanitize_components,
+)
 from mr_memory.models import NormalizedMessage
 from mr_memory.storage import MemoryStorage
 
@@ -26,6 +30,42 @@ class TruthLayerV2Tests(unittest.TestCase):
         self.storage.close()
         for suffix in ("", "-wal", "-shm"):
             Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+
+    def test_current_request_keeps_sender_mention_and_reply_accounts_distinct(
+        self,
+    ) -> None:
+        context = build_request_identity_context(
+            platform_id=self.platform_id,
+            sender_id="1006039062",
+            sender_name="空奏列車",
+            content=[
+                {
+                    "type": "mention",
+                    "account_id": "1094354810",
+                    "display_name": "🍹想喝气泡水🥤",
+                },
+                {
+                    "type": "reply",
+                    "message_id": "quoted-message",
+                    "sender_id": "1094354810",
+                    "sender_name": "🍹想喝气泡水🥤",
+                },
+                {"type": "text", "text": "她是谁，是不是我"},
+            ],
+        )
+
+        sender = context["sender"]
+        mentioned = context["mentions"][0]
+        reply_target = context["reply_target"]
+        self.assertEqual(sender["account_id"], "1006039062")
+        self.assertEqual(mentioned["account_id"], "1094354810")
+        self.assertFalse(mentioned["same_account_as_sender"])
+        self.assertIsNotNone(reply_target)
+        self.assertFalse(reply_target["same_account_as_sender"])
+        self.assertEqual(
+            mentioned["participant_key"],
+            canonical_participant_key(self.platform_id, "1094354810"),
+        )
 
     def message(
         self,

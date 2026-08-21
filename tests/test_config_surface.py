@@ -67,7 +67,7 @@ class ConfigSurfaceTests(unittest.TestCase):
             Path.cwd() / "pages" / "console" / "index.html"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            '<script type="module" src="./script.js?v=0.18.1-conservative-effects"></script>',
+            '<script type="module" src="./script.js?cache=conservative-effects"></script>',
             html,
         )
 

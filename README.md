@@ -1,9 +1,9 @@
 # MR Memory
 
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
-AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提供原始消息
+AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提供原始消息
 真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-0.18.0 把回答时记忆升级为分层运行时：每次请求固定 `RequestSnapshot`，先复用 L1a
+回答时记忆采用分层运行时：每次请求固定 `RequestSnapshot`，先复用 L1a
 证据包和 L1b 语义证书，再由宿主在 L2 单次证据读取与 L3 有界 ECCR 重建之间路由；
 最终只把经过验证的 `EvidenceCertificateV2` 编译成表层提示。局部梗义、反话和委婉语
 可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
@@ -41,7 +41,8 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前版本提
 - 数据库固定写入本插件的 `plugin_data` 目录。
 - 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
   重名不会自动合并。
-- 每群的回忆/整理与反馈学习各有 24 小时 `500000` token 预算，超限时主回答 fail-open；
+- 每群的回忆/整理与反馈学习各有 24 小时 `500000` token 预算；超限时插件记录失败且不注入记忆，
+  AstrBot 主回答链继续正常运行；
   控制台可分别重置有效额度，原始账本不会删除。
 - 日志默认不输出聊天正文。
 - 不连接或重启 NapCat，不发送消息。
@@ -114,7 +115,7 @@ embedding 只提供候选先验，不用固定相似度裁决语义。L2/L3 产�
 `SEMANTIC_NONE`。每次调用单独记录首块延迟、总耗时、Token、路由、证书与表层结果。
 
 schema 16 新增请求快照、证据包缓存、语义证书、证书依赖和重建任务的持久化生命周期；
-升级只迁移插件自己的按群 SQLite。0.18.0 没有新增 Python 依赖，线上仍使用
+升级只迁移插件自己的按群 SQLite。分层运行时没有新增 Python 依赖，线上仍使用
 `requirements.txt`，Harrier 部署才额外使用 `requirements-harrier.txt`。可部署文件边界见
 [运行时文件清单](docs/RUNTIME_FILES.md)。
 

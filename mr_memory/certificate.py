@@ -48,9 +48,7 @@ STOP_REASONS = {
     "SAFETY_ABSTAIN",
     "FRONTIER_EXHAUSTED",
     "SATURATED",
-    "BUDGET_EXHAUSTED",
     "REQUEST_L3",
-    "PROTOCOL_DEGRADED",
 }
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$")
@@ -781,8 +779,6 @@ def parse_evidence_certificate(
         if stop_reason not in {
             "FRONTIER_EXHAUSTED",
             "SATURATED",
-            "BUDGET_EXHAUSTED",
-            "PROTOCOL_DEGRADED",
         }:
             raise ValueError("PARTIAL requires an incomplete stop reason")
         if not (unresolved or conflicts or obligations):

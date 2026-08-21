@@ -1624,6 +1624,90 @@ class MemoryStorageTests(unittest.TestCase):
             "InterruptedError",
         )
 
+    def test_layered_reconstruction_is_visible_in_runtime_health(self) -> None:
+        """The dashboard must count the reconstruction path used in production."""
+
+        umo = "shadow:GroupMessage:group-a"
+        for index in range(12):
+            self.storage.upsert_message(
+                self.message(
+                    f"d-teacher-{index}",
+                    f"D老师参与过的历史消息 {index}",
+                    umo=umo,
+                    sender_id="account-d",
+                    sent_at=100 + index,
+                )
+            )
+        self.storage.bind_participant_alias(
+            umo=umo,
+            platform_id="shadow",
+            account_id="account-d",
+            alias="d老师",
+            at=120,
+        )
+        resolved = self.storage.resolve_participants(
+            umo=umo,
+            reference="d老师",
+        )
+        self.assertEqual(len(resolved["participants"]), 1)
+
+        run_id = "runtime-layered-person-lookup"
+        self.storage.start_experiment(
+            run_id=run_id,
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+            metadata={"path": "layered", "route": "L2"},
+        )
+        self.storage.record_llm_usage(
+            run_id=run_id,
+            phase="reconstruction",
+            input_other=120,
+            output=30,
+            elapsed_ms=250,
+        )
+        self.storage.finish_experiment(
+            run_id=run_id,
+            status="completed",
+            result={
+                "operational_status": "COMPLETED",
+                "semantic_status": "CERTIFIED",
+                "path": "layered",
+                "no_relevant_memory": False,
+            },
+        )
+        failed_run_id = "runtime-layered-person-lookup-failed"
+        self.storage.start_experiment(
+            run_id=failed_run_id,
+            umo=umo,
+            experiment_type="runtime_layered_reconstruction",
+            metadata={"path": "layered", "route": "L2"},
+        )
+        self.storage.finish_experiment(
+            run_id=failed_run_id,
+            status="failed",
+            result={
+                "operational_status": "FAILED",
+                "semantic_status": "UNKNOWN",
+                "path": "layered",
+                "error_type": "TimeoutError",
+                "error_detail": "reader deadline exceeded",
+            },
+        )
+
+        health = self.storage.runtime_health_summary(umo=umo, since=0)
+
+        self.assertEqual(health["reconstruction"]["calls"], 2)
+        self.assertEqual(health["reconstruction"]["completed"], 1)
+        self.assertEqual(health["reconstruction"]["failed"], 1)
+        self.assertEqual(health["reconstruction"]["timeouts"], 1)
+        self.assertEqual(health["reconstruction"]["tokens"], 150)
+        recent = {item["run_id"]: item for item in health["recent"]}
+        self.assertEqual(recent[run_id]["phase"], "reconstruction")
+        self.assertEqual(recent[failed_run_id]["phase"], "reconstruction")
+        self.assertEqual(recent[failed_run_id]["status"], "FAILED")
+        self.assertEqual(recent[failed_run_id]["outcome"], "failed")
+        self.assertEqual(recent[failed_run_id]["error_type"], "TimeoutError")
+
     def test_online_and_history_budgets_are_physically_separate(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         for run_id, phase, tokens in (

@@ -25,7 +25,6 @@ const state = {
 const elements = {
   connectionDot: document.getElementById("connection-dot"),
   connectionLabel: document.getElementById("connection-label"),
-  runtimeVersion: document.getElementById("runtime-version"),
   healthBanner: document.getElementById("health-banner"),
   healthTitle: document.getElementById("health-title"),
   healthCopy: document.getElementById("health-copy"),
@@ -296,8 +295,6 @@ function renderOverview() {
   elements.metricPending.textContent = formatNumber(totals.pending_distillation);
   elements.metricEmbeddings.textContent = formatNumber(totals.embeddings);
   elements.metricStorage.textContent = formatBytes(totals.database_bytes);
-  elements.runtimeVersion.textContent = `MR Memory ${overview?.version || ""}`;
-
   const allowedUmos = runtime.allowed_umos || [];
   elements.policyScope.textContent = allowedUmos.length
     ? `${formatNumber(allowedUmos.length)} 个指定群聊`

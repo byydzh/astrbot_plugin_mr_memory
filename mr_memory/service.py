@@ -493,6 +493,24 @@ class MemoryService:
             message_upper_bound=message_upper_bound,
         )
 
+    async def query_matching_cues(
+        self,
+        *,
+        umo: str,
+        query: str,
+        limit: int = 12,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.query_matching_cues,
+            umo=umo,
+            query=query,
+            limit=limit,
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
+
     async def query_tag_events(
         self,
         *,

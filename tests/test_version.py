@@ -1,38 +1,22 @@
 from __future__ import annotations
 
-import re
 import unittest
 from pathlib import Path
 
-from mr_memory.version import EXTRACTOR_VERSION, PLUGIN_VERSION
 
-
-class VersionConsistencyTests(unittest.TestCase):
-    def test_public_version_surfaces_are_consistent(self) -> None:
+class PluginMetadataTests(unittest.TestCase):
+    def test_plugin_has_no_runtime_version_mechanism(self) -> None:
         root = Path(__file__).resolve().parents[1]
         metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
-        readme = (root / "README.md").read_text(encoding="utf-8")
-        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-        development_log = (root / "docs" / "DEVELOPMENT_LOG.md").read_text(
+        main_source = (root / "main.py").read_text(encoding="utf-8")
+        console_script = (root / "pages" / "console" / "script.js").read_text(
             encoding="utf-8"
         )
-        match = re.search(r"^version:\s*([^\s]+)$", metadata, re.MULTILINE)
-        self.assertIsNotNone(match)
-        assert match is not None
-        self.assertEqual(match.group(1), PLUGIN_VERSION)
-        self.assertIn(PLUGIN_VERSION, readme)
-        changelog_match = re.search(r"(?m)^## ([0-9]+\.[0-9]+\.[0-9]+)$", changelog)
-        development_match = re.search(
-            r"(?m)^## .* / ([0-9]+\.[0-9]+\.[0-9]+)$",
-            development_log,
-        )
-        self.assertIsNotNone(changelog_match)
-        self.assertIsNotNone(development_match)
-        assert changelog_match is not None
-        assert development_match is not None
-        self.assertEqual(changelog_match.group(1), PLUGIN_VERSION)
-        self.assertEqual(development_match.group(1), PLUGIN_VERSION)
-        self.assertEqual(EXTRACTOR_VERSION, f"mr-memory-{PLUGIN_VERSION}")
+        self.assertIn("version: unversioned", metadata)
+        self.assertFalse((root / "mr_memory" / "version.py").exists())
+        self.assertNotIn("PLUGIN_VERSION", main_source)
+        self.assertNotIn("EXTRACTOR_VERSION", main_source)
+        self.assertNotIn("overview?.version", console_script)
 
     def test_runtime_manifest_covers_layered_modules(self) -> None:
         root = Path(__file__).resolve().parents[1]

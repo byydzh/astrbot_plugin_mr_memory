@@ -32,6 +32,82 @@ def canonical_participant_key(platform_id: str, account_id: str) -> str:
     )
 
 
+def build_request_identity_context(
+    *,
+    platform_id: str,
+    sender_id: str,
+    sender_name: str,
+    content: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind current-message identity roles from host-structured metadata.
+
+    Sender, mention and reply account IDs come from the adapter event rather
+    than from model interpretation.  The result intentionally contains no
+    inferred pronoun or alias binding; consumers can compare stable account IDs
+    without guessing that two display names refer to the same person.
+    """
+
+    platform = str(platform_id or "").strip()
+    sender_account = str(sender_id or "").strip()
+    if not platform or not sender_account:
+        raise ValueError("request identity requires platform_id and sender_id")
+
+    def binding(
+        *,
+        account_id: str,
+        display_name: str,
+        binding_basis: str,
+    ) -> dict[str, Any]:
+        account = str(account_id or "").strip()
+        return {
+            "participant_key": canonical_participant_key(platform, account),
+            "platform_id": platform,
+            "account_id": account,
+            "display_name": str(display_name or "").strip()[:300],
+            "binding_basis": binding_basis,
+            "same_account_as_sender": account == sender_account,
+        }
+
+    components = tuple(item for item in content if isinstance(item, dict))
+    mentions = [
+        binding(
+            account_id=item.account_id,
+            display_name=item.display_name,
+            binding_basis="structured_mention",
+        )
+        for item in extract_mentions(components)
+    ]
+    reply = extract_reply(components)
+    reply_target: dict[str, Any] | None = None
+    if reply is not None:
+        reply_target = {
+            "message_id": reply.message_id,
+            "account_id": reply.sender_id,
+            "display_name": reply.sender_name[:300],
+            "binding_basis": "structured_reply",
+            "same_account_as_sender": (
+                reply.sender_id == sender_account if reply.sender_id else None
+            ),
+        }
+        if reply.sender_id:
+            reply_target["participant_key"] = canonical_participant_key(
+                platform,
+                reply.sender_id,
+            )
+            reply_target["platform_id"] = platform
+
+    return {
+        "authority": "current_platform_event",
+        "sender": binding(
+            account_id=sender_account,
+            display_name=sender_name,
+            binding_basis="message_sender",
+        ),
+        "mentions": mentions,
+        "reply_target": reply_target,
+    }
+
+
 def content_fingerprint(
     *,
     sender_id: str,

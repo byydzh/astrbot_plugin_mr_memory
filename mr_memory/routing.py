@@ -190,7 +190,7 @@ class RoutePolicy:
     def _execution(self, features: RouteFeatures, level: str) -> str:
         if features.request_kind in {"MEMORY_QUERY", "DEEP_RECALL"}:
             return "SYNC"
-        if self.mode == "RESEARCH":
+        if self.mode in {"BALANCED", "RESEARCH"}:
             return "SYNC"
         if level == "L3" and features.high_risk:
             return "SYNC"

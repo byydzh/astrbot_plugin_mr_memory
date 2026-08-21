@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.18.0
+## 当前状态
 
 - Freeze every recall request into a host-owned `RequestSnapshot` with scope,
   strict cutoff, message row upper bound, reply target, and data/inference

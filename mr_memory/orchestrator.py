@@ -827,6 +827,63 @@ class EccrProtocolFailure:
         }
 
 
+class EccrProtocolError(ValueError):
+    """Terminal ECCR protocol failure with privacy-safe attempt audit."""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        error: ValueError,
+        protocol_failures: tuple[EccrProtocolFailure, ...],
+        repair_attempted: bool,
+    ) -> None:
+        detail = " ".join(str(error).strip().split())
+        failure_details = " | ".join(
+            f"call {item.call_index} attempt {item.attempt}: {item.message}"
+            for item in protocol_failures
+        )
+        audit_detail = failure_details or detail
+        super().__init__(f"ECCR protocol error ({reason}): {audit_detail}")
+        self.protocol_failures = protocol_failures
+        self.repair_attempted = bool(repair_attempted)
+
+
+class EccrBudgetExhaustedError(RuntimeError):
+    """Terminal ECCR operational failure after a hard runtime limit is spent."""
+
+    def __init__(
+        self,
+        *,
+        limit_kind: str,
+        model_calls: int,
+        max_model_calls: int,
+        retrieval_rounds: int,
+        max_retrieval_rounds: int,
+        elapsed_ms: float,
+        deadline_ms: float,
+        protocol_failures: tuple[EccrProtocolFailure, ...] = (),
+        repair_attempted: bool = False,
+    ) -> None:
+        normalized_limit = str(limit_kind or "budget").strip() or "budget"
+        super().__init__(
+            "ECCR operational budget exhausted "
+            f"({normalized_limit}); model_calls={int(model_calls)}/"
+            f"{int(max_model_calls)}, retrieval_rounds={int(retrieval_rounds)}/"
+            f"{int(max_retrieval_rounds)}, elapsed_ms={float(elapsed_ms):.3f}/"
+            f"{float(deadline_ms):.3f}"
+        )
+        self.limit_kind = normalized_limit
+        self.model_calls = int(model_calls)
+        self.max_model_calls = int(max_model_calls)
+        self.retrieval_rounds = int(retrieval_rounds)
+        self.max_retrieval_rounds = int(max_retrieval_rounds)
+        self.elapsed_ms = float(elapsed_ms)
+        self.deadline_ms = float(deadline_ms)
+        self.protocol_failures = protocol_failures
+        self.repair_attempted = bool(repair_attempted)
+
+
 @dataclass(frozen=True, slots=True)
 class EccrRunResult:
     status: str
@@ -839,7 +896,6 @@ class EccrRunResult:
     elapsed_ms: float
     protocol_failures: tuple[EccrProtocolFailure, ...] = ()
     repair_attempted: bool = False
-    degraded: bool = False
 
     @property
     def brief(self):
@@ -1316,7 +1372,6 @@ class EccrOrchestrator:
         stop_reason = ""
         model_calls_used = 0
         repair_used = False
-        degraded = False
         protocol_failures: list[EccrProtocolFailure] = []
         full_action_catalog = _selected_action_catalog(allowed_tool_names)
 
@@ -1498,11 +1553,17 @@ class EccrOrchestrator:
                     )
                 )
                 if repair_used or model_calls_used >= self.limits.max_model_calls:
-                    if previous is None or previous.brief is None:
-                        raise
-                    degraded = True
-                    stop_reason = "PROTOCOL_DEGRADED"
-                    break
+                    reason = (
+                        "single repair already used"
+                        if repair_used
+                        else "model-call budget has no repair slot"
+                    )
+                    raise EccrProtocolError(
+                        reason=reason,
+                        error=exc,
+                        protocol_failures=tuple(protocol_failures),
+                        repair_attempted=repair_used,
+                    ) from exc
                 repair_used = True
                 repair_call_index = model_calls_used
                 repair_retrieval_available = (
@@ -1543,11 +1604,12 @@ class EccrOrchestrator:
                             error=repair_exc,
                         )
                     )
-                    if previous is None or previous.brief is None:
-                        raise
-                    degraded = True
-                    stop_reason = "PROTOCOL_DEGRADED"
-                    break
+                    raise EccrProtocolError(
+                        reason="single protocol repair failed",
+                        error=repair_exc,
+                        protocol_failures=tuple(protocol_failures),
+                        repair_attempted=True,
+                    ) from repair_exc
                 retrieval_available = repair_retrieval_available
                 trace_call_index = repair_call_index
             gain = (
@@ -1650,15 +1712,39 @@ class EccrOrchestrator:
             retrieval_rounds += 1
             no_progress = 0 if allowed_sources - before else no_progress + 1
 
+        if not stop_reason and previous is not None and not previous.terminal:
+            stop_reason = "BUDGET_EXHAUSTED"
+        if stop_reason == "BUDGET_EXHAUSTED":
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            deadline_ms = self.limits.deadline_seconds * 1000
+            if elapsed_ms >= deadline_ms:
+                limit_kind = "deadline"
+            elif model_calls_used >= self.limits.max_model_calls:
+                limit_kind = "model_calls"
+            elif (
+                self.limits.max_retrieval_rounds > 0
+                and retrieval_rounds >= self.limits.max_retrieval_rounds
+            ):
+                limit_kind = "retrieval_rounds"
+            else:
+                limit_kind = "budget"
+            raise EccrBudgetExhaustedError(
+                limit_kind=limit_kind,
+                model_calls=model_calls_used,
+                max_model_calls=self.limits.max_model_calls,
+                retrieval_rounds=retrieval_rounds,
+                max_retrieval_rounds=self.limits.max_retrieval_rounds,
+                elapsed_ms=elapsed_ms,
+                deadline_ms=deadline_ms,
+                protocol_failures=tuple(protocol_failures),
+                repair_attempted=repair_used,
+            )
         if previous is None:
             raise RuntimeError("ECCR ended without a contract turn")
         if not stop_reason:
-            stop_reason = "CERTIFIED_CLOSE" if previous.terminal else "BUDGET_EXHAUSTED"
+            stop_reason = "CERTIFIED_CLOSE"
         status = "CERTIFIED" if previous.terminal and previous.brief else "PARTIAL"
-        if degraded:
-            status = "PARTIAL"
-            stop_reason = "PROTOCOL_DEGRADED"
-        elif stop_reason == "SAFETY_ABSTAIN":
+        if stop_reason == "SAFETY_ABSTAIN":
             status = "SAFETY_ABSTAIN"
         return EccrRunResult(
             status=status,
@@ -1671,7 +1757,6 @@ class EccrOrchestrator:
             elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
             protocol_failures=tuple(protocol_failures),
             repair_attempted=repair_used,
-            degraded=degraded,
         )
 
     def _phase(self, call_index: int) -> str:

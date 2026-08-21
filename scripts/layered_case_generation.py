@@ -842,7 +842,6 @@ async def _run_l3(
         "retrieval_rounds": result.retrieval_rounds,
         "elapsed_ms": result.elapsed_ms,
         "repair_attempted": result.repair_attempted,
-        "degraded": result.degraded,
         "protocol_failures": [
             item.as_dict() for item in result.protocol_failures
         ],
