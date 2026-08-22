@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from mr_memory.feedback import FeedbackDecision
 from mr_memory.models import NormalizedMessage
@@ -29,6 +31,7 @@ class MemoryStorageTests(unittest.TestCase):
         *,
         umo: str = "shadow:GroupMessage:group-a",
         sender_id: str = "user-a",
+        sender_name: str = "",
         sent_at: int = 100,
     ) -> NormalizedMessage:
         return NormalizedMessage(
@@ -38,7 +41,7 @@ class MemoryStorageTests(unittest.TestCase):
             group_id=umo.rsplit(":", 1)[-1],
             message_id=message_id,
             sender_id=sender_id,
-            sender_name=sender_id,
+            sender_name=sender_name or sender_id,
             sent_at=sent_at,
             plain_text=text,
             content=[{"type": "plain", "text": text}],
@@ -89,6 +92,302 @@ class MemoryStorageTests(unittest.TestCase):
             limit=2,
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
+
+    def test_query_alias_and_recent_activity_are_snapshot_bounded(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        local_timezone = ZoneInfo("Asia/Shanghai")
+
+        def epoch(day: int, hour: int, minute: int = 0) -> int:
+            return int(
+                datetime(2026, 8, day, hour, minute, tzinfo=local_timezone).timestamp()
+            )
+
+        cutoff = epoch(22, 16)
+        first = self.message(
+            "mllop-1",
+            "凌晨发言",
+            umo=umo,
+            sender_id="account-mllop",
+            sender_name="mllop",
+            sent_at=epoch(22, 1, 15),
+        )
+        second = self.message(
+            "mllop-2",
+            "深夜发言",
+            umo=umo,
+            sender_id="account-mllop",
+            sender_name="mllop新名",
+            sent_at=epoch(21, 23, 45),
+        )
+        too_old = self.message(
+            "mllop-old",
+            "窗口之外",
+            umo=umo,
+            sender_id="account-mllop",
+            sender_name="mllop",
+            sent_at=epoch(15, 15, 59),
+        )
+        for message in (first, second, too_old):
+            self.storage.upsert_message(message)
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+
+        # This row arrives after the frozen snapshot even though its platform
+        # timestamp lies inside the seven-day window.
+        self.storage.upsert_message(
+            self.message(
+                "mllop-late-arrival",
+                "快照之后才写入",
+                umo=umo,
+                sender_id="account-mllop",
+                sender_name="未来昵称",
+                sent_at=epoch(22, 2),
+            )
+        )
+
+        resolved = self.storage.resolve_query_participants(
+            umo=umo,
+            query="/chat 通过最近几天mllop的发言时间预测何时醒",
+            before_sent_at=cutoff,
+            message_upper_bound=message_upper_bound,
+        )
+        self.assertFalse(resolved["ambiguous"])
+        self.assertEqual(len(resolved["participants"]), 1)
+        participant = resolved["participants"][0]
+        self.assertEqual(participant["account_id"], "account-mllop")
+        self.assertEqual(participant["matched_aliases"], ["mllop"])
+        self.assertEqual(
+            participant["matched_alias_observations"],
+            [
+                {
+                    "alias": "mllop",
+                    "source_key": first.resolved_source_key(),
+                    "sent_at": first.sent_at,
+                    "source_kind": "observed",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.storage.resolve_query_participants(
+                umo=umo,
+                query="未来昵称什么时候出现",
+                before_sent_at=cutoff,
+                message_upper_bound=message_upper_bound,
+            )["participants"],
+            [],
+        )
+
+        activity = self.storage.query_participant_activity(
+            umo=umo,
+            participant_key=str(participant["canonical_key"]),
+            before_sent_at=cutoff,
+            message_upper_bound=message_upper_bound,
+            days=7,
+        )
+        self.assertTrue(activity["found"])
+        self.assertEqual(activity["timezone"], "Asia/Shanghai")
+        self.assertEqual(activity["message_count"], 2)
+        self.assertEqual(activity["hour_histogram"]["01"], 1)
+        self.assertEqual(activity["hour_histogram"]["23"], 1)
+        self.assertEqual(
+            [item["source_key"] for item in activity["messages"]],
+            [second.resolved_source_key(), first.resolved_source_key()],
+        )
+        self.assertTrue(
+            all(
+                set(item) == {
+                    "source_key",
+                    "sent_at",
+                    "local_datetime",
+                    "local_hour",
+                }
+                for item in activity["messages"]
+            )
+        )
+        self.assertEqual(activity["statistics_basis"], "returned_source_messages_only")
+        self.assertEqual(
+            activity["sampling_method"],
+            "daily_boundaries_plus_message_order_quantiles",
+        )
+
+    def test_query_alias_reports_ambiguous_accounts_without_guessing(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        for account_id in ("account-one", "account-two"):
+            self.storage.upsert_message(
+                self.message(
+                    account_id,
+                    "同名成员发言",
+                    umo=umo,
+                    sender_id=account_id,
+                    sender_name="mllop",
+                    sent_at=100,
+                )
+            )
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+        result = self.storage.resolve_query_participants(
+            umo=umo,
+            query="mllop最近什么时候发言",
+            before_sent_at=200,
+            message_upper_bound=message_upper_bound,
+        )
+        self.assertTrue(result["ambiguous"])
+        self.assertEqual(result["participants"], [])
+        self.assertEqual(len(result["ambiguous_aliases"]), 1)
+        candidates = result["ambiguous_aliases"][0]["candidate_participants"]
+        self.assertEqual(
+            {item["account_id"] for item in candidates},
+            {"account-one", "account-two"},
+        )
+
+    def test_query_alias_keeps_independent_short_alias_occurrence_ambiguous(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        records = (
+            ("d", "account-d", "D老师"),
+            ("one", "account-one", "老师"),
+            ("two", "account-two", "老师"),
+        )
+        for message_id, account_id, alias in records:
+            self.storage.upsert_message(
+                self.message(
+                    message_id,
+                    "身份观察",
+                    umo=umo,
+                    sender_id=account_id,
+                    sender_name=alias,
+                    sent_at=100,
+                )
+            )
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+
+        result = self.storage.resolve_query_participants(
+            umo=umo,
+            query="D老师和老师最近谁活跃",
+            before_sent_at=200,
+            message_upper_bound=message_upper_bound,
+        )
+
+        self.assertTrue(result["ambiguous"])
+        self.assertEqual(
+            {item["account_id"] for item in result["participants"]},
+            {"account-d"},
+        )
+        self.assertEqual(len(result["ambiguous_aliases"]), 1)
+        self.assertEqual(
+            {
+                item["account_id"]
+                for item in result["ambiguous_aliases"][0][
+                    "candidate_participants"
+                ]
+            },
+            {"account-one", "account-two"},
+        )
+
+    def test_activity_target_does_not_bind_common_words_used_as_aliases(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        for message_id, account_id, alias in (
+            ("common", "account-common", "最近"),
+            ("when", "account-when", "什么时候"),
+            ("what-time", "account-what-time", "何时"),
+            ("target", "account-mllop", "mllop"),
+        ):
+            self.storage.upsert_message(
+                self.message(
+                    message_id,
+                    "身份观察",
+                    umo=umo,
+                    sender_id=account_id,
+                    sender_name=alias,
+                    sent_at=100,
+                )
+            )
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+
+        result = self.storage.resolve_query_participants(
+            umo=umo,
+            query="/chat 通过最近几天mllop的发言时间来预测它什么时候醒",
+            before_sent_at=200,
+            message_upper_bound=message_upper_bound,
+        )
+
+        self.assertFalse(result["ambiguous"])
+        self.assertEqual(
+            {item["account_id"] for item in result["participants"]},
+            {"account-mllop"},
+        )
+
+    def test_activity_statistics_use_only_bounded_daily_spanning_sources(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        local_timezone = ZoneInfo("Asia/Shanghai")
+
+        def epoch(day: int, hour: int) -> int:
+            return int(
+                datetime(2026, 8, day, hour, tzinfo=local_timezone).timestamp()
+            )
+
+        expected_boundaries: set[str] = set()
+        for day in (20, 21):
+            for hour in range(20):
+                message = self.message(
+                    f"activity-{day}-{hour}",
+                    "活动采样",
+                    umo=umo,
+                    sender_id="account-active",
+                    sender_name="活跃成员",
+                    sent_at=epoch(day, hour),
+                )
+                self.storage.upsert_message(message)
+                if hour in {0, 19}:
+                    expected_boundaries.add(message.resolved_source_key())
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+        resolved = self.storage.resolve_participants(
+            umo=umo,
+            reference="account-active",
+            before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound,
+        )
+        participant_key = str(resolved["participants"][0]["canonical_key"])
+
+        activity = self.storage.query_participant_activity(
+            umo=umo,
+            participant_key=participant_key,
+            before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound,
+            days=7,
+            limit=4,
+        )
+
+        returned_sources = {
+            item["source_key"] for item in activity["messages"]
+        }
+        self.assertEqual(returned_sources, expected_boundaries)
+        self.assertEqual(activity["message_count"], 4)
+        self.assertEqual(sum(activity["hour_histogram"].values()), 4)
+        self.assertTrue(activity["messages_truncated"])
+        self.assertEqual(activity["statistics_basis"], "returned_source_messages_only")
 
     def test_timestamp_correction_is_a_revision_and_requeues_distillation(self) -> None:
         umo = "shadow:GroupMessage:group-a"

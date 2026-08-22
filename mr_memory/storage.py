@@ -10,10 +10,13 @@ import threading
 import time
 from collections import Counter, deque
 from contextlib import contextmanager
+from datetime import datetime
 from heapq import heappop, heappush
 from pathlib import Path
 from typing import Iterator, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
+from .certificate import MAX_CERTIFICATE_SOURCE_KEYS
 from .embedding import (
     cosine_similarity,
     decode_vector,
@@ -3608,8 +3611,9 @@ class MemoryStorage:
                         visible_parameters.append(max(0, int(message_upper_bound)))
                     visible_messages = self._connection.execute(
                         f"""
-                        SELECT DISTINCT m.id, m.sent_at, m.sender_participant_id,
-                               m.sender_name, m.content_json
+                        SELECT DISTINCT m.id, m.source_key, m.sent_at,
+                               m.sender_participant_id, m.sender_name,
+                               m.content_json
                         FROM messages AS m
                         LEFT JOIN message_participants AS mp
                           ON mp.message_id=m.id AND mp.participant_id=?
@@ -3622,7 +3626,12 @@ class MemoryStorage:
                     observed: dict[str, dict[str, object]] = {}
                     latest_speaker: tuple[int, int, str] | None = None
 
-                    def observe(alias: str, seen_at: int, source_kind: str) -> None:
+                    def observe(
+                        alias: str,
+                        seen_at: int,
+                        source_kind: str,
+                        source_key: str,
+                    ) -> None:
                         display = str(alias or "").strip()
                         alias_key = normalize_alias(display)
                         if not alias_key:
@@ -3635,6 +3644,7 @@ class MemoryStorage:
                                 "last_seen_at": int(seen_at),
                                 "source_kind": source_kind,
                                 "confidence": 1.0,
+                                "source_key": str(source_key),
                             }
                             return
                         current["first_seen_at"] = min(
@@ -3644,14 +3654,16 @@ class MemoryStorage:
                             current["alias"] = display
                             current["last_seen_at"] = int(seen_at)
                             current["source_kind"] = source_kind
+                            current["source_key"] = str(source_key)
 
                     account_id = str(row["account_id"])
                     for message in visible_messages:
                         sent_at = int(message["sent_at"])
                         message_id = int(message["id"])
+                        source_key = str(message["source_key"])
                         if message["sender_participant_id"] == participant_id:
                             sender_name = str(message["sender_name"] or "")
-                            observe(sender_name, sent_at, "observed")
+                            observe(sender_name, sent_at, "observed", source_key)
                             if sender_name and (
                                 latest_speaker is None
                                 or (sent_at, message_id) >= latest_speaker[:2]
@@ -3660,10 +3672,20 @@ class MemoryStorage:
                         content = self._parse_content_json(message["content_json"])
                         for mention in extract_mentions(content):
                             if mention.account_id == account_id:
-                                observe(mention.display_name, sent_at, "mention")
+                                observe(
+                                    mention.display_name,
+                                    sent_at,
+                                    "mention",
+                                    source_key,
+                                )
                         reply = extract_reply(content)
                         if reply is not None and reply.sender_id == account_id:
-                            observe(reply.sender_name, sent_at, "reply")
+                            observe(
+                                reply.sender_name,
+                                sent_at,
+                                "reply",
+                                source_key,
+                            )
 
                     exact_identity = query in {
                         str(row["account_id"]),
@@ -3717,6 +3739,433 @@ class MemoryStorage:
             "reference": query,
             "ambiguous": alias_only and len(result) > 1,
             "participants": result,
+        }
+
+    def resolve_query_participants(
+        self,
+        *,
+        umo: str,
+        query: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        """Resolve aliases that visibly occur in one frozen request query.
+
+        Account identity remains host-owned: this method only scans aliases already
+        observed inside the snapshot and delegates each exact match to
+        :meth:`resolve_participants`.  A nickname shared by several accounts is
+        returned under ``ambiguous_aliases`` and is never promoted to a participant.
+        """
+
+        self._assert_scope(umo)
+        original_query = str(query or "").strip()
+        normalized_query = normalize_alias(original_query)
+        cutoff = int(before_sent_at)
+        upper_bound = max(0, int(message_upper_bound))
+        safe_limit = max(1, min(100, int(limit)))
+        if not normalized_query:
+            return {
+                "query": original_query,
+                "ambiguous": False,
+                "participants": [],
+                "ambiguous_aliases": [],
+            }
+
+        query_body = re.sub(r"^/chat(?:\s+|$)", "", normalized_query).strip()
+        non_identity_aliases = {
+            "最近",
+            "这几天",
+            "近几天",
+            "过去",
+            "近期",
+            "发言",
+            "消息",
+            "聊天记录",
+            "活跃",
+            "时间",
+            "规律",
+            "什么时候",
+            "何时",
+            "几点",
+            "预测",
+            "统计",
+            "分布",
+            "醒",
+        }
+        left_reference_cues = (
+            "@",
+            "找",
+            "叫",
+            "用户",
+            "成员",
+            "群友",
+            "账号",
+            "关于",
+            "user ",
+            "member ",
+        )
+        right_reference_cues = (
+            "的发言",
+            "的消息",
+            "发言",
+            "最近",
+            "近期",
+            "之前",
+            "说",
+            "讲",
+            "活跃",
+            "什么时候",
+            "何时",
+            "几点",
+            "找",
+            "吗",
+            "呢",
+            "和",
+            "与",
+            "、",
+            "'s",
+            "’s",
+        )
+
+        def reference_spans(alias: str) -> list[tuple[int, int]]:
+            spans: list[tuple[int, int]] = []
+            offset = 0
+            while True:
+                start = normalized_query.find(alias, offset)
+                if start < 0:
+                    break
+                end = start + len(alias)
+                left = normalized_query[:start]
+                right = normalized_query[end:]
+                if (
+                    query_body == alias
+                    or any(left.endswith(cue) for cue in left_reference_cues)
+                    or any(right.startswith(cue) for cue in right_reference_cues)
+                ):
+                    spans.append((start, end))
+                offset = start + 1
+            return spans
+
+        with self._lock:
+            alias_rows = self._connection.execute(
+                """
+                SELECT a.normalized_alias, MIN(a.alias) AS alias,
+                       MAX(a.last_seen_at) AS last_seen_at
+                FROM participant_aliases AS a
+                JOIN participants AS p ON p.id=a.participant_id
+                WHERE p.umo=? AND a.is_active=1
+                  AND a.first_seen_at<?
+                  AND length(a.normalized_alias)>=2
+                  AND instr(?, a.normalized_alias)>0
+                  AND EXISTS (
+                      SELECT 1
+                      FROM message_participants AS visible_mp
+                      JOIN messages AS visible_m
+                        ON visible_m.id=visible_mp.message_id
+                      WHERE visible_mp.participant_id=p.id
+                        AND visible_m.umo=p.umo
+                        AND visible_m.is_deleted=0
+                        AND visible_m.sent_at<?
+                        AND visible_m.id<=?
+                  )
+                GROUP BY a.normalized_alias
+                ORDER BY length(a.normalized_alias) DESC,
+                         last_seen_at DESC, a.normalized_alias
+                LIMIT ?
+                """,
+                (
+                    umo,
+                    cutoff,
+                    normalized_query,
+                    cutoff,
+                    upper_bound,
+                    safe_limit * 4,
+                ),
+            ).fetchall()
+
+        resolved_aliases: list[tuple[str, str, dict[str, object]]] = []
+        alias_reference_spans: dict[str, list[tuple[int, int]]] = {}
+        for row in alias_rows:
+            normalized_alias = str(row["normalized_alias"] or "")
+            display_alias = str(row["alias"] or normalized_alias)
+            if normalized_alias in non_identity_aliases:
+                continue
+            spans = reference_spans(normalized_alias)
+            if not spans:
+                continue
+            alias_reference_spans[normalized_alias] = spans
+            resolved = self.resolve_participants(
+                umo=umo,
+                reference=display_alias,
+                limit=safe_limit,
+                before_sent_at=cutoff,
+                message_upper_bound=upper_bound,
+            )
+            participants = resolved.get("participants")
+            if not isinstance(participants, list) or not participants:
+                continue
+            resolved_aliases.append(
+                (normalized_alias, display_alias, resolved)
+            )
+
+        # Prefer a longer alias only when it covers every occurrence of the short
+        # alias in the actual query.  In ``D老师和老师`` the second ``老师`` remains
+        # an independent (and possibly ambiguous) reference; silently dropping it
+        # would guess an identity.
+        selected: list[tuple[str, str, dict[str, object]]] = []
+        selected_spans: list[tuple[int, int]] = []
+        for candidate in resolved_aliases:
+            normalized_alias = candidate[0]
+            occurrences = alias_reference_spans.get(normalized_alias, [])
+            fully_covered = bool(occurrences) and all(
+                any(long_start <= start and end <= long_end
+                    for long_start, long_end in selected_spans)
+                for start, end in occurrences
+            )
+            if fully_covered:
+                continue
+            selected.append(candidate)
+            selected_spans.extend(occurrences)
+            if len(selected) >= safe_limit:
+                break
+
+        participant_by_key: dict[str, dict[str, object]] = {}
+        ambiguous_aliases: list[dict[str, object]] = []
+        for normalized_alias, display_alias, resolved in selected:
+            participants = resolved["participants"]
+            assert isinstance(participants, list)
+            if bool(resolved.get("ambiguous")) or len(participants) > 1:
+                ambiguous_aliases.append(
+                    {
+                        "alias": display_alias,
+                        "normalized_alias": normalized_alias,
+                        "ambiguous": True,
+                        "candidate_participants": [
+                            dict(item) for item in participants
+                            if isinstance(item, dict)
+                        ],
+                    }
+                )
+                continue
+            participant = participants[0]
+            if not isinstance(participant, dict):
+                continue
+            participant_key = str(participant.get("canonical_key") or "")
+            if not participant_key:
+                continue
+            current = participant_by_key.get(participant_key)
+            if current is None:
+                current = {
+                    **participant,
+                    "matched_aliases": [],
+                    "matched_alias_observations": [],
+                }
+                participant_by_key[participant_key] = current
+            matched_aliases = current["matched_aliases"]
+            assert isinstance(matched_aliases, list)
+            if display_alias not in matched_aliases:
+                matched_aliases.append(display_alias)
+            observations = current["matched_alias_observations"]
+            assert isinstance(observations, list)
+            aliases = participant.get("aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if not isinstance(alias, dict):
+                        continue
+                    if normalize_alias(alias.get("alias")) != normalized_alias:
+                        continue
+                    source_key = str(alias.get("source_key") or "").strip()
+                    if source_key:
+                        observations.append(
+                            {
+                                "alias": str(alias.get("alias") or display_alias),
+                                "source_key": source_key,
+                                "sent_at": int(alias.get("last_seen_at") or 0),
+                                "source_kind": str(
+                                    alias.get("source_kind") or "observed"
+                                ),
+                            }
+                        )
+                    break
+
+        return {
+            "query": original_query,
+            "ambiguous": bool(ambiguous_aliases),
+            "participants": list(participant_by_key.values()),
+            "ambiguous_aliases": ambiguous_aliases,
+        }
+
+    def query_participant_activity(
+        self,
+        *,
+        umo: str,
+        participant_key: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        days: int = 7,
+        limit: int = 200,
+    ) -> dict[str, object]:
+        """Return bounded recent speaking-time evidence for one exact account.
+
+        Every aggregate is computed only from the bounded ``messages`` returned to
+        the reader and source audit. The deterministic sample preserves each local
+        day's first and last message, then fills the remaining certificate capacity
+        across message-order quantiles. The timezone is fixed to Asia/Shanghai so
+        the reader cannot mix UTC hours with the group's local activity pattern.
+        """
+
+        self._assert_scope(umo)
+        key = str(participant_key or "").strip()
+        cutoff = int(before_sent_at)
+        upper_bound = max(0, int(message_upper_bound))
+        safe_days = max(1, min(31, int(days)))
+        safe_limit = max(
+            1,
+            min(MAX_CERTIFICATE_SOURCE_KEYS, int(limit)),
+        )
+        window_start = max(0, cutoff - safe_days * 86400)
+        timezone_name = "Asia/Shanghai"
+        local_timezone = ZoneInfo(timezone_name)
+
+        resolved = self.resolve_participants(
+            umo=umo,
+            reference=key,
+            limit=2,
+            before_sent_at=cutoff,
+            message_upper_bound=upper_bound,
+        )
+        participants = resolved.get("participants")
+        if not isinstance(participants, list) or len(participants) != 1:
+            return {
+                "participant_key": key,
+                "found": False,
+                "ambiguous": bool(resolved.get("ambiguous")),
+                "timezone": timezone_name,
+                "window": {
+                    "days": safe_days,
+                    "start_sent_at": window_start,
+                    "end_sent_at_exclusive": cutoff,
+                },
+                "message_count": 0,
+                "hour_histogram": {f"{hour:02d}": 0 for hour in range(24)},
+                "messages": [],
+                "messages_truncated": False,
+            }
+        participant = participants[0]
+        assert isinstance(participant, dict)
+        participant_id = int(participant["id"])
+        query_sql = """
+            FROM messages AS m
+            WHERE m.umo=? AND m.sender_participant_id=?
+              AND m.is_deleted=0
+              AND m.sent_at>=? AND m.sent_at<?
+              AND m.id<=?
+        """
+        query_parameters = (
+            umo,
+            participant_id,
+            window_start,
+            cutoff,
+            upper_bound,
+        )
+        with self._lock:
+            total_row = self._connection.execute(
+                f"SELECT COUNT(*) AS count {query_sql}",
+                query_parameters,
+            ).fetchone()
+            total_count = int(total_row["count"] if total_row is not None else 0)
+            boundary_rows = self._connection.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT m.source_key, m.sent_at, m.id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date(m.sent_at, 'unixepoch', '+8 hours')
+                               ORDER BY m.sent_at, m.id
+                           ) AS day_ascending,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date(m.sent_at, 'unixepoch', '+8 hours')
+                               ORDER BY m.sent_at DESC, m.id DESC
+                           ) AS day_descending
+                    {query_sql}
+                )
+                SELECT source_key, sent_at, id FROM ranked
+                WHERE day_ascending=1 OR day_descending=1
+                ORDER BY sent_at, id
+                """,
+                query_parameters,
+            ).fetchall()
+            selected_rows: dict[str, dict[str, object]] = {}
+            for row in boundary_rows:
+                if len(selected_rows) >= safe_limit:
+                    break
+                selected_rows[str(row["source_key"])] = dict(row)
+
+            remaining = max(0, safe_limit - len(selected_rows))
+            if remaining > 0 and total_count > 0:
+                target_count = min(total_count, remaining + len(selected_rows))
+                if target_count <= 1:
+                    target_indices = {0}
+                else:
+                    target_indices = {
+                        round(index * (total_count - 1) / (target_count - 1))
+                        for index in range(target_count)
+                    }
+                cursor = self._connection.execute(
+                    f"""
+                    SELECT m.source_key, m.sent_at, m.id
+                    {query_sql}
+                    ORDER BY m.sent_at, m.id
+                    """,
+                    query_parameters,
+                )
+                for index, row in enumerate(cursor):
+                    if index not in target_indices:
+                        continue
+                    selected_rows.setdefault(str(row["source_key"]), dict(row))
+                    if len(selected_rows) >= safe_limit:
+                        break
+
+        hour_counts = Counter({hour: 0 for hour in range(24)})
+        message_samples: list[dict[str, object]] = []
+        for row in sorted(
+            selected_rows.values(),
+            key=lambda item: (int(item["sent_at"]), int(item["id"])),
+        ):
+            sent_at = int(row["sent_at"])
+            local_time = datetime.fromtimestamp(sent_at, tz=local_timezone)
+            hour_counts[local_time.hour] += 1
+            message_samples.append(
+                {
+                    "source_key": str(row["source_key"]),
+                    "sent_at": sent_at,
+                    "local_datetime": local_time.isoformat(),
+                    "local_hour": local_time.hour,
+                }
+            )
+        start_local = datetime.fromtimestamp(window_start, tz=local_timezone)
+        end_local = datetime.fromtimestamp(cutoff, tz=local_timezone)
+        return {
+            "participant_key": key,
+            "found": True,
+            "ambiguous": False,
+            "participant": participant,
+            "timezone": timezone_name,
+            "window": {
+                "days": safe_days,
+                "start_sent_at": window_start,
+                "end_sent_at_exclusive": cutoff,
+                "start_local": start_local.isoformat(),
+                "end_local_exclusive": end_local.isoformat(),
+            },
+            "message_count": len(message_samples),
+            "statistics_basis": "returned_source_messages_only",
+            "sampling_method": "daily_boundaries_plus_message_order_quantiles",
+            "hour_histogram": {
+                f"{hour:02d}": int(hour_counts[hour]) for hour in range(24)
+            },
+            "messages": message_samples,
+            "messages_truncated": total_count > len(message_samples),
         }
 
     def list_participants(

@@ -3514,14 +3514,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self._last_reader_model_revision = f"{provider_id}|model={provider_model}"
         reader_model_revision = self._last_reader_model_revision
         return {
-            # v5 combines exact stored cues and embedding candidates as two
-            # explicit retrieval signals.  Neither route is a fallback for the
-            # other, and failures from either route remain visible.
-            "retriever": "host-prefetch.snapshot.v5",
+            # v6 adds snapshot-bound textual alias resolution and participant
+            # activity evidence to the exact-cue + embedding retrieval signals.
+            "retriever": "host-prefetch.snapshot.v6",
             "embedding_model": (
                 self.embedding_model_name if self.embedding_enabled else "disabled"
             ),
-            "fusion_policy": "lexical-plus-embedding-plus-graph.v4",
+            "fusion_policy": "lexical-plus-embedding-plus-activity-plus-graph.v5",
             # Bind certificates to the actual configured model when observable,
             # while retaining that revision through a transient lookup outage.
             # Provider ids alone are not guaranteed to be model-specific after
@@ -3532,6 +3531,51 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "surface_compiler": SURFACE_SCHEMA_VERSION,
             "route_policy": policy.revision,
         }
+
+    @staticmethod
+    def _runtime_activity_analysis(query: str) -> bool:
+        normalized = " ".join(str(query).casefold().split())
+        # Activity/statistical questions may never say “memory”, but answering
+        # them still requires stored group messages. Require all three intent
+        # dimensions. Generic words such as “消息” and “上线” are deliberately
+        # excluded because they commonly describe news or product releases.
+        recent_cues = (
+            "最近",
+            "这几天",
+            "近几天",
+            "过去",
+            "近期",
+            "recent",
+            "past few",
+        )
+        stored_data_cues = (
+            "发言",
+            "聊天记录",
+            "活跃",
+            "发过话",
+            "message timestamp",
+            "message time",
+            "speaking time",
+            "activity",
+        )
+        analysis_cues = (
+            "时间",
+            "规律",
+            "什么时候",
+            "几点",
+            "预测",
+            "统计",
+            "分布",
+            "醒",
+            "when",
+            "time",
+            "predict",
+            "distribution",
+        )
+        return all(
+            any(cue in normalized for cue in cues)
+            for cues in (recent_cues, stored_data_cues, analysis_cues)
+        )
 
     @staticmethod
     def _runtime_request_kind(query: str, *, force: bool) -> str:
@@ -3556,7 +3600,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "remember",
             "recall",
         )
-        return "MEMORY_QUERY" if any(cue in normalized for cue in memory_cues) else "CHAT"
+        if any(cue in normalized for cue in memory_cues):
+            return "MEMORY_QUERY"
+        return (
+            "MEMORY_QUERY"
+            if MrMemoryPlugin._runtime_activity_analysis(normalized)
+            else "CHAT"
+        )
 
     @staticmethod
     def _layered_host_route_flags(
@@ -3725,7 +3775,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
 
     @staticmethod
-    def _layered_pack_key(snapshot: RequestSnapshot) -> str:
+    def _layered_pack_key(
+        snapshot: RequestSnapshot,
+        *,
+        resolve_query_aliases: bool,
+        include_participant_activity: bool,
+    ) -> str:
         return stable_sha256(
             {
                 "scope": snapshot.scope_sha256,
@@ -3737,6 +3792,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "retriever": snapshot.inference_revision.retriever,
                 "embedding_model": snapshot.inference_revision.embedding_model,
                 "fusion_policy": snapshot.inference_revision.fusion_policy,
+                "resolve_query_aliases": bool(resolve_query_aliases),
+                "include_participant_activity": bool(
+                    include_participant_activity
+                ),
             }
         )
 
@@ -3758,8 +3817,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         snapshot: RequestSnapshot,
         normalized: NormalizedMessage,
         query: str,
+        resolve_query_aliases: bool,
+        include_participant_activity: bool,
     ) -> tuple[dict[str, object], str, set[str], set[str], str]:
-        pack_key = self._layered_pack_key(snapshot)
+        pack_key = self._layered_pack_key(
+            snapshot,
+            resolve_query_aliases=resolve_query_aliases,
+            include_participant_activity=include_participant_activity,
+        )
         cached = await service.get_evidence_pack_cache(
             cache_key=pack_key,
             umo=snapshot.umo,
@@ -3820,6 +3885,31 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         continue
                     explicit_participant_keys.add(participant_key)
                     explicit_participants.append(dict(item))
+            query_alias_resolution: dict[str, object] = {
+                "query": query,
+                "ambiguous": False,
+                "participants": [],
+                "ambiguous_aliases": [],
+            }
+            if resolve_query_aliases:
+                query_alias_resolution = await service.resolve_query_participants(
+                    umo=snapshot.umo,
+                    query=query,
+                    before_sent_at=snapshot.cutoff_at,
+                    message_upper_bound=snapshot.message_upper_bound,
+                    limit=12,
+                )
+            query_participants = query_alias_resolution.get("participants")
+            if not isinstance(query_participants, list):
+                query_participants = []
+            for item in query_participants:
+                if not isinstance(item, dict):
+                    continue
+                participant_key = str(item.get("canonical_key") or "")
+                if not participant_key or participant_key in explicit_participant_keys:
+                    continue
+                explicit_participant_keys.add(participant_key)
+                explicit_participants.append(dict(item))
             if self.feedback_learning_enabled:
                 initial["feedback_hypotheses"] = (
                     await service.feedback_hypothesis_candidates(
@@ -3964,6 +4054,26 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             # other evidence source.
             packet = dict(packet)
             packet["request_identity_context"] = request_identity_context
+            packet["query_alias_resolution"] = query_alias_resolution
+            participant_activity: list[dict[str, object]] = []
+            if include_participant_activity:
+                for item in query_participants:
+                    if not isinstance(item, dict):
+                        continue
+                    participant_key = str(item.get("canonical_key") or "").strip()
+                    if not participant_key:
+                        continue
+                    activity = await service.query_participant_activity(
+                        umo=snapshot.umo,
+                        participant_key=participant_key,
+                        before_sent_at=snapshot.cutoff_at,
+                        message_upper_bound=snapshot.message_upper_bound,
+                        days=7,
+                        limit=64,
+                    )
+                    if activity.get("found") is True:
+                        participant_activity.append(activity)
+            packet["participant_activity"] = participant_activity
             packet["reply_context"] = (
                 await service.message_for_source(
                     umo=snapshot.umo,
@@ -3974,6 +4084,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 if snapshot.reply_source_key
                 else None
             )
+            packet["source_count"] = len(_collect_source_keys(packet))
             packet_sha256 = stable_sha256(packet)
             packet_sources = _collect_source_keys(packet)
             await service.audit_snapshot_sources(
@@ -5165,6 +5276,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         scope = self._group_scope(event)
         service = self._service_for_scope(scope)
         normalized = self._normalize_event(event)
+        request_kind = self._runtime_request_kind(bounded_query, force=force)
+        include_participant_activity = self._runtime_activity_analysis(bounded_query)
         request_source_key = normalized.resolved_source_key()
         active_trace = self._active_interaction_traces.get(id(event))
         interaction_trace_id = (
@@ -5202,6 +5315,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 snapshot=snapshot,
                 normalized=normalized,
                 query=bounded_query,
+                resolve_query_aliases=(
+                    request_kind in {"MEMORY_QUERY", "DEEP_RECALL"}
+                ),
+                include_participant_activity=include_participant_activity,
             )
         except Exception as exc:
             logger.exception("MR Memory failed to build a snapshot evidence packet")
@@ -5233,7 +5350,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         cached_edge_ids = cached_entry[1] if cached_entry is not None else ()
         cached_hypothesis_ids = cached_entry[2] if cached_entry is not None else ()
         host_flags = self._layered_host_route_flags(packet, query=bounded_query)
-        request_kind = self._runtime_request_kind(bounded_query, force=force)
         features = RouteFeatures(
             request_kind=request_kind,
             explicit_deep=force,
@@ -5413,6 +5529,35 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         try:
             async with asyncio.timeout(timeout_seconds):
                 return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if hard_sync and not task.done():
+                task.cancel()
+                cancelled_run_id = ""
+                failure_persisted = False
+                try:
+                    await task
+                except asyncio.CancelledError as exc:
+                    cancelled_run_id = str(
+                        getattr(exc, "mr_memory_run_id", "") or ""
+                    ).strip()
+                    failure_persisted = bool(
+                        getattr(exc, "mr_memory_failure_persisted", False)
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "MR Memory producer failed while handling host "
+                        "cancellation | umo=%s | error=%s",
+                        scope.key,
+                        exc,
+                    )
+                logger.error(
+                    "MR Memory synchronous waiter was cancelled by its host; "
+                    "producer cancelled | umo=%s | run=%s | persisted=%s",
+                    scope.key,
+                    cancelled_run_id,
+                    failure_persisted,
+                )
+            raise
         except (TimeoutError, asyncio.TimeoutError):
             if hard_sync:
                 task.cancel()

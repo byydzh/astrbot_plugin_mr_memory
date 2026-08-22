@@ -445,6 +445,11 @@ def _system_prompt(schema: Mapping[str, object]) -> str:
         "speaker 与 subject 必须分开；转述、观察者总结、推导解释不得标成直接发言。\n"
         "输出必须是唯一一个 JSON 对象，严格满足下方 host-bound JSON Schema，"
         "不得加 Markdown 或解释。must_include 必须恰好列出全部 REQUIRED atom id。"
+        "每个 atom 的 source_spans 必须与 source_keys 逐项对应，数量不得超过"
+        "source_keys；没有可逐项核验的短摘录时使用空数组。"
+        "participant_activity 的 message_count 与 hour_histogram 只统计其 messages；"
+        "凡引用这类聚合的 atom，source_keys 必须完整列出对应 messages 的全部"
+        " source_key，不得只挑部分样本。"
         "只有完整读取且真正无相关证据时才可返回 SEMANTIC_NONE；超时、预算、解析"
         "失败不是 SEMANTIC_NONE。证据足够但有保留可 CERTIFIED 并显式保留 unresolved。"
         "需要跨事件审计、消歧或反事实闭合时返回 REQUEST_L3，并给出可执行的"
@@ -672,6 +677,9 @@ def build_single_repair_prompt(
         "validation_error": error,
         "instruction": (
             "只修复结构、allowlist 引用和证书不变量；不得新增证据或改变宿主字段。"
+            "逐个 atom 检查 source_spans 数量不得超过 source_keys；无法对应时清空"
+            "source_spans。"
+            "participant_activity 聚合 atom 必须引用其 messages 的全部 source_key。"
             "重新输出唯一 JSON 对象。"
         ),
     }

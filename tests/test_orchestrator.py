@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from mr_memory.evidence_closure import RetrievalAction
 from mr_memory.orchestrator import (
+    ECCR_CONTRACT_TURN_MAX_CHARS,
     ECCR_TOOL_ACTION_CATALOG,
     EccrBudgetExhaustedError,
     EccrLimits,
@@ -317,6 +318,403 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("s2", prompts[1]["current_visible_source_keys"])
 
+    async def test_oversized_retrieval_is_explicitly_compacted_within_prompt_budget(
+        self,
+    ) -> None:
+        action_raw = {
+            "obligation_id": "o1",
+            "tool_name": "mr_query_event_context",
+            "arguments": {"event_id": 7, "limit": 20},
+            "discriminator": "读取有界事件上下文",
+            "expected_delta": "找到可审计的支持消息",
+        }
+        signature = RetrievalAction.from_value(
+            action_raw,
+            field="action",
+        ).signature()
+        first = {
+            "contract": self.contract(0),
+            "actions": [action_raw],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        second_contract = copy.deepcopy(first["contract"])
+        second_contract["step_index"] = 1
+        second_contract["visited_source_keys"] = ["s1", "a3"]
+        second_contract["tried_action_signatures"] = [signature]
+        second_contract["obligations"][0].update(
+            {
+                "status": "SUPPORTED",
+                "support_keys": ["a3"],
+                "last_changed_step": 1,
+            }
+        )
+        second_contract["interpretations"][0].update(
+            {"status": "SUPPORTED", "support_keys": ["a3"], "uncertainty": ""}
+        )
+        second_contract["uncertainties"][0].update(
+            {"status": "RESOLVED", "source_keys": ["a3"]}
+        )
+        second = {
+            "contract": second_contract,
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "有界结果中的消息支持解释一。",
+                        "source_keys": ["a3"],
+                        "confidence": 0.75,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [],
+            },
+            "terminal": True,
+        }
+        prompt_texts: list[str] = []
+        prompts: list[dict[str, object]] = []
+
+        async def complete(_system: str, prompt: str, index: int, _phase: str):
+            prompt_texts.append(prompt)
+            prompts.append(json.loads(prompt))
+            return first if index == 0 else second
+
+        async def execute(_action: RetrievalAction):
+            return {
+                "messages": [
+                    {
+                        "source_key": "a3" if index == 0 else f"z{index:04d}",
+                        "participant_key": "p1",
+                        "plain_text": "证据" * 300,
+                    }
+                    for index in range(300)
+                ]
+            }
+
+        result = await EccrOrchestrator(
+            limits=EccrLimits(
+                max_model_calls=2,
+                max_retrieval_rounds=1,
+                audit_discovery=False,
+            )
+        ).run(
+            query="问题",
+            host_contract_fields=self.host,
+            evidence_packet=self.packet,
+            complete=complete,
+            execute_action=execute,
+            allowed_tool_names={"mr_query_event_context"},
+        )
+
+        self.assertEqual(result.status, "CERTIFIED")
+        self.assertTrue(all(len(prompt) <= 94_000 for prompt in prompt_texts))
+        compact = prompts[1]["retrieval_results"][0]
+        self.assertTrue(compact["result_compacted"])
+        self.assertGreater(compact["omitted_source_count"], 0)
+        self.assertIn("a3", prompts[1]["current_visible_source_keys"])
+        self.assertNotIn("z0299", prompts[1]["current_visible_source_keys"])
+
+    async def test_large_source_allowlist_uses_ref_schema_and_rejects_forgery(
+        self,
+    ) -> None:
+        source_keys = [
+            (
+                "byy_official|byy_official:GroupMessage:851822508|"
+                f"{1_000_000_000 + index}"
+            )
+            for index in range(103)
+        ]
+        packet = copy.deepcopy(self.packet)
+        packet["messages"].extend(
+            {
+                "source_key": source_key,
+                "participant_key": "p1",
+                "plain_text": "x",
+            }
+            for source_key in source_keys
+        )
+        forged_contract = self.contract(0)
+        forged_contract["visited_source_keys"] = ["s1", "forged-source"]
+        invalid = {
+            "contract": forged_contract,
+            "actions": [],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        prompt_texts: list[str] = []
+        prompts: list[dict[str, object]] = []
+
+        async def complete(_system: str, prompt: str, _index: int, _phase: str):
+            prompt_texts.append(prompt)
+            prompts.append(json.loads(prompt))
+            return invalid
+
+        async def execute(_action: RetrievalAction):
+            self.fail("no action expected")
+
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "outside the host-authorized enum",
+        ):
+            await EccrOrchestrator(
+                limits=EccrLimits(
+                    max_model_calls=1,
+                    max_retrieval_rounds=0,
+                    audit_discovery=False,
+                )
+            ).run(
+                query="问题",
+                host_contract_fields=self.host,
+                evidence_packet=packet,
+                complete=complete,
+                execute_action=execute,
+                allowed_tool_names=set(),
+            )
+
+        self.assertEqual(len(prompt_texts), 1)
+        self.assertLessEqual(len(prompt_texts[0]), 94_000)
+        schema = prompts[0]["output_schema"]
+        source_definition = schema["$defs"]["sourceKey"]
+        self.assertEqual(len(source_definition["enum"]), 105)
+        self.assertNotIn("forged-source", source_definition["enum"])
+        visited_items = schema["properties"]["contract"]["properties"][
+            "visited_source_keys"
+        ]["items"]
+        self.assertEqual(visited_items, {"$ref": "#/$defs/sourceKey"})
+
+    async def test_many_short_retrieval_records_retain_visible_subset(self) -> None:
+        action_raw = {
+            "obligation_id": "o1",
+            "tool_name": "mr_query_event_context",
+            "arguments": {"event_id": 7, "limit": 20},
+            "discriminator": "读取有界事件上下文",
+            "expected_delta": "找到可审计的支持消息",
+        }
+        signature = RetrievalAction.from_value(
+            action_raw,
+            field="action",
+        ).signature()
+        source_keys = [
+            (
+                "byy_official|byy_official:GroupMessage:851822508|"
+                f"{2_000_000_000 + index}"
+            )
+            for index in range(103)
+        ]
+        retained_key = source_keys[0]
+        omitted_key = source_keys[-1]
+        first = {
+            "contract": self.contract(0),
+            "actions": [action_raw],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        final_contract = copy.deepcopy(first["contract"])
+        final_contract["step_index"] = 1
+        final_contract["visited_source_keys"] = ["s1", retained_key]
+        final_contract["tried_action_signatures"] = [signature]
+        final_contract["obligations"][0].update(
+            {
+                "status": "SUPPORTED",
+                "support_keys": [retained_key],
+                "last_changed_step": 1,
+            }
+        )
+        final_contract["interpretations"][0].update(
+            {
+                "status": "SUPPORTED",
+                "support_keys": [retained_key],
+                "uncertainty": "",
+            }
+        )
+        final_contract["uncertainties"][0].update(
+            {"status": "RESOLVED", "source_keys": [retained_key]}
+        )
+        final = {
+            "contract": final_contract,
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "保留的完整记录支持解释一。",
+                        "source_keys": [retained_key],
+                        "confidence": 0.75,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [],
+            },
+            "terminal": True,
+        }
+        prompts: list[dict[str, object]] = []
+        prompt_texts: list[str] = []
+
+        async def complete(_system: str, prompt: str, index: int, _phase: str):
+            prompt_texts.append(prompt)
+            prompts.append(json.loads(prompt))
+            return first if index == 0 else final
+
+        async def execute(_action: RetrievalAction):
+            return {
+                "messages": [
+                    {
+                        "source_key": source_key,
+                        "participant_key": "p1",
+                        "plain_text": "x",
+                    }
+                    for source_key in source_keys
+                ]
+            }
+
+        result = await EccrOrchestrator(
+            limits=EccrLimits(
+                max_model_calls=2,
+                max_retrieval_rounds=1,
+                audit_discovery=False,
+            )
+        ).run(
+            query="问题",
+            host_contract_fields=self.host,
+            evidence_packet=self.packet,
+            complete=complete,
+            execute_action=execute,
+            allowed_tool_names={"mr_query_event_context"},
+        )
+
+        self.assertEqual(result.status, "CERTIFIED")
+        self.assertTrue(all(len(prompt) <= 94_000 for prompt in prompt_texts))
+        compact = prompts[1]["retrieval_results"][0]
+        self.assertTrue(compact["result_compacted"])
+        self.assertGreater(len(compact["records"]), 0)
+        self.assertLess(len(compact["records"]), len(source_keys))
+        self.assertIn(retained_key, compact["evidence_keys"])
+        self.assertNotIn(omitted_key, compact["evidence_keys"])
+        self.assertIn(retained_key, prompts[1]["current_visible_source_keys"])
+        self.assertNotIn(omitted_key, prompts[1]["current_visible_source_keys"])
+        self.assertIn(retained_key, prompts[1]["authorized_source_keys"])
+        self.assertNotIn(omitted_key, prompts[1]["authorized_source_keys"])
+
+    async def test_oversized_contract_turn_uses_one_compact_repair(self) -> None:
+        action_raw = {
+            "obligation_id": "o1",
+            "tool_name": "mr_query_event_context",
+            "arguments": {"event_id": 7, "limit": 20},
+            "discriminator": "读取有界事件上下文",
+            "expected_delta": "找到可审计的支持消息",
+        }
+        signature = RetrievalAction.from_value(
+            action_raw,
+            field="action",
+        ).signature()
+        oversized_contract = self.contract(0)
+        oversized_contract["guarded_claims"] = [
+            ("G" * 790) + str(index) for index in range(16)
+        ]
+        oversized_contract["frontier_discriminators"] = [
+            ("F" * 490) + str(index) for index in range(32)
+        ]
+        oversized = {
+            "contract": oversized_contract,
+            "actions": [action_raw],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        self.assertGreater(
+            len(json.dumps(oversized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))),
+            ECCR_CONTRACT_TURN_MAX_CHARS,
+        )
+
+        repaired = {
+            "contract": self.contract(0),
+            "actions": [action_raw],
+            "memory_brief": None,
+            "terminal": False,
+        }
+        final_contract = copy.deepcopy(repaired["contract"])
+        final_contract["step_index"] = 1
+        final_contract["visited_source_keys"] = ["s1", "a3"]
+        final_contract["tried_action_signatures"] = [signature]
+        final_contract["obligations"][0].update(
+            {
+                "status": "SUPPORTED",
+                "support_keys": ["a3"],
+                "last_changed_step": 1,
+            }
+        )
+        final_contract["interpretations"][0].update(
+            {"status": "SUPPORTED", "support_keys": ["a3"], "uncertainty": ""}
+        )
+        final_contract["uncertainties"][0].update(
+            {"status": "RESOLVED", "source_keys": ["a3"]}
+        )
+        final = {
+            "contract": final_contract,
+            "actions": [],
+            "memory_brief": {
+                "claims": [
+                    {
+                        "statement": "有界事件上下文支持解释一。",
+                        "source_keys": ["a3"],
+                        "confidence": 0.75,
+                    }
+                ],
+                "conflicts": [],
+                "unresolved": [],
+            },
+            "terminal": True,
+        }
+        responses = [oversized, repaired, final]
+        prompt_texts: list[str] = []
+        prompts: list[dict[str, object]] = []
+        system_prompts: list[str] = []
+
+        async def complete(system: str, prompt: str, index: int, _phase: str):
+            system_prompts.append(system)
+            prompt_texts.append(prompt)
+            prompts.append(json.loads(prompt))
+            return responses[index]
+
+        async def execute(_action: RetrievalAction):
+            return {
+                "messages": [
+                    {
+                        "source_key": "a3",
+                        "participant_key": "p1",
+                        "plain_text": "新取回的支持证据",
+                    }
+                ]
+            }
+
+        result = await EccrOrchestrator(
+            limits=EccrLimits(
+                max_model_calls=3,
+                max_retrieval_rounds=1,
+                audit_discovery=False,
+            )
+        ).run(
+            query="问题",
+            host_contract_fields=self.host,
+            evidence_packet=self.packet,
+            complete=complete,
+            execute_action=execute,
+            allowed_tool_names={"mr_query_event_context"},
+        )
+
+        self.assertEqual(result.status, "CERTIFIED")
+        self.assertTrue(result.repair_attempted)
+        self.assertEqual(len(result.protocol_failures), 1)
+        self.assertIn(
+            f"exceeds {ECCR_CONTRACT_TURN_MAX_CHARS}",
+            result.protocol_failures[0].message,
+        )
+        self.assertEqual(len(prompt_texts), 3)
+        self.assertLessEqual(len(prompt_texts[2]), 94_000)
+        self.assertIn("24,000 canonical JSON characters", system_prompts[0])
+        self.assertIn(
+            f"not exceed {ECCR_CONTRACT_TURN_MAX_CHARS} characters",
+            prompts[1]["protocol_repair"]["instruction"],
+        )
+
     async def test_discriminate_cannot_attach_unserialized_initial_source(
         self,
     ) -> None:
@@ -370,7 +768,10 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_action: RetrievalAction):
             self.fail("no action expected")
 
-        with self.assertRaisesRegex(ValueError, "not visible in this call"):
+        with self.assertRaisesRegex(
+            EccrProtocolError,
+            "outside the host-authorized enum",
+        ):
             await EccrOrchestrator(
                 limits=EccrLimits(
                     max_model_calls=3,
@@ -387,7 +788,7 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(prompts[1]["phase"], "DISCRIMINATE")
-        self.assertEqual(prompts[1]["authorized_source_keys"], ["s1", "s2"])
+        self.assertEqual(prompts[1]["authorized_source_keys"], ["s1"])
         self.assertEqual(prompts[1]["current_visible_source_keys"], ["s1"])
 
     async def test_forged_visited_source_does_not_expand_current_visibility(
@@ -419,8 +820,8 @@ class EccrOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             self.fail("no action expected")
 
         with self.assertRaisesRegex(
-            ValueError,
-            "contract.visited_source_keys attached evidence not visible",
+            EccrProtocolError,
+            "outside the host-authorized enum",
         ):
             await EccrOrchestrator(
                 limits=EccrLimits(

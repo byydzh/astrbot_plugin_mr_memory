@@ -176,6 +176,20 @@ class MemoryService:
     async def resolve_participants(self, **kwargs: object) -> dict[str, object]:
         return await asyncio.to_thread(self.storage.resolve_participants, **kwargs)
 
+    async def resolve_query_participants(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.resolve_query_participants, **kwargs
+        )
+
+    async def query_participant_activity(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.query_participant_activity, **kwargs
+        )
+
     async def list_participants(self, **kwargs: object) -> list[dict[str, object]]:
         return await asyncio.to_thread(self.storage.list_participants, **kwargs)
 
