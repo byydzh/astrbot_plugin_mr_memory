@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from mr_memory.feedback import FeedbackDecision
 from mr_memory.models import NormalizedMessage
@@ -29,6 +31,7 @@ class MemoryStorageTests(unittest.TestCase):
         *,
         umo: str = "shadow:GroupMessage:group-a",
         sender_id: str = "user-a",
+        sender_name: str = "",
         sent_at: int = 100,
     ) -> NormalizedMessage:
         return NormalizedMessage(
@@ -38,7 +41,7 @@ class MemoryStorageTests(unittest.TestCase):
             group_id=umo.rsplit(":", 1)[-1],
             message_id=message_id,
             sender_id=sender_id,
-            sender_name=sender_id,
+            sender_name=sender_name or sender_id,
             sent_at=sent_at,
             plain_text=text,
             content=[{"type": "plain", "text": text}],
@@ -89,6 +92,65 @@ class MemoryStorageTests(unittest.TestCase):
             limit=2,
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
+
+
+
+
+
+    def test_activity_statistics_use_only_bounded_daily_spanning_sources(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        local_timezone = ZoneInfo("Asia/Shanghai")
+
+        def epoch(day: int, hour: int) -> int:
+            return int(
+                datetime(2026, 8, day, hour, tzinfo=local_timezone).timestamp()
+            )
+
+        expected_boundaries: set[str] = set()
+        for day in (20, 21):
+            for hour in range(20):
+                message = self.message(
+                    f"activity-{day}-{hour}",
+                    "活动采样",
+                    umo=umo,
+                    sender_id="account-active",
+                    sender_name="活跃成员",
+                    sent_at=epoch(day, hour),
+                )
+                self.storage.upsert_message(message)
+                if hour in {0, 19}:
+                    expected_boundaries.add(message.resolved_source_key())
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (umo,),
+            ).fetchone()[0]
+        )
+        resolved = self.storage.resolve_participants(
+            umo=umo,
+            reference="account-active",
+            before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound,
+        )
+        participant_key = str(resolved["participants"][0]["canonical_key"])
+
+        activity = self.storage.query_participant_activity(
+            umo=umo,
+            participant_key=participant_key,
+            before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound,
+            days=7,
+            limit=4,
+        )
+
+        returned_sources = {
+            item["source_key"] for item in activity["messages"]
+        }
+        self.assertEqual(returned_sources, expected_boundaries)
+        self.assertEqual(activity["message_count"], 4)
+        self.assertEqual(sum(activity["hour_histogram"].values()), 4)
+        self.assertTrue(activity["messages_truncated"])
+        self.assertEqual(activity["statistics_basis"], "returned_source_messages_only")
 
     def test_timestamp_correction_is_a_revision_and_requeues_distillation(self) -> None:
         umo = "shadow:GroupMessage:group-a"

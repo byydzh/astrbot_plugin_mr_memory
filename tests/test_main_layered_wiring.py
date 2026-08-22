@@ -23,6 +23,48 @@ class MainLayeredWiringTests(unittest.TestCase):
                 return node
         raise AssertionError(f"main.py does not define {name}")
 
+    def _runtime_request_classifier(self):
+        activity_method = self._method("_runtime_activity_analysis")
+        isolated_activity = ast.FunctionDef(
+            name="_runtime_activity_analysis",
+            args=activity_method.args,
+            body=activity_method.body,
+            decorator_list=[],
+            returns=activity_method.returns,
+            type_comment=activity_method.type_comment,
+        )
+        method = self._method("_runtime_request_kind")
+        isolated_classifier = ast.FunctionDef(
+            name="classify",
+            args=method.args,
+            body=method.body,
+            decorator_list=[],
+            returns=method.returns,
+            type_comment=method.type_comment,
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(
+                body=[isolated_activity, isolated_classifier],
+                type_ignores=[],
+            )
+        )
+        namespace: dict[str, object] = {}
+        activity_only = ast.fix_missing_locations(
+            ast.Module(body=[isolated_activity], type_ignores=[])
+        )
+        exec(compile(activity_only, "<runtime-activity-analysis>", "exec"), namespace)
+        namespace["MrMemoryPlugin"] = type(
+            "MrMemoryPlugin",
+            (),
+            {
+                "_runtime_activity_analysis": staticmethod(
+                    namespace["_runtime_activity_analysis"]
+                )
+            },
+        )
+        exec(compile(module, "<runtime-request-kind>", "exec"), namespace)
+        return namespace["classify"]
+
     def test_host_return_decision_cannot_fall_through_to_provider(self) -> None:
         method = self._method("_run_layered_subconscious")
         body = ast.unparse(method)
@@ -150,13 +192,19 @@ class MainLayeredWiringTests(unittest.TestCase):
             and "asyncio.timeout(timeout_seconds)"
             in "\n".join(ast.unparse(item) for item in node.body)
         )
-        timeout_handler = timeout_try.handlers[0]
+        timeout_handler = next(
+            handler
+            for handler in timeout_try.handlers
+            if handler.type is not None
+            and "TimeoutError" in ast.unparse(handler.type)
+        )
         cancel_guard = next(
             node
             for node in timeout_handler.body
             if isinstance(node, ast.If)
         )
         self.assertEqual(ast.unparse(cancel_guard.test), "hard_sync")
+
 
 
     def test_existing_feedback_trace_does_not_bypass_memory_reconstruction(
@@ -319,12 +367,18 @@ class MainLayeredWiringTests(unittest.TestCase):
             and "asyncio.timeout(timeout_seconds)"
             in "\n".join(ast.unparse(item) for item in node.body)
         )
+        timeout_handler = next(
+            handler
+            for handler in timeout_try.handlers
+            if handler.type is not None
+            and "TimeoutError" in ast.unparse(handler.type)
+        )
         timeout_body = "\n".join(
-            ast.unparse(node) for node in timeout_try.handlers[0].body
+            ast.unparse(node) for node in timeout_handler.body
         )
         hard_guard = next(
             node
-            for node in timeout_try.handlers[0].body
+            for node in timeout_handler.body
             if isinstance(node, ast.If)
             and ast.unparse(node.test) == "hard_sync"
         )
@@ -338,6 +392,24 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("mr_memory_failure_persisted", hard_body)
         self.assertNotIn("operational_status='RUNNING'", hard_body)
         self.assertNotIn("continues", timeout_body)
+
+        cancellation_handler = next(
+            handler
+            for handler in timeout_try.handlers
+            if handler.type is not None
+            and ast.unparse(handler.type) == "asyncio.CancelledError"
+        )
+        cancellation_body = "\n".join(
+            ast.unparse(node) for node in cancellation_handler.body
+        )
+        self.assertIn("if hard_sync and (not task.done())", cancellation_body)
+        self.assertIn("task.cancel()", cancellation_body)
+        self.assertIn("await task", cancellation_body)
+        self.assertIn("producer cancelled", cancellation_body)
+        self.assertTrue(
+            isinstance(cancellation_handler.body[-1], ast.Raise)
+            and cancellation_handler.body[-1].exc is None
+        )
 
         producer = self._method("_execute_layered_reconstruction_started")
         producer_body = ast.unparse(producer)
@@ -393,7 +465,8 @@ class MainLayeredWiringTests(unittest.TestCase):
 
     def test_reply_target_is_snapshot_bounded_packet_evidence(self) -> None:
         revision = ast.unparse(self._method("_runtime_inference_revision"))
-        self.assertIn("host-prefetch.snapshot.v5", revision)
+        self.assertIn("host-prefetch.snapshot.v6", revision)
+        self.assertIn("lexical-plus-embedding-plus-activity-plus-graph.v5", revision)
 
         method = self._method("_layered_evidence_packet")
         body = ast.unparse(method)
@@ -414,9 +487,35 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("identity_snapshot=request_identity_context", capture)
 
         packet = ast.unparse(self._method("_layered_evidence_packet"))
+        pack_key = ast.unparse(self._method("_layered_pack_key"))
+        self.assertIn("'resolve_query_aliases': bool(resolve_query_aliases)", pack_key)
+        self.assertIn(
+            "'include_participant_activity': bool(include_participant_activity)",
+            pack_key,
+        )
+        self.assertIn(
+            "resolve_query_aliases=resolve_query_aliases",
+            packet,
+        )
+        self.assertIn(
+            "include_participant_activity=include_participant_activity",
+            packet,
+        )
         self.assertIn("request_identity_context['mentions']", packet)
         self.assertIn("reference=account_id", packet)
         self.assertIn("packet['request_identity_context']", packet)
+        self.assertIn("await service.resolve_query_participants", packet)
+        self.assertIn("await service.query_participant_activity", packet)
+        self.assertIn("if include_participant_activity", packet)
+        self.assertIn("limit=64", packet)
+        self.assertIn("packet['query_alias_resolution']", packet)
+        self.assertIn("packet['participant_activity']", packet)
+        self.assertIn(
+            "packet['source_count'] = len(_collect_source_keys(packet))",
+            packet,
+        )
+        self.assertIn("before_sent_at=snapshot.cutoff_at", packet)
+        self.assertIn("message_upper_bound=snapshot.message_upper_bound", packet)
 
     def test_lexical_and_embedding_candidates_are_combined_without_fallback(
         self,

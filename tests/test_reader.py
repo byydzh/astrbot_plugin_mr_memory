@@ -382,6 +382,12 @@ class L2ReaderPromptTests(unittest.TestCase):
         payload = json.loads(repaired.user_prompt)
         self.assertEqual(payload["invalid_response"], "not-json")
         self.assertEqual(payload["original_request"], json.loads(request.user_prompt))
+        self.assertIn("source_spans", payload["instruction"])
+        self.assertIn("不得超过 source_keys", payload["instruction"])
+        self.assertIn("source_spans", request.system_prompt)
+        self.assertIn("participant_activity", request.system_prompt)
+        self.assertIn("全部 source_key", request.system_prompt)
+        self.assertIn("participant_activity", payload["instruction"])
         with self.assertRaisesRegex(ValueError, "already been used"):
             build_single_repair_prompt(
                 repaired,
