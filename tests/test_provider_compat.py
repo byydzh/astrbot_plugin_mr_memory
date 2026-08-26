@@ -14,18 +14,21 @@ from mr_memory.provider_compat import (
 class _PreparedPayloadProvider:
     def __init__(self) -> None:
         self.payload = None
+        self.request_max_retries = None
 
     async def _prepare_chat_payload(self, **kwargs):
         return {"model": "deepseek-v4-flash", "messages": []}, []
 
     async def _query(self, payload, tools, *, request_max_retries=None):
         self.payload = payload
+        self.request_max_retries = request_max_retries
         return "prepared-result"
 
 
 class _StreamingPreparedPayloadProvider(_PreparedPayloadProvider):
     async def _query_stream(self, payload, tools, *, request_max_retries=None):
         self.payload = payload
+        self.request_max_retries = request_max_retries
         yield "partial-result"
         yield "final-result"
 
@@ -38,12 +41,14 @@ class _IncompleteStreamingProvider(_PreparedPayloadProvider):
 class _StreamingOnlyPreparedPayloadProvider:
     def __init__(self) -> None:
         self.payload = None
+        self.request_max_retries = None
 
     async def _prepare_chat_payload(self, **kwargs):
         return {"model": "deepseek-v4-flash", "messages": []}, []
 
     async def _query_stream(self, payload, tools, *, request_max_retries=None):
         self.payload = payload
+        self.request_max_retries = request_max_retries
         yield "stream-only-final"
 
 
@@ -91,6 +96,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
         self.assertEqual(result, "prepared-result")
         self.assertEqual(provider.payload["thinking"], {"type": "disabled"})
         self.assertEqual(provider.payload["max_tokens"], 4096)
+        self.assertEqual(provider.request_max_retries, 0)
 
     def test_public_fallback_arguments_are_not_part_of_the_contract(self) -> None:
         parameters = inspect.signature(generate_with_enforced_options).parameters
@@ -150,6 +156,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result, "final-result")
         self.assertEqual(provider.payload["thinking"], {"type": "enabled"})
+        self.assertEqual(provider.request_max_retries, 0)
         self.assertEqual(
             progress,
             [(1, "partial-result"), (2, "final-result")],
@@ -170,6 +177,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result, "stream-only-final")
         self.assertEqual(provider.payload["thinking"], {"type": "enabled"})
+        self.assertEqual(provider.request_max_retries, 0)
 
     def test_incomplete_stream_is_not_accepted_as_a_full_response(self) -> None:
         provider = _IncompleteStreamingProvider()

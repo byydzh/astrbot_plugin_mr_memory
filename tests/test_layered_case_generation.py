@@ -754,20 +754,37 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         case = dict(effective_case)
         case.pop("recent_context", None)
         packet = json.loads((source / "evidence.input.json").read_text("utf-8"))
-        with self.assertRaisesRegex(
-            EccrProtocolError,
-            "must cite newly visited evidence",
+        ledger_rows = [
+            json.loads(line)
+            for line in (source / "usage.jsonl").read_text("utf-8").splitlines()
+            if line.strip()
+        ]
+        recorded_request_hashes = [
+            (row["options_sha256"], row["payload_sha256"])
+            for row in ledger_rows
+            if row.get("event") == "attempted"
+        ]
+        # This fixture predates the current prompt text. Isolate the intended
+        # protocol-audit assertion from that known prompt-hash drift without
+        # accepting arbitrary replay failures as a pass.
+        with patch(
+            "scripts.layered_case_generation._provider_request_hashes",
+            side_effect=recorded_request_hashes,
         ):
-            await _prepare_provider_stage_import(
-                source / "memory.private.json",
-                target_manifest=target_manifest,
-                case=case,
-                packet=packet,
-                snapshot=RequestSnapshot.from_value(manifest["snapshot"]),
-                source_keys=_source_keys(packet),
-                participant_keys=_participant_keys(case, packet),
-                memory_provider_extra={},
-            )
+            with self.assertRaisesRegex(
+                EccrProtocolError,
+                "must cite newly visited evidence",
+            ):
+                await _prepare_provider_stage_import(
+                    source / "memory.private.json",
+                    target_manifest=target_manifest,
+                    case=case,
+                    packet=packet,
+                    snapshot=RequestSnapshot.from_value(manifest["snapshot"]),
+                    source_keys=_source_keys(packet),
+                    participant_keys=_participant_keys(case, packet),
+                    memory_provider_extra={},
+                )
 
     async def test_l2_repair_yields_certificate_v2_and_compiled_surface_packet(self) -> None:
         case = _case()

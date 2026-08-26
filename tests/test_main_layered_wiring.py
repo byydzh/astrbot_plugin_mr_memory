@@ -75,6 +75,13 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertLess(return_guard, start)
         self.assertIn("semantic_status=decision.semantic_status", body)
 
+    def test_missing_feedback_evidence_is_rejected_without_retry(self) -> None:
+        method = self._method("_run_feedback_maintenance")
+        body = ast.unparse(method)
+        self.assertIn("except FeedbackEvidenceUnavailableError as exc", body)
+        self.assertIn("await service.reject_feedback_proposal", body)
+        self.assertIn("proposals = attributable_proposals", body)
+
     def test_singleflight_is_bound_to_snapshot_and_route(self) -> None:
         method = self._method("_run_layered_subconscious")
         body = ast.unparse(method)
@@ -206,30 +213,63 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertEqual(ast.unparse(cancel_guard.test), "hard_sync")
 
 
+    def test_ordinary_chat_uses_full_local_retrieval_with_small_envelope(self) -> None:
+        method = self._method("_execute_local_memory_serving")
+        body = ast.unparse(method)
+        self.assertIn("identity_question = self._local_direct_identity_question", body)
+        self.assertIn("if include_participant_activity or identity_question", body)
+        self.assertNotIn("request_kind == 'CHAT' and", body)
+        self.assertIn("await self._layered_evidence_packet", body)
+        self.assertIn(
+            "min(self.local_serving_max_chars, 3000) if request_kind == 'CHAT'",
+            body,
+        )
 
-    def test_existing_feedback_trace_does_not_bypass_memory_reconstruction(
+
+    def test_existing_feedback_trace_reuses_local_request_outcome(
         self,
     ) -> None:
-        """Repeated host hooks may reuse a trace, but still need memory evidence."""
+        """Repeated hooks keep feedback tracing but join one local serving result."""
 
         method = self._method("inject_subconscious_memory")
-        trace_guard = next(
-            node
-            for node in method.body
-            if isinstance(node, ast.If)
-            and ast.unparse(node.test) == "self.feedback_learning_enabled"
-            and "self._active_interaction_traces.get(id(event))" in ast.unparse(node)
+        hook_body = ast.unparse(method)
+        self.assertIn("await self._begin_interaction_trace", hook_body)
+        self.assertIn("await self._local_memory_for_request(event, query)", hook_body)
+        self.assertNotIn(
+            "asyncio.timeout(self.local_serving_timeout_seconds)",
+            hook_body,
         )
-        self.assertFalse(
-            any(isinstance(node, ast.Return) for node in ast.walk(trace_guard)),
-            "reusing a feedback trace must not skip _run_subconscious",
+        executor_body = ast.unparse(self._method("_execute_local_memory_serving"))
+        self.assertEqual(
+            executor_body.count(
+                "asyncio.timeout(self.local_serving_timeout_seconds)"
+            ),
+            1,
         )
+        self.assertIn("'last_stage': last_stage", executor_body)
+        local_method = ast.unparse(self._method("_local_memory_for_request"))
+        self.assertIn("self._local_serving_outcomes.get(event_key)", local_method)
+        self.assertIn("self._local_serving_tasks.get(event_key)", local_method)
+        self.assertIn("await running[1]", local_method)
+
+    def test_structured_short_reference_routes_before_full_retrieval(self) -> None:
+        body = ast.unparse(self._method("_execute_local_memory_serving"))
+        reference_index = body.index(
+            "reference_question = self._local_direct_reference_question"
+        )
+        structured_index = body.index("has_structured_reference = bool")
+        direct_index = body.index("await self._local_identity_evidence_packet")
+        full_index = body.index("await self._layered_evidence_packet")
+
+        self.assertLess(reference_index, direct_index)
+        self.assertLess(structured_index, direct_index)
+        self.assertLess(direct_index, full_index)
         self.assertIn(
-            "await self._run_subconscious(event, query)",
-            ast.unparse(method),
+            "reference_question and has_structured_reference",
+            body,
         )
 
-    def test_subconscious_failure_is_logged_but_never_injected(self) -> None:
+    def test_local_serving_failure_is_logged_but_never_injected(self) -> None:
         """Failure is ledger-only; it must not become substitute prompt content."""
 
         method = self._method("inject_subconscious_memory")
@@ -248,100 +288,75 @@ class MainLayeredWiringTests(unittest.TestCase):
         guard_body = "\n".join(ast.unparse(node) for node in unusable_guard.body)
         self.assertNotIn("req.extra_user_content_parts.append", guard_body)
         self.assertIn("logger.error", guard_body)
-        self.assertIn("_record_subconscious_surface_failure", guard_body)
         self.assertNotIn("_stop_failed_memory_query", guard_body)
         self.assertIn("outcome.operational_status", guard_body)
         self.assertIn("outcome.detail", guard_body)
 
-        # Provider exceptions happen before ``outcome`` exists.  They become a
-        # ledger-only outcome and flow through the same no-injection guard.
+        # Local orchestration exceptions are explicit and never become prompt text.
         run_try = next(
             node
             for node in ast.walk(method)
             if isinstance(node, ast.Try)
-            and "await self._run_subconscious(event, query)"
+            and "await self._local_memory_for_request(event, query)"
             in "\n".join(ast.unparse(item) for item in node.body)
         )
-        self.assertGreaterEqual(len(run_try.handlers), 2)
+        self.assertEqual(len(run_try.handlers), 1)
         for handler in run_try.handlers:
             with self.subTest(handler=ast.unparse(handler.type)):
                 handler_body = "\n".join(
                     ast.unparse(node) for node in handler.body
                 )
-                assigns_outcome = any(
-                    isinstance(node, (ast.Assign, ast.AnnAssign))
-                    and any(
-                        isinstance(target, ast.Name) and target.id == "outcome"
-                        for target in (
-                            node.targets
-                            if isinstance(node, ast.Assign)
-                            else [node.target]
-                        )
-                    )
-                    for node in handler.body
-                )
                 self.assertTrue(
-                    assigns_outcome,
-                    "provider failures must become a ledger-only outcome",
+                    "logger.error" in handler_body
+                    or "logger.exception" in handler_body
                 )
+                self.assertIn("return", handler_body)
                 self.assertNotIn("req.extra_user_content_parts.append", handler_body)
 
-        # Prospective hypotheses are staged and appended only after a usable,
-        # JSON-valid evidence packet, so a failed wake injects no memory at all.
-        json_parse = method_body.index("evidence_value = json.loads")
-        prospective_append = method_body.index(
-            "req.extra_user_content_parts.append(prospective_part)",
-            json_parse,
-        )
-        self.assertGreater(prospective_append, json_parse)
+        self.assertNotIn("prospective_part", method_body)
+        self.assertNotIn("_run_subconscious", method_body)
+        self.assertNotIn("get_provider_by_id", method_body)
 
-        feedback_try = next(
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.Try)
-            and "await self._begin_interaction_trace"
-            in "\n".join(ast.unparse(item) for item in node.body)
+        feedback_try = run_try
+        feedback_failures = "\n".join(
+            ast.unparse(node)
+            for handler in feedback_try.handlers
+            for node in handler.body
         )
-        feedback_failure = "\n".join(
-            ast.unparse(node) for node in feedback_try.handlers[0].body
-        )
-        self.assertIn("logger.exception", feedback_failure)
-        self.assertIn("return", feedback_failure)
-        self.assertNotIn("prospective = []", feedback_failure)
-        self.assertNotIn("failed open", feedback_failure.casefold())
+        self.assertIn("no memory injected", feedback_failures)
+        self.assertIn("return", feedback_failures)
+        self.assertNotIn("failed open", feedback_failures.casefold())
 
         parse_try = next(
             node
             for node in ast.walk(method)
             if isinstance(node, ast.Try)
-            and "evidence_value = json.loads(outcome.surface_text)"
+            and "envelope_value = json.loads(outcome.envelope_text)"
             in "\n".join(ast.unparse(item) for item in node.body)
         )
         parse_failure_body = "\n".join(
             ast.unparse(node) for node in parse_try.handlers[0].body
         )
         self.assertIn("logger.error", parse_failure_body)
-        self.assertIn("_record_subconscious_surface_failure", parse_failure_body)
         self.assertNotIn("_stop_failed_memory_query", parse_failure_body)
         self.assertNotIn(
             "req.extra_user_content_parts.append",
             parse_failure_body,
         )
 
-    def test_completed_empty_semantic_result_is_not_rewritten_as_failure(self) -> None:
+    def test_completed_empty_local_result_is_not_rewritten_as_failure(self) -> None:
         method = self._method("inject_subconscious_memory")
         completed_guard = next(
             node
             for node in method.body
             if isinstance(node, ast.If)
             and "outcome.operational_status == 'COMPLETED'" in ast.unparse(node.test)
-            and "SEMANTIC_NONE" in ast.unparse(node.test)
-            and "REQUEST_L3" in ast.unparse(node.test)
+            and "not outcome.usable" in ast.unparse(node.test)
         )
         guard_body = "\n".join(ast.unparse(node) for node in completed_guard.body)
-        self.assertIn("req.extra_user_content_parts.append(prospective_part)", guard_body)
         self.assertIn("return", guard_body)
-        self.assertNotIn("_record_subconscious_surface_failure", guard_body)
+        self.assertNotIn("logger.error", guard_body)
+        self.assertNotIn("req.extra_user_content_parts.append", guard_body)
 
         completed_index = method.body.index(completed_guard)
         failure_index = next(
@@ -581,6 +596,169 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("self._runtime_singleflight.drain(cancel=True)", body)
         self.assertIn("await asyncio.wait(pending_inflight, timeout=5)", body)
         self.assertIn("await asyncio.wait(set(tasks), timeout=10)", body)
+
+    def test_invalid_runtime_backend_configuration_never_falls_back(self) -> None:
+        plugin_class = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MrMemoryPlugin"
+        )
+        plugin_init = next(
+            node
+            for node in plugin_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        body = ast.unparse(plugin_init)
+        self.assertIn("Unsupported MR Memory embedding_backend", body)
+        self.assertIn("Unsupported MR Memory distillation_thinking_mode", body)
+        self.assertGreaterEqual(body.count("raise ValueError"), 2)
+        self.assertNotIn("using fastembed", body)
+        self.assertNotIn("using enabled", body)
+
+    def test_tool_state_errors_and_mismatches_are_terminal(self) -> None:
+        method = self._method("_apply_tool_state")
+        body = ast.unparse(method)
+        self.assertFalse(
+            any(isinstance(node, ast.Try) for node in ast.walk(method)),
+            "tool-state application must not swallow activation errors",
+        )
+        self.assertIn("missing tool", body)
+        self.assertIn("tool state verification failed", body)
+        self.assertNotIn("logger.warning", body)
+        self.assertNotIn("self.expose_traversal_tools", body)
+        self.assertIn("tool_name: False", body)
+        self.assertIn("manager.get_func(tool_name)", body)
+        self.assertGreaterEqual(body.count("raise RuntimeError"), 2)
+
+    def test_distillation_validation_failure_never_repairs_or_sanitizes(self) -> None:
+        method = self._method("_distill_scope")
+        body = ast.unparse(method)
+        provider_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "generate_with_enforced_options"
+        ]
+        self.assertEqual(len(provider_calls), 1)
+        self.assertIn("batch = parse_distillation_response", body)
+        self.assertIn("no repair or fallback will run", body)
+        self.assertNotIn("parse_distillation_response_resilient", body)
+        self.assertNotIn("build_distillation_repair_prompt", body)
+        self.assertNotIn("construction_repair", body)
+        self.assertIn("if index_error", body)
+        self.assertIn(
+            "MR Memory graph committed but embedding refresh failed",
+            body,
+        )
+        self.assertNotIn("logger.warning", body[body.index("if index_error") :])
+        prompt_tries = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Try)
+            and "build_distillation_prompt(" in ast.unparse(node)
+        ]
+        self.assertEqual(len(prompt_tries), 1)
+        prompt_handler = "\n".join(
+            ast.unparse(statement)
+            for handler in prompt_tries[0].handlers
+            for statement in handler.body
+        )
+        self.assertIn("stage': 'prompt_construction", prompt_handler)
+        self.assertIn("status='failed'", prompt_handler)
+        self.assertIn("raise", prompt_handler)
+
+    def test_missing_feedback_provider_consumes_a_bounded_job_attempt(self) -> None:
+        worker = ast.unparse(self._method("_maintenance_worker"))
+        feedback = ast.unparse(self._method("_run_feedback_maintenance"))
+        distill_schedule = ast.unparse(self._method("_ensure_distillation_deadline"))
+        feedback_schedule = ast.unparse(self._method("_schedule_pending_feedback"))
+        self.assertNotIn("kind == 'feedback' and self.context.get_provider_by_id", worker)
+        self.assertIn("await service.claim_maintenance_job", worker)
+        self.assertIn("await service.fail_maintenance_job", worker)
+        self.assertNotIn("max_attempts", worker)
+        self.assertNotIn("release_maintenance_job", worker)
+        self.assertIn("cancelled maintenance did not enter terminal FAILED", worker)
+        self.assertIn("budget_exhausted:", worker)
+        self.assertNotIn("defer_maintenance_job_for_budget", worker)
+        self.assertNotIn("resume_budget_wait", worker)
+        failure_block = worker.split("except Exception as exc:", 1)[1]
+        self.assertNotIn("_schedule_maintenance_wakeup", failure_block)
+        self.assertNotIn("job state persisted", failure_block)
+        self.assertIn("job_state=%s", failure_block)
+        self.assertIn("'FAILED' if failure_persisted else 'UNKNOWN'", failure_block)
+        self.assertNotIn("retry_failed=True", distill_schedule)
+        self.assertNotIn("retry_failed=True", feedback_schedule)
+        self.assertIn("feedback provider is unavailable", feedback)
+        self.assertIn("raise RuntimeError", feedback)
+
+    def test_feedback_failure_never_repairs_synthesizes_or_fails_open(self) -> None:
+        method = self._method("_run_feedback_maintenance")
+        body = ast.unparse(method)
+        provider_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_run_feedback_batch_with_ledger"
+        ]
+        self.assertEqual(len(provider_calls), 1)
+        self.assertIn("plans = parse_gate", body)
+        self.assertIn("gate_response_source = 'completion'", body)
+        self.assertNotIn("parse_structured_response", body)
+        self.assertNotIn("feedback_decision_graph_mutation", body)
+        self.assertNotIn("fallback_mutation", body)
+        self.assertNotIn("repairing once", body)
+        mutation_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "apply_graph_mutation"
+        ]
+        self.assertEqual(len(mutation_calls), 1)
+        mutation_tries = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Try)
+            and "apply_graph_mutation" in ast.unparse(node)
+        ]
+        self.assertEqual(
+            len(mutation_tries),
+            1,
+            "graph mutation must not have an inner fail-open handler",
+        )
+        handler_body = "\n".join(
+            ast.unparse(statement)
+            for handler in mutation_tries[0].handlers
+            for statement in handler.body
+        )
+        self.assertIn("status='failed'", handler_body)
+        self.assertIn("raise", handler_body)
+        self.assertIn("indexed_edge = await service.index_plastic_edge", body)
+        self.assertIn("if not indexed_edge", body)
+        self.assertIn("edge embedding document is unavailable", body)
+        self.assertLess(
+            body.index("await service.compact_feedback_memory"),
+            body.index("status='completed'"),
+        )
+
+    def test_graph_tool_reports_missing_edge_embedding_as_an_error(self) -> None:
+        body = ast.unparse(self._method("mr_graph_mutate"))
+        self.assertIn("indexed_edge = await service.index_plastic_edge", body)
+        self.assertIn("if not indexed_edge", body)
+        self.assertIn("edge embedding document is unavailable", body)
+
+    def test_after_send_observation_cannot_overwrite_failed_local_run(self) -> None:
+        body = ast.unparse(self._method("trace_sent_artifacts"))
+        status_guard = "local_outcome.operational_status == 'COMPLETED'"
+        self.assertIn(status_guard, body)
+        self.assertLess(body.index(status_guard), body.index("status='completed'"))
+        self.assertIn("run_status == 'completed'", body)
+        self.assertLess(
+            body.index("run_status == 'completed'"),
+            body.index("status='completed'"),
+        )
 
 
 if __name__ == "__main__":

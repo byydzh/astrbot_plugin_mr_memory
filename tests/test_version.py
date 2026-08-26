@@ -27,6 +27,7 @@ class PluginMetadataTests(unittest.TestCase):
             "metadata.yaml",
             "_conf_schema.json",
             "requirements.txt",
+            "mr_memory/local_serving.py",
             "mr_memory/snapshot.py",
             "mr_memory/routing.py",
             "mr_memory/reader.py",

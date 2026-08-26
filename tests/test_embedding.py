@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from pathlib import Path
 
@@ -86,6 +87,42 @@ class LocalFastEmbedBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             asyncio.run(backend.embed_texts(["valid", " "]))
         self.assertEqual(created, 0)
+
+    def test_cancelled_waiter_keeps_backend_busy_until_native_inference_exits(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingModel(_FakeFastEmbedModel):
+            def query_embed(self, texts, *, batch_size: int):
+                values = list(texts)
+                self.query_calls.append((values, batch_size))
+                started.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("test did not release native inference")
+                yield [0.0, 2.0, 0.0]
+
+        backend = LocalFastEmbedBackend(
+            model_name="BAAI/bge-small-zh-v1.5",
+            cache_dir="unused",
+            model_factory=lambda **_kwargs: BlockingModel(),
+        )
+
+        async def exercise() -> None:
+            first = asyncio.create_task(backend.embed_query("first"))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            with self.assertRaisesRegex(RuntimeError, "busy; request not queued"):
+                await backend.embed_query("second")
+            release.set()
+            while backend._inference_gate.busy:
+                await asyncio.sleep(0)
+            result = await backend.embed_query("third")
+            self.assertEqual(len(result), 3)
+
+        asyncio.run(exercise())
 
 
 class _FakeSentenceTransformerModel:

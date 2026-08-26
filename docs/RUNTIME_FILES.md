@@ -12,12 +12,14 @@
 | `metadata.yaml` | AstrBot 插件元数据；框架要求的 `version` 字段固定为 `unversioned` |
 | `_conf_schema.json` | 插件配置面 |
 | `requirements.txt` | 基础运行依赖 |
-| `mr_memory/*.py` | 核心数据、分层运行时与 Web API；必须整体部署，不能只复制变更文件 |
+| `mr_memory/*.py` | 核心数据、在线本地证据服务、后台分层研究运行时与 Web API |
 | `pages/console/*` | 已认证管理控制台静态资源 |
 | `.astrbot-plugin/i18n/*.json` | AstrBot 插件页面本地化资源 |
 
 `mr_memory/*.py` 的分层运行时模块包括：
 
+- `mr_memory/local_serving.py`：回答前的 source-backed 本地证据 envelope；普通聊天最多
+  3000 字符，显式历史回忆最多 12000 字符；
 - `mr_memory/snapshot.py`：L0 `RequestSnapshot` 与 revision vector；
 - `mr_memory/routing.py`：宿主持有的 L0–L3 路由策略；
 - `mr_memory/reader.py`：L2 Evidence Reader 协议；
@@ -41,6 +43,6 @@
 - `*.db`、`*.db-wal`、`*.db-shm`、日志、Provider 配置、Token、Cookie、私钥和远程配置快照；
 - Git 元数据及研究报告中的真实实验产物。
 
-热部署必须以整个必需文件集合为单位；校验只覆盖本次实际修改的运行时文件。schema 15→16
-由新代码首次打开各群数据库时执行；数据库应在部署前用 SQLite backup API 备份。只需热重载
-MR Memory 插件，不应因此重启 AstrBot 或 NapCat。
+部署只复制本次实际修改且已验证的运行时文件，并确认其现有依赖文件仍存在；校验也只覆盖
+这些文件。schema 15→16 由新代码首次打开各群数据库时执行。只热重载 MR Memory，
+不应因此重启 AstrBot 或消息适配器。

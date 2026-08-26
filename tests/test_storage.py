@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from mr_memory.feedback import FeedbackDecision
 from mr_memory.models import NormalizedMessage
 from mr_memory.plasticity import parse_graph_mutation
-from mr_memory.storage import MemoryStorage
+from mr_memory.storage import FeedbackEvidenceUnavailableError, MemoryStorage
 
 
 class MemoryStorageTests(unittest.TestCase):
@@ -92,6 +92,7 @@ class MemoryStorageTests(unittest.TestCase):
             limit=2,
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
+
 
 
 
@@ -1669,6 +1670,55 @@ class MemoryStorageTests(unittest.TestCase):
                     all(value is None for value in effects["counts"].values())
                 )
 
+    def test_missing_feedback_evidence_is_a_terminal_inspection_error(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("missing-evidence-request", "给一个方案", sent_at=100)
+        feedback = self.message(
+            "missing-evidence-feedback",
+            "不是这样。",
+            sent_at=110,
+        )
+        self.storage.upsert_message(request)
+        self.storage.upsert_message(feedback)
+        self.storage.start_interaction_trace(
+            trace_id="missing-evidence-trace",
+            umo=umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id="missing-evidence-trace",
+            umo=umo,
+            response_text="这是方案。",
+            response_at=101,
+        )
+        proposal_id = int(
+            self.storage.enqueue_feedback_candidate(
+                umo=umo,
+                feedback_source_key=feedback.resolved_source_key(),
+            )
+            or 0
+        )
+        self.assertTrue(
+            self.storage.mark_message_deleted(
+                umo=umo,
+                platform_id=feedback.platform_id,
+                platform_message_id=feedback.message_id,
+                deleted_at=120,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            FeedbackEvidenceUnavailableError,
+            "source revision is stale",
+        ):
+            self.storage.inspect_feedback_proposal(
+                umo=umo,
+                proposal_id=proposal_id,
+            )
+
     def test_interrupted_experiment_is_closed_on_reopen(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         self.storage.start_experiment(
@@ -1788,12 +1838,16 @@ class MemoryStorageTests(unittest.TestCase):
                 job_id=job_id,
             )
             self.assertIsNotNone(claimed)
-            self.storage.defer_maintenance_job_for_budget(
-                umo=umo,
-                job_id=job_id,
-                available_at=2**31,
-                budget_class=budget_class,
-            )
+            with self.storage._connection:
+                self.storage._connection.execute(
+                    """
+                    UPDATE maintenance_jobs
+                    SET status='BUDGET_WAIT', available_at=?, lease_until=NULL,
+                        last_error=?
+                    WHERE id=? AND umo=?
+                    """,
+                    (2**31, f"budget_wait:{budget_class}", job_id, umo),
+                )
             job_ids[budget_class] = job_id
 
         self.storage.reset_token_budget(
@@ -1828,7 +1882,7 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertEqual(history.processing_class, "BACKFILL")
         self.assertEqual(history.target_source_keys[0].rsplit("|", 1)[-1], "history")
 
-    def test_terminal_retry_can_be_limited_to_live_messages(self) -> None:
+    def test_failed_distillation_stays_terminal_for_each_processing_class(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         self.storage.upsert_message(
             self.message("history", "旧消息", umo=umo, sent_at=100),
@@ -1839,35 +1893,28 @@ class MemoryStorageTests(unittest.TestCase):
             processing_class="LIVE",
         )
         for processing_class in ("LIVE", "BACKFILL"):
-            for _ in range(3):
-                work_item = self.storage.next_distillation_batch(
-                    umo=umo,
-                    limit=1,
-                    overlap=0,
-                    processing_class=processing_class,
-                )
-                assert work_item is not None
-                self.storage.finish_distillation_batch(
-                    work_item=work_item,
-                    error="provider failure",
-                )
-
-        self.assertEqual(
-            self.storage.retry_terminal_distillation_failures(
+            work_item = self.storage.next_distillation_batch(
                 umo=umo,
-                processing_class="LIVE",
-            ),
-            1,
-        )
+                limit=1,
+                overlap=0,
+                processing_class=processing_class,
+            )
+            assert work_item is not None
+            self.storage.finish_distillation_batch(
+                work_item=work_item,
+                error="provider failure",
+            )
+
         rows = self.storage._connection.execute("""
-            SELECT processing_class, status
+            SELECT processing_class, status, attempts
             FROM message_processing
             ORDER BY processing_class
             """).fetchall()
         self.assertEqual(
             {str(row["processing_class"]): str(row["status"]) for row in rows},
-            {"BACKFILL": "FAILED", "LIVE": "PENDING"},
+            {"BACKFILL": "FAILED", "LIVE": "FAILED"},
         )
+        self.assertTrue(all(int(row["attempts"]) == 1 for row in rows))
 
     def test_live_provenance_wins_over_idempotent_history_sync(self) -> None:
         message = self.message("shared", "同一平台消息")
@@ -1935,12 +1982,16 @@ class MemoryStorageTests(unittest.TestCase):
             payload={"proposal_id": 1},
         )
         self.assertIsNotNone(self.storage.claim_maintenance_job(umo=umo, job_id=job_id))
-        self.storage.defer_maintenance_job_for_budget(
-            umo=umo,
-            job_id=job_id,
-            available_at=2**31,
-            budget_class="online",
-        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                """
+                UPDATE maintenance_jobs
+                SET status='BUDGET_WAIT', available_at=?, lease_until=NULL,
+                    last_error='budget_wait:online'
+                WHERE id=? AND umo=?
+                """,
+                (2**31, job_id, umo),
+            )
         with self.storage._connection:
             self.storage._connection.execute(
                 "DELETE FROM schema_meta WHERE key='feedback_budget_v13'"

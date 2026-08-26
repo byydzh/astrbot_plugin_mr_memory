@@ -395,7 +395,7 @@ class PlasticGraphTests(unittest.TestCase):
                 last_query_sha256=digest,
             )
 
-    def test_running_maintenance_job_recovers_after_reopen(self) -> None:
+    def test_expired_running_maintenance_job_fails_after_reopen(self) -> None:
         job_id = self.storage.enqueue_maintenance_job(
             umo=self.umo,
             job_type="plasticity",
@@ -411,11 +411,16 @@ class PlasticGraphTests(unittest.TestCase):
         self.assertIsNotNone(claimed)
         self.storage.close()
         self.storage = MemoryStorage(self.database_path)
-        pending = self.storage.pending_maintenance_jobs(
-            umo=self.umo,
-            now=101,
+        self.assertEqual(
+            self.storage.pending_maintenance_jobs(umo=self.umo, now=101),
+            [],
         )
-        self.assertEqual([row["id"] for row in pending], [job_id])
+        row = self.storage._connection.execute(
+            "SELECT status, last_error FROM maintenance_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["last_error"], "interrupted before completion")
 
     def test_unexpired_maintenance_lease_survives_an_observer_reopen(self) -> None:
         now = int(time.time())
@@ -440,7 +445,7 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.storage.finish_maintenance_job(umo=self.umo, job_id=job_id)
 
-    def test_cancelled_worker_releases_maintenance_lease_without_spending_attempt(self) -> None:
+    def test_cancelled_worker_failure_is_terminal(self) -> None:
         job_id = self.storage.enqueue_maintenance_job(
             umo=self.umo,
             job_type="feedback",
@@ -455,18 +460,25 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.assertEqual(claimed["attempts"], 1)
 
-        self.assertTrue(
-            self.storage.release_maintenance_job(
-                umo=self.umo,
-                job_id=job_id,
-                now=101,
-            )
+        self.assertEqual(
+            self.storage.fail_maintenance_job(
+                umo=self.umo, job_id=job_id, error="CancelledError", now=101
+            ),
+            "FAILED",
         )
-        pending = self.storage.pending_maintenance_jobs(umo=self.umo, now=101)
-        self.assertEqual([row["id"] for row in pending], [job_id])
-        self.assertEqual(pending[0]["attempts"], 0)
+        self.assertEqual(
+            self.storage.pending_maintenance_jobs(umo=self.umo, now=101),
+            [],
+        )
+        row = self.storage._connection.execute(
+            "SELECT status, attempts, last_error FROM maintenance_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["last_error"], "CancelledError")
 
-    def test_terminal_maintenance_job_only_retries_when_explicit(self) -> None:
+    def test_terminal_maintenance_job_cannot_be_requeued_by_enqueue(self) -> None:
         job_id = self.storage.enqueue_maintenance_job(
             umo=self.umo,
             job_type="distill",
@@ -486,7 +498,6 @@ class PlasticGraphTests(unittest.TestCase):
                 job_id=job_id,
                 error="old implementation failed",
                 now=101,
-                max_attempts=1,
             ),
             "FAILED",
         )
@@ -500,17 +511,17 @@ class PlasticGraphTests(unittest.TestCase):
             self.storage.pending_maintenance_jobs(umo=self.umo, now=102),
             [],
         )
-        retried_id = self.storage.enqueue_maintenance_job(
+        existing_id = self.storage.enqueue_maintenance_job(
             umo=self.umo,
             job_type="distill",
             dedupe_key="distill:pending",
             available_at=103,
-            retry_failed=True,
         )
-        self.assertEqual(retried_id, job_id)
-        pending = self.storage.pending_maintenance_jobs(umo=self.umo, now=103)
-        self.assertEqual([row["id"] for row in pending], [job_id])
-        self.assertEqual(pending[0]["attempts"], 0)
+        self.assertEqual(existing_id, job_id)
+        self.assertEqual(
+            self.storage.pending_maintenance_jobs(umo=self.umo, now=103),
+            [],
+        )
 
     def test_human_feedback_assigns_credit_to_activated_plastic_path(self) -> None:
         request = self.message("q-1", "这是好女孩吗", sent_at=100)

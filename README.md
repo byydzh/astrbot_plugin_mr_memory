@@ -2,13 +2,14 @@
 
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提供原始消息
-真值层、LLM 图构建、embedding 候选初始化、主动遍历和离线回放能力。
-回答时记忆采用分层运行时：每次请求固定 `RequestSnapshot`，先复用 L1a
-证据包和 L1b 语义证书，再由宿主在 L2 单次证据读取与 L3 有界 ECCR 重建之间路由；
-最终只把经过验证的 `EvidenceCertificateV2` 编译成表层提示。局部梗义、反话和委婉语
-可以同时保留多条竞争路径，并显式标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED`
-或 `CONFIRMED`；embedding 只生成候选，图的语义状态与回答前相关性均由独立潜意识 LLM
-判断，宿主只执行证据、身份和作用域约束。
+真值层、后台 LLM 图构建、本地 embedding 候选初始化、来源审计和离线回放能力。
+回答时每次请求先固定 `RequestSnapshot`，只在本群 SQLite 中完成稳定账号解析、本地检索、
+有界图/原始消息展开和来源校验，再把候选证据交给 AstrBot 主模型。普通聊天最多
+3000 字符；显式历史回忆最多 12000 字符，以保留跨事件证据而不把不同历史片段压成一段。
+回答关键路径没有第二个记忆模型、修复调用或自动深挖；主模型在一次正常生成中同时完成
+证据相关性判断、综合和最终回答。局部梗义、反话和委婉语可以保留多条竞争路径，并显式
+标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED` 或 `CONFIRMED`。embedding 只排序候选，
+稳定账号、作用域、cutoff 和来源仍由宿主约束。
 
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
 
@@ -23,20 +24,21 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 - `capture_enabled=false`：不采集任何线上消息。
 - `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
   分数的宿主门禁约束，默认提交阈值为 `0.65`；反馈未先被宿主提交时不能修改可塑图。
-- `subconscious_provider_id=deepseek/deepseek-v4-flash`：记忆推理与主 LLM 分离。
+- `local_serving_enabled=true`：回答前只读取本地证据，不调用插件专属远程模型。
+- `local_serving_timeout_seconds=2`、`local_serving_max_chars=12000`：普通聊天仍限制为
+  3000 字符，显式历史回忆才可使用更大证据预算；本地读取超时会明确记为错误且不注入。
+- `subconscious_provider_id=deepseek/deepseek-v4-flash`：只供后台消息整理和反馈维护使用。
 - `distillation_thinking_mode=enabled`：图构建保留模型完整思考能力；长调用采用流式接收，
   关闭思考只作为显式诊断选项，不作为省时默认值。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
-- `expose_traversal_tools=false`：主 LLM 默认看不到论文遍历工具及插件扩展工具。
-- `consult_tool_enabled=true`：主 LLM 只看到一个潜意识咨询桥接工具。
-- `runtime_wake_mode=low_latency`：同步复用仍有效的语义证书；未命中时在后台执行 L2，
-  不把超时、额度拒绝或 Provider 故障伪装成“没有记忆”。`balanced` 可短暂等待 L2，
-  `research` 还允许宿主在强歧义时批准有界 L3 ECCR，`manual_only` 仅保留主动咨询。
+- 主 LLM 始终看不到 MR Memory 的遍历、反馈或咨询工具；旧配置也不能重新开启。
+- `consult_tool_enabled=false`：查询时远程深挖工具固定不暴露给主模型。
 - 新消息达到 `auto_distillation_min_pending=150` 时立即整理；不足 150 条时，最迟由
   `maintenance_interval_minutes=1440`（一天）的后台轮询触发。
-- 回答前记忆判断、主动潜意识深挖和新消息整理使用 `private_daily_token_budget`。反馈学习使用独立的
-  `feedback_daily_token_budget`。外部运维工具一次性写入的旧历史只保留独立审计账本，
+- 后台新消息整理使用 `private_daily_token_budget`，反馈学习使用独立的
+  `feedback_daily_token_budget`；回答前本地检索的插件 Provider 调用与 Token 均为 0。
+  外部运维工具一次性写入的旧历史只保留独立审计账本，
   不设伪装成日常策略的每日额度，也不会挤占这两类在线预算。
 - 数据库固定写入本插件的 `plugin_data` 目录。
 - 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
@@ -45,7 +47,7 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
   不调用模型。在线 Reader 不占这两类后台额度，独立记录用量；Reader 失败时不注入记忆，
   AstrBot 主回答链继续正常运行。控制台可分别重置后台有效额度，原始账本不会删除。
 - 日志默认不输出聊天正文。
-- 不连接或重启 NapCat，不发送消息。
+- 不连接或重启消息适配器，不发送消息。
 
 线上配置可以用 `allowed_umos` 限定群范围；留空明确表示所有群。UMO 的首段必须是
 平台实例 ID，例如 `synthetic_bot:GroupMessage:123456`，不是 `aiocqhttp` 这样的适配器类型。
@@ -53,7 +55,7 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 ## 当前结构
 
 ```text
-AstrBot event adapter (main.py)
+AstrBot event hook (main.py)
         |
         v
 NormalizedMessage
@@ -71,64 +73,58 @@ SQLite truth store + FTS5 + layered memory graph
 L0 RequestSnapshot (scope / cutoff / row bound / revision vectors)
         |
         v
-L1a exact evidence-pack cache + L1b semantic-certificate cache
+local identity / reply / activity fast path
         |
         v
-host-owned route policy
+local cue + embedding candidate retrieval
         |
-        +-- L2 one-pass Evidence Reader
-        +-- L3 bounded ECCR (compile / discriminate / audit)
-        |
-        v
-EvidenceCertificateV2 (claims / attribution / uncertainty / provenance)
+bounded episode / semantic / graph expansion
         |
         v
-surface compiler + answer verifier
+source audit + local-evidence.v1 envelope
+        |
+        v
+stable identity + raw excerpts + qualified derived candidates
         |
         v
 bounded memory context for the main AstrBot LLM
         |
-        +-- bounded feedback maintenance and prospective activation
+        +-- bounded background distillation and feedback maintenance
         +-- persistent bounded operational state and resumable maintenance jobs
-        +-- one optional consultation tool visible to the main LLM
 ```
 
 `mr_memory/` 不依赖 AstrBot，可以通过普通 Python 测试和 JSONL 回放独立运行。
 `main.py` 负责把 AstrBot 事件转换为核心模型。论文 Table 4 的七类工具和可塑关联、
-重复媒体扩展工具只加入
-插件私有 LLM 的工具循环；主 LLM 默认只能接收有长度上限的证据摘要，或调用
-`mr_consult_subconscious` 请求一次更聚焦的重建。
+重复媒体扩展工具只用于离线研究与后台整理；主 LLM 只接收有长度上限、可回到原始消息的
+本地证据 envelope，不暴露查询时远程记忆工具。
 
 插件调用自己配置的 provider，不继承当前会话主 LLM。后台增量整理与反馈学习由该独立模型
-维护情节、人物事实、竞争释义和行为通路；普通回答先在一个不可变 `RequestSnapshot` 下由
-本群 SQLite 与本地 embedding 生成有界证据包。L1a 只按精确查询、上下文、回复目标、cutoff
-和依赖修订复用证据，L1b 只复用重新审计后仍有效的语义证书；相似查询不会直接复用旧答案。
-L2 Evidence Reader 一次读取证据包，必要时只能申请 L3，是否升级仍由宿主策略、预算和风险
-门禁决定。L3 复用生产 `EccrOrchestrator`，最多进行配置上限内的 compile、discriminate 和
-audit/retrieval，不把临时论证图直接写成长期事实。并发相同工作由 snapshot-bound
-singleflight 合并，等待者不会重复预占 Provider 预算。
+维护情节、人物事实、竞争释义和行为通路；普通回答在不可变 `RequestSnapshot` 下由本群
+SQLite 与本地 embedding 生成候选包。查询人物时以 `platform_id + account_id` 为身份真值，
+同名保持歧义；时间分析只使用 envelope 中可审计的 Asia/Shanghai 样本。相似查询不会复用
+旧答案，同一个 AstrBot event 的重复 hook 只复用一次本地读取结果。
 
-embedding 只提供候选先验，不用固定相似度裁决语义。L2/L3 产出的
-`EvidenceCertificateV2` 必须携带主体绑定、逐原子的来源与归因、未决义务、禁止升级项和停止
-原因；表层编译器只释放证书允许的内容，回答后验证器保留缺失必含项和错误升级的审计结果。
-语义状态与运行状态分开记录，因此 Provider 超时、额度不足或后台仍在运行都不会变成
-`SEMANTIC_NONE`。每次调用单独记录首块延迟、总耗时、Token、路由、证书与表层结果。
+embedding 只提供候选先验，不用相似度裁决语义。派生记忆、episode 摘要和图连接必须带原始
+来源，主模型看到相应说话人、时间和短文本后再决定是否采用。`NO_LOCAL_EVIDENCE`、
+`IDENTITY_AMBIGUOUS` 与运行错误分别记录；本地读取错误不会被写成“没有记忆”。每次调用记录
+本地耗时、包长度、来源、图连接，并明确记录 query-time Provider calls/Token/cost 为 0。
 
 schema 16 新增请求快照、证据包缓存、语义证书、证书依赖和重建任务的持久化生命周期；
-升级只迁移插件自己的按群 SQLite。分层运行时没有新增 Python 依赖，线上仍使用
-`requirements.txt`，Harrier 部署才额外使用 `requirements-harrier.txt`。可部署文件边界见
+升级只迁移插件自己的按群 SQLite。`requirements.txt` 直接声明 NumPy，用于对 SQLite 中
+完整候选向量做精确本地评分；Harrier 部署再额外使用 `requirements-harrier.txt`。可部署文件边界见
 [运行时文件清单](docs/RUNTIME_FILES.md)。
 
 消息按 per-message checkpoint 增量整理：批次只选择最早的 `PENDING/FAILED` 消息，附带
 只读重叠上下文，成功后逐条推进；编辑或撤回会使派生图失效并重新排队。达到消息阈值或
-维护周期后由有界后台 worker 池处理，不阻塞主回复。后台整理使用独立长超时，主模型主动
-发起的潜意识深挖仍保留较短超时。自动 worker 只处理适配器实时观察到的 `LIVE` 消息；一次性
+维护周期后由有界后台 worker 池处理，不阻塞主回复。后台整理使用独立长超时。自动 worker
+只处理 AstrBot 事件钩子实时观察到的 `LIVE` 消息；不调用任何消息适配器的历史或群列表 API。一次性
 `BACKFILL` 只能由管理员显式调用，启动恢复和周期 sweeper 都不会自行消费它。DeepSeek V4
 整理默认开启完整思考并流式消费响应；输出上限
 跟随当前 DSV4 的 384k 能力，不再用 4k/8k/32k 截断冒充成本控制。管理员仍可执行 `/mrmem distill`
 立即处理下一批。发布默认每批最多 80 条目标消息并附带 12 条只读重叠上下文，以兼容上下文
 能力未知的 AstrBot Provider；长上下文部署可以显式增大，本项目线上回填经 320/500 条实测后
-使用 500。进程若在批次中断，下一次打开数据库会把悬挂 checkpoint 恢复为有界重试。
+使用 500。进程若在批次中断，下一次打开数据库会把悬挂 checkpoint 标为 `FAILED`，
+记录错误且不自动重试。
 LLM 必须为每条目标消息提供图证据或放入紧凑的批内忽略 ID 列表，不能静默漏掉。
 批内消息和账户主体只以 `mN`/`pN` 短 ID 暴露给模型，宿主验证后再无损还原真实证据键；
 普通文本组件不再与 `plain_text` 重复发送。

@@ -88,7 +88,7 @@ async def generate_with_enforced_options(
             async for response in query_stream(
                 payload,
                 None,
-                request_max_retries=1,
+                request_max_retries=0,
             ):
                 chunk_count += 1
                 final_response = response
@@ -101,7 +101,7 @@ async def generate_with_enforced_options(
                     "provider stream ended before assembling a final response"
                 )
             return final_response
-        return await query(payload, None, request_max_retries=1)
+        return await query(payload, None, request_max_retries=0)
 
     incompatible = []
     if not prepare_compatible:

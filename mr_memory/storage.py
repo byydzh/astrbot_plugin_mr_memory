@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Iterator, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 from .certificate import MAX_CERTIFICATE_SOURCE_KEYS
 from .embedding import (
-    cosine_similarity,
-    decode_vector,
     encode_vector,
     normalize_vector,
 )
@@ -104,6 +104,10 @@ GRAPH_NODE_TYPES = {
     "hypothesis",
     "plastic",
 }
+
+
+class FeedbackEvidenceUnavailableError(ValueError):
+    """A feedback proposal can no longer be evaluated from retained evidence."""
 
 
 class DistillationSnapshotChanged(RuntimeError):
@@ -390,6 +394,14 @@ class MemoryStorage:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = NORMAL")
         self._migrate()
+        # The visibility joins used by local vector retrieval are highly
+        # sensitive to SQLite's join order.  Fresh group databases do not have
+        # sqlite_stat1 rows, which makes SQLite scan messages once per semantic
+        # or cue row.  Refreshing local planner statistics at open is bounded to
+        # this one group database and turns the same exact query into indexed
+        # joins; it does not rewrite memory content.
+        with self._lock, self._connection:
+            self._connection.execute("ANALYZE")
         self._restrict_file_permissions()
 
     @contextmanager
@@ -1677,7 +1689,7 @@ class MemoryStorage:
                 """)
             self._connection.execute("""
                 UPDATE maintenance_jobs
-                SET status='PENDING', lease_until=NULL,
+                SET status='FAILED', lease_until=NULL,
                     last_error='interrupted before completion',
                     updated_at=CURRENT_TIMESTAMP
                 WHERE status='RUNNING'
@@ -3746,6 +3758,7 @@ class MemoryStorage:
         *,
         umo: str,
         query: str,
+        reference_text: str = "",
         before_sent_at: int,
         message_upper_bound: int,
         limit: int = 20,
@@ -3761,10 +3774,14 @@ class MemoryStorage:
         self._assert_scope(umo)
         original_query = str(query or "").strip()
         normalized_query = normalize_alias(original_query)
+        normalized_reference_text = normalize_alias(reference_text)
+        normalized_search_text = " ".join(
+            value for value in (normalized_query, normalized_reference_text) if value
+        )
         cutoff = int(before_sent_at)
         upper_bound = max(0, int(message_upper_bound))
         safe_limit = max(1, min(100, int(limit)))
-        if not normalized_query:
+        if not normalized_search_text:
             return {
                 "query": original_query,
                 "ambiguous": False,
@@ -3845,6 +3862,16 @@ class MemoryStorage:
                 ):
                     spans.append((start, end))
                 offset = start + 1
+            reference_offset = len(normalized_query) + 1
+            offset = 0
+            while normalized_reference_text:
+                start = normalized_reference_text.find(alias, offset)
+                if start < 0:
+                    break
+                spans.append(
+                    (reference_offset + start, reference_offset + start + len(alias))
+                )
+                offset = start + 1
             return spans
 
         with self._lock:
@@ -3877,7 +3904,7 @@ class MemoryStorage:
                 (
                     umo,
                     cutoff,
-                    normalized_query,
+                    normalized_search_text,
                     cutoff,
                     upper_bound,
                     safe_limit * 4,
@@ -3928,19 +3955,59 @@ class MemoryStorage:
 
         participant_by_key: dict[str, dict[str, object]] = {}
         ambiguous_aliases: list[dict[str, object]] = []
+
+        def alias_observations(
+            participant: dict[str, object],
+            *,
+            normalized_alias: str,
+            display_alias: str,
+        ) -> list[dict[str, object]]:
+            observations: list[dict[str, object]] = []
+            aliases = participant.get("aliases")
+            if not isinstance(aliases, list):
+                return observations
+            for alias in aliases:
+                if not isinstance(alias, dict):
+                    continue
+                if normalize_alias(alias.get("alias")) != normalized_alias:
+                    continue
+                source_key = str(alias.get("source_key") or "").strip()
+                if source_key:
+                    observations.append(
+                        {
+                            "alias": str(alias.get("alias") or display_alias),
+                            "source_key": source_key,
+                            "sent_at": int(alias.get("last_seen_at") or 0),
+                            "source_kind": str(
+                                alias.get("source_kind") or "observed"
+                            ),
+                        }
+                    )
+                break
+            return observations
+
         for normalized_alias, display_alias, resolved in selected:
             participants = resolved["participants"]
             assert isinstance(participants, list)
             if bool(resolved.get("ambiguous")) or len(participants) > 1:
+                candidate_participants: list[dict[str, object]] = []
+                for item in participants:
+                    if not isinstance(item, dict):
+                        continue
+                    candidate = dict(item)
+                    candidate["matched_aliases"] = [display_alias]
+                    candidate["matched_alias_observations"] = alias_observations(
+                        candidate,
+                        normalized_alias=normalized_alias,
+                        display_alias=display_alias,
+                    )
+                    candidate_participants.append(candidate)
                 ambiguous_aliases.append(
                     {
                         "alias": display_alias,
                         "normalized_alias": normalized_alias,
                         "ambiguous": True,
-                        "candidate_participants": [
-                            dict(item) for item in participants
-                            if isinstance(item, dict)
-                        ],
+                        "candidate_participants": candidate_participants,
                     }
                 )
                 continue
@@ -3964,26 +4031,13 @@ class MemoryStorage:
                 matched_aliases.append(display_alias)
             observations = current["matched_alias_observations"]
             assert isinstance(observations, list)
-            aliases = participant.get("aliases")
-            if isinstance(aliases, list):
-                for alias in aliases:
-                    if not isinstance(alias, dict):
-                        continue
-                    if normalize_alias(alias.get("alias")) != normalized_alias:
-                        continue
-                    source_key = str(alias.get("source_key") or "").strip()
-                    if source_key:
-                        observations.append(
-                            {
-                                "alias": str(alias.get("alias") or display_alias),
-                                "source_key": source_key,
-                                "sent_at": int(alias.get("last_seen_at") or 0),
-                                "source_kind": str(
-                                    alias.get("source_kind") or "observed"
-                                ),
-                            }
-                        )
-                    break
+            observations.extend(
+                alias_observations(
+                    participant,
+                    normalized_alias=normalized_alias,
+                    display_alias=display_alias,
+                )
+            )
 
         return {
             "query": original_query,
@@ -4585,8 +4639,7 @@ class MemoryStorage:
                 FROM message_processing AS p
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE m.umo = ? AND m.is_deleted = 0
-                  AND (p.status = 'PENDING'
-                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                  AND p.status = 'PENDING'
                   {class_clause}
                 """,
                 parameters,
@@ -4610,8 +4663,7 @@ class MemoryStorage:
                 JOIN messages AS m ON m.id=p.message_id
                 WHERE m.umo=? AND m.is_deleted=0
                   AND p.processing_class=?
-                  AND (p.status='PENDING'
-                       OR (p.status='FAILED' AND p.attempts<3))
+                  AND p.status='PENDING'
                 """,
                 (umo, normalized_class),
             ).fetchone()
@@ -4629,8 +4681,7 @@ class MemoryStorage:
                 FROM message_processing AS p
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE m.umo = ? AND m.is_deleted = 0
-                  AND (p.status = 'PENDING'
-                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                  AND p.status = 'PENDING'
                 ORDER BY CASE p.processing_class
                     WHEN 'LIVE' THEN 0 ELSE 1 END,
                     m.sent_at, m.id
@@ -4639,46 +4690,6 @@ class MemoryStorage:
                 (umo,),
             ).fetchone()
         return str(row["processing_class"]) if row is not None else None
-
-    def retry_terminal_distillation_failures(
-        self,
-        *,
-        umo: str,
-        processing_class: str = "",
-    ) -> int:
-        """Requeue exhausted messages after an explicit runtime reload.
-
-        Normal maintenance keeps the three-attempt ceiling.  A plugin reload is
-        the explicit recovery boundary after code or provider fixes, so terminal
-        failures may receive a fresh bounded attempt window without turning the
-        periodic sweeper into an infinite retry loop.
-        """
-
-        normalized_class = str(processing_class).strip().upper()
-        if normalized_class and normalized_class not in {"LIVE", "BACKFILL"}:
-            raise ValueError("processing_class must be LIVE or BACKFILL")
-        class_clause = " AND p.processing_class = ?" if normalized_class else ""
-        parameters: tuple[object, ...] = (
-            (umo, normalized_class) if normalized_class else (umo,)
-        )
-        with self._lock, self._connection:
-            cursor = self._connection.execute(
-                f"""
-                UPDATE message_processing
-                SET status='PENDING', attempts=0, batch_key='',
-                    last_error='', updated_at=CURRENT_TIMESTAMP
-                WHERE message_id IN (
-                    SELECT p.message_id
-                    FROM message_processing AS p
-                    JOIN messages AS m ON m.id = p.message_id
-                    WHERE m.umo = ? AND m.is_deleted = 0
-                      AND p.status = 'FAILED' AND p.attempts >= 3
-                      {class_clause}
-                )
-                """,
-                parameters,
-            )
-        return max(0, int(cursor.rowcount))
 
     def next_distillation_batch(
         self,
@@ -4703,8 +4714,7 @@ class MemoryStorage:
                     FROM message_processing AS p
                     JOIN messages AS m ON m.id = p.message_id
                     WHERE m.umo = ? AND m.is_deleted = 0
-                      AND (p.status = 'PENDING'
-                           OR (p.status = 'FAILED' AND p.attempts < 3))
+                      AND p.status = 'PENDING'
                     ORDER BY CASE p.processing_class
                         WHEN 'LIVE' THEN 0 ELSE 1 END,
                         m.sent_at, m.id
@@ -4722,8 +4732,7 @@ class MemoryStorage:
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE m.umo = ? AND m.is_deleted = 0
                   AND p.processing_class = ?
-                  AND (p.status = 'PENDING'
-                       OR (p.status = 'FAILED' AND p.attempts < 3))
+                  AND p.status = 'PENDING'
                 ORDER BY m.sent_at, m.id LIMIT ?
                 """,
                 (umo, selected_class, safe_limit),
@@ -8183,64 +8192,6 @@ class MemoryStorage:
             ).fetchall()
         return {str(row["budget_class"]): int(row["reset_at"]) for row in rows}
 
-    def private_budget_retry_at(
-        self,
-        *,
-        umo: str,
-        budget_class: str,
-        budget: int,
-        reserve: int,
-        now: int | None = None,
-    ) -> int:
-        """Return the first ledger-expiry time that can admit one reserved call."""
-
-        self._assert_scope(umo)
-        normalized_class = str(budget_class).strip().casefold()
-        if normalized_class not in TOKEN_BUDGET_PHASES:
-            raise ValueError("budget_class must be online, feedback, or backfill")
-        current = int(now or time.time())
-        if int(budget) <= 0:
-            return current
-        since = current - 86400
-        with self._lock:
-            reset = self._connection.execute(
-                """
-                SELECT reset_at, usage_event_id FROM token_budget_resets
-                WHERE umo=? AND budget_class=?
-                ORDER BY reset_at DESC, id DESC LIMIT 1
-                """,
-                (umo, normalized_class),
-            ).fetchone()
-        minimum_usage_id = 0
-        if reset is not None:
-            since = max(since, int(reset["reset_at"]))
-            minimum_usage_id = int(reset["usage_event_id"] or 0)
-        phases = TOKEN_BUDGET_PHASES[normalized_class]
-        phase_clause, phase_parameters = _token_phase_predicate("u.phase", phases)
-        with self._lock:
-            rows = self._connection.execute(
-                f"""
-                SELECT unixepoch(u.created_at) AS created_at,
-                       (u.input_other + u.input_cached + u.output) AS tokens
-                FROM llm_usage_events AS u
-                JOIN experiment_runs AS r ON r.run_id=u.run_id
-                WHERE r.umo=? AND unixepoch(u.created_at)>=?
-                  AND u.id>?
-                  {phase_clause}
-                ORDER BY u.created_at, u.id
-                """,
-                [umo, since, minimum_usage_id, *phase_parameters],
-            ).fetchall()
-        remaining = sum(int(row["tokens"] or 0) for row in rows)
-        if remaining + max(0, int(reserve)) <= int(budget):
-            return current
-        for row in rows:
-            remaining -= int(row["tokens"] or 0)
-            retry_at = int(row["created_at"] or current) + 86401
-            if remaining + max(0, int(reserve)) <= int(budget):
-                return max(current + 1, retry_at)
-        return current + 86400
-
     def dashboard_summary(self, *, umo: str) -> dict[str, object]:
         """Return bounded operational metrics for the authenticated plugin page."""
         with self._lock:
@@ -8259,10 +8210,7 @@ class MemoryStorage:
                         AS participants,
                     (SELECT COUNT(*) FROM message_processing AS p
                      JOIN messages AS m ON m.id = p.message_id
-                     WHERE m.umo = ? AND (
-                       p.status = 'PENDING'
-                       OR (p.status = 'FAILED' AND p.attempts < 3)
-                     ))
+                     WHERE m.umo = ? AND p.status = 'PENDING')
                         AS pending_distillation,
                     (SELECT COUNT(*) FROM topics WHERE umo = ?) AS topics,
                     (SELECT COUNT(*) FROM memory_embeddings WHERE umo = ?)
@@ -9359,6 +9307,7 @@ class MemoryStorage:
                 message_upper_bound=message_upper_bound,
             )
         scored: list[dict[str, object]] = []
+        query_array = np.asarray(normalized_query, dtype=np.float64)
         for row in rows:
             owner_type = str(row["owner_type"])
             owner_key = str(row["owner_key"])
@@ -9368,8 +9317,19 @@ class MemoryStorage:
             dimensions = int(row["dimensions"])
             if dimensions != len(normalized_query):
                 continue
-            stored = decode_vector(bytes(row["vector"]), dimensions)
-            score = cosine_similarity(normalized_query, stored)
+            vector_blob = bytes(row["vector"])
+            expected_bytes = dimensions * 4
+            if dimensions <= 0 or len(vector_blob) != expected_bytes:
+                raise ValueError(
+                    "invalid embedding blob: "
+                    f"dimensions={dimensions}, bytes={len(vector_blob)}"
+                )
+            # SQLite keeps normalized float32 vectors.  NumPy performs the
+            # exact full scan in native code without building a second matrix;
+            # this preserves deterministic exhaustive ranking while avoiding
+            # millions of Python-level multiply/add operations per request.
+            stored = np.frombuffer(vector_blob, dtype="<f4", count=dimensions)
+            score = float(np.dot(query_array, stored))
             if score < float(min_score):
                 continue
             scored.append(
@@ -13104,7 +13064,6 @@ class MemoryStorage:
         dedupe_key: str,
         payload: Mapping[str, object] | None = None,
         available_at: int | None = None,
-        retry_failed: bool = False,
     ) -> int:
         self._assert_scope(umo)
         kind = str(job_type or "").strip().casefold()
@@ -13150,18 +13109,6 @@ class MemoryStorage:
                 """,
                 (umo, kind, key, encoded, scheduled_at),
             )
-            if retry_failed:
-                self._connection.execute(
-                    """
-                    UPDATE maintenance_jobs
-                    SET status='PENDING', attempts=0, available_at=?,
-                        lease_until=NULL, last_error='',
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE umo=? AND job_type=? AND dedupe_key=?
-                      AND status='FAILED'
-                    """,
-                    (scheduled_at, umo, kind, key),
-                )
             row = self._connection.execute(
                 """
                 SELECT id FROM maintenance_jobs
@@ -13184,57 +13131,6 @@ class MemoryStorage:
             ).fetchone()
         return row is not None
 
-    def defer_maintenance_job_for_budget(
-        self,
-        *,
-        umo: str,
-        job_id: int,
-        available_at: int,
-        budget_class: str,
-    ) -> None:
-        self._assert_scope(umo)
-        normalized_class = str(budget_class).strip().casefold()
-        if normalized_class not in TOKEN_BUDGET_PHASES:
-            raise ValueError("budget_class must be online, feedback, or backfill")
-        with self._lock, self._connection:
-            updated = self._connection.execute(
-                """
-                UPDATE maintenance_jobs
-                SET status='BUDGET_WAIT', available_at=?, lease_until=NULL,
-                    last_error=?, updated_at=CURRENT_TIMESTAMP
-                WHERE id=? AND umo=? AND status='RUNNING'
-                """,
-                (
-                    max(int(time.time()) + 1, int(available_at)),
-                    f"budget_wait:{normalized_class}",
-                    int(job_id),
-                    umo,
-                ),
-            ).rowcount
-        if not updated:
-            raise ValueError("maintenance job is not running")
-
-    def resume_due_budget_jobs(
-        self,
-        *,
-        umo: str,
-        now: int | None = None,
-    ) -> int:
-        self._assert_scope(umo)
-        current = int(now or time.time())
-        with self._lock, self._connection:
-            return int(
-                self._connection.execute(
-                    """
-                    UPDATE maintenance_jobs
-                    SET status='PENDING', lease_until=NULL, last_error='',
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE umo=? AND status='BUDGET_WAIT' AND available_at<=?
-                    """,
-                    (umo, current),
-                ).rowcount
-            )
-
     def pending_maintenance_jobs(
         self,
         *,
@@ -13243,12 +13139,9 @@ class MemoryStorage:
         now: int | None = None,
         limit: int = 20,
         include_future: bool = False,
-        include_budget_wait: bool = False,
     ) -> list[dict[str, object]]:
         self._assert_scope(umo)
         statuses = ["PENDING"]
-        if include_budget_wait:
-            statuses.append("BUDGET_WAIT")
         placeholders = ",".join("?" for _ in statuses)
         clauses = ["umo=?", f"status IN ({placeholders})"]
         parameters: list[object] = [umo, *statuses]
@@ -13328,30 +13221,6 @@ class MemoryStorage:
         if not updated:
             raise ValueError("maintenance job is not running")
 
-    def release_maintenance_job(
-        self,
-        *,
-        umo: str,
-        job_id: int,
-        now: int | None = None,
-    ) -> bool:
-        """Return an interrupted worker lease to the pending queue."""
-
-        self._assert_scope(umo)
-        current = int(now or time.time())
-        with self._lock, self._connection:
-            updated = self._connection.execute(
-                """
-                UPDATE maintenance_jobs
-                SET status='PENDING', attempts=max(0, attempts - 1),
-                    available_at=?, lease_until=NULL, last_error='',
-                    updated_at=CURRENT_TIMESTAMP
-                WHERE id=? AND umo=? AND status='RUNNING'
-                """,
-                (current, int(job_id), umo),
-            ).rowcount
-        return bool(updated)
-
     def fail_maintenance_job(
         self,
         *,
@@ -13359,8 +13228,6 @@ class MemoryStorage:
         job_id: int,
         error: str,
         now: int | None = None,
-        max_attempts: int = 3,
-        retry_delay_seconds: int = 60,
     ) -> str:
         self._assert_scope(umo)
         current = int(now or time.time())
@@ -13374,23 +13241,20 @@ class MemoryStorage:
             ).fetchone()
             if row is None:
                 raise ValueError("maintenance job is not running")
-            terminal = int(row["attempts"]) >= max(1, int(max_attempts))
-            status = "FAILED" if terminal else "PENDING"
             self._connection.execute(
                 """
-                UPDATE maintenance_jobs SET status=?, available_at=?,
+                UPDATE maintenance_jobs SET status='FAILED', available_at=?,
                     lease_until=NULL, last_error=?, updated_at=CURRENT_TIMESTAMP
                 WHERE id=? AND umo=?
                 """,
                 (
-                    status,
-                    current + max(1, int(retry_delay_seconds)),
+                    current,
                     str(error or "")[:1000],
                     int(job_id),
                     umo,
                 ),
             )
-        return status
+        return "FAILED"
 
     def start_interaction_trace(
         self,
@@ -14007,7 +13871,9 @@ class MemoryStorage:
                 (umo, str(proposal["feedback_source_key"])),
             ).fetchone()
             if feedback is None:
-                raise ValueError("feedback evidence no longer exists")
+                raise FeedbackEvidenceUnavailableError(
+                    "feedback evidence no longer exists"
+                )
             trace_ids = json.loads(str(proposal["candidate_trace_ids_json"]))
             observable_nodes: list[sqlite3.Row] = []
             if not trace_ids:

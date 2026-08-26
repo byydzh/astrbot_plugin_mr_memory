@@ -234,18 +234,6 @@ class MemoryService:
             umo=umo,
         )
 
-    async def retry_terminal_distillation_failures(
-        self,
-        *,
-        umo: str,
-        processing_class: str = "",
-    ) -> int:
-        return await asyncio.to_thread(
-            self.storage.retry_terminal_distillation_failures,
-            umo=umo,
-            processing_class=processing_class,
-        )
-
     async def next_distillation_batch(
         self, **kwargs: object
     ) -> DistillationWorkItem | None:
@@ -395,9 +383,6 @@ class MemoryService:
 
     async def reset_token_budget(self, **kwargs: object) -> dict[str, object]:
         return await asyncio.to_thread(self.storage.reset_token_budget, **kwargs)
-
-    async def private_budget_retry_at(self, **kwargs: object) -> int:
-        return await asyncio.to_thread(self.storage.private_budget_retry_at, **kwargs)
 
     async def apply_distillation(
         self,
@@ -734,17 +719,8 @@ class MemoryService:
     async def maintenance_job_ready(self, **kwargs: object) -> bool:
         return await asyncio.to_thread(self.storage.maintenance_job_ready, **kwargs)
 
-    async def defer_maintenance_job_for_budget(self, **kwargs: object) -> None:
-        await asyncio.to_thread(self.storage.defer_maintenance_job_for_budget, **kwargs)
-
-    async def resume_due_budget_jobs(self, **kwargs: object) -> int:
-        return await asyncio.to_thread(self.storage.resume_due_budget_jobs, **kwargs)
-
     async def finish_maintenance_job(self, **kwargs: object) -> None:
         await asyncio.to_thread(self.storage.finish_maintenance_job, **kwargs)
-
-    async def release_maintenance_job(self, **kwargs: object) -> bool:
-        return await asyncio.to_thread(self.storage.release_maintenance_job, **kwargs)
 
     async def fail_maintenance_job(self, **kwargs: object) -> str:
         return await asyncio.to_thread(self.storage.fail_maintenance_job, **kwargs)

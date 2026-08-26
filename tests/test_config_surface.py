@@ -15,10 +15,11 @@ class ConfigSurfaceTests(unittest.TestCase):
     def test_essential_model_and_trigger_controls_are_visible(self) -> None:
         essential = {
             "allowed_umos",
+            "local_serving_enabled",
+            "local_serving_timeout_seconds",
+            "local_serving_max_chars",
             "subconscious_provider_id",
             "distillation_thinking_mode",
-            "runtime_wake_mode",
-            "consult_tool_enabled",
             "feedback_window_hours",
             "feedback_debounce_seconds",
             "embedding_backend",
@@ -43,18 +44,50 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertEqual(self.schema["maintenance_interval_minutes"]["default"], 1440)
         self.assertEqual(self.schema["maintenance_interval_seconds"]["default"], 86400)
 
-    def test_layered_runtime_exposes_host_owned_routing(self) -> None:
-        wake_hint = str(self.schema["runtime_wake_mode"]["hint"])
+    def test_online_runtime_exposes_local_serving_not_remote_routing(self) -> None:
+        local_hint = str(self.schema["local_serving_enabled"]["hint"])
+        timeout_hint = str(self.schema["local_serving_timeout_seconds"]["hint"])
         budget_hint = str(self.schema["private_daily_token_budget"]["hint"])
         main_source = (Path.cwd() / "main.py").read_text(encoding="utf-8")
-        self.assertIn("low_latency", wake_hint)
-        self.assertIn("balanced", wake_hint)
-        self.assertIn("research", wake_hint)
-        self.assertIn("manual_only", wake_hint)
-        self.assertTrue(budget_hint)
-        self.assertIn("self._execute_layered_reconstruction(", main_source)
-        self.assertIn("RoutePolicy(", main_source)
-        self.assertNotIn("materialize_reconstruction_packet(", main_source)
+        self.assertIn("不调用第二个远程模型", local_hint)
+        self.assertIn("不会切换模型", timeout_hint)
+        self.assertIn("本地检索不调用插件模型", budget_hint)
+        for retired in (
+            "runtime_wake_mode",
+            "runtime_l2_wait_seconds",
+            "runtime_auto_deep_analysis",
+            "runtime_certificate_ttl_minutes",
+            "consult_tool_enabled",
+            "wake_on_llm_request",
+            "runtime_l3_max_model_calls",
+            "runtime_l3_max_retrieval_rounds",
+            "runtime_l3_deadline_seconds",
+            "expose_traversal_tools",
+        ):
+            self.assertNotIn(retired, self.schema)
+        self.assertFalse(self.schema["embedding_preload_on_startup"]["default"])
+        self.assertEqual(self.schema["local_serving_max_chars"]["default"], 12000)
+        self.assertIn("普通聊天仍硬限制为 3000 字符", str(
+            self.schema["local_serving_max_chars"]["hint"]
+        ))
+        self.assertIn('self.runtime_wake_mode = "manual_only"', main_source)
+        self.assertIn("self.consult_tool_enabled = False", main_source)
+        self.assertIn("self.expose_traversal_tools = False", main_source)
+        self.assertNotIn(
+            'self.config.get("expose_traversal_tools"',
+            main_source,
+        )
+        self.assertIn("materialize_reconstruction_packet(", main_source)
+        self.assertIn("compile_local_serving_envelope(", main_source)
+        self.assertIn("min(self.local_serving_max_chars, 3000)", main_source)
+        hook_start = main_source.index("async def inject_subconscious_memory")
+        hook_end = main_source.index(
+            '@filter.llm_tool(name="mr_activate_feedback_hypothesis")',
+            hook_start,
+        )
+        hook = main_source[hook_start:hook_end]
+        self.assertIn("_local_memory_for_request", hook)
+        self.assertNotIn("_run_subconscious", hook)
 
     def test_umo_guidance_uses_platform_instance_id(self) -> None:
         hint = str(self.schema["allowed_umos"]["hint"])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import importlib.util
 import math
@@ -23,6 +24,39 @@ class EmbeddingBackend(Protocol):
     async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     async def embed_query(self, text: str) -> list[float]: ...
+
+
+class _SingleInferenceGate:
+    """Run at most one uncancellable local inference per backend instance.
+
+    Cancelling an asyncio waiter does not stop the native model thread.  Keep
+    the real executor future registered until that thread exits so later
+    requests fail explicitly instead of accumulating behind an abandoned job.
+    """
+
+    def __init__(self) -> None:
+        self._active: asyncio.Future[Any] | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self._active is not None and not self._active.done()
+
+    async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        if self.busy:
+            raise RuntimeError("local embedding inference is busy; request not queued")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            None,
+            functools.partial(function, *args, **kwargs),
+        )
+        self._active = future
+
+        def clear(completed: asyncio.Future[Any]) -> None:
+            if self._active is completed:
+                self._active = None
+
+        future.add_done_callback(clear)
+        return await asyncio.shield(future)
 
 
 def normalize_vector(vector: Sequence[float]) -> list[float]:
@@ -82,6 +116,7 @@ class LocalFastEmbedBackend:
         self._dimensions = 0
         self._model_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._inference_gate = _SingleInferenceGate()
 
     @property
     def model_id(self) -> str:
@@ -177,13 +212,13 @@ class LocalFastEmbedBackend:
             return []
         if any(not value for value in values):
             raise ValueError("embedding passages must not be empty")
-        return await asyncio.to_thread(self._embed_texts_sync, values)
+        return await self._inference_gate.run(self._embed_texts_sync, values)
 
     async def embed_query(self, text: str) -> list[float]:
         value = str(text).strip()
         if not value:
             raise ValueError("embedding query must not be empty")
-        return await asyncio.to_thread(self._embed_query_sync, value)
+        return await self._inference_gate.run(self._embed_query_sync, value)
 
 
 class LocalSentenceTransformerBackend:
@@ -220,6 +255,7 @@ class LocalSentenceTransformerBackend:
         self._dimensions = 0
         self._model_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._inference_gate = _SingleInferenceGate()
 
     @property
     def model_id(self) -> str:
@@ -326,13 +362,17 @@ class LocalSentenceTransformerBackend:
             return []
         if any(not value for value in values):
             raise ValueError("embedding passages must not be empty")
-        return await asyncio.to_thread(self._embed_sync, values, query=False)
+        return await self._inference_gate.run(self._embed_sync, values, query=False)
 
     async def embed_query(self, text: str) -> list[float]:
         value = str(text).strip()
         if not value:
             raise ValueError("embedding query must not be empty")
-        vectors = await asyncio.to_thread(self._embed_sync, [value], query=True)
+        vectors = await self._inference_gate.run(
+            self._embed_sync,
+            [value],
+            query=True,
+        )
         return vectors[0]
 
 

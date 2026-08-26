@@ -327,6 +327,50 @@ class DistillationPipelineTests(unittest.TestCase):
         self.assertEqual(len(context), 2)
         self.assertIn("最终决定", context[-1]["plain_text"])
 
+    def test_populated_reopen_analyzes_without_changing_visible_search(self) -> None:
+        messages = self._messages()
+        batch = parse_distillation_response(self._response(), messages)
+        backend = HashEmbeddingBackend(dimensions=128)
+        asyncio.run(
+            self.service.apply_distillation(
+                batch,
+                extractor_version="analyze-reopen-test",
+                embedding_backend=backend,
+            )
+        )
+        query_vector = asyncio.run(backend.embed_query("最后为什么选方案 B？"))
+        message_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?",
+                (self.umo,),
+            ).fetchone()[0]
+        )
+        search_kwargs = {
+            "umo": self.umo,
+            "model": backend.model_id,
+            "query_vector": query_vector,
+            "owner_types": ("cue", "episode", "topic"),
+            "limit": 12,
+            "before_sent_at": 401,
+            "message_upper_bound": message_upper_bound,
+        }
+        before_reopen = self.storage.search_memory_embeddings(**search_kwargs)
+        self.assertTrue(before_reopen)
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        self.service = MemoryService(self.storage)
+
+        statistics = self.storage._connection.execute(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl='memory_embeddings'"
+        ).fetchall()
+        self.assertTrue(statistics)
+        self.assertTrue(
+            all(int(str(row["stat"]).split()[0]) > 0 for row in statistics)
+        )
+        after_reopen = self.storage.search_memory_embeddings(**search_kwargs)
+        self.assertEqual(after_reopen, before_reopen)
+
     def test_rejects_invented_source_ids_before_writing_graph(self) -> None:
         value = json.loads(self._response())
         value["episodes"][0]["source_keys"] = ["invented"]
