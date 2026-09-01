@@ -771,6 +771,308 @@ class LayeredStorageTests(unittest.TestCase):
             [old_episode],
         )
 
+    def test_person_reference_candidates_are_source_bound_and_non_decisive(
+        self,
+    ) -> None:
+        def synthetic_sender(
+            message_id: str,
+            account_id: str,
+            alias: str = "Shared Synthetic Alias",
+        ) -> NormalizedMessage:
+            return NormalizedMessage(
+                platform="aiocqhttp",
+                platform_id="shadow",
+                umo=self.UMO,
+                group_id="layered",
+                message_id=message_id,
+                sender_id=account_id,
+                sender_name=alias,
+                sent_at=100,
+                plain_text="synthetic observation",
+                content=[{"type": "plain", "text": "synthetic observation"}],
+            )
+
+        first = synthetic_sender("candidate-first", "synthetic-account-a")
+        second = synthetic_sender("candidate-second", "synthetic-account-b")
+        third = synthetic_sender(
+            "candidate-third",
+            "synthetic-account-c",
+            "Second Synthetic Alias",
+        )
+        request = self.message(
+            "candidate-request",
+            (
+                "Please compare Shared Synthetic Alias and Second Synthetic "
+                "Alias without deciding identity."
+            ),
+            sent_at=200,
+            sender_id="synthetic-requester",
+        )
+        future = NormalizedMessage(
+            platform="aiocqhttp",
+            platform_id="shadow",
+            umo=self.UMO,
+            group_id="layered",
+            message_id="candidate-future",
+            sender_id="synthetic-account-future",
+            sender_name="Shared Synthetic Alias",
+            sent_at=200,
+            plain_text="future synthetic observation",
+            content=[
+                {"type": "plain", "text": "future synthetic observation"}
+            ],
+        )
+        for message in (first, second, third, request, future):
+            self.storage.upsert_message(message)
+        self.storage.bind_participant_alias(
+            umo=self.UMO,
+            platform_id="shadow",
+            account_id="synthetic-account-admin-only",
+            alias="Shared Synthetic Alias",
+            at=100,
+        )
+        snapshot = self.capture(request=request, cutoff_at=201)
+
+        result = self.storage.query_person_reference_candidates(
+            umo=self.UMO,
+            text=request.plain_text,
+            before_sent_at=201,
+            message_upper_bound=int(snapshot["message_upper_bound"]),
+            limit=1,
+        )
+
+        self.assertEqual(result["host_decision"], "NONE")
+        self.assertEqual(
+            result["coverage"],
+            {
+                "matched_reference_count_total": 2,
+                "matched_reference_count_returned": 1,
+                "candidate_count_total": 3,
+                "candidate_count_returned": 2,
+                "distinct_candidate_count_total": 3,
+                "distinct_candidate_count_returned": 2,
+                "truncated": True,
+            },
+        )
+        self.assertEqual(len(result["references"]), 1)
+        reference = result["references"][0]
+        self.assertEqual(reference["reference"], "shared synthetic alias")
+        candidates = reference["candidate_participants"]
+        self.assertEqual(
+            {candidate["account_id"] for candidate in candidates},
+            {"synthetic-account-a", "synthetic-account-b"},
+        )
+        self.assertEqual(
+            {
+                observation["source_key"]
+                for candidate in candidates
+                for observation in candidate["alias_observations"]
+            },
+            {first.resolved_source_key(), second.resolved_source_key()},
+        )
+        self.assertTrue(
+            all(
+                observation["relation"] == "SPEAKER"
+                for candidate in candidates
+                for observation in candidate["alias_observations"]
+            )
+        )
+        serialized = repr(result).casefold()
+        for forbidden_decision in ("resolved", "unique", "ambiguous"):
+            self.assertNotIn(forbidden_decision, serialized)
+
+    def test_semantic_seed_exposes_source_bound_subject_candidate(self) -> None:
+        old = NormalizedMessage(
+            platform="aiocqhttp",
+            platform_id="shadow",
+            umo=self.UMO,
+            group_id="layered",
+            message_id="subject-old",
+            sender_id="synthetic-account",
+            sender_name="Synthetic Subject Old",
+            sent_at=100,
+            plain_text="Synthetic support mentions NarrativeLabel.",
+            content=[
+                {
+                    "type": "plain",
+                    "text": "Synthetic support mentions NarrativeLabel.",
+                }
+            ],
+        )
+        request = self.message(
+            "subject-request", "Current request", sent_at=200, sender_id="requester"
+        )
+        future = NormalizedMessage(
+            platform="aiocqhttp",
+            platform_id="shadow",
+            umo=self.UMO,
+            group_id="layered",
+            message_id="subject-future",
+            sender_id="synthetic-account",
+            sender_name="Synthetic Subject Future",
+            sent_at=300,
+            plain_text="Synthetic future support.",
+            content=[{"type": "plain", "text": "Synthetic future support."}],
+        )
+        for message in (old, request, future):
+            self.storage.upsert_message(message)
+        snapshot = self.capture(request=request, cutoff_at=201)
+        bound = int(snapshot["message_upper_bound"])
+        participant_key = str(
+            self.storage.resolve_participants(
+                umo=self.UMO,
+                reference="synthetic-account",
+            )["participants"][0]["canonical_key"]
+        )
+        visible_memory_id = self.storage.store_semantic_claim(
+            umo=self.UMO,
+            stable_key="synthetic-visible-subject",
+            subject_participant_key=participant_key,
+            subject_text="",
+            claim_type="PREFERENCE",
+            aspect="synthetic-aspect",
+            content="NarrativeLabel is prose, not an identity binding.",
+            epistemic_status="ASSERTED",
+            operation="ASSERT",
+            target_claim_ids=[],
+            evidence=[
+                {
+                    "source_key": old.resolved_source_key(),
+                    "role": "SUPPORT",
+                    "span": "NarrativeLabel",
+                    "confidence": 0.8,
+                }
+            ],
+            confidence=0.8,
+        )
+        mixed_memory_id = self.storage.store_semantic_claim(
+            umo=self.UMO,
+            stable_key="synthetic-mixed-subject",
+            subject_participant_key=participant_key,
+            subject_text="",
+            claim_type="PREFERENCE",
+            aspect="synthetic-mixed-aspect",
+            content="A mixed-source synthetic claim.",
+            epistemic_status="ASSERTED",
+            operation="ASSERT",
+            target_claim_ids=[],
+            evidence=[
+                {
+                    "source_key": old.resolved_source_key(),
+                    "role": "SUPPORT",
+                    "span": "Synthetic support",
+                    "confidence": 0.8,
+                },
+                {
+                    "source_key": future.resolved_source_key(),
+                    "role": "SUPPORT",
+                    "span": "Synthetic future support",
+                    "confidence": 0.8,
+                },
+            ],
+            confidence=0.8,
+        )
+
+        expanded = self.storage.expand_seed_candidates(
+            umo=self.UMO,
+            matches=[
+                {
+                    "owner_type": "semantic",
+                    "owner_key": str(visible_memory_id),
+                    "score": 0.9,
+                },
+                {
+                    "owner_type": "semantic",
+                    "owner_key": str(mixed_memory_id),
+                    "score": 0.8,
+                },
+            ],
+            before_sent_at=201,
+            message_upper_bound=bound,
+        )
+
+        self.assertEqual(
+            [item["id"] for item in expanded["semantic_memories"]],
+            [visible_memory_id],
+        )
+        semantic = expanded["semantic_memories"][0]
+        self.assertEqual(semantic["subject_participant_key"], participant_key)
+        self.assertEqual(semantic["subject_display_name"], "Synthetic Subject Old")
+        self.assertEqual(semantic["person_cue"], "Synthetic Subject Old")
+        self.assertEqual(semantic["subject_source_keys"], [old.resolved_source_key()])
+        participant = expanded["participants"][0]
+        self.assertEqual(participant["participant_key"], participant_key)
+        self.assertEqual(participant["canonical_key"], participant_key)
+        self.assertEqual(
+            participant["candidate_basis"], "semantic_subject_binding"
+        )
+        self.assertEqual(participant["source_keys"], [old.resolved_source_key()])
+
+    def test_recent_context_is_ordered_bounded_and_excludes_current_request(
+        self,
+    ) -> None:
+        first = self.message("recent-first", "first", sent_at=100, sender_id="a")
+        deleted = self.message(
+            "recent-deleted", "deleted", sent_at=150, sender_id="deleted"
+        )
+        second = self.message("recent-second", "second", sent_at=180, sender_id="b")
+        third = self.message("recent-third", "third", sent_at=200, sender_id="c")
+        fourth = self.message("recent-fourth", "fourth", sent_at=250, sender_id="d")
+        request = self.message(
+            "recent-request",
+            "current request",
+            sent_at=300,
+            sender_id="requester",
+        )
+        future = self.message("recent-future", "future", sent_at=400, sender_id="c")
+        for message in (first, deleted, second, third, fourth, request, future):
+            self.storage.upsert_message(message)
+        self.assertTrue(
+            self.storage.mark_message_deleted(
+                umo=self.UMO,
+                platform_id=deleted.platform_id,
+                platform_message_id=deleted.message_id,
+                deleted_at=290,
+            )
+        )
+        snapshot = self.capture(request=request, cutoff_at=301)
+        upper_bound = int(snapshot["message_upper_bound"])
+
+        self.assertEqual(
+            self.storage.count_snapshot_messages(
+                umo=self.UMO,
+                before_sent_at=301,
+                message_upper_bound=upper_bound,
+                exclude_source_key=request.resolved_source_key(),
+            ),
+            4,
+        )
+
+        recent = self.storage.query_recent_context(
+            umo=self.UMO,
+            before_sent_at=301,
+            message_upper_bound=upper_bound,
+            exclude_source_key=request.resolved_source_key(),
+            exclude_source_keys=(
+                fourth.resolved_source_key(),
+                third.resolved_source_key(),
+            ),
+            limit=2,
+        )
+
+        self.assertEqual(
+            [item["source_key"] for item in recent],
+            [first.resolved_source_key(), second.resolved_source_key()],
+        )
+        self.assertNotIn(
+            request.resolved_source_key(),
+            {item["source_key"] for item in recent},
+        )
+        self.assertNotIn(
+            future.resolved_source_key(),
+            {item["source_key"] for item in recent},
+        )
+
     def test_reply_source_is_resolved_inside_snapshot_boundary(self) -> None:
         original = self.message("original", "原话", sent_at=100)
         current = self.message(

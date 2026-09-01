@@ -21,6 +21,7 @@ from mr_memory.reader import (
     evidence_certificate_v2_schema,
     normalize_l2_reader_response,
     parse_l2_reader_response,
+    validate_certificate_source_bindings,
 )
 from mr_memory.snapshot import (
     DataRevisionVector,
@@ -141,6 +142,7 @@ class L2ReaderPromptTests(unittest.TestCase):
             snapshot=l2_snapshot(),
             allowed_source_keys={"s1", "s2"},
             allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s2", "s1"}},
             pack_read_complete=True,
         )
         self.assertEqual(request.packet_sha256, stable_sha256(packet))
@@ -149,6 +151,8 @@ class L2ReaderPromptTests(unittest.TestCase):
         payload = json.loads(request.user_prompt)
         self.assertEqual(payload["scope_snapshot"], l2_snapshot().as_dict())
         self.assertEqual(payload["evidence_packet"], packet)
+        self.assertEqual(payload["participant_source_keys"], {"p1": ["s1", "s2"]})
+        self.assertTrue(payload["semantic_none_allowed"])
         self.assertEqual(request.messages()[0]["role"], "system")
 
         schema = evidence_certificate_v2_schema(
@@ -200,6 +204,72 @@ class L2ReaderPromptTests(unittest.TestCase):
             schema["properties"]["unresolved"]["maxItems"],
             MAX_CERTIFICATE_UNRESOLVED,
         )
+        certified_atoms = schema["allOf"][0]["then"]["properties"]["atoms"]
+        self.assertEqual(
+            certified_atoms["items"]["properties"]["source_keys"]["minItems"],
+            1,
+        )
+
+    def test_resident_one_pass_schema_excludes_l3_and_bounds_uncertainty(
+        self,
+    ) -> None:
+        packet = {"sources": ["s1", "s2"]}
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
+            pack_read_complete=True,
+            allow_l3=False,
+        )
+        schema = evidence_certificate_v2_schema(
+            snapshot=l2_snapshot(),
+            packet_sha256=request.packet_sha256,
+            allowed_source_keys=request.allowed_source_keys,
+            allowed_participant_keys=request.allowed_participant_keys,
+            pack_read_complete=True,
+            allow_l3=False,
+        )
+        self.assertFalse(request.allow_l3)
+        self.assertNotIn(
+            "REQUEST_L3",
+            schema["properties"]["status"]["enum"],
+        )
+        self.assertNotIn(
+            "REQUEST_L3",
+            schema["properties"]["stop_reason"]["enum"],
+        )
+        self.assertNotIn(
+            '"const": "REQUEST_L3"',
+            json.dumps(schema["allOf"], sort_keys=True),
+        )
+        for directive in (
+            "resident one-pass",
+            "不得返回 REQUEST_L3",
+            "PARTIAL",
+            "SAFETY_ABSTAIN",
+            "unresolved",
+            "不得请求工具、修复或任何升级路径",
+        ):
+            self.assertIn(directive, request.system_prompt)
+
+        offline_schema = evidence_certificate_v2_schema(
+            snapshot=l2_snapshot(),
+            packet_sha256=request.packet_sha256,
+            allowed_source_keys=request.allowed_source_keys,
+            allowed_participant_keys=request.allowed_participant_keys,
+            pack_read_complete=True,
+        )
+        self.assertIn(
+            "REQUEST_L3",
+            offline_schema["properties"]["status"]["enum"],
+        )
+        self.assertIn(
+            "REQUEST_L3",
+            offline_schema["properties"]["stop_reason"]["enum"],
+        )
 
     def test_prompt_rejects_query_or_packet_hash_tampering(self) -> None:
         with self.assertRaisesRegex(ValueError, "query differs"):
@@ -228,6 +298,7 @@ class L2ReaderPromptTests(unittest.TestCase):
             snapshot=l2_snapshot(),
             allowed_source_keys={"s1", "s2"},
             allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
             pack_read_complete=True,
         )
         raw = _raw_certificate()
@@ -243,6 +314,59 @@ class L2ReaderPromptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "allowlist"):
             parse_l2_reader_response(raw, request)
 
+    def test_resident_one_pass_rejects_l3_response_and_repair(self) -> None:
+        packet = {"sources": ["s1", "s2"]}
+        offline_request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw["packet_sha256"] = offline_request.packet_sha256
+        raw.update(
+            {
+                "status": "REQUEST_L3",
+                "stop_reason": "REQUEST_L3",
+                "open_obligations": [
+                    {
+                        "id": "o1",
+                        "question": "两个相邻称呼是否指向同一参与者？",
+                        "critical": True,
+                        "competing_interpretation_ids": ["same", "different"],
+                        "discriminator": "检查另一份边界明确的合成证据",
+                        "expected_information_gain": "区分两个合成候选解释",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            parse_l2_reader_response(raw, offline_request).status,
+            "REQUEST_L3",
+        )
+
+        resident_request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
+            pack_read_complete=True,
+            allow_l3=False,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot request L3"):
+            parse_l2_reader_response(raw, resident_request)
+        with self.assertRaisesRegex(ValueError, "does not support repair"):
+            build_single_repair_prompt(
+                resident_request,
+                invalid_response="not-json",
+                validation_error="invalid certificate",
+            )
+
     def test_l2_host_normalizes_only_exact_singleton_and_safe_identity_downgrade(
         self,
     ) -> None:
@@ -253,6 +377,10 @@ class L2ReaderPromptTests(unittest.TestCase):
             snapshot=l2_snapshot(),
             allowed_source_keys={"s1", "s2"},
             allowed_participant_keys={"p1", "p2"},
+            participant_source_keys={
+                "p1": {"s1", "s2"},
+                "p2": {"s2"},
+            },
             pack_read_complete=True,
         )
         raw = _raw_certificate()
@@ -331,6 +459,7 @@ class L2ReaderPromptTests(unittest.TestCase):
             snapshot=l2_snapshot(),
             allowed_source_keys={"s1", "s2"},
             allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
             pack_read_complete=True,
         )
         raw = _raw_certificate()
@@ -364,6 +493,286 @@ class L2ReaderPromptTests(unittest.TestCase):
         invalid_atom["atoms"][0]["id"] = "invalid atom id"
         with self.assertRaisesRegex(ValueError, "bounded identifier"):
             parse_l2_reader_response(invalid_atom, request)
+
+    def test_certified_atoms_require_a_source_during_parsing(self) -> None:
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet={"messages": [{"source_key": "source-alpha"}]},
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"source-alpha", "s1", "s2"},
+            allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"source-alpha", "s1", "s2"}},
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw["packet_sha256"] = request.packet_sha256
+        raw["atoms"][0]["source_keys"] = []
+        raw["atoms"][0]["source_spans"] = []
+        with self.assertRaisesRegex(
+            ValueError,
+            r"atoms\[0\]\.source_keys must not be empty",
+        ):
+            parse_l2_reader_response(raw, request)
+
+    def test_semantic_none_policy_is_bound_into_schema_prompt_and_parser(
+        self,
+    ) -> None:
+        packet = {"messages": []}
+        allowed_request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys=(),
+            pack_read_complete=True,
+        )
+        forbidden_request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys=(),
+            pack_read_complete=True,
+            semantic_none_allowed=False,
+        )
+        schema = evidence_certificate_v2_schema(
+            snapshot=l2_snapshot(),
+            packet_sha256=forbidden_request.packet_sha256,
+            allowed_source_keys=(),
+            pack_read_complete=True,
+            semantic_none_allowed=False,
+        )
+        self.assertNotIn(
+            "SEMANTIC_NONE",
+            schema["properties"]["status"]["enum"],
+        )
+        self.assertNotIn(
+            "SEMANTIC_NONE",
+            schema["properties"]["stop_reason"]["enum"],
+        )
+        self.assertNotIn(
+            '"const": "SEMANTIC_NONE"',
+            json.dumps(schema["allOf"], sort_keys=True),
+        )
+        payload = json.loads(forbidden_request.user_prompt)
+        self.assertFalse(payload["semantic_none_allowed"])
+        self.assertIn("检索覆盖不足", forbidden_request.system_prompt)
+        self.assertIn("禁止声称历史不存在", forbidden_request.system_prompt)
+
+        raw = _raw_certificate()
+        raw.update(
+            {
+                "packet_sha256": allowed_request.packet_sha256,
+                "status": "SEMANTIC_NONE",
+                "subjects": [],
+                "atoms": [],
+                "must_include": [],
+                "must_not_upgrade": [],
+                "conflicts": [],
+                "unresolved": [],
+                "open_obligations": [],
+                "stop_reason": "SEMANTIC_NONE",
+            }
+        )
+        self.assertEqual(
+            parse_l2_reader_response(raw, allowed_request).status,
+            "SEMANTIC_NONE",
+        )
+        with self.assertRaisesRegex(ValueError, "retrieval coverage is insufficient"):
+            parse_l2_reader_response(raw, forbidden_request)
+
+    def test_participant_sources_bind_unique_alias_and_atom_subjects(self) -> None:
+        packet = {
+            "messages": [
+                {"source_key": "source-alpha", "text": "synthetic alpha"},
+                {"source_key": "source-beta", "text": "synthetic beta"},
+            ]
+        }
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"source-beta", "source-alpha"},
+            allowed_participant_keys={"participant-beta", "participant-alpha"},
+            participant_source_keys={
+                "participant-alpha": ["source-alpha", "source-alpha"],
+                "participant-beta": ["source-beta"],
+            },
+            pack_read_complete=True,
+        )
+        self.assertEqual(
+            dict(request.participant_source_keys),
+            {
+                "participant-alpha": ("source-alpha",),
+                "participant-beta": ("source-beta",),
+            },
+        )
+        self.assertEqual(
+            json.loads(request.user_prompt)["participant_source_keys"],
+            {
+                "participant-alpha": ["source-alpha"],
+                "participant-beta": ["source-beta"],
+            },
+        )
+
+        raw = _raw_certificate()
+        raw.update(
+            {
+                "packet_sha256": request.packet_sha256,
+                "subjects": [
+                    {
+                        "reference": "synthetic-alias-alpha",
+                        "participant_key": "participant-alpha",
+                        "reference_mode": "UNIQUE_ALIAS",
+                        "candidate_participant_keys": [],
+                        "source_keys": ["source-alpha"],
+                        "valid_at": None,
+                    }
+                ],
+                "atoms": [
+                    {
+                        "id": "synthetic-fact-1",
+                        "statement": "A synthetic statement about alpha.",
+                        "speaker_participant_key": "participant-alpha",
+                        "subject_participant_key": "participant-alpha",
+                        "attribution": "DIRECT_SPEAKER_STATEMENT",
+                        "stance": "SUPPORTED",
+                        "source_keys": ["source-alpha"],
+                        "source_spans": ["synthetic alpha"],
+                        "importance": "REQUIRED",
+                        "confidence": 0.9,
+                    }
+                ],
+                "must_include": ["synthetic-fact-1"],
+                "must_not_upgrade": [],
+                "conflicts": [],
+                "unresolved": [],
+                "open_obligations": [],
+            }
+        )
+        self.assertEqual(parse_l2_reader_response(raw, request).status, "CERTIFIED")
+
+        cross_alias = copy.deepcopy(raw)
+        cross_alias["subjects"][0]["source_keys"] = ["source-beta"]
+        with self.assertRaisesRegex(ValueError, r"subjects\[0\].*not admissible"):
+            parse_l2_reader_response(cross_alias, request)
+
+        cross_atom = copy.deepcopy(raw)
+        cross_atom["atoms"][0]["source_keys"] = ["source-beta"]
+        cross_atom["atoms"][0]["source_spans"] = ["synthetic beta"]
+        with self.assertRaisesRegex(ValueError, r"atoms\[0\].*not admissible"):
+            parse_l2_reader_response(cross_atom, request)
+
+        cross_speaker = copy.deepcopy(raw)
+        cross_speaker["atoms"][0]["speaker_participant_key"] = "participant-beta"
+        with self.assertRaisesRegex(
+            ValueError,
+            r"atoms\[0\].*speaker participant",
+        ):
+            parse_l2_reader_response(cross_speaker, request)
+
+        unbound_request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"source-beta", "source-alpha"},
+            allowed_participant_keys={"participant-beta", "participant-alpha"},
+            pack_read_complete=True,
+        )
+        with self.assertRaisesRegex(ValueError, r"subjects\[0\].*not admissible"):
+            parse_l2_reader_response(raw, unbound_request)
+
+        with self.assertRaisesRegex(ValueError, "participant outside the allowlist"):
+            build_l2_reader_prompt(
+                query="好女孩是什么意思",
+                evidence_packet=packet,
+                snapshot=l2_snapshot(),
+                allowed_source_keys={"source-alpha"},
+                allowed_participant_keys={"participant-alpha"},
+                participant_source_keys={"participant-gamma": ["source-alpha"]},
+                pack_read_complete=True,
+            )
+        with self.assertRaisesRegex(ValueError, "source outside the allowlist"):
+            build_l2_reader_prompt(
+                query="好女孩是什么意思",
+                evidence_packet=packet,
+                snapshot=l2_snapshot(),
+                allowed_source_keys={"source-alpha"},
+                allowed_participant_keys={"participant-alpha"},
+                participant_source_keys={"participant-alpha": ["source-beta"]},
+                pack_read_complete=True,
+            )
+
+    def test_parsed_certificate_source_bindings_are_reusable_for_cache_checks(
+        self,
+    ) -> None:
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet={"messages": [{"source_key": "source-alpha"}]},
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"source-alpha", "source-beta"},
+            allowed_participant_keys={"participant-alpha"},
+            participant_source_keys={
+                "participant-alpha": {"source-alpha", "source-beta"},
+            },
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw.update(
+            {
+                "packet_sha256": request.packet_sha256,
+                "subjects": [],
+                "atoms": [
+                    {
+                        "id": "synthetic-fact-1",
+                        "statement": "A synthetic participant-bound statement.",
+                        "speaker_participant_key": "participant-alpha",
+                        "subject_participant_key": "participant-alpha",
+                        "attribution": "DIRECT_SPEAKER_STATEMENT",
+                        "stance": "SUPPORTED",
+                        "source_keys": ["source-alpha"],
+                        "source_spans": ["synthetic evidence"],
+                        "importance": "REQUIRED",
+                        "confidence": 0.9,
+                    }
+                ],
+                "must_include": ["synthetic-fact-1"],
+                "must_not_upgrade": [],
+                "conflicts": [],
+                "unresolved": [],
+                "open_obligations": [],
+            }
+        )
+        certificate = parse_l2_reader_response(raw, request)
+        inadmissible = {"participant-alpha": {"source-beta"}}
+
+        speaker_only = replace(
+            certificate,
+            atoms=(
+                replace(
+                    certificate.atoms[0],
+                    subject_participant_key="",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, r"speaker participant"):
+            validate_certificate_source_bindings(
+                speaker_only,
+                participant_source_keys=inadmissible,
+            )
+
+        subject_only = replace(
+            certificate,
+            atoms=(
+                replace(
+                    certificate.atoms[0],
+                    speaker_participant_key="",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, r"subject participant"):
+            validate_certificate_source_bindings(
+                subject_only,
+                participant_source_keys=inadmissible,
+            )
 
     def test_repair_prompt_is_available_exactly_once(self) -> None:
         request = build_l2_reader_prompt(
@@ -419,6 +828,40 @@ class EccrCertificateAdapterTests(unittest.TestCase):
             [item.statement for item in certificate.unresolved],
         )
         self.assertEqual(certificate.scope_snapshot, _eccr_snapshot())
+
+    def test_adapter_enforces_participant_source_bindings(self) -> None:
+        certificate = certificate_from_contract_turn(
+            _terminal_turn(),
+            snapshot=_eccr_snapshot(),
+            packet_sha256="b" * 64,
+            allowed_source_keys={"source-1", "source-2"},
+            allowed_participant_keys={"participant:a", "participant:b"},
+            participant_source_keys={
+                "participant:a": {"source-1"},
+                "participant:b": {"source-2"},
+            },
+            stop_reason="CERTIFIED_CLOSE",
+            pack_read_complete=True,
+        )
+        self.assertEqual(certificate.status, "CERTIFIED")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"atoms\[0\].*subject participant",
+        ):
+            certificate_from_contract_turn(
+                _terminal_turn(),
+                snapshot=_eccr_snapshot(),
+                packet_sha256="b" * 64,
+                allowed_source_keys={"source-1", "source-2"},
+                allowed_participant_keys={"participant:a", "participant:b"},
+                participant_source_keys={
+                    "participant:a": {"source-2"},
+                    "participant:b": {"source-1"},
+                },
+                stop_reason="CERTIFIED_CLOSE",
+                pack_read_complete=True,
+            )
 
     def test_ambiguous_contract_maps_to_safety_abstain(self) -> None:
         turn = _terminal_turn(

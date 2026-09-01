@@ -81,7 +81,7 @@ class MainLayeredWiringTests(unittest.TestCase):
         )
         return namespace["classify"]
 
-    def test_production_local_outcome_keeps_unresolved_identity_injectable(self) -> None:
+    def test_production_local_outcome_requires_a_compiled_reader_surface(self) -> None:
         outcome_class = next(
             node
             for node in self.tree.body
@@ -93,9 +93,13 @@ class MainLayeredWiringTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "usable"
         )
         body = ast.unparse(usable)
-        self.assertIn("EVIDENCE_AVAILABLE", body)
-        self.assertIn("IDENTITY_AMBIGUOUS", body)
-        self.assertIn("IDENTITY_UNRESOLVED", body)
+        self.assertIn("self.envelope_text", body)
+        self.assertIn("self.operational_status == 'COMPLETED'", body)
+        for status in ("CERTIFIED", "PARTIAL", "SAFETY_ABSTAIN"):
+            self.assertIn(status, body)
+        self.assertNotIn("EVIDENCE_AVAILABLE", body)
+        self.assertNotIn("IDENTITY_AMBIGUOUS", body)
+        self.assertNotIn("IDENTITY_UNRESOLVED", body)
 
     def test_host_return_decision_cannot_fall_through_to_provider(self) -> None:
         method = self._method("_run_layered_subconscious")
@@ -244,18 +248,72 @@ class MainLayeredWiringTests(unittest.TestCase):
         )
         self.assertEqual(ast.unparse(cancel_guard.test), "hard_sync")
 
+    def test_person_queries_are_classified_without_selecting_an_identity_path(
+        self,
+    ) -> None:
+        classify = self._runtime_request_classifier()
+        self.assertTrue(callable(classify))
+        self.assertEqual(classify("/chat 你好", force=False), "CHAT")
+        request_kind = classify(
+            "/chat 群里有合成代号甲吗，请把他找出来",
+            force=False,
+        )
+        self.assertEqual(request_kind, "MEMORY_QUERY")
+        self.assertEqual(
+            classify(
+                "/chat 分辨一下合成甲，合成乙和合成丙是几个人",
+                force=False,
+            ),
+            "MEMORY_QUERY",
+        )
+        self.assertEqual(classify("/chat 你是谁", force=False), "CHAT")
+        self.assertEqual(
+            classify("/chat 一个足球队有几个人", force=False),
+            "CHAT",
+        )
+        self.assertEqual(classify("/chat 这些人真有趣", force=False), "CHAT")
+        self.assertEqual(classify("/chat 这些人是谁", force=False), "CHAT")
+        self.assertEqual(
+            classify("/chat 帮我把那个文件找出来", force=False),
+            "CHAT",
+        )
+        self.assertEqual(
+            classify(
+                "/chat 这些人是谁",
+                force=False,
+                has_structured_reference=True,
+            ),
+            "MEMORY_QUERY",
+        )
 
-    def test_ordinary_chat_uses_full_local_retrieval_with_small_envelope(self) -> None:
+    def test_online_serving_uses_fresh_full_retrieval_without_identity_shortcut(
+        self,
+    ) -> None:
         method = self._method("_execute_local_memory_serving")
         body = ast.unparse(method)
-        self.assertIn("identity_question = self._local_direct_identity_question", body)
-        self.assertIn("if include_participant_activity or identity_question", body)
-        self.assertNotIn("request_kind == 'CHAT' and", body)
-        self.assertIn("await self._layered_evidence_packet", body)
-        self.assertIn(
-            "min(self.local_serving_max_chars, 3000) if request_kind == 'CHAT'",
-            body,
-        )
+        packet_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_layered_evidence_packet"
+        ]
+        self.assertEqual(len(packet_calls), 1)
+        keywords = {
+            item.arg: ast.unparse(item.value)
+            for item in packet_calls[0].keywords
+            if item.arg
+        }
+        self.assertEqual(keywords["resolve_query_aliases"], "False")
+        self.assertEqual(keywords["use_cache"], "False")
+        self.assertEqual(keywords["finalize_packet"], "False")
+        self.assertEqual(keywords["include_participant_activity"], "True")
+        for forbidden in (
+            "_local_identity_evidence_packet",
+            "_local_direct_identity_question",
+            "_local_direct_reference_question",
+        ):
+            self.assertNotIn(forbidden, body)
 
 
     def test_existing_feedback_trace_reuses_local_request_outcome(
@@ -294,11 +352,10 @@ class MainLayeredWiringTests(unittest.TestCase):
             "SERVICE_READY",
             "INTERACTION_TRACE",
             "EXPERIMENT_START",
-            "DIRECT_RETRIEVAL",
             "FULL_RETRIEVAL",
-            "PACKET_MATERIALIZE",
-            "ENVELOPE_COMPILE",
             "SOURCE_AUDIT",
+            "RESIDENT_READER",
+            "SURFACE_COMPILE",
             "LEDGER_RECORD",
         ):
             self.assertIn(f"begin_stage('{stage}')", body)
@@ -311,22 +368,41 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("self._local_serving_tasks.get(event_key)", local_method)
         self.assertIn("await running[1]", local_method)
 
-    def test_structured_short_reference_routes_before_full_retrieval(self) -> None:
-        body = ast.unparse(self._method("_execute_local_memory_serving"))
-        reference_index = body.index(
-            "reference_question = self._local_direct_reference_question"
-        )
-        structured_index = body.index("has_structured_reference = bool")
-        direct_index = body.index("await self._local_identity_evidence_packet")
-        full_index = body.index("await self._layered_evidence_packet")
-
-        self.assertLess(reference_index, direct_index)
-        self.assertLess(structured_index, direct_index)
-        self.assertLess(direct_index, full_index)
-        self.assertIn(
-            "reference_question and has_structured_reference",
-            body,
-        )
+    def test_online_serving_runs_one_l2_reader_without_repair_l3_cache_or_store(
+        self,
+    ) -> None:
+        method = self._method("_execute_local_memory_serving")
+        body = ast.unparse(method)
+        reader_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_read_l2_certificate"
+        ]
+        self.assertEqual(len(reader_calls), 1)
+        reader_keywords = {
+            item.arg: ast.unparse(item.value)
+            for item in reader_calls[0].keywords
+            if item.arg
+        }
+        self.assertEqual(reader_keywords["allow_l3"], "False")
+        self.assertIn("provider_calls_started = 1", body)
+        self.assertIn("'reader_calls': 1", body)
+        self.assertIn("'repair_attempted': False", body)
+        self.assertIn("'l3_attempted': False", body)
+        self.assertIn("RoutePolicy(mode='LOW_LATENCY', allow_l3=False)", body)
+        for forbidden in (
+            "_run_l3_certificate",
+            "_load_layered_certificate",
+            "_store_layered_certificate",
+            "get_memory_certificate",
+            "put_memory_certificate",
+            "get_evidence_pack_cache",
+            "put_evidence_pack_cache",
+            "parse_repair",
+        ):
+            self.assertNotIn(forbidden, body)
 
     def test_local_serving_failure_is_logged_but_never_injected(self) -> None:
         """Failure is ledger-only; it must not become substitute prompt content."""
@@ -390,7 +466,7 @@ class MainLayeredWiringTests(unittest.TestCase):
             node
             for node in ast.walk(method)
             if isinstance(node, ast.Try)
-            and "envelope_value = json.loads(outcome.envelope_text)"
+            and "surface_value = json.loads(outcome.envelope_text)"
             in "\n".join(ast.unparse(item) for item in node.body)
         )
         parse_failure_body = "\n".join(
@@ -402,6 +478,21 @@ class MainLayeredWiringTests(unittest.TestCase):
             "req.extra_user_content_parts.append",
             parse_failure_body,
         )
+
+    def test_injection_validates_surface_protocol_and_uses_one_marker(self) -> None:
+        body = ast.unparse(self._method("inject_subconscious_memory"))
+        parse_index = body.index("surface_value = json.loads(outcome.envelope_text)")
+        schema_index = body.index(
+            "surface_value.get('schema_version') != SURFACE_SCHEMA_VERSION"
+        )
+        marker_index = body.index("marker = '<mr_memory_surface>'")
+        append_index = body.index("req.extra_user_content_parts.append(memory_part)")
+        self.assertLess(parse_index, schema_index)
+        self.assertLess(schema_index, marker_index)
+        self.assertLess(marker_index, append_index)
+        self.assertIn("NOT_INJECTED_WRONG_PROTOCOL", body)
+        self.assertIn("{marker}{outcome.envelope_text}</mr_memory_surface>", body)
+        self.assertIn("ALREADY_INJECTED_FOR_EVENT", body)
 
     def test_completed_empty_local_result_is_not_rewritten_as_failure(self) -> None:
         method = self._method("inject_subconscious_memory")
@@ -539,8 +630,8 @@ class MainLayeredWiringTests(unittest.TestCase):
 
     def test_reply_target_is_snapshot_bounded_packet_evidence(self) -> None:
         revision = ast.unparse(self._method("_runtime_inference_revision"))
-        self.assertIn("host-prefetch.snapshot.v6", revision)
-        self.assertIn("lexical-plus-embedding-plus-activity-plus-graph.v5", revision)
+        self.assertIn("host-prefetch.snapshot.v7", revision)
+        self.assertIn("lexical-plus-embedding-plus-resident-reader.v6", revision)
 
         method = self._method("_layered_evidence_packet")
         body = ast.unparse(method)
@@ -579,13 +670,27 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("reference=account_id", packet)
         self.assertIn("packet['request_identity_context']", packet)
         self.assertIn("await service.resolve_query_participants", packet)
-        self.assertIn("await service.query_participant_activity", packet)
+        self.assertIn("if resolve_query_aliases", packet)
+        self.assertIn("'status': 'NOT_PRE_RESOLVED'", packet)
+        self.assertIn("'reader_required': True", packet)
+        self.assertIn("service.query_participant_history", packet)
+        self.assertIn("service.query_participant_activity", packet)
         self.assertIn("if include_participant_activity", packet)
-        self.assertIn("limit=64", packet)
+        self.assertIn("limit=12", packet)
+        self.assertIn("days=7", packet)
+        self.assertIn("limit=32", packet)
         self.assertIn("packet['query_alias_resolution']", packet)
         self.assertIn("packet['participant_activity']", packet)
+        self.assertIn("packet['participant_history']", packet)
+        self.assertIn("packet['person_reasoning_candidates']", packet)
+        self.assertIn("service.query_person_reference_candidates", packet)
+        self.assertIn("service.count_snapshot_messages", packet)
+        self.assertIn("exclude_source_keys=sorted(preexisting_source_keys)", packet)
+        self.assertIn("packet['retrieval_coverage']", packet)
+        self.assertIn("packet['participant_source_keys']", packet)
+        self.assertIn("'host_decision': 'NONE'", packet)
         self.assertIn(
-            "packet['source_count'] = len(_collect_source_keys(packet))",
+            "packet['source_count'] = len(packet_source_keys)",
             packet,
         )
         self.assertIn("before_sent_at=snapshot.cutoff_at", packet)
@@ -613,7 +718,7 @@ class MainLayeredWiringTests(unittest.TestCase):
             "embedding errors must reach the existing ERROR/failed-ledger path",
         )
 
-    def test_l2_reader_uses_disabled_thinking_and_independent_output_cap(
+    def test_l2_reader_is_one_pass_with_configured_thinking_and_output_cap(
         self,
     ) -> None:
         method = self._method("_read_l2_certificate")
@@ -624,28 +729,76 @@ class MainLayeredWiringTests(unittest.TestCase):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "_run_fast_reconstruction_with_ledger"
         ]
-        self.assertEqual(len(calls), 2)
-        for call in calls:
-            keywords = {item.arg: item.value for item in call.keywords if item.arg}
-            with self.subTest(call=ast.unparse(call)):
-                self.assertEqual(ast.literal_eval(keywords["thinking_mode"]), "disabled")
-                self.assertEqual(ast.literal_eval(keywords["max_output_tokens"]), 8192)
+        self.assertEqual(len(calls), 1)
+        keywords = {
+            item.arg: ast.unparse(item.value)
+            for item in calls[0].keywords
+            if item.arg
+        }
+        self.assertEqual(keywords["thinking_mode"], "self.distillation_thinking_mode")
+        self.assertEqual(keywords["max_output_tokens"], "8192")
+        self.assertEqual(keywords["phase"], "'resident_evidence_reader'")
+        self.assertEqual(keywords["usage_source"], "'resident_reader_one_pass'")
+        prompt_call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "build_l2_reader_prompt"
+        )
+        prompt_keywords = {
+            item.arg: ast.unparse(item.value)
+            for item in prompt_call.keywords
+            if item.arg
+        }
+        self.assertEqual(
+            prompt_keywords["participant_source_keys"],
+            "participant_source_keys",
+        )
+        self.assertIn(
+            "retrieval_coverage.get('semantic_none_allowed', False)",
+            prompt_keywords["semantic_none_allowed"],
+        )
 
         runner = ast.unparse(self._method("_run_fast_reconstruction_with_ledger"))
         self.assertIn("if max_output_tokens is None", runner)
         self.assertIn("else max(1, int(max_output_tokens))", runner)
-        self.assertNotIn(
-            "max_output_tokens=8192",
-            ast.unparse(self._method("_run_l3_certificate")),
-        )
 
-    def test_l2_reader_never_uses_hidden_reasoning_as_a_fallback(self) -> None:
+    def test_l2_reader_protocol_failure_is_terminal_without_repair_or_l3(self) -> None:
         body = ast.unparse(self._method("_read_l2_certificate"))
         self.assertNotIn("parse_structured_response", body)
         self.assertNotIn("reasoning_content", body)
-        self.assertIn("certificate = parse(", body)
-        self.assertIn("certificate = parse_repair(", body)
-        self.assertIn("response_source = 'completion'", body)
+        self.assertIn("certificate = parse_l2_reader_response", body)
+        self.assertIn("allow_l3=allow_l3", body)
+        self.assertIn("return (certificate, False, 'completion', first_chunk_ms)", body)
+        self.assertNotIn("parse_repair", body)
+        self.assertNotIn("_run_l3_certificate", body)
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Try)
+                for node in ast.walk(self._method("_read_l2_certificate"))
+            )
+        )
+
+    def test_l3_and_cached_certificates_reuse_participant_source_guards(self) -> None:
+        l3_body = ast.unparse(self._method("_run_l3_certificate"))
+        self.assertIn(
+            "expanded_participant_sources = _participant_source_bindings",
+            l3_body,
+        )
+        self.assertIn(
+            "participant_source_keys=expanded_participant_sources",
+            l3_body,
+        )
+
+        cache_body = ast.unparse(self._method("_load_layered_certificate"))
+        self.assertIn("validate_certificate_source_bindings", cache_body)
+        self.assertIn("participant_source_keys=participant_source_keys", cache_body)
+
+        runtime_body = ast.unparse(self._method("_run_layered_subconscious"))
+        self.assertIn(
+            "participant_source_keys=_participant_source_bindings(packet)",
+            runtime_body,
+        )
 
     def test_hot_reload_never_unboundedly_gathers_cancelled_tasks(self) -> None:
         method = self._method("terminate")

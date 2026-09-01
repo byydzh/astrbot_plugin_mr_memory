@@ -293,17 +293,25 @@ class RuntimePlanTests(unittest.TestCase):
                 {
                     "memory": {
                         "id": 1,
-                        "content": "甲说自己不喜欢密集构图。",
+                        "person_cue": "青岚",
+                        "aspect_tag": "视觉偏好",
+                        "content": "青岚说自己不喜欢密集构图。",
                         "confidence": 0.83,
                         "epistemic_status": "ASSERTED",
                         "status": "ACTIVE",
+                        "semantic_subject": {
+                            "canonical_key": "participant:synthetic-account-one",
+                            "account_id": "synthetic-account-one",
+                        },
                     },
                     "evidence": [{"source_key": "message-1"}],
                 },
                 {
                     "memory": {
                         "id": 2,
-                        "content": "“好女孩”可能是群内反话。",
+                        "subject_candidate": "琥珀",
+                        "predicate": "语用含义",
+                        "content": "某个称呼可能是群内反话。",
                         "confidence": 0.58,
                         "epistemic_status": "JOKE",
                         "status": "ACTIVE",
@@ -318,7 +326,7 @@ class RuntimePlanTests(unittest.TestCase):
                     {
                         "id": 9,
                         "score": 0.71,
-                        "statement": "好女孩在该语境中存在竞争释义。",
+                        "statement": "合成术语 Z7 在该语境中存在竞争释义。",
                         "source_keys": ["message-3"],
                         "epistemic_confidence": 0.61,
                         "epistemic_state": "CONTESTED",
@@ -332,12 +340,23 @@ class RuntimePlanTests(unittest.TestCase):
                 ]
             },
         }
-        result = materialize_reconstruction_packet(packet, query="好女孩")
+        result = materialize_reconstruction_packet(packet, query="合成术语 Z7")
         self.assertIsNotNone(result.brief)
         assert result.brief is not None
         self.assertEqual(len(result.brief.claims), 1)
         self.assertEqual(len(result.brief.unresolved), 1)
         self.assertEqual(len(result.brief.conflicts), 1)
+        claim = result.brief.claims[0].statement
+        self.assertIn('"subject_candidate":"青岚"', claim)
+        self.assertIn('"predicate":"视觉偏好"', claim)
+        self.assertIn('"epistemic_state":"ASSERTED"', claim)
+        self.assertIn('"content":"青岚说自己不喜欢密集构图。"', claim)
+        self.assertNotIn("synthetic-account-one", claim)
+        unresolved = result.brief.unresolved[0].statement
+        self.assertIn('"subject_candidate":"琥珀"', unresolved)
+        self.assertIn('"predicate":"语用含义"', unresolved)
+        self.assertIn('"epistemic_state":"JOKE"', unresolved)
+        self.assertIn('"content":"某个称呼可能是群内反话。"', unresolved)
         self.assertEqual(result.edge_ids, (9,))
         self.assertEqual(
             result.source_keys,

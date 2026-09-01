@@ -4548,6 +4548,236 @@ class MemoryStorage:
             )
         return list(by_id.values())
 
+    def query_person_reference_candidates(
+        self,
+        *,
+        umo: str,
+        text: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        """Return source-bound account candidates for observed aliases in text.
+
+        This is deliberately a retrieval interface, not an identity resolver.  It
+        performs no syntax, intent, uniqueness, or semantic-equivalence inference;
+        the resident reader remains responsible for any interpretation.  Every
+        returned alias observation is reconstructed from one non-deleted message
+        inside the supplied frozen snapshot.
+        """
+
+        self._assert_scope(umo)
+        normalized_text = normalize_alias(text)
+        cutoff = int(before_sent_at)
+        upper_bound = max(0, int(message_upper_bound))
+        safe_limit = max(1, min(100, int(limit)))
+        empty_coverage = {
+            "matched_reference_count_total": 0,
+            "matched_reference_count_returned": 0,
+            "candidate_count_total": 0,
+            "candidate_count_returned": 0,
+            "distinct_candidate_count_total": 0,
+            "distinct_candidate_count_returned": 0,
+            "truncated": False,
+        }
+        if not normalized_text:
+            return {
+                "host_decision": "NONE",
+                "references": [],
+                "coverage": empty_coverage,
+            }
+
+        with self._lock:
+            alias_rows = self._connection.execute(
+                """
+                SELECT pa.normalized_alias, p.id AS participant_id,
+                       p.canonical_key, p.platform_id, p.account_id,
+                       p.account_type
+                FROM participant_aliases AS pa
+                JOIN participants AS p ON p.id=pa.participant_id
+                WHERE p.umo=? AND pa.is_active=1
+                  AND pa.normalized_alias<>''
+                  AND instr(?, pa.normalized_alias)>0
+                ORDER BY instr(?, pa.normalized_alias),
+                         length(pa.normalized_alias) DESC,
+                         pa.normalized_alias, p.canonical_key
+                """,
+                (umo, normalized_text, normalized_text),
+            ).fetchall()
+            matched_references = tuple(
+                dict.fromkeys(str(row["normalized_alias"]) for row in alias_rows)
+            )
+            if not matched_references:
+                return {
+                    "host_decision": "NONE",
+                    "references": [],
+                    "coverage": empty_coverage,
+                }
+
+            candidates_by_reference: dict[
+                str, dict[int, dict[str, object]]
+            ] = {reference: {} for reference in matched_references}
+            account_id_by_participant: dict[int, str] = {}
+            for row in alias_rows:
+                reference = str(row["normalized_alias"])
+                participant_id = int(row["participant_id"])
+                account_id_by_participant[participant_id] = str(row["account_id"])
+                candidates_by_reference[reference][participant_id] = {
+                    "participant_key": str(row["canonical_key"]),
+                    "platform_id": str(row["platform_id"]),
+                    "account_id": str(row["account_id"]),
+                    "account_type": str(row["account_type"]),
+                    "display_name": "",
+                    "alias_observations": [],
+                    "source_count_total": 0,
+                    "observations_truncated": False,
+                }
+
+            observation_rows = self._connection.execute(
+                """
+                SELECT mp.participant_id, mp.relation, m.source_key, m.sent_at,
+                       m.sender_name, m.content_json
+                FROM message_participants AS mp
+                JOIN messages AS m ON m.id=mp.message_id
+                WHERE m.umo=? AND m.is_deleted=0
+                  AND m.sent_at<? AND m.id<=?
+                  AND mp.relation IN ('SPEAKER', 'MENTIONED', 'REPLY_TARGET')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM participant_aliases AS matched_alias
+                      WHERE matched_alias.participant_id=mp.participant_id
+                        AND matched_alias.is_active=1
+                        AND matched_alias.normalized_alias<>''
+                        AND instr(?, matched_alias.normalized_alias)>0
+                  )
+                ORDER BY m.sent_at DESC, m.id DESC, mp.position
+                """,
+                (
+                    umo,
+                    cutoff,
+                    upper_bound,
+                    normalized_text,
+                ),
+            ).fetchall()
+
+        observation_cap = 8
+        seen_observations: set[tuple[int, str, str, str]] = set()
+        for row in observation_rows:
+            participant_id = int(row["participant_id"])
+            relation = str(row["relation"])
+            content = self._parse_content_json(row["content_json"])
+            observed_aliases: list[str] = []
+            if relation == "SPEAKER":
+                observed_aliases.append(str(row["sender_name"] or ""))
+            elif relation == "MENTIONED":
+                account_id = account_id_by_participant.get(participant_id, "")
+                observed_aliases.extend(
+                    mention.display_name
+                    for mention in extract_mentions(content)
+                    if mention.account_id == account_id
+                )
+            elif relation == "REPLY_TARGET":
+                reply = extract_reply(content)
+                if reply is not None:
+                    if reply.sender_id == account_id_by_participant.get(
+                        participant_id, ""
+                    ):
+                        observed_aliases.append(reply.sender_name)
+
+            for alias in observed_aliases:
+                normalized_alias = normalize_alias(alias)
+                candidates = candidates_by_reference.get(normalized_alias)
+                if not normalized_alias or candidates is None:
+                    continue
+                candidate = candidates.get(participant_id)
+                if candidate is None:
+                    continue
+                observation_key = (
+                    participant_id,
+                    normalized_alias,
+                    str(row["source_key"]),
+                    relation,
+                )
+                if observation_key in seen_observations:
+                    continue
+                seen_observations.add(observation_key)
+                candidate["source_count_total"] = (
+                    int(candidate["source_count_total"]) + 1
+                )
+                observations = candidate["alias_observations"]
+                assert isinstance(observations, list)
+                if not candidate["display_name"]:
+                    candidate["display_name"] = str(alias or "")
+                if len(observations) < observation_cap:
+                    observations.append(
+                        {
+                            "alias": str(alias or ""),
+                            "normalized_alias": normalized_alias,
+                            "source_key": str(row["source_key"]),
+                            "sent_at": int(row["sent_at"] or 0),
+                            "relation": relation,
+                        }
+                    )
+
+        all_references: list[dict[str, object]] = []
+        for reference in matched_references:
+            candidates = []
+            for candidate in candidates_by_reference[reference].values():
+                observations = candidate["alias_observations"]
+                assert isinstance(observations, list)
+                if not observations:
+                    continue
+                candidate["observations_truncated"] = (
+                    int(candidate["source_count_total"]) > len(observations)
+                )
+                candidates.append(candidate)
+            if candidates:
+                all_references.append(
+                    {
+                        "reference": reference,
+                        "candidate_participants": candidates,
+                        "candidate_count_total": len(candidates),
+                        "candidate_count_returned": len(candidates),
+                        "truncated": False,
+                    }
+                )
+        references = all_references[:safe_limit]
+        candidate_count_total = sum(
+            len(reference["candidate_participants"])
+            for reference in all_references
+        )
+        candidate_count_returned = sum(
+            len(reference["candidate_participants"])
+            for reference in references
+        )
+        distinct_candidate_keys_total = {
+            str(candidate["participant_key"])
+            for reference in all_references
+            for candidate in reference["candidate_participants"]
+        }
+        distinct_candidate_keys_returned = {
+            str(candidate["participant_key"])
+            for reference in references
+            for candidate in reference["candidate_participants"]
+        }
+        return {
+            "host_decision": "NONE",
+            "references": references,
+            "coverage": {
+                "matched_reference_count_total": len(all_references),
+                "matched_reference_count_returned": len(references),
+                "candidate_count_total": candidate_count_total,
+                "candidate_count_returned": candidate_count_returned,
+                "distinct_candidate_count_total": len(
+                    distinct_candidate_keys_total
+                ),
+                "distinct_candidate_count_returned": len(
+                    distinct_candidate_keys_returned
+                ),
+                "truncated": len(references) < len(all_references),
+            },
+        }
+
     def query_participant_history(
         self,
         *,
@@ -4620,6 +4850,108 @@ class MemoryStorage:
             "source_count_total": source_count_total,
             "messages_truncated": source_count_total > len(messages),
         }
+
+    def count_snapshot_messages(
+        self,
+        *,
+        umo: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        exclude_source_key: str = "",
+    ) -> int:
+        """Count visible, non-deleted messages inside one frozen snapshot."""
+
+        self._assert_scope(umo)
+        parameters: list[object] = [
+            umo,
+            int(before_sent_at),
+            max(0, int(message_upper_bound)),
+        ]
+        exclusion_sql = ""
+        excluded = str(exclude_source_key or "").strip()
+        if excluded:
+            exclusion_sql = " AND source_key<>?"
+            parameters.append(excluded)
+        with self._lock:
+            row = self._connection.execute(
+                f"""
+                SELECT COUNT(*) AS message_count
+                FROM messages
+                WHERE umo=? AND is_deleted=0
+                  AND sent_at<? AND id<=?
+                  {exclusion_sql}
+                """,
+                parameters,
+            ).fetchone()
+        return int(row["message_count"] or 0) if row is not None else 0
+
+    def query_recent_context(
+        self,
+        *,
+        umo: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        limit: int = 24,
+        exclude_source_key: str = "",
+        exclude_source_keys: Iterable[str] | None = None,
+    ) -> list[dict[str, object]]:
+        """Return one frozen, ordered recent-message layer for the resident reader."""
+
+        self._assert_scope(umo)
+        safe_limit = max(1, min(64, int(limit)))
+        many_exclusions = (
+            (exclude_source_keys,)
+            if isinstance(exclude_source_keys, str)
+            else tuple(exclude_source_keys or ())
+        )
+        exclusions = tuple(
+            dict.fromkeys(
+                source_key
+                for raw_source_key in (exclude_source_key, *many_exclusions)
+                if (source_key := str(raw_source_key or "").strip())
+            )
+        )
+        exclusion_sql = ""
+        parameters: list[object] = [
+            umo,
+            int(before_sent_at),
+            max(0, int(message_upper_bound)),
+        ]
+        if exclusions:
+            placeholders = ",".join("?" for _ in exclusions)
+            exclusion_sql = f" AND m.source_key NOT IN ({placeholders})"
+            parameters.extend(exclusions)
+        parameters.append(safe_limit)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT m.*
+                FROM messages AS m
+                WHERE m.umo=? AND m.is_deleted=0
+                  AND m.sent_at<? AND m.id<=?
+                  {exclusion_sql}
+                ORDER BY m.sent_at DESC, m.id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            messages = [self._stored_message_from_row(row) for row in reversed(rows)]
+        return [
+            {
+                "source_key": message.source_key,
+                "sent_at": message.sent_at,
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "sender_participant_key": message.sender_participant_key,
+                "role": message.role,
+                "plain_text": message.plain_text,
+                "reply_to_source_key": message.reply_to_source_key,
+                "mentions": list(message.mentions),
+                "components": message.content,
+                "revision_no": message.revision_no,
+            }
+            for message in messages
+        ]
 
     def query_participant_activity(
         self,
@@ -10648,38 +10980,128 @@ class MemoryStorage:
                             topic["summary"] = ""
                         result["topics"].append({**topic, "score": score})
                 elif owner_type == "semantic" and owner_key.isdigit():
-                    cutoff_sql = ""
-                    parameters = [umo, int(owner_key)]
-                    if before_sent_at is not None:
-                        cutoff_sql = (
-                            " AND EXISTS (SELECT 1 FROM messages AS m "
-                            "WHERE m.id = semantic_memories.source_message_id "
-                            "AND m.umo = semantic_memories.umo "
-                            "AND m.sent_at < ? AND m.is_deleted = 0)"
+                    cutoff_sql, cutoff_parameters = (
+                        self._semantic_source_visibility_clause(
+                            memory_alias="s",
+                            before_sent_at=before_sent_at,
+                            message_upper_bound=message_upper_bound,
                         )
-                        parameters.append(int(before_sent_at))
-                    if message_upper_bound is not None:
-                        cutoff_sql += (
-                            " AND EXISTS (SELECT 1 FROM messages AS bounded_m "
-                            "WHERE bounded_m.id=semantic_memories.source_message_id "
-                            "AND bounded_m.umo=semantic_memories.umo "
-                            "AND bounded_m.id<=? AND bounded_m.is_deleted=0)"
-                        )
-                        parameters.append(max(0, int(message_upper_bound)))
+                    )
                     row = self._connection.execute(
                         f"""
-                        SELECT id, person_cue, aspect_tag, content, claim_type,
-                               epistemic_status, status, confidence
-                        FROM semantic_memories WHERE umo = ? AND id = ?
-                          AND status IN ('ACTIVE', 'CONFLICTED')
+                        SELECT s.id, s.person_cue, s.aspect_tag, s.content,
+                               s.claim_type, s.epistemic_status, s.status,
+                               s.confidence, s.subject_participant_id,
+                               p.canonical_key AS subject_participant_key
+                        FROM semantic_memories AS s
+                        LEFT JOIN participants AS p
+                          ON p.id=s.subject_participant_id AND p.umo=s.umo
+                        WHERE s.umo = ? AND s.id = ?
+                          AND s.status IN ('ACTIVE', 'CONFLICTED')
                         {cutoff_sql}
                         """,
-                        parameters,
+                        (umo, int(owner_key), *cutoff_parameters),
                     ).fetchone()
                     if row:
-                        result["semantic_memories"].append(
-                            {**dict(row), "score": score}
-                        )
+                        semantic = {**dict(row), "score": score}
+                        source_cutoff_sql = ""
+                        source_parameters: list[object] = [
+                            int(owner_key),
+                            int(owner_key),
+                            umo,
+                            umo,
+                        ]
+                        if before_sent_at is not None:
+                            source_cutoff_sql += " AND m.sent_at < ?"
+                            source_parameters.append(int(before_sent_at))
+                        if message_upper_bound is not None:
+                            source_cutoff_sql += " AND m.id <= ?"
+                            source_parameters.append(
+                                max(0, int(message_upper_bound))
+                            )
+                        source_rows = self._connection.execute(
+                            f"""
+                            SELECT m.source_key, m.sent_at, m.id
+                            FROM messages AS m
+                            WHERE m.id IN (
+                                SELECT source.message_id
+                                FROM semantic_memory_sources AS source
+                                WHERE source.semantic_memory_id = ?
+                                UNION
+                                SELECT legacy.source_message_id
+                                FROM semantic_memories AS legacy
+                                WHERE legacy.id = ? AND legacy.umo = ?
+                                  AND legacy.source_message_id IS NOT NULL
+                            )
+                              AND m.umo = ? AND m.is_deleted = 0
+                              {source_cutoff_sql}
+                            ORDER BY m.sent_at, m.id
+                            """,
+                            source_parameters,
+                        ).fetchall()
+                        source_keys = [
+                            str(source["source_key"]) for source in source_rows
+                        ]
+                        if source_keys:
+                            semantic["source_keys"] = source_keys
+
+                        subject_key = str(
+                            semantic.get("subject_participant_key") or ""
+                        ).strip()
+                        visible_subject: dict[str, object] | None = None
+                        if subject_key and source_keys:
+                            resolved = self.resolve_participants(
+                                umo=umo,
+                                reference=subject_key,
+                                limit=1,
+                                before_sent_at=before_sent_at,
+                                message_upper_bound=message_upper_bound,
+                            )
+                            visible_subject = next(
+                                (
+                                    dict(item)
+                                    for item in resolved.get("participants", [])
+                                    if str(item.get("canonical_key") or "")
+                                    == subject_key
+                                ),
+                                None,
+                            )
+                        if visible_subject is not None:
+                            subject_display_name = str(
+                                visible_subject.get("current_display_name") or ""
+                            )
+                            semantic["subject_participant_key"] = subject_key
+                            semantic["subject_display_name"] = subject_display_name
+                            semantic["subject_source_keys"] = source_keys
+                            if subject_display_name:
+                                # The persisted person cue is a mutable display
+                                # label.  A bounded read must expose the display
+                                # name visible in that snapshot instead.
+                                semantic["person_cue"] = subject_display_name
+                            if not any(
+                                str(item.get("canonical_key") or "") == subject_key
+                                for item in result["participants"]
+                            ):
+                                result["participants"].append(
+                                    {
+                                        **visible_subject,
+                                        "participant_key": subject_key,
+                                        "candidate_basis": (
+                                            "semantic_subject_binding"
+                                        ),
+                                        "semantic_memory_id": int(row["id"]),
+                                        "source_keys": source_keys,
+                                        "score": score,
+                                    }
+                                )
+                        else:
+                            # A database foreign key is not sufficient evidence
+                            # inside a historical snapshot.  Keep the semantic
+                            # memory as a retrieval seed without exporting a
+                            # participant binding that was not yet visible.
+                            semantic.pop("subject_participant_id", None)
+                            semantic.pop("subject_participant_key", None)
+                        result["semantic_memories"].append(semantic)
                 elif owner_type == "plastic_edge" and owner_key.isdigit():
                     associations = self.query_plastic_associations(
                         umo=umo,

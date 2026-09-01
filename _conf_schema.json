@@ -19,7 +19,7 @@
     "type": "bool",
     "default": true,
     "obvious_hint": true,
-    "hint": "只读取本群 SQLite、稳定账号、原始消息、关系图和本地向量；回答前不调用第二个远程模型。"
+    "hint": "先读取本群 SQLite、稳定账号、原始消息、关系图和本地向量，再由已配置的记忆分析模型进行且仅进行一次证据阅读；不会修复重试、升级深挖或切换模型。"
   },
   "local_serving_timeout_seconds": {
     "description": "本地记忆异常卡死保护（秒）",
@@ -33,23 +33,22 @@
     "type": "int",
     "default": 12000,
     "condition": {"local_serving_enabled": true},
-    "hint": "仅显式历史回忆可使用这个上限；普通聊天仍硬限制为 3000 字符。按完整证据项压缩并公平覆盖不同历史片段，不会截断成缺少来源的半条事实。"
+    "hint": "限制一次 Reader 产出的 memory-surface 注入主模型的字符数。按完整证据项压缩并保留来源约束，不会截断成缺少来源的半条事实。"
   },
   "subconscious_enabled": {
     "description": "启用后台记忆整理",
     "type": "bool",
     "default": true,
     "obvious_hint": true,
-    "hint": "插件专属模型只在消息整理和反馈维护中运行，不进入 /chat 回答关键路径。"
+    "hint": "只控制后台消息整理和反馈维护；关闭它不会关闭回答前的一次证据 Reader，后者由“回答前注入本地记忆证据”单独控制。"
   },
   "subconscious_provider_id": {
-    "description": "记忆分析模型",
+    "description": "记忆分析与证据 Reader 模型",
     "type": "string",
     "default": "deepseek/deepseek-v4-flash",
     "_special": "select_provider",
     "obvious_hint": true,
-    "condition": {"subconscious_enabled": true},
-    "hint": "选择 AstrBot 已配置的聊天模型。它只负责后台整理和反馈，不会在回答前被调用。"
+    "hint": "选择 AstrBot 已配置的聊天模型。启用回答前记忆时，每次请求最多调用它一次；失败会记录错误并跳过记忆注入，不会修复重试、切换 provider 或阻止 AstrBot 自己回答。"
   },
   "distillation_thinking_mode": {
     "description": "记忆分析是否完整推理",
@@ -57,8 +56,7 @@
     "options": ["enabled", "disabled"],
     "default": "enabled",
     "obvious_hint": true,
-    "condition": {"subconscious_enabled": true},
-    "hint": "保持 enabled 可保留完整语义判断能力；disabled 只适合临时排障。"
+    "hint": "同时用于后台整理和回答前的单次证据 Reader。保持 enabled 可保留完整语义判断能力；disabled 只适合临时排障。"
   },
   "feedback_learning_enabled": {
     "description": "学习群友的后续反馈",
@@ -132,7 +130,7 @@
     "type": "int",
     "default": 500000,
     "condition": {"subconscious_enabled": true},
-    "hint": "只覆盖后台消息整理；回答前的本地检索不调用插件模型、Token 增量为 0。另不含反馈学习与一次性历史导入；0 表示不限。"
+    "hint": "只覆盖后台消息整理。回答前的一次证据 Reader 不受该后台额度阻断，其实际 usage 单独记录在调用账本；另不含反馈学习与一次性历史导入。0 表示后台整理不限。"
   },
   "feedback_daily_token_budget": {
     "description": "每群每日反馈学习额度",

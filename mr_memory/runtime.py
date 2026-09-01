@@ -418,6 +418,42 @@ def _materialized_sources(value: object) -> tuple[str, ...]:
     return tuple(sorted(found))[:32]
 
 
+def _materialized_semantic_statement(memory: Mapping[str, object]) -> str:
+    """Expose a stored semantic candidate without resolving its identity or truth."""
+
+    def field(value: object, *, limit: int, missing: str = "UNSPECIFIED") -> str:
+        normalized = " ".join(str(value or "").strip().split())
+        return normalized[:limit] if normalized else missing
+
+    subject_candidate = field(
+        memory.get("subject_candidate")
+        or memory.get("subject_text")
+        or memory.get("person_cue"),
+        limit=240,
+    )
+    predicate = field(
+        memory.get("predicate")
+        or memory.get("aspect_tag")
+        or memory.get("claim_type"),
+        limit=240,
+    )
+    epistemic_state = field(
+        memory.get("epistemic_state") or memory.get("epistemic_status"),
+        limit=64,
+    ).upper()
+    content = field(memory.get("content"), limit=1200)
+    payload = {
+        "subject_candidate": subject_candidate,
+        "predicate": predicate,
+        "epistemic_state": epistemic_state,
+        "content": content,
+    }
+    return (
+        "候选语义陈述（来源绑定；未作身份合并或事实裁决）："
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def materialize_reconstruction_packet(
     packet: Mapping[str, object],
     *,
@@ -478,18 +514,22 @@ def materialize_reconstruction_packet(
         memory = item.get("memory")
         memory = memory if isinstance(memory, Mapping) else {}
         status = str(memory.get("status") or "").upper()
-        epistemic = str(memory.get("epistemic_status") or "ASSERTED").upper()
+        epistemic = str(
+            memory.get("epistemic_state")
+            or memory.get("epistemic_status")
+            or "UNSPECIFIED"
+        ).upper()
         disposition = (
             "conflict"
             if status == "CONFLICTED" or epistemic == "CORRECTED"
             else (
                 "unresolved"
-                if epistemic in {"UNCERTAIN", "HEARSAY", "JOKE"}
+                if epistemic in {"UNSPECIFIED", "UNCERTAIN", "HEARSAY", "JOKE"}
                 else "claim"
             )
         )
         add(
-            memory.get("content"),
+            _materialized_semantic_statement(memory),
             item.get("evidence"),
             confidence=float(memory.get("confidence") or 0.65),
             disposition=disposition,

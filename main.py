@@ -49,10 +49,6 @@ from .mr_memory.feedback import (
     parse_feedback_decision,
 )
 from .mr_memory.maintenance import scoped_job_key
-from .mr_memory.local_serving import (
-    LOCAL_SERVING_SCHEMA_VERSION,
-    compile_local_serving_envelope,
-)
 from .mr_memory.identity import (
     build_request_identity_context,
     canonical_participant_key,
@@ -71,16 +67,15 @@ from .mr_memory.provider_compat import generate_with_enforced_options
 from .mr_memory.reader import (
     L2_READER_PROTOCOL,
     build_l2_reader_prompt,
-    build_single_repair_prompt,
     certificate_from_contract_turn,
     parse_l2_reader_response,
+    validate_certificate_source_bindings,
 )
 from .mr_memory.runtime import (
     FAST_RECONSTRUCTION_SYSTEM_PROMPT,
     FEEDBACK_BATCH_SYSTEM_PROMPT,
     feedback_packet_edge_ids,
     feedback_packet_evidence,
-    materialize_reconstruction_packet,
     parse_feedback_batch_plan,
     parse_reconstruction_plan,
     parse_structured_response,
@@ -180,11 +175,7 @@ class _LocalMemoryOutcome:
             self.envelope_text
             and self.operational_status == "COMPLETED"
             and self.semantic_status
-            in {
-                "EVIDENCE_AVAILABLE",
-                "IDENTITY_AMBIGUOUS",
-                "IDENTITY_UNRESOLVED",
-            }
+            in {"CERTIFIED", "PARTIAL", "SAFETY_ABSTAIN"}
         )
 
 
@@ -308,13 +299,38 @@ def _collect_source_keys(value: Any) -> set[str]:
     return found
 
 
+def _collect_full_message_source_keys(value: Any) -> set[str]:
+    """Collect sources whose packet row contains the original message payload."""
+
+    found: set[str] = set()
+    if isinstance(value, dict):
+        source_key = value.get("source_key")
+        if (
+            isinstance(source_key, str)
+            and source_key
+            and (
+                "plain_text" in value
+                or "components" in value
+            )
+        ):
+            found.add(source_key)
+        for item in value.values():
+            found.update(_collect_full_message_source_keys(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.update(_collect_full_message_source_keys(item))
+    return found
+
+
 def _collect_participant_keys(value: Any) -> set[str]:
     found: set[str] = set()
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"participant_key", "sender_participant_key"} and isinstance(
-                item, str
-            ):
+            if key in {
+                "participant_key",
+                "sender_participant_key",
+                "subject_participant_key",
+            } and isinstance(item, str):
                 if item:
                     found.add(item)
             elif key == "candidate_participant_keys" and isinstance(item, list):
@@ -343,6 +359,133 @@ def _collect_participant_keys(value: Any) -> set[str]:
         for item in value:
             found.update(_collect_participant_keys(item))
     return found
+
+
+def _collect_participant_keys_in_order(value: Any) -> list[str]:
+    """Collect host-bound participant keys without losing evidence order."""
+
+    found: list[str] = []
+
+    def add(item: object) -> None:
+        participant_key = str(item or "").strip()
+        if participant_key and participant_key not in found:
+            found.append(participant_key)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in {
+                    "participant_key",
+                    "sender_participant_key",
+                    "subject_participant_key",
+                } and isinstance(item, str):
+                    add(item)
+                elif key == "candidate_participant_keys" and isinstance(item, list):
+                    for participant_key in item:
+                        add(participant_key)
+                elif (
+                    key == "canonical_key"
+                    and isinstance(item, str)
+                    and any(
+                        marker in node
+                        for marker in (
+                            "account_id",
+                            "current_display_name",
+                            "subject_display_name",
+                            "platform_id",
+                        )
+                    )
+                ):
+                    add(item)
+                else:
+                    visit(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    visit(value)
+    return found
+
+
+def _participant_source_bindings(value: Any) -> dict[str, list[str]]:
+    """Bind participant candidates to the raw sources that expose them.
+
+    The result is an allowlist for the Evidence Reader, not an identity verdict.
+    A source inherited from a containing raw-message record may support nested
+    mention/reply participants; participant history and semantic subject records
+    may additionally bind to the source keys inside their own evidence subtree.
+    """
+
+    collected: dict[str, set[str]] = {}
+
+    def direct_sources(node: dict[str, Any]) -> set[str]:
+        sources: set[str] = set()
+        source_key = node.get("source_key")
+        if isinstance(source_key, str) and source_key:
+            sources.add(source_key)
+        for key, item in node.items():
+            if (
+                (key == "source_keys" or key.endswith("_source_keys"))
+                and isinstance(item, list)
+            ):
+                sources.update(str(source) for source in item if str(source))
+        return sources
+
+    def visit(node: Any, inherited_sources: set[str]) -> None:
+        if isinstance(node, dict):
+            local_sources = direct_sources(node)
+            effective_sources = {*inherited_sources, *local_sources}
+            participant_keys: set[str] = set()
+            for key in (
+                "participant_key",
+                "sender_participant_key",
+                "subject_participant_key",
+            ):
+                item = node.get(key)
+                if isinstance(item, str) and item:
+                    participant_keys.add(item)
+            canonical_key = node.get("canonical_key")
+            if (
+                isinstance(canonical_key, str)
+                and canonical_key
+                and any(
+                    marker in node
+                    for marker in (
+                        "account_id",
+                        "current_display_name",
+                        "subject_display_name",
+                        "platform_id",
+                    )
+                )
+            ):
+                participant_keys.add(canonical_key)
+            if participant_keys:
+                # Never grant a participant every source in an arbitrary
+                # subtree: sibling candidates can live under the same parent.
+                # Only relation-specific evidence containers are known to be
+                # exclusively about the participant carried by this node.
+                relation_sources: set[str] = set()
+                for relation_key in ("alias_observations", "messages"):
+                    relation_value = node.get(relation_key)
+                    if isinstance(relation_value, list):
+                        relation_sources.update(
+                            _collect_source_keys(relation_value)
+                        )
+                admissible = {*effective_sources, *relation_sources}
+                for participant_key in participant_keys:
+                    collected.setdefault(participant_key, set()).update(admissible)
+            for item in node.values():
+                visit(item, effective_sources)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item, inherited_sources)
+
+    visit(value, set())
+    return {
+        participant_key: sorted(source_keys)
+        for participant_key, source_keys in sorted(collected.items())
+        if source_keys
+    }
 
 
 def _request_snapshot_from_row(value: dict[str, object]) -> RequestSnapshot:
@@ -3386,13 +3529,13 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self._last_reader_model_revision = f"{provider_id}|model={provider_model}"
         reader_model_revision = self._last_reader_model_revision
         return {
-            # v6 adds snapshot-bound textual alias resolution and participant
-            # activity evidence to the exact-cue + embedding retrieval signals.
-            "retriever": "host-prefetch.snapshot.v6",
+            # v7 leaves nickname equivalence to the resident reader and adds
+            # source-bound semantic-subject/history/activity candidates.
+            "retriever": "host-prefetch.snapshot.v7",
             "embedding_model": (
                 self.embedding_model_name if self.embedding_enabled else "disabled"
             ),
-            "fusion_policy": "lexical-plus-embedding-plus-activity-plus-graph.v5",
+            "fusion_policy": "lexical-plus-embedding-plus-resident-reader.v6",
             # Bind certificates to the actual configured model when observable,
             # while retaining that revision through a transient lookup outage.
             # Provider ids alone are not guaranteed to be model-specific after
@@ -3402,20 +3545,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "certificate_schema": CERTIFICATE_SCHEMA_VERSION,
             "surface_compiler": SURFACE_SCHEMA_VERSION,
             "route_policy": policy.revision,
-        }
-
-    def _local_serving_inference_revision(self) -> dict[str, str]:
-        return {
-            "retriever": "host-local-serving.snapshot.v1",
-            "embedding_model": (
-                self.embedding_model_name if self.embedding_enabled else "disabled"
-            ),
-            "fusion_policy": "identity-plus-local-retrieval-plus-raw-sources.v1",
-            "reader_model": "astrbot-main-model",
-            "reader_protocol": LOCAL_SERVING_SCHEMA_VERSION,
-            "certificate_schema": "none",
-            "surface_compiler": LOCAL_SERVING_SCHEMA_VERSION,
-            "route_policy": "local-only.v1",
         }
 
     @staticmethod
@@ -3839,8 +3968,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 sender_name=normalized.sender_name,
                 content=normalized.content,
             )
-            identity_bindings = [request_identity_context["sender"]]
-            identity_bindings.extend(request_identity_context["mentions"])
+            # The current sender is already a host-bound subject in
+            # request_identity_context.  Do not automatically turn that sender
+            # into a retrieval seed: doing so floods ordinary queries with the
+            # requester's own history.  Structured mention/reply targets remain
+            # deterministic candidate anchors for the resident reader.
+            identity_bindings = list(request_identity_context["mentions"])
             reply_binding = request_identity_context.get("reply_target")
             if isinstance(reply_binding, dict) and reply_binding.get("account_id"):
                 identity_bindings.append(reply_binding)
@@ -3871,6 +4004,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     explicit_participants.append(dict(item))
             query_alias_resolution: dict[str, object] = {
                 "query": query,
+                "status": "NOT_PRE_RESOLVED",
+                "reader_required": True,
                 "ambiguous": False,
                 "participants": [],
                 "ambiguous_aliases": [],
@@ -4096,36 +4231,222 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             packet = dict(packet)
             packet["request_identity_context"] = request_identity_context
             packet["query_alias_resolution"] = query_alias_resolution
-            participant_activity: list[dict[str, object]] = []
-            if include_participant_activity:
-                for item in query_participants:
-                    if not isinstance(item, dict):
-                        continue
-                    participant_key = str(item.get("canonical_key") or "").strip()
-                    if not participant_key:
-                        continue
-                    activity = await service.query_participant_activity(
-                        umo=snapshot.umo,
-                        participant_key=participant_key,
-                        before_sent_at=snapshot.cutoff_at,
-                        message_upper_bound=snapshot.message_upper_bound,
-                        days=7,
-                        limit=64,
-                    )
-                    if activity.get("found") is True:
-                        participant_activity.append(activity)
-            packet["participant_activity"] = participant_activity
-            packet["reply_context"] = (
-                await service.message_for_source(
+
+            # The host retrieves source-bound possibilities and coverage facts;
+            # the resident reader remains the only component allowed to decide
+            # whether textual references denote the same person.  Reply lookup,
+            # candidate lookup and the exact frozen-snapshot message count are
+            # independent SQLite reads and can run together.
+            person_candidates_started = time.perf_counter()
+
+            async def reply_context_for_snapshot() -> dict[str, object] | None:
+                if not snapshot.reply_source_key:
+                    return None
+                return await service.message_for_source(
                     umo=snapshot.umo,
                     source_key=snapshot.reply_source_key,
                     before_sent_at=snapshot.cutoff_at,
                     message_upper_bound=snapshot.message_upper_bound,
                 )
-                if snapshot.reply_source_key
-                else None
+
+            (
+                person_reference_candidates,
+                snapshot_visible_message_total,
+                reply_context,
+            ) = await asyncio.gather(
+                service.query_person_reference_candidates(
+                    umo=snapshot.umo,
+                    text=query,
+                    before_sent_at=snapshot.cutoff_at,
+                    message_upper_bound=snapshot.message_upper_bound,
+                    limit=64,
+                ),
+                service.count_snapshot_messages(
+                    umo=snapshot.umo,
+                    before_sent_at=snapshot.cutoff_at,
+                    message_upper_bound=snapshot.message_upper_bound,
+                    exclude_source_key=snapshot.request_source_key,
+                ),
+                reply_context_for_snapshot(),
             )
-            packet["source_count"] = len(_collect_source_keys(packet))
+            if stage_elapsed_ms is not None:
+                stage_elapsed_ms["FULL_PERSON_CANDIDATES"] = (
+                    time.perf_counter() - person_candidates_started
+                ) * 1000
+            packet["person_reference_candidates"] = person_reference_candidates
+            packet["reply_context"] = reply_context
+
+            # Exclude every source already present before SQL LIMIT so the recent
+            # layer refills with genuinely new messages instead of returning a
+            # short page after Python-side deduplication.
+            recent_context_started = time.perf_counter()
+            preexisting_source_keys = _collect_source_keys(packet)
+            recent_context = await service.query_recent_context(
+                umo=snapshot.umo,
+                before_sent_at=snapshot.cutoff_at,
+                message_upper_bound=snapshot.message_upper_bound,
+                limit=24,
+                exclude_source_key=snapshot.request_source_key,
+                exclude_source_keys=sorted(preexisting_source_keys),
+            )
+            packet["recent_context"] = recent_context
+            if stage_elapsed_ms is not None:
+                stage_elapsed_ms["FULL_RECENT_CONTEXT"] = (
+                    time.perf_counter() - recent_context_started
+                ) * 1000
+
+            # Expand bounded history/activity for the most relevant candidates.
+            # Query-mentioned candidates come first, followed by structured and
+            # retrieved evidence order.  Every candidate still remains in the
+            # packet even when the optional context expansion is capped.
+            all_candidate_participant_keys: list[str] = []
+
+            def add_candidate_participant_keys(value: object) -> None:
+                for participant_key in _collect_participant_keys_in_order(value):
+                    if participant_key not in all_candidate_participant_keys:
+                        all_candidate_participant_keys.append(participant_key)
+
+            add_candidate_participant_keys(person_reference_candidates)
+            add_candidate_participant_keys(explicit_participants)
+            add_candidate_participant_keys(packet.get("semantic_evidence"))
+            add_candidate_participant_keys(packet.get("candidates"))
+            add_candidate_participant_keys(packet.get("expanded_episodes"))
+            participant_context_limit = max(
+                6,
+                min(12, int(self.embedding_top_k)),
+            )
+            candidate_participant_keys = all_candidate_participant_keys[
+                :participant_context_limit
+            ]
+
+            async def participant_context(
+                participant_key: str,
+            ) -> tuple[dict[str, object], dict[str, object]]:
+                history_task = asyncio.create_task(
+                    service.query_participant_history(
+                        umo=snapshot.umo,
+                        participant_key=participant_key,
+                        before_sent_at=snapshot.cutoff_at,
+                        message_upper_bound=snapshot.message_upper_bound,
+                        limit=12,
+                    )
+                )
+                activity_task = (
+                    asyncio.create_task(
+                        service.query_participant_activity(
+                            umo=snapshot.umo,
+                            participant_key=participant_key,
+                            before_sent_at=snapshot.cutoff_at,
+                            message_upper_bound=snapshot.message_upper_bound,
+                            days=7,
+                            limit=32,
+                        )
+                    )
+                    if include_participant_activity
+                    else None
+                )
+                try:
+                    history = await history_task
+                    activity = await activity_task if activity_task is not None else {}
+                except BaseException:
+                    for task in (history_task, activity_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(task for task in (history_task, activity_task) if task is not None),
+                        return_exceptions=True,
+                    )
+                    raise
+                return history, activity
+
+            participant_context_started = time.perf_counter()
+            participant_contexts = await asyncio.gather(
+                *(
+                    participant_context(participant_key)
+                    for participant_key in candidate_participant_keys
+                )
+            )
+            if stage_elapsed_ms is not None:
+                stage_elapsed_ms["FULL_PARTICIPANT_CONTEXT"] = (
+                    time.perf_counter() - participant_context_started
+                ) * 1000
+            packet["participant_history"] = [
+                history
+                for history, _activity in participant_contexts
+                if history.get("status") == "SOURCE_BACKED"
+            ]
+            packet["participant_activity"] = [
+                activity
+                for _history, activity in participant_contexts
+                if activity.get("found") is True
+            ]
+            packet["person_reasoning_candidates"] = {
+                "participant_keys": all_candidate_participant_keys,
+                "context_expanded_participant_keys": candidate_participant_keys,
+                "context_expansion_limit": participant_context_limit,
+                "context_expansion_truncated": (
+                    len(candidate_participant_keys)
+                    < len(all_candidate_participant_keys)
+                ),
+                "host_decision": "NONE",
+                "instruction": (
+                    "Resolve references jointly with all source-bound evidence; "
+                    "do not merge or split people from string similarity alone."
+                ),
+            }
+            packet_source_keys = _collect_source_keys(packet)
+            full_message_source_keys = _collect_full_message_source_keys(packet)
+            reference_coverage = person_reference_candidates.get("coverage")
+            if not isinstance(reference_coverage, dict):
+                reference_coverage = {}
+            reference_candidates_truncated = bool(
+                reference_coverage.get("truncated")
+            )
+            participant_context_truncated = (
+                len(candidate_participant_keys)
+                < len(all_candidate_participant_keys)
+            )
+            participant_history_truncated = sum(
+                1
+                for history in packet["participant_history"]
+                if bool(history.get("messages_truncated"))
+            )
+            participant_activity_truncated = sum(
+                1
+                for activity in packet["participant_activity"]
+                if bool(activity.get("messages_truncated"))
+            )
+            raw_history_complete = len(full_message_source_keys) >= int(
+                snapshot_visible_message_total
+            )
+            semantic_none_allowed = (
+                raw_history_complete
+                and not reference_candidates_truncated
+                and not participant_context_truncated
+                and participant_history_truncated == 0
+                and participant_activity_truncated == 0
+            )
+            packet["retrieval_coverage"] = {
+                "snapshot_visible_message_total": int(
+                    snapshot_visible_message_total
+                ),
+                "packet_unique_message_sources": len(packet_source_keys),
+                "packet_full_message_sources": len(full_message_source_keys),
+                "raw_history_complete": raw_history_complete,
+                "recent_context_limit": 24,
+                "recent_context_returned": len(recent_context),
+                "person_reference_coverage": dict(reference_coverage),
+                "participant_context_candidate_total": len(
+                    all_candidate_participant_keys
+                ),
+                "participant_context_selected": len(candidate_participant_keys),
+                "participant_context_truncated": participant_context_truncated,
+                "participant_history_truncated": participant_history_truncated,
+                "participant_activity_truncated": participant_activity_truncated,
+                "semantic_none_allowed": semantic_none_allowed,
+            }
+            packet["participant_source_keys"] = _participant_source_bindings(packet)
+            packet["source_count"] = len(packet_source_keys)
             packet_sha256 = stable_sha256(packet)
         source_keys = _collect_source_keys(packet)
         if finalize_packet or write_cache:
@@ -4295,7 +4616,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         snapshot: RequestSnapshot,
         source_keys: set[str],
         participant_keys: set[str],
+        allow_l3: bool = True,
+        enforce_budget: bool = True,
     ) -> tuple[EvidenceCertificateV2, bool, str, float]:
+        retrieval_coverage = packet.get("retrieval_coverage")
+        if not isinstance(retrieval_coverage, dict):
+            retrieval_coverage = {}
+        participant_source_keys = packet.get("participant_source_keys")
+        if not isinstance(participant_source_keys, dict):
+            participant_source_keys = {}
         request = build_l2_reader_prompt(
             query=query,
             evidence_packet=packet,
@@ -4304,6 +4633,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             allowed_participant_keys=sorted(participant_keys),
             pack_read_complete=True,
             packet_sha256=stable_sha256(packet),
+            allow_l3=allow_l3,
+            semantic_none_allowed=bool(
+                retrieval_coverage.get("semantic_none_allowed", False)
+            ),
+            participant_source_keys=participant_source_keys,
         )
         response, first_chunk_ms = await self._run_fast_reconstruction_with_ledger(
             provider=provider,
@@ -4311,55 +4645,20 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             run_id=run_id,
             prompt=request.user_prompt,
             system_prompt=request.system_prompt,
-            thinking_mode="disabled",
+            thinking_mode=self.distillation_thinking_mode,
             max_output_tokens=8192,
-            phase="certificate_reader",
-            usage_source="layered_l2_reader",
-            budget_umo=snapshot.umo,
+            phase="resident_evidence_reader",
+            usage_source="resident_reader_one_pass",
+            budget_umo=(snapshot.umo if enforce_budget else ""),
         )
-
-        def parse(value: str) -> EvidenceCertificateV2:
-            return parse_l2_reader_response(value, request)
-
-        repair_attempted = False
-        response_source = "completion"
-        try:
-            certificate = parse(
-                str(getattr(response, "completion_text", "") or "")
-            )
-        except ValueError as exc:
-            repair_attempted = True
-            invalid = str(getattr(response, "completion_text", "") or "")
-            repair = build_single_repair_prompt(
-                request,
-                invalid_response=invalid,
-                validation_error=exc,
-            )
-            response, repair_first_chunk_ms = (
-                await self._run_fast_reconstruction_with_ledger(
-                    provider=provider,
-                    service=service,
-                    run_id=run_id,
-                    prompt=repair.user_prompt,
-                    call_index=1,
-                    thinking_mode="disabled",
-                    max_output_tokens=8192,
-                    system_prompt=repair.system_prompt,
-                    phase="certificate_reader",
-                    usage_source="layered_l2_repair_once",
-                    budget_umo=snapshot.umo,
-                )
-            )
-            if first_chunk_ms <= 0:
-                first_chunk_ms = repair_first_chunk_ms
-
-            def parse_repair(value: str) -> EvidenceCertificateV2:
-                return parse_l2_reader_response(value, repair)
-
-            certificate = parse_repair(
-                str(getattr(response, "completion_text", "") or "")
-            )
-        return certificate, repair_attempted, response_source, first_chunk_ms
+        # This reader is the single semantic pass for the request.  A malformed
+        # response is an operational error: do not launch a repair call, switch
+        # provider, or relabel it as missing memory.
+        certificate = parse_l2_reader_response(
+            str(getattr(response, "completion_text", "") or ""),
+            request,
+        )
+        return certificate, False, "completion", first_chunk_ms
 
     async def _run_l3_certificate(
         self,
@@ -4446,6 +4745,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             expanded_participants.update(
                 _collect_participant_keys(item.get("result"))
             )
+        expanded_participant_sources = _participant_source_bindings(
+            {
+                "initial_packet": packet,
+                "retrieval_results": [
+                    item.get("result") for item in result.retrieval_results
+                ],
+            }
+        )
         await service.audit_snapshot_sources(
             snapshot_id=snapshot.snapshot_id,
             umo=snapshot.umo,
@@ -4473,6 +4780,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             packet_sha256=certificate_packet_sha256,
             allowed_source_keys=sorted(expanded_sources),
             allowed_participant_keys=sorted(expanded_participants),
+            participant_source_keys=expanded_participant_sources,
             stop_reason=result.stop_reason,
             pack_read_complete=True,
         )
@@ -4553,6 +4861,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         certificate_key: str,
         packet_sha256: str,
         participant_keys: set[str],
+        participant_source_keys: dict[str, list[str]],
     ) -> tuple[EvidenceCertificateV2, tuple[int, ...], tuple[int, ...]] | None:
         row = await service.get_memory_certificate(
             umo=snapshot.umo,
@@ -4615,6 +4924,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 allowed_participant_keys=participants,
                 pack_read_complete=True,
                 host_validated=True,
+            )
+            validate_certificate_source_bindings(
+                certificate,
+                participant_source_keys=participant_source_keys,
             )
             await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
             dependencies = list(row.get("dependencies") or [])
@@ -5260,326 +5573,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             detail="Daily online token budget is exhausted.",
         )
 
-    @staticmethod
-    def _local_direct_identity_question(
-        query: str,
-        *,
-        has_structured_reference: bool = False,
-    ) -> bool:
-        return MrMemoryPlugin._explicit_identity_intent(
-            query,
-            has_structured_reference=has_structured_reference,
-        )
-
-    @staticmethod
-    def _local_direct_reference_question(query: str) -> bool:
-        """Recognize short deictic questions that are anchored by a reply/mention.
-
-        The predicate is deliberately narrower than generic words such as
-        ``什么`` or ``喜欢``.  The caller must additionally prove that the
-        current event contains a structured reply or mention; text alone never
-        manufactures a referent.
-        """
-
-        normalized = " ".join(str(query or "").casefold().split())
-        normalized = re.sub(
-            r"^/chat(?:@\S+)?(?=\s|$)\s*",
-            "",
-            normalized,
-            count=1,
-        ).strip()
-        if not normalized or len(normalized) > 80:
-            return False
-        deictic_cues = (
-            "这人",
-            "这个人",
-            "那人",
-            "那个人",
-            "这位",
-            "那位",
-            "此人",
-            "this person",
-            "that person",
-        )
-        referenced_sender = bool(
-            re.search(
-                r"(?:发|发送|说|讲|贴|用|使用)(?:了|的)?"
-                r"(?:这|那|此|这个|那个|这条|那条|这张|那张)"
-                r".{0,24}?的人",
-                normalized,
-            )
-        )
-        reference_questions = (
-            "是谁",
-            "什么人",
-            "啥人",
-            "什么物种",
-            "啥物种",
-            "什么品种",
-            "啥品种",
-            "什么动物",
-            "啥动物",
-            "什么猪",
-            "啥猪",
-            "哪种猪",
-            "who is",
-            "what species",
-            "what breed",
-        )
-        has_reference = referenced_sender or any(
-            cue in normalized for cue in deictic_cues
-        )
-        return has_reference and any(cue in normalized for cue in reference_questions)
-
-    async def _local_identity_evidence_packet(
-        self,
-        *,
-        service: MemoryService,
-        snapshot: RequestSnapshot,
-        normalized: NormalizedMessage,
-        query: str,
-        include_participant_activity: bool,
-    ) -> tuple[dict[str, object], str, set[str], set[str], str]:
-        request_identity_context = build_request_identity_context(
-            platform_id=normalized.platform_id,
-            sender_id=normalized.sender_id,
-            sender_name=normalized.sender_name,
-            content=normalized.content,
-        )
-        reply_context = (
-            await service.message_for_source(
-                umo=snapshot.umo,
-                source_key=snapshot.reply_source_key,
-                before_sent_at=snapshot.cutoff_at,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
-            if snapshot.reply_source_key
-            else None
-        )
-        reply_text = (
-            str(reply_context.get("plain_text") or "")[:2000]
-            if isinstance(reply_context, dict)
-            else ""
-        )
-        query_alias_resolution = await service.resolve_query_participants(
-            umo=snapshot.umo,
-            query=query,
-            reference_text=reply_text,
-            before_sent_at=snapshot.cutoff_at,
-            message_upper_bound=snapshot.message_upper_bound,
-            limit=12,
-        )
-        participants_by_key: dict[str, dict[str, object]] = {}
-        history_participant_keys: set[str] = set()
-        history_account_ids: set[str] = set()
-        identity_bindings: list[dict[str, object]] = []
-        sender_binding = request_identity_context.get("sender")
-        if isinstance(sender_binding, dict):
-            identity_bindings.append(sender_binding)
-        mentions = request_identity_context.get("mentions")
-        if isinstance(mentions, list):
-            for item in mentions:
-                if not isinstance(item, dict):
-                    continue
-                identity_bindings.append(item)
-                account_id = str(item.get("account_id") or "").strip()
-                if account_id:
-                    history_account_ids.add(account_id)
-        reply_binding = request_identity_context.get("reply_target")
-        if isinstance(reply_binding, dict) and reply_binding.get("account_id"):
-            identity_bindings.append(reply_binding)
-            history_account_ids.add(str(reply_binding["account_id"]).strip())
-        for binding in identity_bindings:
-            account_id = str(binding.get("account_id") or "").strip()
-            if not account_id:
-                continue
-            resolved = await service.resolve_participants(
-                umo=snapshot.umo,
-                reference=account_id,
-                limit=4,
-                before_sent_at=snapshot.cutoff_at,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
-            participants = resolved.get("participants")
-            for item in participants if isinstance(participants, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                participant_key = str(item.get("canonical_key") or "").strip()
-                if participant_key:
-                    participants_by_key[participant_key] = dict(item)
-                    if account_id in history_account_ids:
-                        history_participant_keys.add(participant_key)
-        query_participants = query_alias_resolution.get("participants")
-        if not isinstance(query_participants, list):
-            query_participants = []
-        for item in query_participants:
-            if not isinstance(item, dict):
-                continue
-            participant_key = str(item.get("canonical_key") or "").strip()
-            if participant_key:
-                participants_by_key[participant_key] = dict(item)
-                history_participant_keys.add(participant_key)
-
-        participant_activity: list[dict[str, object]] = []
-        if include_participant_activity:
-            for item in query_participants:
-                if not isinstance(item, dict):
-                    continue
-                participant_key = str(item.get("canonical_key") or "").strip()
-                if not participant_key:
-                    continue
-                activity = await service.query_participant_activity(
-                    umo=snapshot.umo,
-                    participant_key=participant_key,
-                    before_sent_at=snapshot.cutoff_at,
-                    message_upper_bound=snapshot.message_upper_bound,
-                    days=7,
-                    limit=64,
-                )
-                if activity.get("found") is True:
-                    participant_activity.append(activity)
-        participant_history: list[dict[str, object]] = []
-        for participant_key in sorted(history_participant_keys):
-            participant_history.append(
-                await service.query_participant_history(
-                    umo=snapshot.umo,
-                    participant_key=participant_key,
-                    before_sent_at=snapshot.cutoff_at,
-                    message_upper_bound=snapshot.message_upper_bound,
-                    limit=8,
-                )
-            )
-        identity_aliases: list[str] = []
-        seen_identity_aliases: set[str] = set()
-        query_mentions = query_alias_resolution.get("mentions")
-        for item in query_mentions if isinstance(query_mentions, list) else []:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("status") or "").upper() not in {
-                "UNRESOLVED",
-                "AMBIGUOUS",
-            }:
-                continue
-            for field in ("alias", "normalized_alias"):
-                alias = str(item.get(field) or "").strip()
-                normalized_alias = alias.casefold()
-                if alias and normalized_alias not in seen_identity_aliases:
-                    seen_identity_aliases.add(normalized_alias)
-                    identity_aliases.append(alias)
-        identity_semantic_rows = await service.query_identity_semantic_evidence(
-            umo=snapshot.umo,
-            aliases=identity_aliases,
-            before_sent_at=snapshot.cutoff_at,
-            message_upper_bound=snapshot.message_upper_bound,
-            limit=12,
-        )
-        identity_semantic_candidates: list[dict[str, object]] = []
-        identity_semantic_evidence: list[dict[str, object]] = []
-        for item in identity_semantic_rows:
-            if not isinstance(item, dict):
-                continue
-            memory = {
-                key: value
-                for key, value in item.items()
-                if key not in {"sources", "source_count_total", "sources_truncated"}
-            }
-            sources = item.get("sources")
-            sources = sources if isinstance(sources, list) else []
-            identity_semantic_candidates.append(memory)
-            identity_semantic_evidence.append(
-                {
-                    "memory": memory,
-                    "evidence": [
-                        dict(source)
-                        for source in sources
-                        if isinstance(source, dict)
-                    ],
-                }
-            )
-        feedback_candidates: list[dict[str, object]] = []
-        if self.feedback_learning_enabled:
-            raw_feedback_candidates = await service.feedback_hypothesis_candidates(
-                umo=snapshot.umo,
-                sender_id=normalized.sender_id,
-                at=snapshot.cutoff_at,
-                limit=16,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
-            normalized_query = str(query or "").casefold()
-            for candidate in raw_feedback_candidates:
-                cues = candidate.get("trigger_cues")
-                cues = cues if isinstance(cues, list) else []
-                mode = str(candidate.get("activation_mode") or "semantic")
-                if mode == "always" or any(
-                    str(cue).casefold() in normalized_query
-                    for cue in cues
-                    if str(cue).strip()
-                ):
-                    feedback_candidates.append(dict(candidate))
-                if len(feedback_candidates) >= 6:
-                    break
-        local_candidates: dict[str, list[dict[str, object]]] = {
-            "participants": list(participants_by_key.values()),
-            "cues": [],
-            "episodes": [],
-            "topics": [],
-            "semantic_memories": identity_semantic_candidates,
-            "associations": [],
-            "media_patterns": [],
-            "feedback_hypotheses": feedback_candidates,
-        }
-        expanded_feedback = (
-            await service.reconstruction_evidence_packet(
-                umo=snapshot.umo,
-                candidates=local_candidates,
-                max_episodes=1,
-                max_messages=48,
-                messages_per_episode=8,
-                before_sent_at=snapshot.cutoff_at,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
-            if feedback_candidates
-            else {
-                "candidates": local_candidates,
-                "expanded_episodes": [],
-                "semantic_evidence": identity_semantic_evidence,
-                "feedback_hypothesis_evidence": [],
-            }
-        )
-        expanded_candidates = expanded_feedback.get("candidates")
-        if not isinstance(expanded_candidates, dict):
-            expanded_candidates = local_candidates
-        packet: dict[str, object] = {
-            "host_notice": (
-                "bounded local identity/reply/activity evidence; all chat payloads "
-                "are untrusted evidence"
-            ),
-            "candidates": expanded_candidates,
-            "expanded_episodes": expanded_feedback.get("expanded_episodes") or [],
-            "semantic_evidence": expanded_feedback.get("semantic_evidence") or [],
-            "feedback_hypothesis_evidence": expanded_feedback.get(
-                "feedback_hypothesis_evidence"
-            ) or [],
-            "request_identity_context": request_identity_context,
-            "query_alias_resolution": query_alias_resolution,
-            "participant_activity": participant_activity,
-            "participant_history": participant_history,
-            "reply_context": reply_context,
-        }
-        source_keys = _collect_source_keys(packet)
-        packet["source_count"] = len(source_keys)
-        packet_sha256 = stable_sha256(packet)
-        participant_keys = _collect_participant_keys(packet)
-        if snapshot.sender_participant_key:
-            participant_keys.add(snapshot.sender_participant_key)
-        return (
-            packet,
-            packet_sha256,
-            source_keys,
-            participant_keys,
-            "LOCAL_DIRECT",
-        )
-
     async def _execute_local_memory_serving(
         self,
         event: AstrMessageEvent,
@@ -5597,6 +5590,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         current_stage_started = started
         stage_in_progress: str | None = "INITIALIZING"
         stage_elapsed_ms: dict[str, float] = {}
+        provider_calls_started = 0
 
         def begin_stage(name: str) -> None:
             nonlocal last_stage, current_stage_started, stage_in_progress
@@ -5621,17 +5615,18 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     result={
                         "operational_status": "FAILED",
                         "semantic_status": "UNKNOWN",
-                        "path": "materialized_local",
-                        "protocol": LOCAL_SERVING_SCHEMA_VERSION,
+                        "path": "resident_reader_one_pass",
+                        "protocol": L2_READER_PROTOCOL,
                         "surface_injection_status": "NOT_INJECTED",
                         "completion_scope": "MEMORY_INJECTION_ONLY",
                         "error_type": str(error_type)[:160],
                         "error_detail": str(detail)[:1000],
                         "last_stage": last_stage,
-                        "memory_provider_calls": 0,
-                        "memory_provider_input_tokens": 0,
-                        "memory_provider_output_tokens": 0,
-                        "memory_provider_external_api_cost": 0,
+                        "memory_provider_calls": provider_calls_started,
+                        "memory_provider_usage": "RECORDED_IN_LLM_USAGE_EVENTS",
+                        "memory_provider_external_api_cost": (
+                            "UNKNOWN_NO_BILLING_EVIDENCE"
+                        ),
                         "main_model_incremental_cost": "UNKNOWN_NOT_MEASURED",
                         "elapsed_ms": (time.perf_counter() - started) * 1000,
                         "hang_guard_seconds": self.local_serving_timeout_seconds,
@@ -5673,6 +5668,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     operational_status="FAILED",
                     detail="The local memory query is empty.",
                 )
+            if not self.subconscious_provider_id:
+                return _LocalMemoryOutcome(
+                    operational_status="PROVIDER_UNAVAILABLE",
+                    detail="No resident Evidence Reader provider is configured.",
+                )
+            provider = self.context.get_provider_by_id(self.subconscious_provider_id)
+            if provider is None:
+                return _LocalMemoryOutcome(
+                    operational_status="PROVIDER_UNAVAILABLE",
+                    detail="The configured resident Evidence Reader provider is unavailable.",
+                )
             # This is only an abnormal-hang guard for the complete local operation.
             # Latency policy is observational: stage timings below expose slow work
             # without turning an ordinary slow retrieval into missing memory.
@@ -5711,9 +5717,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     force=False,
                     has_structured_reference=has_structured_reference,
                 )
-                include_participant_activity = self._runtime_activity_analysis(
-                    bounded_query
-                )
                 begin_stage("INTERACTION_TRACE")
                 if self.feedback_learning_enabled:
                     await self._begin_interaction_trace(
@@ -5741,8 +5744,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     query_sha256=_stable_hash(bounded_query),
                     metadata={
                         "scope_id": scope.storage_id,
-                        "path": "materialized_local",
-                        "protocol": LOCAL_SERVING_SCHEMA_VERSION,
+                        "path": "resident_reader_one_pass",
+                        "protocol": L2_READER_PROTOCOL,
                         "trace_id": interaction_trace_id,
                         "request_kind": request_kind,
                         "completion_scope": "MEMORY_INJECTION_ONLY",
@@ -5758,175 +5761,131 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     service=service,
                     normalized=normalized,
                     query=bounded_query,
-                    provider=None,
+                    provider=provider,
                     policy=policy,
-                    inference_revision=self._local_serving_inference_revision(),
                 )
                 finish_stage("SNAPSHOT_CAPTURE")
                 last_stage = "SNAPSHOT_CAPTURED"
-                direct: tuple[
-                    dict[str, object],
-                    str,
-                    set[str],
-                    set[str],
-                    str,
-                ] | None = None
-                identity_question = self._local_direct_identity_question(
-                    bounded_query,
-                    has_structured_reference=has_structured_reference,
-                )
-                reference_question = self._local_direct_reference_question(
-                    bounded_query
-                )
-                use_direct = bool(include_participant_activity)
-                if (
-                    include_participant_activity
-                    or identity_question
-                    or (reference_question and has_structured_reference)
-                ):
-                    begin_stage("DIRECT_RETRIEVAL")
-                    direct = await self._local_identity_evidence_packet(
-                        service=service,
-                        snapshot=snapshot,
-                        normalized=normalized,
-                        query=bounded_query,
-                        include_participant_activity=include_participant_activity,
-                    )
-                    finish_stage("DIRECT_RETRIEVAL")
-                    direct_packet = direct[0]
-                    query_resolution = direct_packet.get("query_alias_resolution")
-                    resolved_people = (
-                        query_resolution.get("participants")
-                        if isinstance(query_resolution, dict)
-                        else []
-                    )
-                    ambiguous_people = bool(
-                        query_resolution.get("ambiguous")
-                        if isinstance(query_resolution, dict)
-                        else False
-                    )
-                    classified_mentions = (
-                        query_resolution.get("mentions")
-                        if isinstance(query_resolution, dict)
-                        and isinstance(query_resolution.get("mentions"), list)
-                        else []
-                    )
-                    packet_identity = direct_packet.get("request_identity_context")
-                    packet_has_structured_reference = bool(
-                        isinstance(packet_identity, dict)
-                        and (
-                            packet_identity.get("mentions")
-                            or packet_identity.get("reply_target")
+                begin_stage("FULL_RETRIEVAL_PRECHECK")
+                if self.embedding_enabled:
+                    if not self._embedding_preload_complete:
+                        raise RuntimeError(
+                            "local embedding preload is still in progress"
                         )
-                    )
-                    use_direct = bool(
-                        include_participant_activity
-                        or (
-                            (identity_question or reference_question)
-                            and (
-                                resolved_people
-                                or ambiguous_people
-                                or classified_mentions
-                                or packet_has_structured_reference
-                            )
-                        )
-                    )
-                if use_direct:
-                    assert direct is not None
-                    (
-                        packet,
-                        packet_sha256,
-                        _packet_source_keys,
-                        _participant_keys,
-                        pack_cache_layer,
-                    ) = direct
-                else:
-                    begin_stage("FULL_RETRIEVAL_PRECHECK")
-                    if self.embedding_enabled:
-                        if not self._embedding_preload_complete:
-                            raise RuntimeError(
-                                "local embedding preload is still in progress"
-                            )
-                        if self._embedding_preload_error:
-                            raise RuntimeError(self._embedding_preload_error)
-                    finish_stage("FULL_RETRIEVAL_PRECHECK")
-                    begin_stage("FULL_RETRIEVAL")
-                    (
-                        packet,
-                        packet_sha256,
-                        _packet_source_keys,
-                        _participant_keys,
-                        pack_cache_layer,
-                    ) = await self._layered_evidence_packet(
-                        service=service,
-                        snapshot=snapshot,
-                        normalized=normalized,
-                        query=bounded_query,
-                        resolve_query_aliases=True,
-                        include_participant_activity=False,
-                        use_cache=False,
-                        finalize_packet=False,
-                        stage_elapsed_ms=stage_elapsed_ms,
-                    )
-                    finish_stage("FULL_RETRIEVAL")
-                last_stage = "PACKET_RETRIEVED"
-                begin_stage("PACKET_MATERIALIZE")
-                materialized = materialize_reconstruction_packet(
+                    if self._embedding_preload_error:
+                        raise RuntimeError(self._embedding_preload_error)
+                finish_stage("FULL_RETRIEVAL_PRECHECK")
+                begin_stage("FULL_RETRIEVAL")
+                (
                     packet,
+                    packet_sha256,
+                    _packet_source_keys,
+                    _participant_keys,
+                    _pack_cache_layer,
+                ) = await self._layered_evidence_packet(
+                    service=service,
+                    snapshot=snapshot,
+                    normalized=normalized,
                     query=bounded_query,
-                    max_items=self.local_serving_max_items,
+                    # The legacy textual resolver made the semantic identity
+                    # decision before memory reasoning.  Online serving now only
+                    # retrieves candidates; the one resident reader below jointly
+                    # resolves references and memory meaning.
+                    resolve_query_aliases=False,
+                    include_participant_activity=True,
+                    use_cache=False,
+                    finalize_packet=False,
+                    stage_elapsed_ms=stage_elapsed_ms,
                 )
-                finish_stage("PACKET_MATERIALIZE")
-                last_stage = "PACKET_MATERIALIZED"
-                begin_stage("ENVELOPE_COMPILE")
-                envelope = compile_local_serving_envelope(
-                    packet,
-                    materialized,
-                    request_kind=request_kind,
-                    # Ordinary chat keeps the small prompt budget even when it
-                    # needs full local retrieval. Explicit historical
-                    # reconstruction may use the configured larger budget so
-                    # distinct episodes are not silently collapsed into one
-                    # recent slice.
-                    max_chars=(
-                        min(self.local_serving_max_chars, 3000)
-                        if request_kind == "CHAT"
-                        else self.local_serving_max_chars
-                    ),
-                )
-                finish_stage("ENVELOPE_COMPILE")
-                last_stage = "ENVELOPE_COMPILED"
+                finish_stage("FULL_RETRIEVAL")
+                last_stage = "PACKET_RETRIEVED"
                 begin_stage("SOURCE_AUDIT")
                 await service.audit_snapshot_sources(
                     snapshot_id=snapshot.snapshot_id,
                     umo=snapshot.umo,
-                    # Audit every source that influenced retrieval and
-                    # materialization, including items later omitted by the
-                    # prompt budget.  The envelope is only a selected subset.
                     source_keys=_packet_source_keys,
                     fail_closed=True,
                 )
                 await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
                 finish_stage("SOURCE_AUDIT")
                 last_stage = "SOURCES_AUDITED"
-                envelope_value = json.loads(envelope.json_text)
-                memory_brief = envelope_value.get("memory_brief")
-                reconstruction_elapsed_ms = (
-                    time.perf_counter() - started
-                ) * 1000
+
+                begin_stage("RESIDENT_READER")
+                provider_calls_started = 1
+                (
+                    certificate,
+                    repair_attempted,
+                    _response_source,
+                    first_chunk_ms,
+                ) = await self._read_l2_certificate(
+                    provider=provider,
+                    service=service,
+                    run_id=run_id,
+                    query=bounded_query,
+                    packet=packet,
+                    snapshot=snapshot,
+                    source_keys=_packet_source_keys,
+                    participant_keys=_participant_keys,
+                    allow_l3=False,
+                    enforce_budget=False,
+                )
+                finish_stage("RESIDENT_READER")
+                stage_elapsed_ms["RESIDENT_READER_TTFB"] = first_chunk_ms
+                last_stage = "READER_COMPLETED"
+                if repair_attempted:
+                    raise RuntimeError(
+                        "resident Evidence Reader attempted a forbidden repair call"
+                    )
+                if certificate.status == "REQUEST_L3":
+                    raise RuntimeError(
+                        "resident Evidence Reader requested unavailable L3 escalation"
+                    )
+                await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
+
+                surface_text = ""
+                surface_omitted_optional = 0
+                surface_source_keys: set[str] = set()
+                if certificate.status != "SEMANTIC_NONE":
+                    begin_stage("SURFACE_COMPILE")
+                    surface_packet = compile_surface_packet(
+                        certificate,
+                        max_chars=self.local_serving_max_chars,
+                    )
+                    validate_surface_packet(surface_packet, certificate)
+                    surface_text = surface_packet.text
+                    surface_omitted_optional = surface_packet.omitted_optional
+                    surface_source_keys = _collect_source_keys(
+                        surface_packet.as_dict()
+                    )
+                    finish_stage("SURFACE_COMPILE")
+                    last_stage = "SURFACE_COMPILED"
+
+                reconstruction_elapsed_ms = (time.perf_counter() - started) * 1000
                 begin_stage("LEDGER_RECORD")
                 await service.record_reconstruction_step(
                     run_id=run_id,
                     step_index=0,
-                    tool_name="materialized_local_evidence",
+                    tool_name="resident_reader_one_pass",
                     arguments={
                         "request_kind": request_kind,
                         "packet_sha256": packet_sha256,
-                        "cache_layer": pack_cache_layer,
-                        "protocol": LOCAL_SERVING_SCHEMA_VERSION,
+                        "retrieval_mode": "FRESH",
+                        "protocol": L2_READER_PROTOCOL,
+                        "reader_calls": 1,
+                        "repair_attempted": False,
+                        "l3_attempted": False,
                     },
-                    evidence_keys=list(envelope.source_keys),
-                    result_text=envelope.json_text,
+                    evidence_keys=sorted(_packet_source_keys)[:160],
+                    # Never persist the reader's semantic answer here.  Usage and
+                    # phase timing are auditable independently in the ledger.
+                    result_text=json.dumps(
+                        {
+                            "operational_status": "COMPLETED",
+                            "semantic_status": certificate.status,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                     elapsed_ms=reconstruction_elapsed_ms,
                 )
                 finish_stage("LEDGER_RECORD")
@@ -5934,28 +5893,37 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 ledger_result: dict[str, object] = {
                     "operational_status": "COMPLETED",
-                    "semantic_status": envelope.semantic_status,
-                    "path": "materialized_local",
-                    "protocol": LOCAL_SERVING_SCHEMA_VERSION,
+                    "semantic_status": certificate.status,
+                    "path": "resident_reader_one_pass",
+                    "protocol": L2_READER_PROTOCOL,
                     "request_kind": request_kind,
                     "snapshot_id": snapshot.snapshot_id,
                     "snapshot_sha256": snapshot.digest,
                     "packet_sha256": packet_sha256,
-                    "cache_layer": pack_cache_layer,
-                    "memory_brief": memory_brief,
-                    "visited_source_keys": list(envelope.source_keys),
-                    "selected_edge_ids": list(envelope.edge_ids),
-                    "selected_hypothesis_ids": list(envelope.hypothesis_ids),
+                    "retrieval_mode": "FRESH",
+                    "cache_layer": "NONE",
+                    "visited_source_keys": sorted(_packet_source_keys),
+                    "presented_source_keys": sorted(surface_source_keys),
+                    # The resident Reader certificate and compiled surface do not
+                    # identify graph edge/hypothesis rows.  Do not misreport raw
+                    # retrieval candidates as evidence actually shown downstream.
+                    "selected_edge_ids": [],
+                    "selected_hypothesis_ids": [],
                     "trace_id": interaction_trace_id,
-                    "no_local_evidence": not envelope.usable,
+                    "no_local_evidence": certificate.status == "SEMANTIC_NONE",
                     "surface_injection_status": "COMPILED_NOT_YET_INJECTED",
                     "completion_scope": "MEMORY_INJECTION_ONLY",
-                    "envelope_chars": len(envelope.json_text),
-                    "envelope_truncated": envelope.truncated,
-                    "memory_provider_calls": 0,
-                    "memory_provider_input_tokens": 0,
-                    "memory_provider_output_tokens": 0,
-                    "memory_provider_external_api_cost": 0,
+                    "memory_provider_calls": 1,
+                    "memory_provider_usage": "RECORDED_IN_LLM_USAGE_EVENTS",
+                    "memory_provider_external_api_cost": (
+                        "UNKNOWN_NO_BILLING_EVIDENCE"
+                    ),
+                    "reader_first_chunk_ms": first_chunk_ms,
+                    "surface_chars": len(surface_text),
+                    "surface_omitted_optional": surface_omitted_optional,
+                    "surface_truncated": surface_omitted_optional > 0,
+                    "repair_attempted": False,
+                    "l3_attempted": False,
                     "main_model_incremental_cost": "UNKNOWN_NOT_MEASURED",
                     "elapsed_ms": elapsed_ms,
                     "hang_guard_seconds": self.local_serving_timeout_seconds,
@@ -5965,14 +5933,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 last_stage = "COMPLETED"
                 return _LocalMemoryOutcome(
                     operational_status="COMPLETED",
-                    semantic_status=envelope.semantic_status,
-                    envelope_text=envelope.json_text,
+                    semantic_status=certificate.status,
+                    envelope_text=surface_text,
                     run_id=run_id,
                     elapsed_ms=elapsed_ms,
-                    source_keys=envelope.source_keys,
-                    selected_edge_ids=envelope.edge_ids,
-                    selected_hypothesis_ids=envelope.hypothesis_ids,
-                    truncated=envelope.truncated,
+                    source_keys=tuple(sorted(surface_source_keys)),
+                    selected_edge_ids=(),
+                    selected_hypothesis_ids=(),
+                    truncated=surface_omitted_optional > 0,
                     ledger_result=ledger_result,
                 )
         except asyncio.CancelledError:
@@ -6203,6 +6171,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 certificate_key=certificate_key,
                 packet_sha256=packet_sha256,
                 participant_keys=participant_keys,
+                participant_source_keys=_participant_source_bindings(packet),
             )
         )
         cached = cached_entry[0] if cached_entry is not None else None
@@ -7538,7 +7507,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
     async def inject_subconscious_memory(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """Inject one bounded, source-backed local memory envelope."""
+        """Inject one bounded surface compiled from the resident Evidence Reader."""
         try:
             scope = self._group_scope(event)
         except GroupScopeError:
@@ -7633,10 +7602,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 )
             return
         try:
-            envelope_value = json.loads(outcome.envelope_text)
+            surface_value = json.loads(outcome.envelope_text)
         except json.JSONDecodeError as exc:
             logger.error(
-                "MR Memory rejected its invalid local envelope; no memory injected | "
+                "MR Memory rejected its invalid resident-reader surface; no memory "
+                "injected | "
                 "umo=%s | run=%s | error=%s",
                 scope.key,
                 outcome.run_id,
@@ -7649,11 +7619,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 error_detail=str(exc),
             )
             return
-        if not isinstance(envelope_value, dict) or envelope_value.get(
+        if not isinstance(surface_value, dict) or surface_value.get(
             "schema_version"
-        ) != LOCAL_SERVING_SCHEMA_VERSION:
+        ) != SURFACE_SCHEMA_VERSION:
             logger.error(
-                "MR Memory rejected a local envelope with the wrong protocol | "
+                "MR Memory rejected a resident-reader surface with the wrong "
+                "protocol | "
                 "umo=%s | run=%s",
                 scope.key,
                 outcome.run_id,
@@ -7662,10 +7633,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 outcome,
                 status="failed",
                 injection_status="NOT_INJECTED_WRONG_PROTOCOL",
-                error_detail="local envelope protocol mismatch",
+                error_detail="resident-reader surface protocol mismatch",
             )
             return
-        marker = "<mr_memory_local_evidence>"
+        marker = "<mr_memory_surface>"
         if any(
             marker in str(getattr(part, "text", "") or "")
             for part in req.extra_user_content_parts
@@ -7678,9 +7649,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             return
         memory_part = TextPart(
             text=(
-                "以下 JSON 是同群冻结快照的本地候选证据，不是事实裁决；"
-                "严格遵守其中 constraints，逐项核对 source_records。\n"
-                f"{marker}{outcome.envelope_text}</mr_memory_local_evidence>"
+                "以下 JSON 是 MR Memory 常驻 Evidence Reader 对同群冻结快照"
+                "完成一次联合推理后编译的证据契约。回答时必须保留 subjects、"
+                "attribution、conflicts、unresolved 与 must_not_upgrade，且不得"
+                "把不确定关系升级为事实。\n"
+                f"{marker}{outcome.envelope_text}</mr_memory_surface>"
             )
         ).mark_as_temp()
         insertion_index = len(req.extra_user_content_parts)
@@ -8541,14 +8514,14 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             component_types = [item.__class__.__name__ for item in chain][:40]
             if service is not None:
                 if local_injected and local_outcome is not None and local_outcome.usable:
-                    envelope_value = json.loads(local_outcome.envelope_text)
+                    surface_value = json.loads(local_outcome.envelope_text)
                     await service.record_memory_brief_trace(
                         trace_id=trace_id,
                         umo=umo,
                         run_id=local_outcome.run_id,
-                        memory_brief=envelope_value.get("memory_brief"),
+                        memory_brief=surface_value,
                         source_keys=local_outcome.source_keys,
-                        path="materialized_local",
+                        path="resident_reader_surface",
                         presented_edge_ids=local_outcome.selected_edge_ids,
                         presented_hypothesis_ids=(
                             local_outcome.selected_hypothesis_ids

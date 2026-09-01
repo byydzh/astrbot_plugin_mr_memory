@@ -27,12 +27,7 @@ class LocalServingEnvelope:
     def usable(self) -> bool:
         return bool(
             self.json_text
-            and self.semantic_status
-            in {
-                "EVIDENCE_AVAILABLE",
-                "IDENTITY_AMBIGUOUS",
-                "IDENTITY_UNRESOLVED",
-            }
+            and self.semantic_status == "EVIDENCE_AVAILABLE"
         )
 
 
@@ -412,6 +407,131 @@ def _provenance_bound_query_identity(value: object) -> dict[str, object]:
     for marker in ("participants_truncated", "ambiguous_aliases_truncated"):
         if value.get(marker) is True:
             result[marker] = True
+    return result
+
+
+def _parser_person_candidates(value: object) -> dict[str, object]:
+    """Represent alias-parser output as evidence candidates, never a verdict."""
+
+    if not isinstance(value, Mapping):
+        return {
+            "references": [],
+            "participants": [],
+            "ambiguous_references": [],
+        }
+    participants = [
+        dict(item)
+        for item in (
+            value.get("participants")
+            if isinstance(value.get("participants"), list)
+            else []
+        )
+        if isinstance(item, Mapping)
+    ]
+    multi_candidate_references = [
+        dict(item)
+        for item in (
+            value.get("ambiguous_aliases")
+            if isinstance(value.get("ambiguous_aliases"), list)
+            else []
+        )
+        if isinstance(item, Mapping)
+    ]
+    references: list[dict[str, object]] = []
+    mapped_signals = {
+        "RESOLVED": "UNIQUE_ALIAS_CANDIDATE",
+        "AMBIGUOUS": "MULTIPLE_ALIAS_CANDIDATES",
+        "UNRESOLVED": "NO_ALIAS_CANDIDATE",
+    }
+    for item in value.get("mentions", []) if isinstance(value.get("mentions"), list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        reference = _text(item.get("alias"), 200)
+        if not reference:
+            continue
+        keys = [
+            _text(key, 500)
+            for key in (
+                item.get("participant_keys")
+                if isinstance(item.get("participant_keys"), list)
+                else []
+            )
+            if _text(key, 500)
+        ]
+        parser_status = _text(item.get("status"), 40).upper()
+        candidate = {
+            "reference": reference,
+            "parser_signal": mapped_signals.get(
+                parser_status, "PARSER_CANDIDATE"
+            ),
+            "candidate_participant_keys": keys,
+        }
+        if item.get("evidence_omitted_by_budget") is True:
+            candidate["evidence_omitted_by_budget"] = True
+        references.append(candidate)
+    result: dict[str, object] = {
+        "references": references,
+        "participants": participants,
+        "ambiguous_references": multi_candidate_references,
+    }
+    for marker in ("participants_truncated", "ambiguous_aliases_truncated"):
+        if value.get(marker) is True:
+            result[marker] = True
+    return result
+
+
+def _semantic_person_hypotheses(
+    packet: Mapping[str, object],
+    *,
+    item_limit: int,
+    statement_limit: int,
+) -> list[dict[str, object]]:
+    """Expose source-bound person cues for the reader's semantic reasoning."""
+
+    if int(item_limit) <= 0:
+        return []
+    result: list[dict[str, object]] = []
+    raw = packet.get("semantic_evidence")
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        memory = item.get("memory")
+        if not isinstance(memory, Mapping):
+            continue
+        subject_candidate = _text(
+            memory.get("subject_candidate")
+            or memory.get("subject_text")
+            or memory.get("person_cue"),
+            240,
+        )
+        if not subject_candidate:
+            continue
+        source_keys = _unique_sources(item.get("evidence"))
+        if not source_keys:
+            continue
+        result.append(
+            {
+                "candidate_kind": "SOURCE_BOUND_SEMANTIC_HYPOTHESIS",
+                "subject_candidate": subject_candidate,
+                "predicate": _text(
+                    memory.get("predicate")
+                    or memory.get("aspect_tag")
+                    or memory.get("claim_type"),
+                    240,
+                ),
+                "epistemic_state": _text(
+                    memory.get("epistemic_state")
+                    or memory.get("epistemic_status")
+                    or "UNSPECIFIED",
+                    64,
+                ).upper(),
+                "content": _text(memory.get("content"), statement_limit),
+                "source_keys": source_keys[:8],
+                "source_count_total": len(source_keys),
+            }
+        )
+        if len(result) >= max(1, int(item_limit)):
+            break
     return result
 
 
@@ -957,6 +1077,11 @@ def _build_envelope(
         statement_limit=statement_limit,
         sources_per_item=8,
     )
+    semantic_person_hypotheses = _semantic_person_hypotheses(
+        packet,
+        item_limit=item_limit if source_limit > 4 else 0,
+        statement_limit=statement_limit,
+    )
     primary_source_groups: list[list[str]] = []
     for value in (query_identity, reply_context):
         sources = _unique_sources(value)
@@ -972,6 +1097,10 @@ def _build_envelope(
         if sources:
             primary_source_groups.append(sources)
     for row in learned_patterns:
+        sources = _unique_sources(row)
+        if sources:
+            primary_source_groups.append(sources)
+    for row in semantic_person_hypotheses:
         sources = _unique_sources(row)
         if sources:
             primary_source_groups.append(sources)
@@ -1020,33 +1149,26 @@ def _build_envelope(
     visible_query_identity = _provenance_bound_query_identity(
         _source_alias_view(query_identity, source_aliases)
     )
-    ambiguous = bool(visible_query_identity.get("ambiguous"))
+    parser_person_candidates = _parser_person_candidates(visible_query_identity)
+    visible_semantic_person_hypotheses = _source_bound_rows(
+        semantic_person_hypotheses, source_aliases
+    )
     has_identity_match = bool(visible_query_identity.get("participants"))
-    identity_mentions = visible_query_identity.get("mentions")
-    has_identity_coverage = bool(identity_mentions)
-    identity_only_unresolved = bool(identity_mentions) and all(
-        isinstance(item, Mapping) and item.get("status") == "UNRESOLVED"
-        for item in identity_mentions
+    has_multiple_identity_candidates = bool(
+        visible_query_identity.get("ambiguous_aliases")
     )
     has_evidence = bool(
         any(memory_brief.values())
         or has_identity_match
-        or has_identity_coverage
+        or has_multiple_identity_candidates
+        or visible_semantic_person_hypotheses
         or visible_activity
         or visible_participant_history
         or visible_reply
         or visible_graph_connections
         or visible_learned_patterns
     )
-    semantic_status = (
-        "IDENTITY_AMBIGUOUS"
-        if ambiguous
-        else (
-            "IDENTITY_UNRESOLVED"
-            if identity_only_unresolved
-            else ("EVIDENCE_AVAILABLE" if has_evidence else "NO_LOCAL_EVIDENCE")
-        )
-    )
+    semantic_status = "EVIDENCE_AVAILABLE" if has_evidence else "NO_LOCAL_EVIDENCE"
     actual_truncated = bool(
         truncated
         or len(source_order) < len(all_source_order)
@@ -1056,6 +1178,7 @@ def _build_envelope(
                 "brief": brief,
                 "graph": graph_connections,
                 "learned_patterns": learned_patterns,
+                "semantic_person_hypotheses": semantic_person_hypotheses,
                 "activity": activity,
                 "participant_history": participant_history,
                 "reply": reply_context,
@@ -1072,11 +1195,15 @@ def _build_envelope(
             "current_event": _request_identity(
                 packet.get("request_identity_context"), alias_limit=alias_limit
             ),
-            "query_resolution": visible_query_identity,
-            "rule": (
-                "canonical_key/account_id are identity truth; never merge people "
-                "because a nickname, display name, pronoun, or plural phrase matches"
-            ),
+            "person_reasoning_candidates": {
+                "parser": parser_person_candidates,
+                "semantic": visible_semantic_person_hypotheses,
+            },
+            "rules": [
+                "Host sender/structured mention/reply target are identity anchors.",
+                "Alias-parser matches are candidates, not identity verdicts.",
+                "Semantic nickname equivalence is a reader hypothesis, never a canonical merge.",
+            ],
         },
         "memory_brief": memory_brief,
         "graph_connections": visible_graph_connections,
@@ -1149,8 +1276,8 @@ def compile_local_serving_envelope(
         (8, 550, 24, 450, 12, 5, 8, 5, 5, 4, True),
         (5, 360, 12, 300, 8, 4, 6, 4, 4, 2, True),
         (3, 240, 8, 200, 6, 3, 4, 3, 3, 0, True),
-        (2, 180, 6, 120, 1, 2, 3, 2, 2, 0, True),
-        (1, 180, 4, 140, 1, 2, 3, 2, 2, 0, True),
+        (2, 180, 6, 120, 2, 2, 3, 2, 2, 0, True),
+        (1, 180, 4, 140, 2, 2, 3, 2, 2, 0, True),
     )
     last_length = 0
     for (
@@ -1192,22 +1319,27 @@ def compile_local_serving_envelope(
         encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
         last_length = len(encoded)
         identity = envelope.get("identity")
-        resolution = (
-            identity.get("query_resolution")
+        reasoning_candidates = (
+            identity.get("person_reasoning_candidates")
             if isinstance(identity, Mapping)
             else None
         )
+        parser_evidence = (
+            reasoning_candidates.get("parser")
+            if isinstance(reasoning_candidates, Mapping)
+            else None
+        )
         identity_incomplete = bool(
-            isinstance(resolution, Mapping)
+            isinstance(parser_evidence, Mapping)
             and (
-                resolution.get("participants_truncated") is True
-                or resolution.get("ambiguous_aliases_truncated") is True
+                parser_evidence.get("participants_truncated") is True
+                or parser_evidence.get("ambiguous_aliases_truncated") is True
                 or any(
                     isinstance(item, Mapping)
                     and item.get("evidence_omitted_by_budget") is True
                     for item in (
-                        resolution.get("mentions")
-                        if isinstance(resolution.get("mentions"), list)
+                        parser_evidence.get("references")
+                        if isinstance(parser_evidence.get("references"), list)
                         else []
                     )
                 )

@@ -183,6 +183,13 @@ class MemoryService:
             self.storage.resolve_query_participants, **kwargs
         )
 
+    async def query_person_reference_candidates(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.query_person_reference_candidates, **kwargs
+        )
+
     async def query_participant_activity(
         self, **kwargs: object
     ) -> dict[str, object]:
@@ -196,6 +203,16 @@ class MemoryService:
         return await asyncio.to_thread(
             self.storage.query_participant_history, **kwargs
         )
+
+    async def count_snapshot_messages(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(
+            self.storage.count_snapshot_messages, **kwargs
+        )
+
+    async def query_recent_context(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.storage.query_recent_context, **kwargs)
 
     async def query_identity_semantic_evidence(
         self, **kwargs: object

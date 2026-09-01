@@ -119,7 +119,7 @@ def compile_surface_packet(
             included = candidate
             encoded = candidate_text
         else:
-            break
+            continue
     return SurfacePacket(
         text=encoded,
         certificate_sha256=certificate.digest,
@@ -202,7 +202,13 @@ def validate_surface_packet(
         for item in certificate.atoms
         if item.atom_id not in set(certificate.must_include)
     ]
-    if included_ids != certificate_optional_order[: len(included_ids)]:
+    included_id_set = set(included_ids)
+    certified_subsequence = [
+        atom_id
+        for atom_id in certificate_optional_order
+        if atom_id in included_id_set
+    ]
+    if included_ids != certified_subsequence:
         raise SurfaceCompilationError("surface optional evidence order is invalid")
     contract = raw.get("contract")
     expected_contract = {

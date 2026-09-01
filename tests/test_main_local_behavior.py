@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, Mock
 from mr_memory.identity import build_request_identity_context
 from mr_memory.snapshot import stable_sha256
 
-
 MAIN_SOURCE = (
     Path(__file__).resolve().parents[1] / "main.py"
 ).read_text(encoding="utf-8")
@@ -67,37 +66,7 @@ def _main_method(name: str, **namespace: object):
     return values[name]
 
 
-def _collect_source_keys(value: object) -> set[str]:
-    result: set[str] = set()
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key == "source_key" and isinstance(nested, str) and nested:
-                result.add(nested)
-            elif (
-                (key == "source_keys" or key.endswith("_source_keys"))
-                and isinstance(nested, list)
-            ):
-                result.update(str(item) for item in nested if str(item))
-            else:
-                result.update(_collect_source_keys(nested))
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            result.update(_collect_source_keys(nested))
-    return result
-
-
 class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
-    def test_short_deictic_reference_requires_a_specific_identity_question(self) -> None:
-        method = _main_method("_local_direct_reference_question", re=re)
-
-        self.assertTrue(method("/chat 这人啥物种？"))
-        self.assertTrue(method("/chat 这个人是什么品种"))
-        self.assertTrue(method("/chat 在这个时间发这个表情包的人是什么猪"))
-        self.assertFalse(method("/chat 这人喜欢什么"))
-        self.assertFalse(method("/chat 啥物种？"))
-        self.assertFalse(method("/chat 喜欢这个表情包的人是什么品种"))
-        self.assertFalse(method("/chat 回忆这人以前说过什么"))
-
     async def test_opening_feedback_trace_does_not_activate_a_hypothesis(self) -> None:
         method = _main_method(
             "_begin_interaction_trace",
@@ -155,55 +124,117 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         provider_spy.assert_not_called()
 
 
-    async def test_reply_target_history_is_loaded_without_loading_requester_history(self) -> None:
+
+
+    async def test_source_bound_person_candidate_is_expanded_for_reader_reasoning(
+        self,
+    ) -> None:
+        collect_source_keys = _main_method("_collect_source_keys")
+        collect_full_message_source_keys = _main_method(
+            "_collect_full_message_source_keys"
+        )
+        collect_participant_keys = _main_method("_collect_participant_keys")
+        collect_participant_keys_in_order = _main_method(
+            "_collect_participant_keys_in_order"
+        )
+        participant_source_bindings = _main_method(
+            "_participant_source_bindings",
+            Any=object,
+            _collect_source_keys=collect_source_keys,
+        )
         method = _main_method(
-            "_local_identity_evidence_packet",
+            "_layered_evidence_packet",
+            asyncio=asyncio,
+            re=re,
+            time=time,
             build_request_identity_context=build_request_identity_context,
-            _collect_source_keys=_collect_source_keys,
-            _collect_participant_keys=lambda value: set(),
+            _collect_source_keys=collect_source_keys,
+            _collect_full_message_source_keys=collect_full_message_source_keys,
+            _collect_participant_keys=collect_participant_keys,
+            _collect_participant_keys_in_order=collect_participant_keys_in_order,
+            _participant_source_bindings=participant_source_bindings,
             stable_sha256=stable_sha256,
         )
+        recent_participant = 'participant:["synthetic","recent-account"]'
 
         class Service:
             def __init__(self) -> None:
                 self.history_keys: list[str] = []
+                self.activity_keys: list[str] = []
+                self.resolve_query_participants = AsyncMock(
+                    side_effect=AssertionError(
+                        "text alias parser must not decide resident identity"
+                    )
+                )
 
-            async def message_for_source(self, **kwargs: object) -> dict[str, object]:
-                return {
-                    "source_key": "reply-source",
-                    "sent_at": 90,
-                    "sender_id": "reply-account",
-                    "sender_name": "被引用者",
-                    "role": "USER",
-                    "plain_text": "普通消息",
-                }
+            async def query_plastic_associations(self, **_kwargs: object) -> list:
+                return []
 
-            async def resolve_query_participants(
-                self, **kwargs: object
+            async def query_matching_cues(self, **_kwargs: object) -> list:
+                return []
+
+            async def reconstruction_evidence_packet(
+                self, **_kwargs: object
             ) -> dict[str, object]:
                 return {
-                    "query": kwargs["query"],
-                    "ambiguous": False,
-                    "participants": [],
-                    "ambiguous_aliases": [],
-                    "mentions": [],
-                    "unresolved_aliases": [],
+                    "candidates": {"participants": []},
+                    "semantic_evidence": [],
+                    "expanded_episodes": [],
                 }
 
-            async def resolve_participants(
-                self, **kwargs: object
+            async def query_recent_context(
+                self, **_kwargs: object
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "source_key": "synthetic-recent-source",
+                        "sent_at": 90,
+                        "sender_id": "recent-account",
+                        "sender_name": "近期成员",
+                        "sender_participant_key": recent_participant,
+                        "plain_text": "一条合成近期消息",
+                    }
+                ]
+
+            async def query_person_reference_candidates(
+                self, **_kwargs: object
             ) -> dict[str, object]:
-                account_id = str(kwargs["reference"])
                 return {
-                    "ambiguous": False,
-                    "participants": [
+                    "host_decision": "NONE",
+                    "references": [
                         {
-                            "canonical_key": f'participant:["bot","{account_id}"]',
-                            "account_id": account_id,
-                            "current_display_name": account_id,
+                            "reference": "近期成员",
+                            "candidate_participants": [
+                                {
+                                    "participant_key": recent_participant,
+                                    "platform_id": "synthetic",
+                                    "account_id": "recent-account",
+                                    "alias_observations": [
+                                        {
+                                            "alias": "近期成员",
+                                            "normalized_alias": "近期成员",
+                                            "source_key": "synthetic-recent-source",
+                                            "sent_at": 90,
+                                            "relation": "SPEAKER",
+                                        }
+                                    ],
+                                }
+                            ],
                         }
                     ],
+                    "coverage": {
+                        "matched_reference_count_total": 1,
+                        "matched_reference_count_returned": 1,
+                        "candidate_count_total": 1,
+                        "candidate_count_returned": 1,
+                        "distinct_candidate_count_total": 1,
+                        "distinct_candidate_count_returned": 1,
+                        "truncated": False,
+                    },
                 }
+
+            async def count_snapshot_messages(self, **_kwargs: object) -> int:
+                return 2
 
             async def query_participant_history(
                 self, **kwargs: object
@@ -213,56 +244,129 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "participant_key": participant_key,
                     "status": "SOURCE_BACKED",
-                    "messages": [{"source_key": "reply-source", "sent_at": 90}],
+                    "messages": [
+                        {
+                            "source_key": "synthetic-history-source",
+                            "sent_at": 50,
+                            "plain_text": "一条合成历史消息",
+                        }
+                    ],
                 }
 
-            async def query_identity_semantic_evidence(
+            async def query_participant_activity(
                 self, **kwargs: object
-            ) -> list[dict[str, object]]:
-                return []
+            ) -> dict[str, object]:
+                participant_key = str(kwargs["participant_key"])
+                self.activity_keys.append(participant_key)
+                return {
+                    "participant_key": participant_key,
+                    "found": True,
+                    "source_keys": ["synthetic-history-source"],
+                }
+
+            async def message_for_source(self, **_kwargs: object) -> None:
+                return None
 
         service = Service()
-        host = SimpleNamespace(feedback_learning_enabled=False)
-        normalized = SimpleNamespace(
-            platform_id="bot",
-            sender_id="requester",
-            sender_name="提问者",
-            content=[
-                {
-                    "type": "reply",
-                    "message_id": "reply-message",
-                    "sender_id": "reply-account",
-                    "sender_name": "被引用者",
-                }
-            ],
+        host = SimpleNamespace(
+            _layered_pack_key=lambda *_args, **_kwargs: "synthetic-pack",
+            feedback_learning_enabled=False,
+            embedding_top_k=8,
+            candidate_seed_floor=0.0,
+            _embedding_backend=lambda: None,
         )
         snapshot = SimpleNamespace(
-            umo="scope-1",
-            reply_source_key="reply-source",
+            umo="synthetic:GroupMessage:scope",
             cutoff_at=100,
-            message_upper_bound=999,
-            snapshot_id="snapshot-1",
-            sender_participant_key='participant:["bot","requester"]',
+            message_upper_bound=99,
+            request_source_key="synthetic-current-source",
+            sender_participant_key='participant:["synthetic","requester"]',
+            reply_source_key="",
+            snapshot_id="synthetic-snapshot",
+        )
+        normalized = SimpleNamespace(
+            platform_id="synthetic",
+            sender_id="requester",
+            sender_name="提问者",
+            content=[{"type": "plain", "text": "/chat 合成人物问题"}],
         )
 
-        packet, *_ = await method(
+        packet, _digest, source_keys, participant_keys, cache_layer = await method(
             host,
             service=service,
             snapshot=snapshot,
             normalized=normalized,
-            query="/chat 这个人是谁",
-            include_participant_activity=False,
+            query="/chat 合成人物问题",
+            resolve_query_aliases=False,
+            include_participant_activity=True,
+            use_cache=False,
+            finalize_packet=False,
+        )
+
+        service.resolve_query_participants.assert_not_awaited()
+        self.assertEqual(service.history_keys, [recent_participant])
+        self.assertEqual(service.activity_keys, [recent_participant])
+        self.assertEqual(
+            packet["person_reasoning_candidates"]["participant_keys"],
+            [recent_participant],
+        )
+        self.assertEqual(packet["participant_history"][0]["status"], "SOURCE_BACKED")
+        self.assertEqual(
+            packet["recent_context"][0]["source_key"],
+            "synthetic-recent-source",
+        )
+        self.assertEqual(
+            source_keys,
+            {"synthetic-history-source", "synthetic-recent-source"},
+        )
+        self.assertEqual(
+            packet["participant_source_keys"][recent_participant],
+            ["synthetic-history-source", "synthetic-recent-source"],
+        )
+        self.assertTrue(packet["retrieval_coverage"]["semantic_none_allowed"])
+        self.assertIn(recent_participant, participant_keys)
+        self.assertEqual(cache_layer, "LOCAL_FRESH")
+
+    def test_participant_source_bindings_do_not_cross_candidate_siblings(
+        self,
+    ) -> None:
+        collect_source_keys = _main_method("_collect_source_keys")
+        method = _main_method(
+            "_participant_source_bindings",
+            Any=object,
+            _collect_source_keys=collect_source_keys,
+        )
+
+        bindings = method(
+            {
+                "references": [
+                    {
+                        "candidate_participants": [
+                            {
+                                "participant_key": "synthetic-participant-a",
+                                "alias_observations": [
+                                    {"source_key": "synthetic-source-a"}
+                                ],
+                            },
+                            {
+                                "participant_key": "synthetic-participant-b",
+                                "alias_observations": [
+                                    {"source_key": "synthetic-source-b"}
+                                ],
+                            },
+                        ]
+                    }
+                ]
+            }
         )
 
         self.assertEqual(
-            service.history_keys,
-            ['participant:["bot","reply-account"]'],
+            bindings,
+            {
+                "synthetic-participant-a": ["synthetic-source-a"],
+                "synthetic-participant-b": ["synthetic-source-b"],
+            },
         )
-        self.assertEqual(
-            packet["participant_history"][0]["status"],
-            "SOURCE_BACKED",
-        )
-
 
     def _hook_host(self, local_result: object, *, timeout: float = 0.2):
         provider_spy = Mock(side_effect=AssertionError("provider lookup is forbidden"))
@@ -291,196 +395,104 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             GroupScopeError=_GroupScopeError,
             logger=logger,
             json=json,
-            LOCAL_SERVING_SCHEMA_VERSION="mr-local-serving.v1",
+            SURFACE_SCHEMA_VERSION="memory-surface.v1",
             TextPart=_FakeTextPart,
         )
         return method, host, provider_spy, logger
 
-    async def test_success_is_recorded_only_after_prompt_injection(self) -> None:
-        outcome = SimpleNamespace(
-            operational_status="COMPLETED",
-            semantic_status="EVIDENCE_AVAILABLE",
-            run_id="local-run",
-            detail="",
-            usable=True,
-            envelope_text=json.dumps(
-                {
-                    "schema_version": "mr-local-serving.v1",
-                    "source_records": [{"id": "s1", "text": "证据"}],
-                },
-                ensure_ascii=False,
-            ),
-            ledger_result={"surface_injection_status": "COMPILED_NOT_YET_INJECTED"},
-        )
-        method, host, provider_spy, _logger = self._hook_host(
-            AsyncMock(return_value=outcome)
-        )
-        event = SimpleNamespace(message_obj=SimpleNamespace(message_str="/chat 回忆"))
-        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
+    @staticmethod
+    def _synthetic_surface(status: str) -> dict[str, object]:
+        return {
+            "schema_version": "memory-surface.v1",
+            "certificate_sha256": "synthetic-certificate-digest",
+            "snapshot_sha256": "synthetic-snapshot-digest",
+            "status": status,
+            "scope": {"umo": "synthetic:GroupMessage:scope", "cutoff_at": 123},
+            "subjects": [],
+            "evidence": {"required": [], "optional": []},
+            "contract": {
+                "must_include": [],
+                "must_not_upgrade": [],
+                "conflicts": [],
+                "unresolved": [],
+                "open_obligations": [],
+            },
+            "stop_reason": "SYNTHETIC_TEST",
+            "omitted_optional": 0,
+        }
 
-        await method(host, event, request)
+    async def test_synthetic_memory_surface_is_injected_by_request_hook(self) -> None:
+        for semantic_status in ("CERTIFIED", "PARTIAL", "SAFETY_ABSTAIN"):
+            with self.subTest(semantic_status=semantic_status):
+                surface = self._synthetic_surface(semantic_status)
+                outcome = SimpleNamespace(
+                    operational_status="COMPLETED",
+                    semantic_status=semantic_status,
+                    run_id=f"synthetic-{semantic_status.casefold()}",
+                    detail="",
+                    usable=True,
+                    envelope_text=json.dumps(surface, ensure_ascii=False),
+                    ledger_result={
+                        "surface_injection_status": "COMPILED_NOT_YET_INJECTED"
+                    },
+                )
+                local_result = AsyncMock(return_value=outcome)
+                method, host, provider_spy, _logger = self._hook_host(local_result)
+                event = SimpleNamespace(
+                    message_obj=SimpleNamespace(message_str="/chat 合成回忆请求")
+                )
+                request = SimpleNamespace(
+                    prompt="合成宿主提示",
+                    extra_user_content_parts=[],
+                )
 
-        self.assertEqual(len(request.extra_user_content_parts), 1)
-        self.assertIn(id(event), host._local_serving_injected)
-        host._test_service.finish_experiment.assert_awaited_once()
-        final = host._test_service.finish_experiment.await_args.kwargs
-        self.assertEqual(final["status"], "completed")
-        self.assertEqual(
-            final["result"]["surface_injection_status"],
-            "INJECTED_IN_REQUEST_HOOK",
-        )
-        provider_spy.assert_not_called()
+                returned = await method(host, event, request)
 
-    async def test_ledger_failure_rolls_back_injected_evidence(self) -> None:
-        outcome = SimpleNamespace(
-            operational_status="COMPLETED",
-            semantic_status="EVIDENCE_AVAILABLE",
-            run_id="local-run",
-            detail="",
-            usable=True,
-            envelope_text=json.dumps(
-                {
-                    "schema_version": "mr-local-serving.v1",
-                    "source_records": [{"id": "s1", "text": "证据"}],
-                },
-                ensure_ascii=False,
-            ),
-            ledger_result={"surface_injection_status": "COMPILED_NOT_YET_INJECTED"},
-        )
-        method, host, provider_spy, logger = self._hook_host(
-            AsyncMock(return_value=outcome)
-        )
-        host._test_service.finish_experiment.side_effect = RuntimeError(
-            "ledger unavailable"
-        )
-        event = SimpleNamespace(message_obj=SimpleNamespace(message_str="/chat 回忆"))
-        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
+                self.assertIsNone(returned)
+                self.assertEqual(request.prompt, "合成宿主提示")
+                self.assertEqual(len(request.extra_user_content_parts), 1)
+                injected = request.extra_user_content_parts[0].text
+                opening = "<mr_memory_surface>"
+                closing = "</mr_memory_surface>"
+                self.assertEqual(injected.count(opening), 1)
+                self.assertEqual(injected.count(closing), 1)
+                encoded_surface = injected.split(opening, 1)[1].split(closing, 1)[0]
+                self.assertEqual(json.loads(encoded_surface), surface)
+                self.assertIn(id(event), host._local_serving_injected)
+                host._test_service.finish_experiment.assert_awaited_once()
+                final = host._test_service.finish_experiment.await_args.kwargs
+                self.assertEqual(final["status"], "completed")
+                self.assertEqual(
+                    final["result"]["surface_injection_status"],
+                    "INJECTED_IN_REQUEST_HOOK",
+                )
+                provider_spy.assert_not_called()
 
-        await method(host, event, request)
-
-        self.assertEqual(request.extra_user_content_parts, [])
-        self.assertNotIn(id(event), host._local_serving_injected)
-        host._test_service.finish_experiment.assert_awaited_once()
-        logger.exception.assert_called_once()
-        logger.error.assert_called_once()
-        provider_spy.assert_not_called()
-
-    async def test_append_failure_is_terminal_failed_not_completed(self) -> None:
-        class RejectingParts(list):
-            def append(self, _value: object) -> None:
-                raise RuntimeError("prompt is sealed")
-
-        outcome = SimpleNamespace(
-            operational_status="COMPLETED",
-            semantic_status="EVIDENCE_AVAILABLE",
-            run_id="local-run",
-            detail="",
-            usable=True,
-            envelope_text=json.dumps(
-                {"schema_version": "mr-local-serving.v1", "source_records": []}
-            ),
-            ledger_result={"surface_injection_status": "COMPILED_NOT_YET_INJECTED"},
-        )
-        method, host, provider_spy, logger = self._hook_host(
-            AsyncMock(return_value=outcome)
-        )
-        event = SimpleNamespace(message_obj=SimpleNamespace(message_str="/chat 回忆"))
-        request = SimpleNamespace(prompt="", extra_user_content_parts=RejectingParts())
-
-        await method(host, event, request)
-
-        self.assertNotIn(id(event), host._local_serving_injected)
-        final = host._test_service.finish_experiment.await_args.kwargs
-        self.assertEqual(final["status"], "failed")
-        self.assertEqual(
-            final["result"]["surface_injection_status"],
-            "NOT_INJECTED_APPEND_FAILED",
-        )
-        self.assertEqual(final["result"]["operational_status"], "FAILED")
-        logger.exception.assert_called_once()
-        provider_spy.assert_not_called()
-
-    async def test_hook_does_not_race_the_owned_retrieval_deadline(self) -> None:
-        async def delayed_result(event: object, query: str) -> object:
-            await asyncio.sleep(0.01)
-            return SimpleNamespace(
-                operational_status="FAILED",
-                semantic_status="UNKNOWN",
-                run_id="timed-out-local-run",
-                detail="Local memory serving exceeded its owned hard deadline",
-                usable=False,
-                envelope_text="",
-                ledger_result=None,
-            )
-
-        method, host, provider_spy, logger = self._hook_host(
-            delayed_result,
-            timeout=0.001,
-        )
-        event = SimpleNamespace(
-            message_obj=SimpleNamespace(message_str="/chat 回忆一下")
-        )
-        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
-
-        await method(host, event, request)
-
-        self.assertEqual(request.extra_user_content_parts, [])
-        self.assertNotIn(id(event), host._local_serving_injected)
-        provider_spy.assert_not_called()
-        logger.error.assert_called_once()
-        self.assertIn(
-            "produced no injectable result",
-            logger.error.call_args.args[0],
-        )
-
-    async def test_missing_preloaded_service_does_not_drop_local_retrieval(self) -> None:
+    async def test_reader_provider_failure_does_not_inject_or_block_host(self) -> None:
         local_result = AsyncMock(
-            return_value=SimpleNamespace(
-                operational_status="COMPLETED",
-                semantic_status="NO_LOCAL_EVIDENCE",
-                run_id="",
-                detail="",
-                usable=False,
-                envelope_text="",
-            )
+            side_effect=RuntimeError("synthetic resident reader provider failure")
         )
         method, host, provider_spy, logger = self._hook_host(local_result)
-        host._services = {}
         event = SimpleNamespace(
-            message_obj=SimpleNamespace(message_str="/chat 回忆一下")
+            message_obj=SimpleNamespace(message_str="/chat 合成失败请求")
         )
-        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
+        existing = _FakeTextPart(text="合成宿主既有上下文")
+        request = SimpleNamespace(
+            prompt="合成宿主提示",
+            extra_user_content_parts=[existing],
+        )
 
-        await method(host, event, request)
+        returned = await method(host, event, request)
 
-        self.assertEqual(request.extra_user_content_parts, [])
+        self.assertIsNone(returned)
+        self.assertEqual(request.prompt, "合成宿主提示")
+        self.assertEqual(request.extra_user_content_parts, [existing])
+        self.assertNotIn("<mr_memory_surface>", existing.text)
         self.assertNotIn(id(event), host._local_serving_injected)
-        local_result.assert_awaited_once_with(event, "/chat 回忆一下")
+        local_result.assert_awaited_once_with(event, "/chat 合成失败请求")
+        host._test_service.finish_experiment.assert_not_awaited()
+        logger.exception.assert_called_once()
         provider_spy.assert_not_called()
-        logger.error.assert_not_called()
-
-    async def test_failed_local_result_does_not_inject_or_lookup_a_provider(self) -> None:
-        failed = SimpleNamespace(
-            operational_status="FAILED",
-            semantic_status="UNKNOWN",
-            run_id="failed-run",
-            detail="local retrieval failed",
-            usable=False,
-            envelope_text="",
-        )
-        local_result = AsyncMock(return_value=failed)
-        method, host, provider_spy, logger = self._hook_host(local_result)
-        event = SimpleNamespace(
-            message_obj=SimpleNamespace(message_str="/chat 回忆一下")
-        )
-        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
-
-        await method(host, event, request)
-
-        self.assertEqual(request.extra_user_content_parts, [])
-        self.assertNotIn(id(event), host._local_serving_injected)
-        provider_spy.assert_not_called()
-        logger.error.assert_called_once()
 
     async def test_sent_trace_uses_only_identifiers_from_the_final_outcome(
         self,
@@ -496,14 +508,12 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         event_key = id(event)
         local_outcome = SimpleNamespace(
             operational_status="COMPLETED",
+            semantic_status="CERTIFIED",
             run_id="local-run",
             usable=True,
             envelope_text=json.dumps(
-                {
-                    "memory_brief": {"claims": [], "conflicts": [], "unresolved": []},
-                    "graph_connections": [{"edge_id": 9}],
-                    "learned_patterns": [{"hypothesis_id": 77}],
-                }
+                self._synthetic_surface("CERTIFIED"),
+                ensure_ascii=False,
             ),
             source_keys=("source-1",),
             selected_edge_ids=(9,),

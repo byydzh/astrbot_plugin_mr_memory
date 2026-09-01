@@ -58,9 +58,10 @@ class ConfigSurfaceTests(unittest.TestCase):
         )
         self.assertIn("min(\n                600.0,", main_source)
         self.assertIn("max(\n            1.0,", main_source)
-        self.assertIn("不调用第二个远程模型", local_hint)
+        self.assertIn("且仅进行一次证据阅读", local_hint)
+        self.assertIn("不会修复重试", local_hint)
         self.assertIn("不会切换模型", timeout_hint)
-        self.assertIn("本地检索不调用插件模型", budget_hint)
+        self.assertIn("实际 usage 单独记录", budget_hint)
         for retired in (
             "runtime_wake_mode",
             "runtime_l2_wait_seconds",
@@ -76,7 +77,7 @@ class ConfigSurfaceTests(unittest.TestCase):
             self.assertNotIn(retired, self.schema)
         self.assertFalse(self.schema["embedding_preload_on_startup"]["default"])
         self.assertEqual(self.schema["local_serving_max_chars"]["default"], 12000)
-        self.assertIn("普通聊天仍硬限制为 3000 字符", str(
+        self.assertIn("memory-surface", str(
             self.schema["local_serving_max_chars"]["hint"]
         ))
         self.assertIn('self.runtime_wake_mode = "manual_only"', main_source)
@@ -86,9 +87,10 @@ class ConfigSurfaceTests(unittest.TestCase):
             'self.config.get("expose_traversal_tools"',
             main_source,
         )
-        self.assertIn("materialize_reconstruction_packet(", main_source)
-        self.assertIn("compile_local_serving_envelope(", main_source)
-        self.assertIn("min(self.local_serving_max_chars, 3000)", main_source)
+        self.assertNotIn("materialize_reconstruction_packet(", main_source)
+        self.assertIn("compile_surface_packet(", main_source)
+        self.assertIn("max_chars=self.local_serving_max_chars", main_source)
+        self.assertNotIn("compile_local_serving_envelope(", main_source)
         hook_start = main_source.index("async def inject_subconscious_memory")
         hook_end = main_source.index(
             '@filter.llm_tool(name="mr_activate_feedback_hypothesis")',

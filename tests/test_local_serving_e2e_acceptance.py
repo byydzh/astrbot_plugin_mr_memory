@@ -4,34 +4,39 @@ import ast
 import asyncio
 import copy
 import json
-import re
 import time
 import unittest
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from mr_memory.certificate import parse_evidence_certificate
 from mr_memory.identity import build_request_identity_context
-from mr_memory.local_serving import (
-    LOCAL_SERVING_SCHEMA_VERSION,
-    compile_local_serving_envelope,
-)
 from mr_memory.models import NormalizedMessage
-from mr_memory.runtime import materialize_reconstruction_packet
-from mr_memory.service import MemoryService
-from mr_memory.snapshot import stable_sha256
-from mr_memory.storage import MemoryStorage
-from scripts.local_serving_e2e_acceptance import (
-    EXECUTION_SCOPE,
-    provider_turn_report,
-    release_gate_coverage,
-    run_local_serving_case,
+from mr_memory.reader import (
+    L2_READER_PROTOCOL,
+    build_l2_reader_prompt,
+    parse_l2_reader_response,
 )
-from tests import test_local_serving as local_serving_fixtures
+from mr_memory.snapshot import (
+    DataRevisionVector,
+    InferenceRevisionVector,
+    RequestSnapshot,
+    stable_sha256,
+)
+from mr_memory.surface import (
+    SURFACE_SCHEMA_VERSION,
+    compile_surface_packet,
+    validate_surface_packet,
+)
+from scripts.local_serving_e2e_acceptance import provider_turn_report
 
 
+QUERY = "/chat 回忆参与者甲的作品态度变化"
+SOURCE_KEYS = {"source-old", "source-new", "source-candidate-only"}
+SURFACE_SOURCE_KEYS = {"source-old", "source-new"}
+PARTICIPANT_KEYS = {"participant:a", "participant:asker"}
 MAIN_SOURCE = (Path(__file__).resolve().parents[1] / "main.py").read_text(
     encoding="utf-8"
 )
@@ -55,32 +60,18 @@ def main_method(name: str, **namespace: object):
     return values[name]
 
 
-def collect_source_keys(value: object) -> set[str]:
-    found: set[str] = set()
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key == "source_key" and isinstance(nested, str) and nested:
-                found.add(nested)
-            elif isinstance(nested, (dict, list, tuple)):
-                found.update(collect_source_keys(nested))
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            found.update(collect_source_keys(nested))
-    return found
-
-
 @dataclass
 class LocalOutcome:
     operational_status: str
     semantic_status: str = "UNKNOWN"
     envelope_text: str = ""
     run_id: str = ""
+    detail: str = ""
     elapsed_ms: float = 0.0
     source_keys: tuple[str, ...] = ()
     selected_edge_ids: tuple[int, ...] = ()
     selected_hypothesis_ids: tuple[int, ...] = ()
     truncated: bool = False
-    detail: str = ""
     ledger_result: dict[str, object] | None = None
 
     @property
@@ -88,12 +79,7 @@ class LocalOutcome:
         return bool(
             self.envelope_text
             and self.operational_status == "COMPLETED"
-            and self.semantic_status
-            in {
-                "EVIDENCE_AVAILABLE",
-                "IDENTITY_AMBIGUOUS",
-                "IDENTITY_UNRESOLVED",
-            }
+            and self.semantic_status in {"CERTIFIED", "PARTIAL", "SAFETY_ABSTAIN"}
         )
 
 
@@ -103,6 +89,180 @@ class FakeTextPart:
 
     def mark_as_temp(self):
         return self
+
+
+def synthetic_snapshot() -> RequestSnapshot:
+    return RequestSnapshot.create(
+        snapshot_id="snapshot-online-e2e",
+        umo="bot:GroupMessage:synthetic",
+        cutoff_at=2_000,
+        message_upper_bound=20,
+        request_source_key="source-query",
+        sender_participant_key="participant:asker",
+        reply_source_key="",
+        query=QUERY,
+        context={"case": "online-resident-reader"},
+        data_revision=DataRevisionVector.from_value(
+            {
+                "message": 20,
+                "deletion": 0,
+                "identity": 3,
+                "graph": 5,
+                "relation": 2,
+                "feedback": 1,
+            }
+        ),
+        inference_revision=InferenceRevisionVector.from_value(
+            {
+                "retriever": "synthetic-full-retrieval",
+                "embedding_model": "disabled",
+                "fusion_policy": "synthetic-fusion",
+                "reader_model": "synthetic-resident-reader",
+                "reader_protocol": L2_READER_PROTOCOL,
+                "certificate_schema": "evidence-certificate.v2",
+                "surface_compiler": SURFACE_SCHEMA_VERSION,
+                "route_policy": "resident-one-pass",
+            }
+        ),
+        captured_at=2_001,
+    )
+
+
+def synthetic_packet() -> dict[str, object]:
+    return {
+        "semantic_evidence": [],
+        "expanded_episodes": [
+            {
+                "title": "合成作品态度记录",
+                "summary": "参与者甲先表达保留，后来明确表示愿意尝试。",
+                "messages": [
+                    {
+                        "source_key": "source-old",
+                        "sent_at": 1_000,
+                        "sender_id": "account-a",
+                        "sender_name": "参与者甲",
+                        "role": "USER",
+                        "plain_text": "我暂时没有兴趣。",
+                    },
+                    {
+                        "source_key": "source-new",
+                        "sent_at": 1_500,
+                        "sender_id": "account-a",
+                        "sender_name": "参与者甲",
+                        "role": "USER",
+                        "plain_text": "现在愿意试试看。",
+                    },
+                ],
+            }
+        ],
+        "request_identity_context": {
+            "authority": "current_platform_event",
+            "sender": {
+                "participant_key": "participant:asker",
+                "platform_id": "bot",
+                "account_id": "asker",
+                "display_name": "提问者",
+                "binding_basis": "message_sender",
+                "same_account_as_sender": True,
+            },
+            "mentions": [],
+            "reply_target": None,
+        },
+        "query_alias_resolution": {
+            "query": QUERY,
+            "ambiguous": False,
+            "participants": [],
+            "ambiguous_aliases": [],
+        },
+        "participant_activity": [],
+        "participant_history": [],
+        "feedback_hypothesis_evidence": [
+            {
+                "hypothesis": {
+                    "id": 702,
+                    "activation_mode": "always",
+                    "prospective_cue": "合成候选偏好",
+                },
+                "evidence": [{"source_key": "source-new"}],
+            }
+        ],
+        "participant_source_keys": {
+            "participant:a": ["source-old", "source-new"],
+            "participant:asker": [],
+        },
+        "retrieval_coverage": {
+            "semantic_none_allowed": True,
+            "raw_history_complete": True,
+            "snapshot_visible_message_total": 2,
+            "packet_full_message_sources": 2,
+        },
+        "reply_context": None,
+        # Raw retrieval candidates are visible to the Reader, but their database
+        # identifiers are not evidence that the compiled surface presented them.
+        "candidates": {
+            "associations": [
+                {
+                    "id": 701,
+                    "score": 0.91,
+                    "statement": "合成候选关系",
+                    "source_keys": ["source-candidate-only"],
+                    "epistemic_state": "HYPOTHESIS",
+                }
+            ]
+        },
+    }
+
+
+def synthetic_certificate_response(
+    snapshot: RequestSnapshot,
+    packet_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "evidence-certificate.v2",
+        "status": "CERTIFIED",
+        "scope_snapshot": snapshot.as_dict(),
+        "data_revision": snapshot.data_revision.as_dict(),
+        "inference_revision": snapshot.inference_revision.as_dict(),
+        "packet_sha256": packet_sha256,
+        "subjects": [
+            {
+                "reference": "参与者甲",
+                "participant_key": "participant:a",
+                "reference_mode": "UNIQUE_ALIAS",
+                "candidate_participant_keys": [],
+                "source_keys": ["source-old", "source-new"],
+                "valid_at": 1_500,
+            }
+        ],
+        "atoms": [
+            {
+                "id": "attitude_change",
+                "statement": "参与者甲的表达从保留变为愿意尝试。",
+                "speaker_participant_key": "participant:a",
+                "subject_participant_key": "participant:a",
+                "attribution": "DERIVED_INTERPRETATION",
+                "stance": "SUPPORTED",
+                "source_keys": ["source-old", "source-new"],
+                "source_spans": ["我暂时没有兴趣。", "现在愿意试试看。"],
+                "importance": "REQUIRED",
+                "confidence": 0.86,
+            }
+        ],
+        "must_include": ["attitude_change"],
+        "must_not_upgrade": [
+            {
+                "observed": "愿意尝试",
+                "forbidden": ["已经购买", "已经完成体验"],
+                "atom_ids": ["attitude_change"],
+                "reason": "尝试意向不等于已经采取行动。",
+            }
+        ],
+        "conflicts": [],
+        "unresolved": [],
+        "open_obligations": [],
+        "stop_reason": "CERTIFIED_CLOSE",
+        "validation": {"pack_read_complete": True, "host_validated": True},
+    }
 
 
 def production_execute_method():
@@ -116,9 +276,10 @@ def production_execute_method():
         _LocalMemoryOutcome=LocalOutcome,
         RoutePolicy=lambda **kwargs: SimpleNamespace(**kwargs),
         build_request_identity_context=build_request_identity_context,
-        materialize_reconstruction_packet=materialize_reconstruction_packet,
-        compile_local_serving_envelope=compile_local_serving_envelope,
-        LOCAL_SERVING_SCHEMA_VERSION=LOCAL_SERVING_SCHEMA_VERSION,
+        _collect_source_keys=main_method("_collect_source_keys"),
+        compile_surface_packet=compile_surface_packet,
+        validate_surface_packet=validate_surface_packet,
+        L2_READER_PROTOCOL=L2_READER_PROTOCOL,
         logger=SimpleNamespace(
             error=lambda *args, **kwargs: None,
             exception=lambda *args, **kwargs: None,
@@ -126,86 +287,65 @@ def production_execute_method():
     )
 
 
-def production_classifier():
-    activity_analysis = main_method("_runtime_activity_analysis")
-    explicit_identity_intent = main_method("_explicit_identity_intent", re=re)
-    owner = SimpleNamespace(
-        _runtime_activity_analysis=activity_analysis,
-        _explicit_identity_intent=explicit_identity_intent,
-    )
-    return (
-        main_method("_runtime_request_kind", MrMemoryPlugin=owner),
-        activity_analysis,
-        main_method("_local_direct_identity_question", MrMemoryPlugin=owner),
-    )
-
-
-async def run_identity_case(
-    *,
-    storage: MemoryStorage,
-    query: str,
-    normalized: NormalizedMessage,
-    snapshot: object,
-) -> dict[str, object]:
-    service = MemoryService(storage)
-    service.audit_snapshot_sources = AsyncMock()
-    host = SimpleNamespace(
-        feedback_learning_enabled=False,
-        _assert_snapshot_fresh=AsyncMock(),
-    )
-    identity_packet = main_method(
-        "_local_identity_evidence_packet",
-        build_request_identity_context=build_request_identity_context,
-        _collect_source_keys=collect_source_keys,
-        _collect_participant_keys=lambda value: set(),
+def production_reader_method():
+    return main_method(
+        "_read_l2_certificate",
+        build_l2_reader_prompt=build_l2_reader_prompt,
+        parse_l2_reader_response=parse_l2_reader_response,
         stable_sha256=stable_sha256,
     )
 
-    async def build_identity_packet(**kwargs):
-        return await identity_packet(host, **kwargs)
 
-    async def forbidden_full_packet(**kwargs):
-        raise AssertionError("identity query must not use full retrieval")
-
-    classifier, activity_analysis, identity_question = production_classifier()
-    return await run_local_serving_case(
-        query=query,
-        normalized=normalized,
-        snapshot=snapshot,
-        service=service,
-        classify_request=classifier,
-        activity_analysis=activity_analysis,
-        identity_question=identity_question,
-        reference_question=main_method(
-            "_local_direct_reference_question", re=__import__("re")
+def production_inject_method():
+    return main_method(
+        "inject_subconscious_memory",
+        json=json,
+        SURFACE_SCHEMA_VERSION=SURFACE_SCHEMA_VERSION,
+        TextPart=FakeTextPart,
+        logger=SimpleNamespace(
+            error=lambda *args, **kwargs: None,
+            exception=lambda *args, **kwargs: None,
         ),
-        build_identity_packet=build_identity_packet,
-        build_full_packet=forbidden_full_packet,
+        GroupScopeError=ValueError,
     )
 
 
-class LocalServingEndToEndAcceptanceTests(unittest.IsolatedAsyncioTestCase):
+class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     def production_host(
         self,
         *,
         normalized: NormalizedMessage,
-        service: object,
-        snapshot: object,
+        snapshot: RequestSnapshot,
         packet: dict[str, object],
-        timeout: float = 1.0,
+        service: object,
     ) -> SimpleNamespace:
-        classifier, activity_analysis, identity_question = production_classifier()
-        return SimpleNamespace(
+        packet_sha256 = stable_sha256(packet)
+        response = SimpleNamespace(
+            completion_text=json.dumps(
+                synthetic_certificate_response(snapshot, packet_sha256),
+                ensure_ascii=False,
+            )
+        )
+        provider = SimpleNamespace(name="synthetic-reader")
+        host = SimpleNamespace(
             _inflight_runtime_tasks=set(),
             feedback_learning_enabled=False,
             local_serving_enabled=True,
-            local_serving_timeout_seconds=timeout,
+            # Production uses this only as an abnormal-hang guard.
+            local_serving_timeout_seconds=180.0,
+            subconscious_provider_id="resident-reader",
+            context=SimpleNamespace(
+                get_provider_by_id=lambda provider_id: (
+                    provider if provider_id == "resident-reader" else None
+                )
+            ),
             _runtime_initialized=True,
             _runtime_bootstrap_task=None,
             _initialize_runtime=AsyncMock(),
-            max_query_chars=4000,
+            max_query_chars=4_000,
             local_serving_max_items=12,
-            local_serving_max_chars=12000,
+            local_serving_max_chars=12_000,
+            max_brief_chars=12_000,
             embedding_enabled=False,
             _embedding_preload_complete=True,
             _embedding_preload_error="",
@@ -213,221 +353,280 @@ class LocalServingEndToEndAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             _begin_interaction_trace=AsyncMock(),
             _local_serving_guard=lambda event: "",
             _group_scope=lambda event: SimpleNamespace(
-                key=normalized.umo, storage_id="scope-e2e"
+                key=normalized.umo,
+                storage_id="scope-online-e2e",
             ),
             _service_for_scope=lambda scope: service,
             _normalize_event=lambda event: normalized,
-            _runtime_request_kind=classifier,
-            _runtime_activity_analysis=activity_analysis,
+            _runtime_request_kind=lambda query, **kwargs: "MEMORY_QUERY",
             _capture_layered_snapshot=AsyncMock(return_value=snapshot),
-            _local_serving_inference_revision=lambda: {},
-            _local_direct_identity_question=identity_question,
-            _local_direct_reference_question=main_method(
-                "_local_direct_reference_question", re=__import__("re")
-            ),
-            _local_identity_evidence_packet=AsyncMock(
-                side_effect=AssertionError("full retrieval case must not route direct")
-            ),
             _layered_evidence_packet=AsyncMock(
-                return_value=(packet, stable_sha256(packet), set(), set(), "LOCAL_FRESH")
+                return_value=(
+                    packet,
+                    packet_sha256,
+                    set(SOURCE_KEYS),
+                    set(PARTICIPANT_KEYS),
+                    "NONE",
+                )
             ),
             _assert_snapshot_fresh=AsyncMock(),
+            distillation_thinking_mode="enabled",
+            _run_fast_reconstruction_with_ledger=AsyncMock(
+                return_value=(response, 8.5)
+            ),
         )
 
+        reader = production_reader_method()
 
+        async def read_once(**kwargs):
+            return await reader(host, **kwargs)
 
-    async def test_production_execute_full_retrieval_audits_ledgers_and_injects(self) -> None:
-        query = "/chat 解释作品态度前后变化"
-        normalized = NormalizedMessage(
+        host._read_l2_certificate = AsyncMock(side_effect=read_once)
+        return host
+
+    @staticmethod
+    def normalized_message(snapshot: RequestSnapshot) -> NormalizedMessage:
+        return NormalizedMessage(
             platform="aiocqhttp",
             platform_id="bot",
-            umo="bot:GroupMessage:full-e2e",
-            group_id="full-e2e",
-            message_id="query-full",
+            umo=snapshot.umo,
+            group_id="synthetic",
+            message_id="query",
             sender_id="asker",
             sender_name="提问者",
-            sent_at=400,
-            plain_text=query,
-            content=[{"type": "plain", "text": query}],
+            sent_at=snapshot.cutoff_at,
+            plain_text=QUERY,
+            content=[{"type": "plain", "text": QUERY}],
         )
-        packet = local_serving_fixtures.LocalServingEnvelopeTests.packet()
+
+    async def test_fresh_full_retrieval_one_reader_and_surface_injection(self) -> None:
+        snapshot = synthetic_snapshot()
+        packet = synthetic_packet()
+        normalized = self.normalized_message(snapshot)
         service = SimpleNamespace(
             start_experiment=AsyncMock(),
             finish_experiment=AsyncMock(),
             audit_snapshot_sources=AsyncMock(),
             record_reconstruction_step=AsyncMock(),
         )
-        snapshot = SimpleNamespace(
-            umo=normalized.umo,
-            cutoff_at=400,
-            message_upper_bound=10,
-            snapshot_id="snapshot-full-e2e",
-            digest="snapshot-digest",
-            sender_participant_key='participant:["bot","asker"]',
-            reply_source_key="",
-        )
         host = self.production_host(
             normalized=normalized,
-            service=service,
             snapshot=snapshot,
             packet=packet,
+            service=service,
         )
-        packet_sources = {"packet-source-selected", "packet-source-budget-omitted"}
-        host._layered_evidence_packet = AsyncMock(
-            return_value=(
-                packet,
-                stable_sha256(packet),
-                packet_sources,
-                set(),
-                "LOCAL_FRESH",
-            )
-        )
-        outcome = await production_execute_method()(host, object(), query)
+
+        event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
+        outcome = await production_execute_method()(host, event, QUERY)
 
         self.assertTrue(outcome.usable)
         self.assertEqual(outcome.operational_status, "COMPLETED")
-        self.assertEqual(outcome.ledger_result["surface_injection_status"], "COMPILED_NOT_YET_INJECTED")
-        self.assertIn("FULL_RETRIEVAL", outcome.ledger_result["stage_elapsed_ms"])
-        self.assertIn("LEDGER_RECORD", outcome.ledger_result["stage_elapsed_ms"])
-        self.assertIn("RUNTIME_READY", outcome.ledger_result["stage_elapsed_ms"])
-        service.start_experiment.assert_awaited_once()
+        self.assertEqual(outcome.semantic_status, "CERTIFIED")
+        host._layered_evidence_packet.assert_awaited_once()
+        retrieval = host._layered_evidence_packet.await_args.kwargs
+        self.assertFalse(retrieval["resolve_query_aliases"])
+        self.assertTrue(retrieval["include_participant_activity"])
+        self.assertFalse(retrieval["use_cache"])
+        self.assertFalse(retrieval["finalize_packet"])
+
+        host._read_l2_certificate.assert_awaited_once()
+        reader_request = host._read_l2_certificate.await_args.kwargs
+        self.assertFalse(reader_request["allow_l3"])
+        self.assertEqual(reader_request["packet"], packet)
+        host._run_fast_reconstruction_with_ledger.assert_awaited_once()
+        provider_request = host._run_fast_reconstruction_with_ledger.await_args.kwargs
+        self.assertEqual(provider_request["phase"], "resident_evidence_reader")
+        self.assertEqual(provider_request["usage_source"], "resident_reader_one_pass")
+        self.assertIn("resident one-pass", provider_request["system_prompt"])
+        self.assertIn("不得返回 REQUEST_L3", provider_request["system_prompt"])
+
+        ledger = outcome.ledger_result
+        self.assertEqual(ledger["path"], "resident_reader_one_pass")
+        self.assertEqual(ledger["retrieval_mode"], "FRESH")
+        self.assertEqual(ledger["cache_layer"], "NONE")
+        self.assertEqual(ledger["memory_provider_calls"], 1)
+        self.assertFalse(ledger["repair_attempted"])
+        self.assertFalse(ledger["l3_attempted"])
+        self.assertEqual(ledger["selected_edge_ids"], [])
+        self.assertEqual(ledger["selected_hypothesis_ids"], [])
+        self.assertEqual(
+            set(ledger["visited_source_keys"]),
+            SOURCE_KEYS,
+        )
+        self.assertEqual(
+            set(ledger["presented_source_keys"]),
+            SURFACE_SOURCE_KEYS,
+        )
+        self.assertEqual(set(outcome.source_keys), SURFACE_SOURCE_KEYS)
+        self.assertEqual(outcome.selected_edge_ids, ())
+        self.assertEqual(outcome.selected_hypothesis_ids, ())
+        self.assertFalse(outcome.truncated)
+        self.assertEqual(ledger["surface_omitted_optional"], 0)
+        self.assertFalse(ledger["surface_truncated"])
+        self.assertEqual(
+            ledger["surface_injection_status"],
+            "COMPILED_NOT_YET_INJECTED",
+        )
+        self.assertIn("FULL_RETRIEVAL", ledger["stage_elapsed_ms"])
+        self.assertIn("RESIDENT_READER", ledger["stage_elapsed_ms"])
         service.audit_snapshot_sources.assert_awaited_once()
         self.assertEqual(
             service.audit_snapshot_sources.await_args.kwargs["source_keys"],
-            packet_sources,
+            SOURCE_KEYS,
         )
+        self.assertEqual(host._assert_snapshot_fresh.await_count, 2)
         service.record_reconstruction_step.assert_awaited_once()
-        host._assert_snapshot_fresh.assert_awaited_once()
+        reconstruction = service.record_reconstruction_step.await_args.kwargs
+        self.assertEqual(reconstruction["tool_name"], "resident_reader_one_pass")
+        self.assertEqual(reconstruction["arguments"]["reader_calls"], 1)
 
-        inject = main_method(
-            "inject_subconscious_memory",
-            asyncio=asyncio,
-            json=json,
-            LOCAL_SERVING_SCHEMA_VERSION=LOCAL_SERVING_SCHEMA_VERSION,
-            TextPart=FakeTextPart,
-            logger=SimpleNamespace(
-                error=lambda *args, **kwargs: None,
-                exception=lambda *args, **kwargs: None,
-            ),
-            GroupScopeError=ValueError,
-        )
-        event = SimpleNamespace(message_obj=SimpleNamespace(message_str=query))
+        self.assertEqual(service.finish_experiment.await_count, 0)
         request = SimpleNamespace(prompt="", extra_user_content_parts=[])
-        host.context = SimpleNamespace(
-            get_provider_by_id=lambda value: (_ for _ in ()).throw(
-                AssertionError("local injection must not look up a provider")
-            )
-        )
-        host._group_scope = lambda value: SimpleNamespace(
-            key=normalized.umo, storage_id="scope-e2e"
-        )
-        host._session_allowed = lambda value: True
+        host._session_allowed = lambda umo: True
         host._scope_event_carriers = {}
-        host._services = {normalized.umo: service}
-        host._service_scopes = {normalized.umo: host._group_scope(event)}
-        host._test_service = service
-        host.feedback_learning_enabled = False
-        host._local_memory_for_request = AsyncMock(return_value=outcome)
         host._feedback_candidate_ids = {}
+        host._local_memory_for_request = AsyncMock(return_value=outcome)
         host._local_serving_injected = set()
 
-        await inject(host, event, request)
+        await production_inject_method()(host, event, request)
+
         self.assertEqual(len(request.extra_user_content_parts), 1)
-        self.assertIn("<mr_memory_local_evidence>", request.extra_user_content_parts[0].text)
+        injected = request.extra_user_content_parts[0].text
+        marker = "<mr_memory_surface>"
+        self.assertIn(marker, injected)
+        surface_text = injected.split(marker, 1)[1].split(
+            "</mr_memory_surface>", 1
+        )[0]
+        surface = json.loads(surface_text)
+        self.assertEqual(surface["schema_version"], SURFACE_SCHEMA_VERSION)
+        self.assertEqual(surface["status"], "CERTIFIED")
         self.assertIn(id(event), host._local_serving_injected)
         service.finish_experiment.assert_awaited_once()
+        terminal = service.finish_experiment.await_args.kwargs
+        self.assertEqual(terminal["status"], "completed")
         self.assertEqual(
-            service.finish_experiment.await_args.kwargs["result"]["surface_injection_status"],
+            terminal["result"]["surface_injection_status"],
             "INJECTED_IN_REQUEST_HOOK",
         )
+        self.assertEqual(terminal["result"]["memory_provider_calls"], 1)
 
-    async def test_normal_full_retrieval_over_old_two_second_gate_completes(self) -> None:
-        query = "/chat 解释作品态度前后变化"
-        normalized = NormalizedMessage(
-            platform="aiocqhttp",
-            platform_id="bot",
-            umo="bot:GroupMessage:slow-e2e",
-            group_id="slow-e2e",
-            message_id="query-slow",
-            sender_id="asker",
-            sender_name="提问者",
-            sent_at=450,
-            plain_text=query,
-            content=[{"type": "plain", "text": query}],
+    async def test_surface_optional_omission_is_reported_as_truncation(self) -> None:
+        snapshot = synthetic_snapshot()
+        packet = synthetic_packet()
+        packet_sha256 = stable_sha256(packet)
+        raw_certificate = synthetic_certificate_response(snapshot, packet_sha256)
+        raw_certificate["atoms"].append(
+            {
+                "id": "optional_context",
+                "statement": "可选的合成背景。" * 80,
+                "speaker_participant_key": "participant:a",
+                "subject_participant_key": "participant:a",
+                "attribution": "DIRECT_SPEAKER_STATEMENT",
+                "stance": "SUPPORTED",
+                "source_keys": ["source-old"],
+                "source_spans": ["我暂时没有兴趣。"],
+                "importance": "OPTIONAL",
+                "confidence": 0.7,
+            }
         )
-        packet = local_serving_fixtures.LocalServingEnvelopeTests.packet()
+        certificate = parse_evidence_certificate(
+            raw_certificate,
+            expected_snapshot=snapshot,
+            expected_packet_sha256=packet_sha256,
+            allowed_source_keys=SOURCE_KEYS,
+            allowed_participant_keys=PARTICIPANT_KEYS,
+            pack_read_complete=True,
+        )
+        full_surface = compile_surface_packet(certificate, max_chars=50_000)
+        self.assertEqual(full_surface.omitted_optional, 0)
+
+        normalized = self.normalized_message(snapshot)
         service = SimpleNamespace(
             start_experiment=AsyncMock(),
             finish_experiment=AsyncMock(),
             audit_snapshot_sources=AsyncMock(),
             record_reconstruction_step=AsyncMock(),
-        )
-        snapshot = SimpleNamespace(
-            umo=normalized.umo,
-            cutoff_at=450,
-            message_upper_bound=10,
-            snapshot_id="snapshot-slow-e2e",
-            digest="snapshot-digest",
-            sender_participant_key='participant:["bot","asker"]',
-            reply_source_key="",
         )
         host = self.production_host(
             normalized=normalized,
-            service=service,
             snapshot=snapshot,
             packet=packet,
-            timeout=180.0,
+            service=service,
+        )
+        host.local_serving_max_chars = len(full_surface.text) - 1
+        host._run_fast_reconstruction_with_ledger = AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    completion_text=json.dumps(raw_certificate, ensure_ascii=False)
+                ),
+                8.5,
+            )
         )
 
-        async def slow_full_retrieval(**kwargs):
-            await asyncio.sleep(2.05)
-            return (packet, stable_sha256(packet), set(), set(), "LOCAL_FRESH")
+        event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
+        outcome = await production_execute_method()(host, event, QUERY)
 
-        host._layered_evidence_packet = AsyncMock(side_effect=slow_full_retrieval)
-        outcome = await production_execute_method()(host, object(), query)
-
-        self.assertEqual(outcome.operational_status, "COMPLETED")
         self.assertTrue(outcome.usable)
-        self.assertGreaterEqual(
-            outcome.ledger_result["stage_elapsed_ms"]["FULL_RETRIEVAL"],
-            2000.0,
-        )
-        self.assertEqual(outcome.ledger_result["hang_guard_seconds"], 180.0)
+        self.assertTrue(outcome.truncated)
+        self.assertEqual(outcome.ledger_result["surface_omitted_optional"], 1)
+        self.assertTrue(outcome.ledger_result["surface_truncated"])
+        surface = json.loads(outcome.envelope_text)
+        self.assertEqual(surface["omitted_optional"], 1)
+        self.assertEqual(surface["evidence"]["optional"], [])
 
-    async def test_production_execute_hang_guard_records_failed_retrieval_stage(self) -> None:
-        query = "/chat 解释作品态度前后变化"
-        normalized = NormalizedMessage(
-            platform="aiocqhttp", platform_id="bot",
-            umo="bot:GroupMessage:hang-e2e", group_id="hang-e2e",
-            message_id="query-hang", sender_id="asker", sender_name="提问者",
-            sent_at=500, plain_text=query,
-            content=[{"type": "plain", "text": query}],
-        )
-        packet = local_serving_fixtures.LocalServingEnvelopeTests.packet()
+        request = SimpleNamespace(prompt="", extra_user_content_parts=[])
+        host._session_allowed = lambda umo: True
+        host._scope_event_carriers = {}
+        host._feedback_candidate_ids = {}
+        host._local_memory_for_request = AsyncMock(return_value=outcome)
+        host._local_serving_injected = set()
+        await production_inject_method()(host, event, request)
+        terminal = service.finish_experiment.await_args.kwargs["result"]
+        self.assertEqual(terminal["surface_omitted_optional"], 1)
+        self.assertTrue(terminal["surface_truncated"])
+
+    async def test_180_seconds_is_only_an_abnormal_hang_guard(self) -> None:
+        snapshot = synthetic_snapshot()
+        packet = synthetic_packet()
+        normalized = self.normalized_message(snapshot)
         service = SimpleNamespace(
             start_experiment=AsyncMock(),
             finish_experiment=AsyncMock(),
             audit_snapshot_sources=AsyncMock(),
             record_reconstruction_step=AsyncMock(),
         )
-        snapshot = SimpleNamespace(
-            umo=normalized.umo, cutoff_at=500, message_upper_bound=10,
-            snapshot_id="snapshot-hang", digest="snapshot-digest",
-            sender_participant_key="", reply_source_key="",
-        )
         host = self.production_host(
-            normalized=normalized, service=service, snapshot=snapshot,
-            packet=packet, timeout=0.01,
+            normalized=normalized,
+            snapshot=snapshot,
+            packet=packet,
+            service=service,
         )
-        async def hung_retrieval(**kwargs):
-            await asyncio.sleep(1)
-            return (packet, stable_sha256(packet), set(), set(), "LOCAL_FRESH")
+        self.assertEqual(host.local_serving_timeout_seconds, 180.0)
 
-        host._layered_evidence_packet = AsyncMock(side_effect=hung_retrieval)
-        outcome = await production_execute_method()(host, object(), query)
+        # Compress only the wall-clock duration of the synthetic hang. The same
+        # production timeout branch remains under test.
+        host.local_serving_timeout_seconds = 0.01
+
+        async def hung_full_retrieval(**kwargs):
+            await asyncio.sleep(1)
+            return (
+                packet,
+                stable_sha256(packet),
+                set(SOURCE_KEYS),
+                set(PARTICIPANT_KEYS),
+                "NONE",
+            )
+
+        host._layered_evidence_packet = AsyncMock(side_effect=hung_full_retrieval)
+        event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
+        outcome = await production_execute_method()(host, event, QUERY)
 
         self.assertEqual(outcome.operational_status, "FAILED")
+        self.assertEqual(outcome.semantic_status, "UNKNOWN")
+        self.assertFalse(outcome.envelope_text)
         self.assertIn("abnormal-hang guard", outcome.detail)
+        host._read_l2_certificate.assert_not_awaited()
+        host._run_fast_reconstruction_with_ledger.assert_not_awaited()
         service.finish_experiment.assert_awaited_once()
         failure = service.finish_experiment.await_args.kwargs
         self.assertEqual(failure["status"], "failed")
@@ -437,124 +636,44 @@ class LocalServingEndToEndAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             failure["result"]["stage_elapsed_ms"],
         )
 
-    async def test_full_retrieval_requests_are_not_globally_serialized(self) -> None:
-        query = "/chat 解释作品态度前后变化"
-        normalized = NormalizedMessage(
-            platform="aiocqhttp", platform_id="bot",
-            umo="bot:GroupMessage:concurrent-e2e", group_id="concurrent-e2e",
-            message_id="query-concurrent", sender_id="asker",
-            sender_name="提问者", sent_at=550, plain_text=query,
-            content=[{"type": "plain", "text": query}],
-        )
-        packet = local_serving_fixtures.LocalServingEnvelopeTests.packet()
-        service = SimpleNamespace(
-            start_experiment=AsyncMock(), finish_experiment=AsyncMock(),
-            audit_snapshot_sources=AsyncMock(),
-            record_reconstruction_step=AsyncMock(),
-        )
-        snapshot = SimpleNamespace(
-            umo=normalized.umo, cutoff_at=550, message_upper_bound=10,
-            snapshot_id="snapshot-concurrent", digest="snapshot-digest",
-            sender_participant_key="", reply_source_key="",
-        )
-        host = self.production_host(
-            normalized=normalized, service=service, snapshot=snapshot,
-            packet=packet, timeout=1.0,
-        )
-        both_entered = asyncio.Event()
-        active = 0
-        maximum_active = 0
-
-        async def concurrent_retrieval(**kwargs):
-            nonlocal active, maximum_active
-            active += 1
-            maximum_active = max(maximum_active, active)
-            if active == 2:
-                both_entered.set()
-            try:
-                await both_entered.wait()
-                return (packet, stable_sha256(packet), set(), set(), "LOCAL_FRESH")
-            finally:
-                active -= 1
-
-        host._layered_evidence_packet = AsyncMock(side_effect=concurrent_retrieval)
-        outcomes = await asyncio.wait_for(
-            asyncio.gather(
-                production_execute_method()(host, object(), query),
-                production_execute_method()(host, object(), query),
-            ),
-            timeout=0.5,
-        )
-        self.assertEqual(maximum_active, 2)
-        self.assertTrue(all(item.operational_status == "COMPLETED" for item in outcomes))
-
-
-    async def test_provider_turn_report_is_pairwise_closed_and_explicit(self) -> None:
+    def test_provider_ledger_reports_exactly_one_resident_reader_turn(self) -> None:
         common = {
-            "request_id": "run-1:analysis:0", "run_id": "run-1", "arm": "memory",
-            "repetition": 1, "phase": "analysis", "call_index": 0,
-            "provider_id": "provider", "model": "model", "thinking": "enabled",
-            "max_tokens": 1000, "options_sha256": "options", "payload_sha256": "payload",
+            "request_id": "run-1:resident_evidence_reader:0",
+            "run_id": "run-1",
+            "arm": "memory",
+            "repetition": 1,
+            "phase": "resident_evidence_reader",
+            "call_index": 0,
+            "provider_id": "resident-reader",
+            "model": "synthetic-model",
+            "thinking": "enabled",
+            "max_tokens": 8_192,
+            "options_sha256": "options",
+            "payload_sha256": "payload",
         }
         report = provider_turn_report(
             [
                 {**common, "event": "attempted"},
-                {**common, "event": "completed", "usage_present": True,
-                 "input_other": 100, "input_cached": 20, "input": 120,
-                 "output": 30, "total": 150, "elapsed_ms": 250.5},
+                {
+                    **common,
+                    "event": "completed",
+                    "usage_present": True,
+                    "input_other": 1_000,
+                    "input_cached": 200,
+                    "input": 1_200,
+                    "output": 180,
+                    "total": 1_380,
+                    "elapsed_ms": 320.5,
+                },
             ],
             run_id="run-1",
         )
         self.assertTrue(report["pairwise_closed"])
         self.assertEqual(report["attempted_calls"], 1)
-        self.assertEqual(report["measured_completed_total_lower_bound"], 150)
-        self.assertTrue(report["usage_complete"])
-        self.assertEqual(report["turns"][0]["payload_sha256"], "payload")
-        self.assertEqual(
-            report["currency_cost"], "UNKNOWN_PROVIDER_PRICING_NOT_IN_LEDGER"
-        )
-
-        with self.assertRaisesRegex(ValueError, "pairwise closed"):
-            provider_turn_report([{**common, "event": "attempted"}], run_id="run-1")
-
-        with self.assertRaisesRegex(ValueError, "no rows"):
-            provider_turn_report([], run_id="run-1")
-        zero = provider_turn_report(
-            [],
-            run_id="local-run",
-            expect_zero_calls=True,
-            non_llm_run_evidence={
-                "run_id": "local-run",
-                "operational_status": "COMPLETED",
-                "path": "materialized_local",
-                "memory_provider_calls": 0,
-            },
-        )
-        self.assertTrue(zero["expected_zero_calls"])
-        self.assertEqual(zero["attempted_calls"], 0)
-
-        with self.assertRaisesRegex(ValueError, "terminal precedes"):
-            provider_turn_report(
-                [
-                    {**common, "event": "completed", "usage_present": True,
-                     "input_other": 0, "input_cached": 0, "input": 0,
-                     "output": 0, "total": 0},
-                    {**common, "event": "attempted"},
-                ],
-                run_id="run-1",
-            )
-
-        failed = provider_turn_report(
-            [
-                {**common, "event": "attempted"},
-                {**common, "event": "failed", "elapsed_ms": 10,
-                 "error_type": "TimeoutError", "error_detail": "timeout"},
-            ],
-            run_id="run-1",
-        )
-        self.assertFalse(failed["usage_complete"])
-        self.assertEqual(failed["failed_calls"], 1)
-        self.assertEqual(failed["measured_completed_total_lower_bound"], 0)
+        self.assertEqual(report["completed_calls"], 1)
+        self.assertEqual(report["failed_calls"], 0)
+        self.assertEqual(report["turns"][0]["phase"], "resident_evidence_reader")
+        self.assertEqual(report["measured_completed_total_lower_bound"], 1_380)
 
 
 if __name__ == "__main__":

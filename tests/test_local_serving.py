@@ -82,8 +82,15 @@ class LocalServingEnvelopeTests(unittest.TestCase):
             "semantic_evidence": [
                 {
                     "memory": {
+                        "person_cue": "甲",
+                        "aspect_tag": "购买状态",
                         "content": "甲后来明确说已经买了。",
+                        "epistemic_status": "ASSERTED",
                         "status": "ACTIVE",
+                        "semantic_subject": {
+                            "canonical_key": "participant:synthetic-semantic-subject",
+                            "account_id": "synthetic-semantic-subject",
+                        },
                     },
                     "evidence": [
                         {
@@ -157,6 +164,32 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         value = json.loads(result.json_text)
         self.assertEqual(value["schema_version"], LOCAL_SERVING_SCHEMA_VERSION)
         self.assertEqual(value["retrieval"]["memory_provider_calls"], 0)
+        reasoning = value["identity"]["person_reasoning_candidates"]
+        self.assertEqual(
+            reasoning["parser"]["references"],
+            [],
+        )
+        self.assertEqual(
+            reasoning["semantic"][0]["subject_candidate"],
+            "甲",
+        )
+        self.assertEqual(
+            reasoning["semantic"][0]["predicate"],
+            "购买状态",
+        )
+        self.assertEqual(
+            reasoning["semantic"][0]["epistemic_state"],
+            "ASSERTED",
+        )
+        hypothesis_source_ids = reasoning["semantic"][0]["source_ids"]
+        self.assertEqual(len(hypothesis_source_ids), 1)
+        source_records = {item["id"]: item for item in value["source_records"]}
+        self.assertEqual(source_records[hypothesis_source_ids[0]]["text"], "我买了")
+        self.assertNotIn("participant_key", reasoning["semantic"][0])
+        self.assertNotIn("synthetic-semantic-subject", reasoning["semantic"][0].values())
+        self.assertIn("identity anchors", value["identity"]["rules"][0])
+        self.assertIn("not identity verdicts", value["identity"]["rules"][1])
+        self.assertIn("never a canonical merge", value["identity"]["rules"][2])
 
     def test_identity_coverage_and_participant_history_are_visible(self) -> None:
         packet = self.packet()
@@ -188,12 +221,15 @@ class LocalServingEnvelopeTests(unittest.TestCase):
             max_chars=4000,
         )
         value = json.loads(result.json_text)
+        parser_evidence = value["identity"]["person_reasoning_candidates"][
+            "parser"
+        ]
         self.assertEqual(
-            [item["status"] for item in value["identity"]["query_resolution"]["mentions"]],
-            ["RESOLVED", "UNRESOLVED"],
+            [item["parser_signal"] for item in parser_evidence["references"]],
+            ["UNIQUE_ALIAS_CANDIDATE", "NO_ALIAS_CANDIDATE"],
         )
         self.assertEqual(
-            value["identity"]["query_resolution"]["mentions"][0]["participant_keys"],
+            parser_evidence["references"][0]["candidate_participant_keys"],
             ['participant:["bot","account-a"]'],
         )
         self.assertEqual(value["participant_history"][0]["status"], "SOURCE_BACKED")
@@ -219,11 +255,18 @@ class LocalServingEnvelopeTests(unittest.TestCase):
             max_chars=3000,
         )
         unresolved_value = json.loads(unresolved.json_text)
-        self.assertTrue(unresolved.usable)
-        self.assertEqual(unresolved.semantic_status, "IDENTITY_UNRESOLVED")
+        self.assertFalse(unresolved.usable)
+        self.assertEqual(unresolved.semantic_status, "NO_LOCAL_EVIDENCE")
+        unresolved_references = unresolved_value["identity"][
+            "person_reasoning_candidates"
+        ]["parser"]["references"]
         self.assertEqual(
-            [item["alias"] for item in unresolved_value["identity"]["query_resolution"]["unresolved_aliases"]],
+            [item["reference"] for item in unresolved_references],
             ["幽灵甲", "幽灵乙"],
+        )
+        self.assertEqual(
+            {item["parser_signal"] for item in unresolved_references},
+            {"NO_ALIAS_CANDIDATE"},
         )
 
     def test_history_budget_never_claims_that_existing_history_does_not_exist(self) -> None:
@@ -325,14 +368,16 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         except LocalServingEnvelopeError:
             return
         value = json.loads(envelope.json_text)
-        visible = value["identity"]["query_resolution"]
+        visible = value["identity"]["person_reasoning_candidates"][
+            "parser"
+        ]
         self.assertEqual(len(visible["participants"]), 12)
         self.assertEqual(
-            [item["status"] for item in visible["mentions"]],
-            ["RESOLVED"] * 12,
+            [item["parser_signal"] for item in visible["references"]],
+            ["UNIQUE_ALIAS_CANDIDATE"] * 12,
         )
         self.assertTrue(
-            all(item["participant_keys"] for item in visible["mentions"])
+            all(item["candidate_participant_keys"] for item in visible["references"])
         )
         self.assertEqual(value["retrieval"]["memory_provider_tokens"], 0)
         self.assertEqual(
@@ -555,21 +600,21 @@ class LocalServingEnvelopeTests(unittest.TestCase):
     def test_ambiguous_alias_keeps_accounts_separate(self) -> None:
         packet = self.packet()
         packet["query_alias_resolution"] = {
-            "query": "/chat 老师是谁",
+            "query": "/chat 合成昵称-X 是谁",
             "ambiguous": True,
             "participants": [],
             "ambiguous_aliases": [
                 {
-                    "alias": "老师",
+                    "alias": "合成昵称-X",
                     "candidate_participants": [
                         {
                             "canonical_key": 'participant:["bot","100"]',
                             "account_id": "100",
-                            "current_display_name": "老师",
-                            "matched_aliases": ["老师"],
+                            "current_display_name": "合成成员-X1",
+                            "matched_aliases": ["合成昵称-X"],
                             "matched_alias_observations": [
                                 {
-                                    "alias": "老师",
+                                    "alias": "合成昵称-X",
                                     "source_key": "source-dislike",
                                     "sent_at": 100,
                                     "source_kind": "observed",
@@ -579,11 +624,11 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                         {
                             "canonical_key": 'participant:["bot","200"]',
                             "account_id": "200",
-                            "current_display_name": "老师",
-                            "matched_aliases": ["老师"],
+                            "current_display_name": "合成成员-X2",
+                            "matched_aliases": ["合成昵称-X"],
                             "matched_alias_observations": [
                                 {
-                                    "alias": "老师",
+                                    "alias": "合成昵称-X",
                                     "source_key": "source-joke",
                                     "sent_at": 301,
                                     "source_kind": "observed",
@@ -604,35 +649,43 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         )
 
         self.assertTrue(result.usable)
-        self.assertEqual(result.semantic_status, "IDENTITY_AMBIGUOUS")
+        self.assertEqual(result.semantic_status, "EVIDENCE_AVAILABLE")
         value = json.loads(result.json_text)
-        candidates = value["identity"]["query_resolution"]["ambiguous_aliases"][0][
-            "candidates"
-        ]
+        candidates = value["identity"]["person_reasoning_candidates"][
+            "parser"
+        ]["ambiguous_references"][0]["candidates"]
         self.assertEqual([item["account_id"] for item in candidates], ["100", "200"])
         self.assertNotEqual(candidates[0]["canonical_key"], candidates[1]["canonical_key"])
-        self.assertEqual(candidates[0]["alias_observations"][0]["source_id"], "s1")
-        self.assertEqual(candidates[1]["alias_observations"][0]["source_id"], "s2")
+        candidate_source_ids = {
+            candidate["alias_observations"][0]["source_id"]
+            for candidate in candidates
+        }
+        self.assertEqual(len(candidate_source_ids), 2)
+        self.assertTrue(
+            candidate_source_ids.issubset(
+                {item["id"] for item in value["source_records"]}
+            )
+        )
 
     def test_unbacked_ambiguous_alias_is_not_injectable_identity_evidence(self) -> None:
         packet = {
             "query_alias_resolution": {
-                "query": "/chat 老师是谁",
+                "query": "/chat 合成昵称-Y 是谁",
                 "ambiguous": True,
                 "participants": [],
                 "ambiguous_aliases": [
                     {
-                        "alias": "老师",
+                        "alias": "合成昵称-Y",
                         "candidate_participants": [
                             {
                                 "canonical_key": 'participant:["bot","100"]',
                                 "account_id": "100",
-                                "current_display_name": "老师",
+                                "current_display_name": "合成成员-Y1",
                             },
                             {
                                 "canonical_key": 'participant:["bot","200"]',
                                 "account_id": "200",
-                                "current_display_name": "老师",
+                                "current_display_name": "合成成员-Y2",
                             },
                         ],
                     }
@@ -653,7 +706,12 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         self.assertFalse(result.usable)
         self.assertEqual(result.semantic_status, "NO_LOCAL_EVIDENCE")
         value = json.loads(result.json_text)
-        self.assertEqual(value["identity"]["query_resolution"]["ambiguous_aliases"], [])
+        self.assertEqual(
+            value["identity"]["person_reasoning_candidates"]["parser"][
+                "ambiguous_references"
+            ],
+            [],
+        )
 
 
     def test_empty_local_packet_is_not_reported_as_semantic_absence(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 from dataclasses import replace
@@ -67,6 +68,77 @@ class SurfaceCompilerTests(unittest.TestCase):
         self.assertEqual(payload["evidence"]["optional"], [])
         self.assertEqual(packet_ids(payload["evidence"]["required"]), ["a1"])
         self.assertEqual(bounded.omitted_optional, 1)
+
+    def test_oversized_optional_does_not_block_later_small_atom(self) -> None:
+        raw = _raw_certificate()
+        required = copy.deepcopy(raw["atoms"][0])
+        required.update(
+            {
+                "id": "required_core",
+                "statement": "合成核心事实必须保留。",
+                "source_spans": ["核心事实"],
+            }
+        )
+        oversized = copy.deepcopy(raw["atoms"][1])
+        oversized.update(
+            {
+                "id": "optional_oversized",
+                "statement": "大" * 1_500,
+                "source_spans": ["大型可选证据"],
+            }
+        )
+        small = copy.deepcopy(raw["atoms"][1])
+        small.update(
+            {
+                "id": "optional_small",
+                "statement": "后续短小的合成可选事实。",
+                "source_spans": ["短小可选证据"],
+            }
+        )
+        raw["subjects"][0]["reference"] = "参与者甲"
+        raw["atoms"] = [required, oversized, small]
+        raw["must_include"] = ["required_core"]
+        raw["must_not_upgrade"] = [
+            {
+                "observed": "愿意尝试",
+                "forbidden": ["已经完成"],
+                "atom_ids": ["required_core"],
+                "reason": "合成观察不等于已经完成。",
+            }
+        ]
+
+        def parse_variant(atoms: list[dict[str, object]]):
+            variant = copy.deepcopy(raw)
+            variant["atoms"] = atoms
+            return parse_evidence_certificate(
+                variant,
+                expected_snapshot=_snapshot(),
+                expected_packet_sha256="a" * 64,
+                allowed_source_keys={"s1", "s2"},
+                allowed_participant_keys={"p1"},
+                pack_read_complete=True,
+                host_validated=True,
+            )
+
+        certificate = parse_variant([required, oversized, small])
+        small_only = parse_variant([required, small])
+        oversized_only = parse_variant([required, oversized])
+        bound = len(compile_surface_packet(small_only, max_chars=100_000).text)
+        self.assertGreater(
+            len(compile_surface_packet(oversized_only, max_chars=100_000).text),
+            bound,
+        )
+
+        packet = compile_surface_packet(certificate, max_chars=bound)
+
+        validate_surface_packet(packet, certificate)
+        self.assertLessEqual(len(packet.text), bound)
+        self.assertEqual(packet.included_optional_atom_ids, ("optional_small",))
+        self.assertEqual(packet.omitted_optional, 1)
+        self.assertGreater(
+            len(compile_surface_packet(certificate, max_chars=100_000).text),
+            bound,
+        )
 
     def test_compiler_fails_closed_if_mandatory_contract_does_not_fit(self) -> None:
         with self.assertRaisesRegex(SurfaceCompilationError, "refusing truncation"):
