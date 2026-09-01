@@ -47,8 +47,17 @@ class ConfigSurfaceTests(unittest.TestCase):
     def test_online_runtime_exposes_local_serving_not_remote_routing(self) -> None:
         local_hint = str(self.schema["local_serving_enabled"]["hint"])
         timeout_hint = str(self.schema["local_serving_timeout_seconds"]["hint"])
+        self.assertEqual(self.schema["local_serving_timeout_seconds"]["default"], 180)
+        self.assertIn("1-600 秒", timeout_hint)
+        self.assertIn("异常卡死", timeout_hint)
         budget_hint = str(self.schema["private_daily_token_budget"]["hint"])
         main_source = (Path.cwd() / "main.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'float(self.config.get("local_serving_timeout_seconds", 180.0))',
+            main_source,
+        )
+        self.assertIn("min(\n                600.0,", main_source)
+        self.assertIn("max(\n            1.0,", main_source)
         self.assertIn("不调用第二个远程模型", local_hint)
         self.assertIn("不会切换模型", timeout_hint)
         self.assertIn("本地检索不调用插件模型", budget_hint)

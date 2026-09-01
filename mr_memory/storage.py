@@ -3787,9 +3787,70 @@ class MemoryStorage:
                 "ambiguous": False,
                 "participants": [],
                 "ambiguous_aliases": [],
+                "mentions": [],
+                "unresolved_aliases": [],
             }
 
-        query_body = re.sub(r"^/chat(?:\s+|$)", "", normalized_query).strip()
+        query_body = re.sub(
+            r"^/chat(?:@\S+)?(?=\s|$)\s*",
+            "",
+            normalized_query,
+            count=1,
+        ).strip()
+        display_query_body = re.sub(
+            r"^/chat(?:@\S+)?(?=\s|$)\s*",
+            "",
+            original_query,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        explicit_mentions: list[tuple[str, str]] = []
+        explicit_mention_text = ""
+        explicit_single_target = False
+        explicit_action = bool(
+            re.match(
+                r"^(?:请)?(?:帮我)?(?:分辨|区分|辨认)(?:一下)?(?=\S|\s)",
+                query_body,
+            )
+        )
+        explicit_result_cue = bool(
+            re.search(
+                r"(?:是|有)几个人|分别是谁|都是谁|谁是谁|是谁$",
+                query_body,
+            )
+        )
+        if explicit_action or explicit_result_cue:
+            explicit_mention_text = re.sub(
+                r"^(?:请)?(?:帮我)?(?:分辨|区分|辨认)(?:一下)?",
+                "",
+                display_query_body,
+                count=1,
+            ).strip()
+            explicit_mention_text = re.split(
+                r"(?:是|有)几个人|分别是谁|都是谁|谁是谁|是谁$",
+                explicit_mention_text,
+                maxsplit=1,
+            )[0].strip(" ，,、；;：:")
+        if not explicit_mention_text:
+            group_target = re.search(
+                r"(?:群里|群内)(?:有没有|有)\s*"
+                r"([^，,。；;！？!?\s]{1,40}?)(?:吗|么|[，,。；;！？!?]|$)",
+                display_query_body,
+                flags=re.IGNORECASE,
+            )
+            if group_target:
+                explicit_mention_text = group_target.group(1).strip()
+                explicit_single_target = bool(explicit_mention_text)
+        if not explicit_mention_text:
+            activity_target = re.search(
+                r"(?:通过|根据)?(?:最近几天|近几天|过去几天|近期)?\s*"
+                r"([a-z0-9_.-]{2,40})\s*的(?:发言|消息|聊天(?:记录)?)",
+                display_query_body,
+                flags=re.IGNORECASE,
+            )
+            if activity_target:
+                explicit_mention_text = activity_target.group(1).strip()
+                explicit_single_target = bool(explicit_mention_text)
         non_identity_aliases = {
             "最近",
             "这几天",
@@ -3838,6 +3899,8 @@ class MemoryStorage:
             "找",
             "吗",
             "呢",
+            "是谁",
+            "是哪位",
             "和",
             "与",
             "、",
@@ -3857,6 +3920,10 @@ class MemoryStorage:
                 right = normalized_query[end:]
                 if (
                     query_body == alias
+                    or (
+                        explicit_mention_text
+                        and alias in normalize_alias(explicit_mention_text)
+                    )
                     or any(left.endswith(cue) for cue in left_reference_cues)
                     or any(right.startswith(cue) for cue in right_reference_cues)
                 ):
@@ -3910,6 +3977,154 @@ class MemoryStorage:
                     safe_limit * 4,
                 ),
             ).fetchall()
+
+        semantic_claim_rows: list[sqlite3.Row] = []
+        semantic_claimed_aliases: dict[int, str] = {}
+        # Semantic self-claims are used only to resolve an explicitly enumerated
+        # identity request below.  Ordinary chat and ordinary observed-alias
+        # lookup must not scan every semantic source in the group.
+        if explicit_mention_text:
+            with self._lock:
+                semantic_claim_rows = self._connection.execute(
+                    """
+                    SELECT sm.id AS semantic_memory_id, sm.aspect_tag, sm.content,
+                           sm.subject_participant_id, p.canonical_key,
+                           m.source_key, m.sent_at
+                    FROM semantic_memories AS sm
+                    JOIN participants AS p
+                      ON p.id=sm.subject_participant_id AND p.umo=sm.umo
+                    JOIN semantic_memory_sources AS sms
+                      ON sms.semantic_memory_id=sm.id AND sms.evidence_role='SUPPORT'
+                    JOIN messages AS m
+                      ON m.id=sms.message_id AND m.umo=sm.umo
+                    WHERE sm.umo=? AND sm.subject_participant_id IS NOT NULL
+                      AND COALESCE(sm.status, 'ACTIVE')='ACTIVE'
+                      AND CAST(strftime('%s', sm.created_at) AS INTEGER)<?
+                      AND CAST(strftime('%s', sm.updated_at) AS INTEGER)<?
+                      AND m.is_deleted=0 AND m.sent_at<? AND m.id<=?
+                    ORDER BY sm.id, m.sent_at, m.id
+                    """,
+                    (umo, cutoff, cutoff, cutoff, upper_bound),
+                ).fetchall()
+
+        def strong_semantic_claimed_alias(
+            *, aspect: object, content: object
+        ) -> str:
+            text = normalize_alias(content)
+            subject_marker = (
+                r"(?:(?:p\d+|他|她|该用户|该成员|该群友|本人|自己)"
+                r"[：:，,\s]*)?"
+            )
+            self_claim = (
+                r"(?:自称|称自己(?:为|是|叫)|叫自己(?:为|是|叫)|"
+                r"自己称自己(?:为|是|叫)|自我介绍(?:为|是|叫)|"
+                r"自己的(?:昵称|名字)(?:是|叫)|"
+                r"本人(?:的)?(?:昵称|名字)(?:是|叫))"
+            )
+            prefix = r"^\s*" + subject_marker + self_claim + r"\s*"
+            parenthetical_self_prefix = (
+                r"^\s*" + subject_marker + r"称自己\s*"
+            )
+            for delimited in (
+                r"[（(]\s*([^）)]{2,40})\s*[）)]",
+                r"[【\[]\s*([^】\]]{2,40})\s*[】\]]",
+                r"[“\"‘'「『]\s*([^”\"’'」』]{2,40})\s*[”\"’'」』]",
+            ):
+                matched = re.match(prefix + delimited, text)
+                if not matched:
+                    matched = re.match(parenthetical_self_prefix + delimited, text)
+                if matched:
+                    return normalize_alias(matched.group(1))
+            matched = re.match(
+                prefix + r"([^，,。；;：:\s（）()【】\[\]“”\"'‘’「」『』]{2,40})",
+                text,
+            )
+            return normalize_alias(matched.group(1)) if matched else ""
+
+        for row in semantic_claim_rows:
+            claimed = strong_semantic_claimed_alias(
+                aspect=row["aspect_tag"], content=row["content"]
+            )
+            if claimed:
+                semantic_claimed_aliases[int(row["semantic_memory_id"])] = claimed
+
+        if explicit_mention_text:
+            known_aliases = sorted(
+                {
+                    str(row["normalized_alias"] or "")
+                    for row in alias_rows
+                    if str(row["normalized_alias"] or "")
+                    not in non_identity_aliases
+                }
+                | set(semantic_claimed_aliases.values()),
+                key=lambda value: (-len(value), value),
+            )
+            parsed_mentions: list[tuple[str, str]] = []
+
+            def add_explicit_piece(value: str) -> None:
+                piece = str(value or "").strip(" \t\r\n，,、；;：:")
+                normalized_piece = normalize_alias(piece)
+                if (
+                    normalized_piece
+                    and normalized_piece not in {"和", "与"}
+                    and len(normalized_piece) <= 80
+                ):
+                    parsed_mentions.append((piece, normalized_piece))
+
+            def add_unknown_gap(value: str) -> None:
+                for piece in re.split(r"\s*(?:和|与)\s*", value):
+                    add_explicit_piece(piece)
+
+            for raw_clause in re.split(
+                r"\s*(?:，|,|、|；|;)\s*",
+                explicit_mention_text,
+            ):
+                display_clause = raw_clause.strip()
+                clause = normalize_alias(display_clause)
+                if not clause:
+                    continue
+                occurrences: list[tuple[int, int]] = []
+                for alias in known_aliases:
+                    offset = 0
+                    while True:
+                        start = clause.find(alias, offset)
+                        if start < 0:
+                            break
+                        occurrences.append((start, start + len(alias)))
+                        offset = start + 1
+                occurrences.sort(key=lambda span: (span[0], -(span[1] - span[0])))
+                selected_occurrences: list[tuple[int, int]] = []
+                covered_until = 0
+                for start, end in occurrences:
+                    if start < covered_until:
+                        continue
+                    selected_occurrences.append((start, end))
+                    covered_until = end
+                cursor = 0
+                for start, end in selected_occurrences:
+                    display_source = (
+                        display_clause
+                        if len(display_clause) == len(clause)
+                        else clause
+                    )
+                    add_unknown_gap(display_source[cursor:start])
+                    add_explicit_piece(display_source[start:end])
+                    cursor = end
+                display_source = (
+                    display_clause if len(display_clause) == len(clause) else clause
+                )
+                add_unknown_gap(display_source[cursor:])
+
+            if (
+                1 <= len(parsed_mentions) <= 12
+                and (
+                    explicit_action
+                    or explicit_result_cue
+                    or explicit_single_target
+                    or len(parsed_mentions) >= 2
+                )
+            ):
+                explicit_mentions = parsed_mentions
 
         resolved_aliases: list[tuple[str, str, dict[str, object]]] = []
         alias_reference_spans: dict[str, list[tuple[int, int]]] = {}
@@ -4039,11 +4254,371 @@ class MemoryStorage:
                 )
             )
 
+        # Rebuild the final result alias-by-alias.  Earlier collection is retained
+        # for compatibility with observed aliases, but status is decided here so
+        # one ambiguous alias cannot delete the same account's unrelated unique
+        # alias and a semantic singleton cannot downgrade an observed ambiguity.
+        alias_candidates: dict[str, dict[str, dict[str, object]]] = {}
+        alias_displays: dict[str, str] = {}
+        for normalized_alias, display_alias, resolved in selected:
+            alias_displays[normalized_alias] = display_alias
+            participants = resolved.get("participants")
+            for participant in participants if isinstance(participants, list) else []:
+                if not isinstance(participant, dict):
+                    continue
+                key = str(participant.get("canonical_key") or "")
+                if not key:
+                    continue
+                candidate = {
+                    **participant,
+                    "matched_aliases": [display_alias],
+                    "matched_alias_observations": alias_observations(
+                        participant,
+                        normalized_alias=normalized_alias,
+                        display_alias=display_alias,
+                    ),
+                }
+                alias_candidates.setdefault(normalized_alias, {})[key] = candidate
+
+        explicit_alias_displays = {
+            normalized: display for display, normalized in explicit_mentions
+        }
+        semantic_candidate_cache: dict[str, dict[str, object]] = {}
+        for row in semantic_claim_rows:
+            claimed = semantic_claimed_aliases.get(int(row["semantic_memory_id"]), "")
+            if (
+                len(claimed) < 2
+                or claimed not in explicit_alias_displays
+            ):
+                continue
+            participant_key = str(row["canonical_key"] or "")
+            if not participant_key:
+                continue
+            candidate = semantic_candidate_cache.get(participant_key)
+            if candidate is None:
+                resolved = self.resolve_participants(
+                    umo=umo,
+                    reference=participant_key,
+                    limit=safe_limit,
+                    before_sent_at=cutoff,
+                    message_upper_bound=upper_bound,
+                )
+                participants = resolved.get("participants")
+                if not isinstance(participants, list) or len(participants) != 1:
+                    continue
+                candidate = dict(participants[0])
+                semantic_candidate_cache[participant_key] = candidate
+            display_alias = explicit_alias_displays[claimed]
+            by_key = alias_candidates.setdefault(claimed, {})
+            semantic_candidate = by_key.setdefault(
+                participant_key,
+                {
+                    **candidate,
+                    "matched_aliases": [display_alias],
+                    "matched_alias_observations": [],
+                },
+            )
+            observations = semantic_candidate["matched_alias_observations"]
+            assert isinstance(observations, list)
+            observation = {
+                "alias": display_alias,
+                "source_key": str(row["source_key"] or ""),
+                "sent_at": int(row["sent_at"] or 0),
+                "source_kind": "semantic_self_alias",
+            }
+            if observation not in observations:
+                observations.append(observation)
+            alias_displays[claimed] = display_alias
+
+        participant_by_key = {}
+        ambiguous_aliases = []
+        for normalized_alias, candidates_by_key in alias_candidates.items():
+            candidates = list(candidates_by_key.values())
+            display_alias = alias_displays.get(normalized_alias, normalized_alias)
+            if len(candidates) > 1:
+                ambiguous_aliases.append(
+                    {
+                        "alias": display_alias,
+                        "normalized_alias": normalized_alias,
+                        "ambiguous": True,
+                        "candidate_participants": candidates,
+                    }
+                )
+                continue
+            if not candidates:
+                continue
+            candidate = candidates[0]
+            key = str(candidate.get("canonical_key") or "")
+            current = participant_by_key.get(key)
+            if current is None:
+                participant_by_key[key] = candidate
+                continue
+            matched_aliases = current["matched_aliases"]
+            observations = current["matched_alias_observations"]
+            assert isinstance(matched_aliases, list)
+            assert isinstance(observations, list)
+            for alias in candidate.get("matched_aliases", []):
+                if alias not in matched_aliases:
+                    matched_aliases.append(alias)
+            for observation in candidate.get("matched_alias_observations", []):
+                if observation not in observations:
+                    observations.append(observation)
+
+        mention_resolution: list[dict[str, object]] = []
+        unresolved_aliases: list[dict[str, object]] = []
+        ambiguous_by_alias = {
+            str(item.get("normalized_alias") or ""): item
+            for item in ambiguous_aliases
+        }
+        for display_alias, normalized_alias in explicit_mentions:
+            matched_keys = [
+                key
+                for key, participant in participant_by_key.items()
+                if normalized_alias
+                in {
+                    normalize_alias(alias)
+                    for alias in participant.get("matched_aliases", [])
+                }
+            ]
+            if matched_keys:
+                mention_resolution.append(
+                    {
+                        "alias": display_alias,
+                        "normalized_alias": normalized_alias,
+                        "status": "RESOLVED",
+                        "participant_keys": matched_keys,
+                    }
+                )
+                continue
+            ambiguous_match = ambiguous_by_alias.get(normalized_alias)
+            if ambiguous_match is not None:
+                candidates = ambiguous_match.get("candidate_participants")
+                mention_resolution.append(
+                    {
+                        "alias": display_alias,
+                        "normalized_alias": normalized_alias,
+                        "status": "AMBIGUOUS",
+                        "participant_keys": [
+                            str(item.get("canonical_key") or "")
+                            for item in candidates
+                            if isinstance(item, Mapping)
+                            and item.get("canonical_key")
+                        ]
+                        if isinstance(candidates, list)
+                        else [],
+                    }
+                )
+                continue
+            unresolved = {
+                "alias": display_alias,
+                "normalized_alias": normalized_alias,
+                "status": "UNRESOLVED",
+            }
+            mention_resolution.append(unresolved)
+            unresolved_aliases.append(unresolved)
+
         return {
             "query": original_query,
             "ambiguous": bool(ambiguous_aliases),
             "participants": list(participant_by_key.values()),
             "ambiguous_aliases": ambiguous_aliases,
+            "mentions": mention_resolution,
+            "unresolved_aliases": unresolved_aliases,
+        }
+
+    def query_identity_semantic_evidence(
+        self,
+        *,
+        umo: str,
+        aliases: Iterable[str],
+        before_sent_at: int,
+        message_upper_bound: int,
+        limit: int = 12,
+    ) -> list[dict[str, object]]:
+        """Return source-backed identity evidence for resolved participants."""
+
+        self._assert_scope(umo)
+        normalized_aliases = tuple(
+            dict.fromkeys(
+                normalized
+                for alias in aliases
+                if 2 <= len(normalized := normalize_alias(alias)) <= 40
+            )
+        )[:12]
+        if not normalized_aliases:
+            return []
+        cutoff = int(before_sent_at)
+        upper_bound = max(0, int(message_upper_bound))
+        safe_limit = max(1, min(24, int(limit)))
+        alias_predicates: list[str] = []
+        alias_parameters: list[object] = []
+        for alias in normalized_aliases:
+            alias_predicates.append(
+                "(instr(lower(s.person_cue), ?) > 0 "
+                "OR instr(lower(s.aspect_tag), ?) > 0 "
+                "OR instr(lower(s.content), ?) > 0)"
+            )
+            alias_parameters.extend((alias, alias, alias))
+        visibility_sql, visibility_parameters = (
+            self._semantic_source_visibility_clause(
+                memory_alias="s",
+                before_sent_at=cutoff,
+                message_upper_bound=upper_bound,
+            )
+        )
+        parameters: list[object] = [umo, cutoff, cutoff]
+        parameters.extend(alias_parameters)
+        parameters.extend(visibility_parameters)
+        parameters.append(safe_limit)
+        parameters.extend((cutoff, upper_bound))
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                WITH matched AS (
+                    SELECT s.*
+                    FROM semantic_memories AS s
+                    WHERE s.umo=?
+                      AND COALESCE(s.status, 'ACTIVE') IN ('ACTIVE', 'CONFLICTED')
+                      AND CAST(strftime('%s', s.created_at) AS INTEGER)<?
+                      AND CAST(strftime('%s', s.updated_at) AS INTEGER)<?
+                      AND ({' OR '.join(alias_predicates)})
+                      {visibility_sql}
+                    ORDER BY s.confidence DESC, s.id DESC
+                    LIMIT ?
+                ), ranked_sources AS (
+                    SELECT s.id, s.person_cue, s.aspect_tag, s.content,
+                           s.claim_type, s.epistemic_status, s.status,
+                           s.confidence, p.canonical_key, p.account_id,
+                           m.source_key, m.sent_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.id ORDER BY m.sent_at DESC, m.id DESC
+                           ) AS source_rank,
+                           COUNT(*) OVER (PARTITION BY s.id) AS source_count_total
+                    FROM matched AS s
+                    LEFT JOIN participants AS p
+                      ON p.id=s.subject_participant_id AND p.umo=s.umo
+                    JOIN semantic_memory_sources AS sms
+                      ON sms.semantic_memory_id=s.id
+                     AND sms.evidence_role='SUPPORT'
+                    JOIN messages AS m
+                      ON m.id=sms.message_id AND m.umo=s.umo
+                    WHERE m.is_deleted=0 AND m.sent_at<? AND m.id<=?
+                )
+                SELECT * FROM ranked_sources WHERE source_rank<=4
+                ORDER BY confidence DESC, id DESC, sent_at
+                """,
+                parameters,
+            ).fetchall()
+        by_id: dict[int, dict[str, object]] = {}
+        for row in rows:
+            memory_id = int(row["id"])
+            memory = by_id.get(memory_id)
+            if memory is None:
+                memory = {
+                    "id": memory_id,
+                    "person_cue": str(row["person_cue"] or ""),
+                    "aspect_tag": str(row["aspect_tag"] or ""),
+                    "content": str(row["content"] or ""),
+                    "claim_type": str(row["claim_type"] or ""),
+                    "epistemic_status": str(row["epistemic_status"] or ""),
+                    "status": str(row["status"] or ""),
+                    "confidence": float(row["confidence"] or 0.0),
+                    "semantic_subject": {
+                        "canonical_key": str(row["canonical_key"] or ""),
+                        "account_id": str(row["account_id"] or ""),
+                        "role": "SEMANTIC_SUBJECT_NOT_ALIAS_OWNER",
+                    },
+                    "sources": [],
+                    "source_count_total": int(row["source_count_total"] or 0),
+                }
+                by_id[memory_id] = memory
+            sources = memory["sources"]
+            assert isinstance(sources, list)
+            sources.append(
+                {
+                    "source_key": str(row["source_key"] or ""),
+                    "sent_at": int(row["sent_at"] or 0),
+                }
+            )
+        for memory in by_id.values():
+            sources = memory["sources"]
+            assert isinstance(sources, list)
+            memory["sources_truncated"] = (
+                int(memory["source_count_total"]) > len(sources)
+            )
+        return list(by_id.values())
+
+    def query_participant_history(
+        self,
+        *,
+        umo: str,
+        participant_key: str,
+        before_sent_at: int,
+        message_upper_bound: int,
+        limit: int = 8,
+    ) -> dict[str, object]:
+        """Return a bounded, source-backed recent transcript for one account."""
+
+        self._assert_scope(umo)
+        safe_limit = max(1, min(24, int(limit)))
+        canonical_key = str(participant_key or "").strip()
+        if not canonical_key:
+            return {
+                "participant_key": "",
+                "status": "NO_HISTORY",
+                "messages": [],
+                "source_count_total": 0,
+                "messages_truncated": False,
+            }
+        with self._lock:
+            participant = self._connection.execute(
+                """
+                SELECT id, canonical_key
+                FROM participants
+                WHERE umo=? AND canonical_key=?
+                LIMIT 1
+                """,
+                (umo, canonical_key),
+            ).fetchone()
+            if participant is None:
+                return {
+                    "participant_key": canonical_key,
+                    "status": "NO_HISTORY",
+                    "messages": [],
+                    "source_count_total": 0,
+                    "messages_truncated": False,
+                }
+            rows = self._connection.execute(
+                """
+                SELECT source_key, sent_at, sender_id, sender_name, role, plain_text,
+                       COUNT(*) OVER () AS source_count_total
+                FROM messages
+                WHERE umo=? AND sender_participant_id=? AND is_deleted=0
+                  AND sent_at<? AND id<=?
+                ORDER BY sent_at DESC, id DESC LIMIT ?
+                """,
+                (
+                    umo,
+                    int(participant["id"]),
+                    int(before_sent_at),
+                    max(0, int(message_upper_bound)),
+                    safe_limit,
+                ),
+            ).fetchall()
+        source_count_total = (
+            int(rows[0]["source_count_total"] or 0) if rows else 0
+        )
+        messages: list[dict[str, object]] = []
+        for row in reversed(rows):
+            message = dict(row)
+            message.pop("source_count_total", None)
+            messages.append(message)
+        return {
+            "participant_key": str(participant["canonical_key"]),
+            "status": "SOURCE_BACKED" if messages else "NO_HISTORY",
+            "messages": messages,
+            "source_count_total": source_count_total,
+            "messages_truncated": source_count_total > len(messages),
         }
 
     def query_participant_activity(
@@ -5307,7 +5882,37 @@ class MemoryStorage:
         """Verify that every cited raw source belongs to one immutable snapshot."""
 
         self._assert_scope(umo)
-        snapshot_value = self.request_snapshot(snapshot_id=snapshot_id, umo=umo)
+        requested = tuple(
+            dict.fromkeys(
+                str(source_key).strip()
+                for source_key in source_keys
+                if str(source_key).strip()
+            )
+        )
+        with self._lock:
+            snapshot_row = self._connection.execute(
+                "SELECT * FROM request_snapshots WHERE snapshot_id=? AND umo=?",
+                (str(snapshot_id).strip(), umo),
+            ).fetchone()
+            snapshot_value = self._decode_layered_row(
+                snapshot_row,
+                json_columns=(
+                    "scope_snapshot_json",
+                    "identity_snapshot_json",
+                    "data_revision_json",
+                    "inference_revision_json",
+                ),
+            )
+            rows: list[sqlite3.Row] = []
+            if requested:
+                placeholders = ",".join("?" for _ in requested)
+                rows = self._connection.execute(
+                    f"""
+                    SELECT id, umo, sent_at, source_key, is_deleted
+                    FROM messages WHERE source_key IN ({placeholders})
+                    """,
+                    requested,
+                ).fetchall()
         if snapshot_value is None:
             raise ValueError("request snapshot does not exist in this group")
         snapshot = RequestSnapshot.from_value(
@@ -5330,41 +5935,28 @@ class MemoryStorage:
                 )
             }
         )
-        requested = tuple(
-            dict.fromkeys(
-                str(source_key).strip()
-                for source_key in source_keys
-                if str(source_key).strip()
-            )
-        )
+        rows_by_source = {str(row["source_key"]): row for row in rows}
         accepted: list[str] = []
         violations: list[dict[str, str]] = []
-        with self._lock:
-            for source_key in requested:
-                row = self._connection.execute(
-                    """
-                    SELECT id, umo, sent_at, source_key, is_deleted
-                    FROM messages WHERE source_key=? LIMIT 1
-                    """,
-                    (source_key,),
-                ).fetchone()
-                reason = ""
-                if row is None:
-                    reason = "SOURCE_NOT_FOUND"
-                elif int(row["is_deleted"]):
-                    reason = "SOURCE_DELETED"
-                elif str(row["umo"]) != umo:
-                    reason = "SCOPE_MISMATCH"
-                elif str(row["source_key"]) == snapshot.request_source_key:
-                    reason = "CURRENT_REQUEST_SOURCE"
-                elif int(row["sent_at"]) >= snapshot.cutoff_at:
-                    reason = "AT_OR_AFTER_CUTOFF"
-                elif int(row["id"]) > snapshot.message_upper_bound:
-                    reason = "AFTER_MESSAGE_UPPER_BOUND"
-                else:
-                    accepted.append(source_key)
-                if reason:
-                    violations.append({"source_key": source_key, "reason": reason})
+        for source_key in requested:
+            row = rows_by_source.get(source_key)
+            reason = ""
+            if row is None:
+                reason = "SOURCE_NOT_FOUND"
+            elif int(row["is_deleted"]):
+                reason = "SOURCE_DELETED"
+            elif str(row["umo"]) != umo:
+                reason = "SCOPE_MISMATCH"
+            elif str(row["source_key"]) == snapshot.request_source_key:
+                reason = "CURRENT_REQUEST_SOURCE"
+            elif int(row["sent_at"]) >= snapshot.cutoff_at:
+                reason = "AT_OR_AFTER_CUTOFF"
+            elif int(row["id"]) > snapshot.message_upper_bound:
+                reason = "AFTER_MESSAGE_UPPER_BOUND"
+            else:
+                accepted.append(source_key)
+            if reason:
+                violations.append({"source_key": source_key, "reason": reason})
         result: dict[str, object] = {
             "snapshot_id": snapshot.snapshot_id,
             "umo": umo,

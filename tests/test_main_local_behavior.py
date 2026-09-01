@@ -155,6 +155,115 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         provider_spy.assert_not_called()
 
 
+    async def test_reply_target_history_is_loaded_without_loading_requester_history(self) -> None:
+        method = _main_method(
+            "_local_identity_evidence_packet",
+            build_request_identity_context=build_request_identity_context,
+            _collect_source_keys=_collect_source_keys,
+            _collect_participant_keys=lambda value: set(),
+            stable_sha256=stable_sha256,
+        )
+
+        class Service:
+            def __init__(self) -> None:
+                self.history_keys: list[str] = []
+
+            async def message_for_source(self, **kwargs: object) -> dict[str, object]:
+                return {
+                    "source_key": "reply-source",
+                    "sent_at": 90,
+                    "sender_id": "reply-account",
+                    "sender_name": "被引用者",
+                    "role": "USER",
+                    "plain_text": "普通消息",
+                }
+
+            async def resolve_query_participants(
+                self, **kwargs: object
+            ) -> dict[str, object]:
+                return {
+                    "query": kwargs["query"],
+                    "ambiguous": False,
+                    "participants": [],
+                    "ambiguous_aliases": [],
+                    "mentions": [],
+                    "unresolved_aliases": [],
+                }
+
+            async def resolve_participants(
+                self, **kwargs: object
+            ) -> dict[str, object]:
+                account_id = str(kwargs["reference"])
+                return {
+                    "ambiguous": False,
+                    "participants": [
+                        {
+                            "canonical_key": f'participant:["bot","{account_id}"]',
+                            "account_id": account_id,
+                            "current_display_name": account_id,
+                        }
+                    ],
+                }
+
+            async def query_participant_history(
+                self, **kwargs: object
+            ) -> dict[str, object]:
+                participant_key = str(kwargs["participant_key"])
+                self.history_keys.append(participant_key)
+                return {
+                    "participant_key": participant_key,
+                    "status": "SOURCE_BACKED",
+                    "messages": [{"source_key": "reply-source", "sent_at": 90}],
+                }
+
+            async def query_identity_semantic_evidence(
+                self, **kwargs: object
+            ) -> list[dict[str, object]]:
+                return []
+
+        service = Service()
+        host = SimpleNamespace(feedback_learning_enabled=False)
+        normalized = SimpleNamespace(
+            platform_id="bot",
+            sender_id="requester",
+            sender_name="提问者",
+            content=[
+                {
+                    "type": "reply",
+                    "message_id": "reply-message",
+                    "sender_id": "reply-account",
+                    "sender_name": "被引用者",
+                }
+            ],
+        )
+        snapshot = SimpleNamespace(
+            umo="scope-1",
+            reply_source_key="reply-source",
+            cutoff_at=100,
+            message_upper_bound=999,
+            snapshot_id="snapshot-1",
+            sender_participant_key='participant:["bot","requester"]',
+        )
+
+        packet, *_ = await method(
+            host,
+            service=service,
+            snapshot=snapshot,
+            normalized=normalized,
+            query="/chat 这个人是谁",
+            include_participant_activity=False,
+        )
+
+        self.assertEqual(
+            service.history_keys,
+            ['participant:["bot","reply-account"]'],
+        )
+        self.assertEqual(
+            packet["participant_history"][0]["status"],
+            "SOURCE_BACKED",
+        )
+
+
     def _hook_host(self, local_result: object, *, timeout: float = 0.2):
         provider_spy = Mock(side_effect=AssertionError("provider lookup is forbidden"))
         logger = Mock()
@@ -167,7 +276,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             _scope_event_carriers={},
             _services={scope.key: service},
             _service_scopes={scope.key: scope},
-            _service_for_scope=lambda value: service,
+            _service_for_scope=Mock(return_value=service),
             _test_service=service,
             feedback_learning_enabled=False,
             local_serving_enabled=True,
@@ -324,9 +433,16 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             logger.error.call_args.args[0],
         )
 
-    async def test_missing_preloaded_service_does_not_block_host(self) -> None:
+    async def test_missing_preloaded_service_does_not_drop_local_retrieval(self) -> None:
         local_result = AsyncMock(
-            side_effect=AssertionError("local retrieval must not run")
+            return_value=SimpleNamespace(
+                operational_status="COMPLETED",
+                semantic_status="NO_LOCAL_EVIDENCE",
+                run_id="",
+                detail="",
+                usable=False,
+                envelope_text="",
+            )
         )
         method, host, provider_spy, logger = self._hook_host(local_result)
         host._services = {}
@@ -339,13 +455,9 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(request.extra_user_content_parts, [])
         self.assertNotIn(id(event), host._local_serving_injected)
-        local_result.assert_not_awaited()
+        local_result.assert_awaited_once_with(event, "/chat 回忆一下")
         provider_spy.assert_not_called()
-        logger.error.assert_called_once()
-        self.assertIn(
-            "preloaded local service is unavailable",
-            logger.error.call_args.args[0],
-        )
+        logger.error.assert_not_called()
 
     async def test_failed_local_result_does_not_inject_or_lookup_a_provider(self) -> None:
         failed = SimpleNamespace(

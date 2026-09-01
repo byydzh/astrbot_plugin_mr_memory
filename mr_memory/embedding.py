@@ -27,36 +27,55 @@ class EmbeddingBackend(Protocol):
 
 
 class _SingleInferenceGate:
-    """Run at most one uncancellable local inference per backend instance.
+    """Serialize uncancellable local inference per backend instance.
 
     Cancelling an asyncio waiter does not stop the native model thread.  Keep
-    the real executor future registered until that thread exits so later
-    requests fail explicitly instead of accumulating behind an abandoned job.
+    the real executor future registered until that thread exits.  Later
+    requests wait for that exact resource instead of failing an otherwise
+    healthy memory request merely because another inference is in flight.
     """
 
     def __init__(self) -> None:
         self._active: asyncio.Future[Any] | None = None
+        self._slot = asyncio.Lock()
 
     @property
     def busy(self) -> bool:
         return self._active is not None and not self._active.done()
 
     async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        if self.busy:
-            raise RuntimeError("local embedding inference is busy; request not queued")
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(
-            None,
-            functools.partial(function, *args, **kwargs),
-        )
-        self._active = future
+        # asyncio.Lock queues waiters fairly.  Do not submit multiple native
+        # calls that would only occupy executor threads while blocking on the
+        # backend's threading lock.
+        await self._slot.acquire()
+        release_when_native_finishes = False
+        try:
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                None,
+                functools.partial(function, *args, **kwargs),
+            )
+            self._active = future
 
-        def clear(completed: asyncio.Future[Any]) -> None:
-            if self._active is completed:
-                self._active = None
+            def clear(completed: asyncio.Future[Any]) -> None:
+                if self._active is completed:
+                    self._active = None
 
-        future.add_done_callback(clear)
-        return await asyncio.shield(future)
+            future.add_done_callback(clear)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                if not future.done():
+                    release_when_native_finishes = True
+
+                    def release_slot(_completed: asyncio.Future[Any]) -> None:
+                        self._slot.release()
+
+                    future.add_done_callback(release_slot)
+                raise
+        finally:
+            if not release_when_native_finishes:
+                self._slot.release()
 
 
 def normalize_vector(vector: Sequence[float]) -> list[float]:
@@ -212,7 +231,15 @@ class LocalFastEmbedBackend:
             return []
         if any(not value for value in values):
             raise ValueError("embedding passages must not be empty")
-        return await self._inference_gate.run(self._embed_texts_sync, values)
+        vectors: list[list[float]] = []
+        for offset in range(0, len(values), self._batch_size):
+            vectors.extend(
+                await self._inference_gate.run(
+                    self._embed_texts_sync,
+                    values[offset : offset + self._batch_size],
+                )
+            )
+        return vectors
 
     async def embed_query(self, text: str) -> list[float]:
         value = str(text).strip()
@@ -362,7 +389,16 @@ class LocalSentenceTransformerBackend:
             return []
         if any(not value for value in values):
             raise ValueError("embedding passages must not be empty")
-        return await self._inference_gate.run(self._embed_sync, values, query=False)
+        vectors: list[list[float]] = []
+        for offset in range(0, len(values), self._batch_size):
+            vectors.extend(
+                await self._inference_gate.run(
+                    self._embed_sync,
+                    values[offset : offset + self._batch_size],
+                    query=False,
+                )
+            )
+        return vectors
 
     async def embed_query(self, text: str) -> list[float]:
         value = str(text).strip()

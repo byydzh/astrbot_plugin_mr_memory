@@ -6,6 +6,10 @@ import unittest
 from mr_memory.brief import EvidenceBrief, EvidenceClaim, EvidenceQualification
 from mr_memory.local_serving import (
     LOCAL_SERVING_SCHEMA_VERSION,
+    LocalServingEnvelopeError,
+    _participant_history,
+    _participant_history_alias_view,
+    _query_identity,
     compile_local_serving_envelope,
 )
 from mr_memory.runtime import MaterializedReconstruction
@@ -153,6 +157,183 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         value = json.loads(result.json_text)
         self.assertEqual(value["schema_version"], LOCAL_SERVING_SCHEMA_VERSION)
         self.assertEqual(value["retrieval"]["memory_provider_calls"], 0)
+
+    def test_identity_coverage_and_participant_history_are_visible(self) -> None:
+        packet = self.packet()
+        packet["query_alias_resolution"]["mentions"] = [
+            {"alias": "甲", "status": "RESOLVED", "participant_keys": ['participant:["bot","account-a"]']},
+            {"alias": "幽灵", "status": "UNRESOLVED", "participant_keys": []},
+        ]
+        packet["participant_history"] = [
+            {
+                "participant": packet["query_alias_resolution"]["participants"][0],
+                "status": "SOURCE_BACKED",
+                "messages": [
+                    {
+                        "source_key": "source-dislike",
+                        "sent_at": 100,
+                        "sender_id": "account-a",
+                        "sender_name": "甲",
+                        "role": "USER",
+                        "plain_text": "我不喜欢",
+                    }
+                ],
+            }
+        ]
+
+        result = compile_local_serving_envelope(
+            packet,
+            self.materialized(),
+            request_kind="CHAT",
+            max_chars=4000,
+        )
+        value = json.loads(result.json_text)
+        self.assertEqual(
+            [item["status"] for item in value["identity"]["query_resolution"]["mentions"]],
+            ["RESOLVED", "UNRESOLVED"],
+        )
+        self.assertEqual(
+            value["identity"]["query_resolution"]["mentions"][0]["participant_keys"],
+            ['participant:["bot","account-a"]'],
+        )
+        self.assertEqual(value["participant_history"][0]["status"], "SOURCE_BACKED")
+        self.assertEqual(value["participant_history"][0]["messages"][0]["source_id"], "s1")
+
+        unresolved = compile_local_serving_envelope(
+            {
+                "query_alias_resolution": {
+                    "participants": [],
+                    "ambiguous": False,
+                    "ambiguous_aliases": [],
+                    "mentions": [
+                        {"alias": "幽灵甲", "status": "UNRESOLVED"},
+                        {"alias": "幽灵乙", "status": "UNRESOLVED"},
+                    ],
+                },
+                "participant_history": [],
+                "participant_activity": [],
+                "candidates": {},
+            },
+            MaterializedReconstruction(None, (), (), ()),
+            request_kind="MEMORY_QUERY",
+            max_chars=3000,
+        )
+        unresolved_value = json.loads(unresolved.json_text)
+        self.assertTrue(unresolved.usable)
+        self.assertEqual(unresolved.semantic_status, "IDENTITY_UNRESOLVED")
+        self.assertEqual(
+            [item["alias"] for item in unresolved_value["identity"]["query_resolution"]["unresolved_aliases"]],
+            ["幽灵甲", "幽灵乙"],
+        )
+
+    def test_history_budget_never_claims_that_existing_history_does_not_exist(self) -> None:
+        packet = {
+            "participant_history": [
+                {
+                    "participant_key": "participant-1",
+                    "status": "SOURCE_BACKED",
+                    "messages": [
+                        {"source_key": f"history-{index}", "plain_text": f"消息{index}"}
+                        for index in range(4)
+                    ],
+                }
+            ]
+        }
+        compact = _participant_history(packet, message_limit=1, alias_limit=1)
+        self.assertEqual(compact[0]["status"], "SOURCE_BACKED")
+        self.assertEqual(compact[0]["source_count_total"], 4)
+        self.assertTrue(compact[0]["messages_truncated"])
+
+        omitted = _participant_history_alias_view(compact, {})
+        self.assertEqual(omitted[0]["status"], "HISTORY_OMITTED_BY_BUDGET")
+        self.assertEqual(omitted[0]["source_count_total"], 4)
+        self.assertTrue(omitted[0]["messages_truncated"])
+
+        no_history = _participant_history_alias_view(
+            [
+                {
+                    "participant_key": "participant-2",
+                    "status": "NO_HISTORY",
+                    "messages": [],
+                    "source_count_total": 0,
+                    "messages_truncated": False,
+                }
+            ],
+            {},
+        )
+        self.assertEqual(no_history[0]["status"], "NO_HISTORY")
+        self.assertFalse(no_history[0]["messages_truncated"])
+
+    def test_serving_profiles_cannot_truncate_or_rewrite_explicit_identity(self) -> None:
+        participants = []
+        mentions = []
+        for index in range(12):
+            key = f"participant-{index}"
+            participants.append(
+                {
+                    "canonical_key": key,
+                    "account_id": f"account-{index}",
+                    "current_display_name": f"成员{index}",
+                    "matched_aliases": [f"成员{index}"],
+                    "matched_alias_observations": [
+                        {
+                            "alias": f"成员{index}",
+                            "source_key": f"identity-{index}",
+                            "sent_at": 100 + index,
+                            "source_kind": "observed",
+                        }
+                    ],
+                }
+            )
+            mentions.append(
+                {
+                    "alias": f"成员{index}",
+                    "status": "RESOLVED",
+                    "participant_keys": [key],
+                }
+            )
+        resolution = {
+            "participants": participants,
+            "ambiguous": False,
+            "ambiguous_aliases": [],
+            "mentions": mentions,
+        }
+        compact = _query_identity(
+            resolution,
+            alias_limit=1,
+            participant_limit=3,
+            ambiguous_limit=2,
+            candidates_per_alias=2,
+        )
+        self.assertEqual(len(compact["participants"]), 12)
+        self.assertEqual(len(compact["mentions"]), 12)
+        self.assertFalse(compact.get("participants_truncated", False))
+
+        packet = {
+            "query_alias_resolution": resolution,
+            "participant_history": [],
+            "participant_activity": [],
+            "candidates": {},
+        }
+        try:
+            envelope = compile_local_serving_envelope(
+                packet,
+                MaterializedReconstruction(None, (), (), ()),
+                request_kind="MEMORY_QUERY",
+                max_chars=3000,
+            )
+        except LocalServingEnvelopeError:
+            return
+        value = json.loads(envelope.json_text)
+        visible = value["identity"]["query_resolution"]
+        self.assertEqual(len(visible["participants"]), 12)
+        self.assertEqual(
+            [item["status"] for item in visible["mentions"]],
+            ["RESOLVED"] * 12,
+        )
+        self.assertTrue(
+            all(item["participant_keys"] for item in visible["mentions"])
+        )
         self.assertEqual(value["retrieval"]["memory_provider_tokens"], 0)
         self.assertEqual(
             value["retrieval"]["main_model_incremental_cost"],

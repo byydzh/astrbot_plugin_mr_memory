@@ -277,15 +277,26 @@ class LayeredStorageTests(unittest.TestCase):
                 source_key=request.resolved_source_key(),
             )
         )
-        audit = self.storage.audit_snapshot_sources(
-            snapshot_id=snapshot.snapshot_id,
-            umo=self.UMO,
-            source_keys=(
-                previous.resolved_source_key(),
-                request.resolved_source_key(),
-                later.resolved_source_key(),
-            ),
-        )
+        audited_sql: list[str] = []
+        self.storage._connection.set_trace_callback(audited_sql.append)
+        try:
+            audit = self.storage.audit_snapshot_sources(
+                snapshot_id=snapshot.snapshot_id,
+                umo=self.UMO,
+                source_keys=(
+                    previous.resolved_source_key(),
+                    request.resolved_source_key(),
+                    later.resolved_source_key(),
+                ),
+            )
+        finally:
+            self.storage._connection.set_trace_callback(None)
+        message_reads = [
+            statement
+            for statement in audited_sql
+            if "FROM messages WHERE source_key IN" in " ".join(statement.split())
+        ]
+        self.assertEqual(len(message_reads), 1)
         self.assertFalse(audit["valid"])
         self.assertEqual(audit["accepted_source_keys"], [previous.resolved_source_key()])
         reasons = {item["reason"] for item in audit["violations"]}

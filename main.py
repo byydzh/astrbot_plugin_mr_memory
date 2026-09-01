@@ -180,7 +180,11 @@ class _LocalMemoryOutcome:
             self.envelope_text
             and self.operational_status == "COMPLETED"
             and self.semantic_status
-            in {"EVIDENCE_AVAILABLE", "IDENTITY_AMBIGUOUS"}
+            in {
+                "EVIDENCE_AVAILABLE",
+                "IDENTITY_AMBIGUOUS",
+                "IDENTITY_UNRESOLVED",
+            }
         )
 
 
@@ -809,10 +813,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self.config.get("local_serving_enabled", True)
         )
         self.local_serving_timeout_seconds = max(
-            0.1,
+            1.0,
             min(
-                10.0,
-                float(self.config.get("local_serving_timeout_seconds", 2.0)),
+                600.0,
+                float(self.config.get("local_serving_timeout_seconds", 180.0)),
             ),
         )
         self.local_serving_max_chars = max(
@@ -1090,7 +1094,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         self._wake_locks: dict[str, asyncio.Lock] = {}
         self._wake_execution_locks: dict[str, asyncio.Lock] = {}
         self._runtime_singleflight: AsyncSingleFlight[Any] = AsyncSingleFlight()
-        self._local_full_retrieval_lock = asyncio.Lock()
         self._online_budget_reservation_lock = asyncio.Lock()
         self._online_budget_reservations: dict[str, int] = {}
         self._distill_locks: dict[str, asyncio.Lock] = {}
@@ -1251,10 +1254,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 if self.embedding_preload_on_startup:
                     started = time.perf_counter()
                     try:
-                        vector = await asyncio.wait_for(
-                            backend.embed_query("群聊记忆检索健康检查"),
-                            timeout=300,
-                        )
+                        vector = await backend.embed_query("群聊记忆检索健康检查")
                     except Exception:
                         self._embedding_preload_error = (
                             f"local embedding preload failed: {backend.model_id}"
@@ -3464,7 +3464,73 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
 
     @staticmethod
-    def _runtime_request_kind(query: str, *, force: bool) -> str:
+    def _explicit_identity_intent(
+        query: str,
+        *,
+        has_structured_reference: bool = False,
+    ) -> bool:
+        """Recognize an actual person-identification request, not a keyword hit."""
+
+        normalized = " ".join(str(query or "").casefold().split())
+        normalized = re.sub(
+            r"^/chat(?:@\S+)?(?=\s|$)\s*",
+            "",
+            normalized,
+            count=1,
+        ).strip()
+        if not normalized or len(normalized) > 240:
+            return False
+        if re.match(
+            r"^(?:请)?(?:帮我)?(?:分辨|区分|辨认)(?:一下)?(?=\S|\s)",
+            normalized,
+        ):
+            return True
+        if "找出来" in normalized and any(
+            cue in normalized for cue in ("群里", "群友", "成员", "账号", "用户")
+        ):
+            return True
+        if any(
+            cue in normalized
+            for cue in ("用户是谁", "成员是谁", "哪个群友", "哪位群友")
+        ):
+            return True
+        has_identity_result_cue = bool(
+            re.search(r"(?:是|有)几个人|分别是谁|都是谁|谁是谁", normalized)
+        )
+        has_enumeration_shape = bool(
+            re.search(r"[,，、；;]", normalized)
+            or re.search(r"\S{1,40}(?:和|与)\S{1,40}", normalized)
+        )
+        if has_identity_result_cue and has_enumeration_shape:
+            return True
+        if has_structured_reference and re.search(
+            r"(?:这些人|这几个人|他们|她们|它们|这位|那位|这个人|那个人)"
+            r"(?:分别)?(?:是谁|是哪些人|是哪位|有几个人)$",
+            normalized,
+        ):
+            return True
+        if has_structured_reference and (
+            re.search(
+                r"(?:这|那)(?:几|[一二三四五六七八九十0-9]+)个昵称"
+                r".{0,24}?(?:哪(?:几|[一二三四五六七八九十0-9]+)个群友|谁)",
+                normalized,
+            )
+            or re.search(
+                r"(?:昵称|称呼).{0,24}?(?:对应|属于|是)"
+                r".{0,16}?(?:谁|哪(?:个|几个|些)群友)",
+                normalized,
+            )
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _runtime_request_kind(
+        query: str,
+        *,
+        force: bool,
+        has_structured_reference: bool = False,
+    ) -> str:
         if force:
             return "DEEP_RECALL"
         normalized = " ".join(str(query).casefold().split())
@@ -3499,6 +3565,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         if any(cue in normalized for cue in strong_memory_cues):
             return "MEMORY_QUERY"
         if MrMemoryPlugin._runtime_activity_analysis(normalized):
+            return "MEMORY_QUERY"
+        if MrMemoryPlugin._explicit_identity_intent(
+            normalized,
+            has_structured_reference=has_structured_reference,
+        ):
             return "MEMORY_QUERY"
         if any(cue in normalized for cue in history_context_cues) and any(
             cue in normalized for cue in history_analysis_cues
@@ -3723,6 +3794,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         resolve_query_aliases: bool,
         include_participant_activity: bool,
         use_cache: bool = True,
+        finalize_packet: bool = True,
+        stage_elapsed_ms: dict[str, float] | None = None,
     ) -> tuple[dict[str, object], str, set[str], set[str], str]:
         pack_key = self._layered_pack_key(
             snapshot,
@@ -3740,6 +3813,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         cache_layer = "L1A" if cached is not None else (
             "NONE" if use_cache else "LOCAL_FRESH"
         )
+        write_cache = bool(use_cache and cached is None)
         if cached is not None:
             packet_value = cached.get("packet")
             if not isinstance(packet_value, dict):
@@ -3830,13 +3904,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         message_upper_bound=snapshot.message_upper_bound,
                     )
                 )
-            initial["associations"] = await service.query_plastic_associations(
-                umo=snapshot.umo,
-                query=query,
-                limit=self.embedding_top_k,
-                before_sent_at=snapshot.cutoff_at,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
             current_media_hashes = tuple(
                 sorted(
                     {
@@ -3849,37 +3916,97 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     }
                 )
             )
-            if current_media_hashes:
-                initial["media_patterns"] = await service.query_media_patterns(
+
+            async def collect_nonembedding_seeds() -> None:
+                initial["associations"] = await service.query_plastic_associations(
                     umo=snapshot.umo,
-                    fingerprints=current_media_hashes,
-                    media_type="image",
-                    min_observations=2,
-                    limit=min(8, self.embedding_top_k),
+                    query=query,
+                    limit=self.embedding_top_k,
                     before_sent_at=snapshot.cutoff_at,
                     message_upper_bound=snapshot.message_upper_bound,
                 )
-            lexical_matches = await service.query_matching_cues(
-                umo=snapshot.umo,
-                query=query,
-                limit=self.embedding_top_k,
-                before_sent_at=snapshot.cutoff_at,
-                message_upper_bound=snapshot.message_upper_bound,
-            )
-            initial["cues"] = [
-                dict(item) for item in lexical_matches if isinstance(item, dict)
-            ]
+                if current_media_hashes:
+                    initial["media_patterns"] = await service.query_media_patterns(
+                        umo=snapshot.umo,
+                        fingerprints=current_media_hashes,
+                        media_type="image",
+                        min_observations=2,
+                        limit=min(8, self.embedding_top_k),
+                        before_sent_at=snapshot.cutoff_at,
+                        message_upper_bound=snapshot.message_upper_bound,
+                    )
+                lexical_matches = await service.query_matching_cues(
+                    umo=snapshot.umo,
+                    query=query,
+                    limit=self.embedding_top_k,
+                    before_sent_at=snapshot.cutoff_at,
+                    message_upper_bound=snapshot.message_upper_bound,
+                )
+                initial["cues"] = [
+                    dict(item)
+                    for item in lexical_matches
+                    if isinstance(item, dict)
+                ]
+
             backend = self._embedding_backend()
+            query_vector: list[float] | None = None
+            embedding_task: asyncio.Task[list[float]] | None = None
+            embedding_started = 0.0
+            embedding_finished: list[float] = []
             if backend is not None:
+                embedding_started = time.perf_counter()
+                embedding_task = asyncio.create_task(
+                    backend.embed_query(query),
+                    name="mr-memory-online-query-embedding",
+                )
+                embedding_task.add_done_callback(
+                    lambda _task: embedding_finished.append(time.perf_counter())
+                )
+            auxiliary_started = time.perf_counter()
+            auxiliary_finished = auxiliary_started
+            try:
+                await collect_nonembedding_seeds()
+                auxiliary_finished = time.perf_counter()
+                if embedding_task is not None:
+                    query_vector = await embedding_task
+            except BaseException:
+                if embedding_task is not None and not embedding_task.done():
+                    embedding_task.cancel()
+                if embedding_task is not None:
+                    try:
+                        await embedding_task
+                    except BaseException:
+                        pass
+                raise
+            if stage_elapsed_ms is not None:
+                stage_elapsed_ms["FULL_AUXILIARY_SEEDS"] = (
+                    auxiliary_finished - auxiliary_started
+                ) * 1000
+                if embedding_task is not None:
+                    finished_at = (
+                        embedding_finished[0]
+                        if embedding_finished
+                        else time.perf_counter()
+                    )
+                    stage_elapsed_ms["FULL_EMBED_QUERY"] = (
+                        finished_at - embedding_started
+                    ) * 1000
+            if backend is not None:
+                seed_expansion_started = time.perf_counter()
                 embedded = await service.initialize_candidates(
                     umo=snapshot.umo,
                     query=query,
                     embedding_backend=backend,
+                    query_vector=query_vector,
                     limit=self.embedding_top_k,
                     min_score=self.candidate_seed_floor,
                     before_sent_at=snapshot.cutoff_at,
                     message_upper_bound=snapshot.message_upper_bound,
                 )
+                if stage_elapsed_ms is not None:
+                    stage_elapsed_ms["FULL_VECTOR_SEARCH_EXPAND"] = (
+                        time.perf_counter() - seed_expansion_started
+                    ) * 1000
                 for key in (
                     "participants",
                     "episodes",
@@ -3946,7 +4073,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 if key:
                     participant_by_key[key] = item
             initial["participants"] = list(participant_by_key.values())
-            await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
+            reconstruction_started = time.perf_counter()
             packet = await service.reconstruction_evidence_packet(
                 umo=snapshot.umo,
                 candidates=initial,
@@ -3956,6 +4083,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 before_sent_at=snapshot.cutoff_at,
                 message_upper_bound=snapshot.message_upper_bound,
             )
+            if stage_elapsed_ms is not None:
+                stage_elapsed_ms["FULL_RECONSTRUCTION"] = (
+                    time.perf_counter() - reconstruction_started
+                ) * 1000
             # A reply target is direct conversational evidence, not a retrieval
             # candidate and not the current request.  Keep it in a distinct
             # packet field so the reader can resolve elliptical prompts without
@@ -3996,38 +4127,32 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             )
             packet["source_count"] = len(_collect_source_keys(packet))
             packet_sha256 = stable_sha256(packet)
-            packet_sources = _collect_source_keys(packet)
+        source_keys = _collect_source_keys(packet)
+        if finalize_packet or write_cache:
             await service.audit_snapshot_sources(
                 snapshot_id=snapshot.snapshot_id,
                 umo=snapshot.umo,
-                source_keys=packet_sources,
+                source_keys=source_keys,
                 fail_closed=True,
             )
             await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
-            if use_cache:
-                await service.put_evidence_pack_cache(
-                    cache_key=pack_key,
-                    umo=snapshot.umo,
-                    snapshot_id=snapshot.snapshot_id,
-                    packet=packet,
-                    packet_hash=packet_sha256,
-                    source_keys=sorted(packet_sources),
-                    data_revision=snapshot.data_revision.as_dict(),
-                    retrieval_revision={
-                        "retriever": snapshot.inference_revision.retriever,
-                        "embedding_model": snapshot.inference_revision.embedding_model,
-                        "fusion_policy": snapshot.inference_revision.fusion_policy,
-                    },
-                    expires_at=snapshot.cutoff_at
-                    + self.runtime_certificate_ttl_seconds,
-                )
-        source_keys = _collect_source_keys(packet)
-        await service.audit_snapshot_sources(
-            snapshot_id=snapshot.snapshot_id,
-            umo=snapshot.umo,
-            source_keys=source_keys,
-            fail_closed=True,
-        )
+        if write_cache:
+            await service.put_evidence_pack_cache(
+                cache_key=pack_key,
+                umo=snapshot.umo,
+                snapshot_id=snapshot.snapshot_id,
+                packet=packet,
+                packet_hash=packet_sha256,
+                source_keys=sorted(source_keys),
+                data_revision=snapshot.data_revision.as_dict(),
+                retrieval_revision={
+                    "retriever": snapshot.inference_revision.retriever,
+                    "embedding_model": snapshot.inference_revision.embedding_model,
+                    "fusion_policy": snapshot.inference_revision.fusion_policy,
+                },
+                expires_at=snapshot.cutoff_at
+                + self.runtime_certificate_ttl_seconds,
+            )
         participant_keys = _collect_participant_keys(packet)
         if snapshot.sender_participant_key:
             participant_keys.add(snapshot.sender_participant_key)
@@ -5136,23 +5261,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         )
 
     @staticmethod
-    def _local_direct_identity_question(query: str) -> bool:
-        normalized = " ".join(str(query or "").casefold().split())
-        cues = (
-            "是谁",
-            "哪些人",
-            "这些人",
-            "哪个人",
-            "哪位",
-            "找出来",
-            "账号",
-            "用户是谁",
-            "成员是谁",
-            "who is",
-            "which user",
-            "which member",
+    def _local_direct_identity_question(
+        query: str,
+        *,
+        has_structured_reference: bool = False,
+    ) -> bool:
+        return MrMemoryPlugin._explicit_identity_intent(
+            query,
+            has_structured_reference=has_structured_reference,
         )
-        return any(cue in normalized for cue in cues)
 
     @staticmethod
     def _local_direct_reference_question(query: str) -> bool:
@@ -5253,18 +5370,25 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             limit=12,
         )
         participants_by_key: dict[str, dict[str, object]] = {}
+        history_participant_keys: set[str] = set()
+        history_account_ids: set[str] = set()
         identity_bindings: list[dict[str, object]] = []
         sender_binding = request_identity_context.get("sender")
         if isinstance(sender_binding, dict):
             identity_bindings.append(sender_binding)
         mentions = request_identity_context.get("mentions")
         if isinstance(mentions, list):
-            identity_bindings.extend(
-                item for item in mentions if isinstance(item, dict)
-            )
+            for item in mentions:
+                if not isinstance(item, dict):
+                    continue
+                identity_bindings.append(item)
+                account_id = str(item.get("account_id") or "").strip()
+                if account_id:
+                    history_account_ids.add(account_id)
         reply_binding = request_identity_context.get("reply_target")
         if isinstance(reply_binding, dict) and reply_binding.get("account_id"):
             identity_bindings.append(reply_binding)
+            history_account_ids.add(str(reply_binding["account_id"]).strip())
         for binding in identity_bindings:
             account_id = str(binding.get("account_id") or "").strip()
             if not account_id:
@@ -5283,6 +5407,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 participant_key = str(item.get("canonical_key") or "").strip()
                 if participant_key:
                     participants_by_key[participant_key] = dict(item)
+                    if account_id in history_account_ids:
+                        history_participant_keys.add(participant_key)
         query_participants = query_alias_resolution.get("participants")
         if not isinstance(query_participants, list):
             query_participants = []
@@ -5292,6 +5418,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             participant_key = str(item.get("canonical_key") or "").strip()
             if participant_key:
                 participants_by_key[participant_key] = dict(item)
+                history_participant_keys.add(participant_key)
 
         participant_activity: list[dict[str, object]] = []
         if include_participant_activity:
@@ -5311,6 +5438,64 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 )
                 if activity.get("found") is True:
                     participant_activity.append(activity)
+        participant_history: list[dict[str, object]] = []
+        for participant_key in sorted(history_participant_keys):
+            participant_history.append(
+                await service.query_participant_history(
+                    umo=snapshot.umo,
+                    participant_key=participant_key,
+                    before_sent_at=snapshot.cutoff_at,
+                    message_upper_bound=snapshot.message_upper_bound,
+                    limit=8,
+                )
+            )
+        identity_aliases: list[str] = []
+        seen_identity_aliases: set[str] = set()
+        query_mentions = query_alias_resolution.get("mentions")
+        for item in query_mentions if isinstance(query_mentions, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status") or "").upper() not in {
+                "UNRESOLVED",
+                "AMBIGUOUS",
+            }:
+                continue
+            for field in ("alias", "normalized_alias"):
+                alias = str(item.get(field) or "").strip()
+                normalized_alias = alias.casefold()
+                if alias and normalized_alias not in seen_identity_aliases:
+                    seen_identity_aliases.add(normalized_alias)
+                    identity_aliases.append(alias)
+        identity_semantic_rows = await service.query_identity_semantic_evidence(
+            umo=snapshot.umo,
+            aliases=identity_aliases,
+            before_sent_at=snapshot.cutoff_at,
+            message_upper_bound=snapshot.message_upper_bound,
+            limit=12,
+        )
+        identity_semantic_candidates: list[dict[str, object]] = []
+        identity_semantic_evidence: list[dict[str, object]] = []
+        for item in identity_semantic_rows:
+            if not isinstance(item, dict):
+                continue
+            memory = {
+                key: value
+                for key, value in item.items()
+                if key not in {"sources", "source_count_total", "sources_truncated"}
+            }
+            sources = item.get("sources")
+            sources = sources if isinstance(sources, list) else []
+            identity_semantic_candidates.append(memory)
+            identity_semantic_evidence.append(
+                {
+                    "memory": memory,
+                    "evidence": [
+                        dict(source)
+                        for source in sources
+                        if isinstance(source, dict)
+                    ],
+                }
+            )
         feedback_candidates: list[dict[str, object]] = []
         if self.feedback_learning_enabled:
             raw_feedback_candidates = await service.feedback_hypothesis_candidates(
@@ -5338,7 +5523,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "cues": [],
             "episodes": [],
             "topics": [],
-            "semantic_memories": [],
+            "semantic_memories": identity_semantic_candidates,
             "associations": [],
             "media_patterns": [],
             "feedback_hypotheses": feedback_candidates,
@@ -5357,7 +5542,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             else {
                 "candidates": local_candidates,
                 "expanded_episodes": [],
-                "semantic_evidence": [],
+                "semantic_evidence": identity_semantic_evidence,
                 "feedback_hypothesis_evidence": [],
             }
         )
@@ -5378,18 +5563,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             "request_identity_context": request_identity_context,
             "query_alias_resolution": query_alias_resolution,
             "participant_activity": participant_activity,
+            "participant_history": participant_history,
             "reply_context": reply_context,
         }
         source_keys = _collect_source_keys(packet)
         packet["source_count"] = len(source_keys)
         packet_sha256 = stable_sha256(packet)
-        await service.audit_snapshot_sources(
-            snapshot_id=snapshot.snapshot_id,
-            umo=snapshot.umo,
-            source_keys=source_keys,
-            fail_closed=True,
-        )
-        await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
         participant_keys = _collect_participant_keys(packet)
         if snapshot.sender_participant_key:
             participant_keys.add(snapshot.sender_participant_key)
@@ -5415,6 +5594,22 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         scope: GroupMemoryScope | None = None
         experiment_started = False
         last_stage = "INITIALIZING"
+        current_stage_started = started
+        stage_in_progress: str | None = "INITIALIZING"
+        stage_elapsed_ms: dict[str, float] = {}
+
+        def begin_stage(name: str) -> None:
+            nonlocal last_stage, current_stage_started, stage_in_progress
+            last_stage = name
+            stage_in_progress = name
+            current_stage_started = time.perf_counter()
+
+        def finish_stage(name: str) -> None:
+            nonlocal stage_in_progress
+            stage_elapsed_ms[name] = (
+                time.perf_counter() - current_stage_started
+            ) * 1000
+            stage_in_progress = None
 
         async def persist_failure(*, error_type: str, detail: str) -> None:
             if not experiment_started or service is None:
@@ -5439,6 +5634,20 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "memory_provider_external_api_cost": 0,
                         "main_model_incremental_cost": "UNKNOWN_NOT_MEASURED",
                         "elapsed_ms": (time.perf_counter() - started) * 1000,
+                        "hang_guard_seconds": self.local_serving_timeout_seconds,
+                        "stage_elapsed_ms": {
+                            **stage_elapsed_ms,
+                            **(
+                                {
+                                    f"{stage_in_progress}_INCOMPLETE": (
+                                        time.perf_counter() - current_stage_started
+                                    )
+                                    * 1000
+                                }
+                                if stage_in_progress is not None
+                                else {}
+                            ),
+                        },
                     },
                 )
             except Exception:
@@ -5464,66 +5673,29 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     operational_status="FAILED",
                     detail="The local memory query is empty.",
                 )
-            scope = self._group_scope(event)
-            service = self._service_for_scope(scope)
-            last_stage = "SCOPE_READY"
-            normalized = self._normalize_event(event)
-            request_kind = self._runtime_request_kind(bounded_query, force=False)
-            include_participant_activity = self._runtime_activity_analysis(
-                bounded_query
-            )
-            active_trace = self._active_interaction_traces.get(id(event))
-            request_source_key = normalized.resolved_source_key()
-            interaction_trace_id = (
-                active_trace[1]
-                if active_trace is not None
-                and active_trace[0] == scope.key
-                and active_trace[2] == request_source_key
-                else ""
-            )
-            await service.start_experiment(
-                run_id=run_id,
-                umo=scope.key,
-                experiment_type="runtime_local_serving",
-                cutoff_at=int(normalized.sent_at or time.time()),
-                query_sha256=_stable_hash(bounded_query),
-                metadata={
-                    "scope_id": scope.storage_id,
-                    "path": "materialized_local",
-                    "protocol": LOCAL_SERVING_SCHEMA_VERSION,
-                    "trace_id": interaction_trace_id,
-                    "request_kind": request_kind,
-                    "completion_scope": "MEMORY_INJECTION_ONLY",
-                },
-            )
-            experiment_started = True
-            last_stage = "EXPERIMENT_STARTED"
+            # This is only an abnormal-hang guard for the complete local operation.
+            # Latency policy is observational: stage timings below expose slow work
+            # without turning an ordinary slow retrieval into missing memory.
             async with asyncio.timeout(self.local_serving_timeout_seconds):
-                policy = RoutePolicy(mode="LOW_LATENCY", allow_l3=False)
-                last_stage = "SNAPSHOT_CAPTURE"
-                snapshot = await self._capture_layered_snapshot(
-                    scope=scope,
-                    service=service,
-                    normalized=normalized,
-                    query=bounded_query,
-                    provider=None,
-                    policy=policy,
-                    inference_revision=self._local_serving_inference_revision(),
-                )
-                last_stage = "SNAPSHOT_CAPTURED"
-                direct: tuple[
-                    dict[str, object],
-                    str,
-                    set[str],
-                    set[str],
-                    str,
-                ] | None = None
-                identity_question = self._local_direct_identity_question(
-                    bounded_query
-                )
-                reference_question = self._local_direct_reference_question(
-                    bounded_query
-                )
+                scope = self._group_scope(event)
+                normalized = self._normalize_event(event)
+                begin_stage("RUNTIME_READY")
+                if not self._runtime_initialized:
+                    bootstrap_task = self._runtime_bootstrap_task
+                    if (
+                        bootstrap_task is not None
+                        and bootstrap_task is not asyncio.current_task()
+                    ):
+                        await asyncio.shield(bootstrap_task)
+                    else:
+                        await self._initialize_runtime()
+                if not self._runtime_initialized:
+                    raise RuntimeError("local memory runtime initialization incomplete")
+                finish_stage("RUNTIME_READY")
+
+                begin_stage("SERVICE_READY")
+                service = self._service_for_scope(scope)
+                finish_stage("SERVICE_READY")
                 request_identity = build_request_identity_context(
                     platform_id=normalized.platform_id,
                     sender_id=normalized.sender_id,
@@ -5534,13 +5706,85 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     request_identity.get("mentions")
                     or request_identity.get("reply_target")
                 )
+                request_kind = self._runtime_request_kind(
+                    bounded_query,
+                    force=False,
+                    has_structured_reference=has_structured_reference,
+                )
+                include_participant_activity = self._runtime_activity_analysis(
+                    bounded_query
+                )
+                begin_stage("INTERACTION_TRACE")
+                if self.feedback_learning_enabled:
+                    await self._begin_interaction_trace(
+                        event=event,
+                        scope=scope,
+                        service=service,
+                        query=bounded_query,
+                    )
+                finish_stage("INTERACTION_TRACE")
+                active_trace = self._active_interaction_traces.get(id(event))
+                request_source_key = normalized.resolved_source_key()
+                interaction_trace_id = (
+                    active_trace[1]
+                    if active_trace is not None
+                    and active_trace[0] == scope.key
+                    and active_trace[2] == request_source_key
+                    else ""
+                )
+                begin_stage("EXPERIMENT_START")
+                await service.start_experiment(
+                    run_id=run_id,
+                    umo=scope.key,
+                    experiment_type="runtime_local_serving",
+                    cutoff_at=int(normalized.sent_at or time.time()),
+                    query_sha256=_stable_hash(bounded_query),
+                    metadata={
+                        "scope_id": scope.storage_id,
+                        "path": "materialized_local",
+                        "protocol": LOCAL_SERVING_SCHEMA_VERSION,
+                        "trace_id": interaction_trace_id,
+                        "request_kind": request_kind,
+                        "completion_scope": "MEMORY_INJECTION_ONLY",
+                    },
+                )
+                experiment_started = True
+                finish_stage("EXPERIMENT_START")
+                last_stage = "EXPERIMENT_STARTED"
+                policy = RoutePolicy(mode="LOW_LATENCY", allow_l3=False)
+                begin_stage("SNAPSHOT_CAPTURE")
+                snapshot = await self._capture_layered_snapshot(
+                    scope=scope,
+                    service=service,
+                    normalized=normalized,
+                    query=bounded_query,
+                    provider=None,
+                    policy=policy,
+                    inference_revision=self._local_serving_inference_revision(),
+                )
+                finish_stage("SNAPSHOT_CAPTURE")
+                last_stage = "SNAPSHOT_CAPTURED"
+                direct: tuple[
+                    dict[str, object],
+                    str,
+                    set[str],
+                    set[str],
+                    str,
+                ] | None = None
+                identity_question = self._local_direct_identity_question(
+                    bounded_query,
+                    has_structured_reference=has_structured_reference,
+                )
+                reference_question = self._local_direct_reference_question(
+                    bounded_query
+                )
                 use_direct = bool(include_participant_activity)
                 if (
                     include_participant_activity
                     or identity_question
                     or (reference_question and has_structured_reference)
                 ):
-                    last_stage = "DIRECT_RETRIEVAL"
+                    begin_stage("DIRECT_RETRIEVAL")
                     direct = await self._local_identity_evidence_packet(
                         service=service,
                         snapshot=snapshot,
@@ -5548,6 +5792,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         query=bounded_query,
                         include_participant_activity=include_participant_activity,
                     )
+                    finish_stage("DIRECT_RETRIEVAL")
                     direct_packet = direct[0]
                     query_resolution = direct_packet.get("query_alias_resolution")
                     resolved_people = (
@@ -5559,6 +5804,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         query_resolution.get("ambiguous")
                         if isinstance(query_resolution, dict)
                         else False
+                    )
+                    classified_mentions = (
+                        query_resolution.get("mentions")
+                        if isinstance(query_resolution, dict)
+                        and isinstance(query_resolution.get("mentions"), list)
+                        else []
                     )
                     packet_identity = direct_packet.get("request_identity_context")
                     packet_has_structured_reference = bool(
@@ -5575,6 +5826,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             and (
                                 resolved_people
                                 or ambiguous_people
+                                or classified_mentions
                                 or packet_has_structured_reference
                             )
                         )
@@ -5589,7 +5841,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         pack_cache_layer,
                     ) = direct
                 else:
-                    last_stage = "FULL_RETRIEVAL_PRECHECK"
+                    begin_stage("FULL_RETRIEVAL_PRECHECK")
                     if self.embedding_enabled:
                         if not self._embedding_preload_complete:
                             raise RuntimeError(
@@ -5597,37 +5849,36 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             )
                         if self._embedding_preload_error:
                             raise RuntimeError(self._embedding_preload_error)
-                    if self._local_full_retrieval_lock.locked():
-                        raise RuntimeError(
-                            "local full-memory retrieval is busy; request not queued"
-                        )
-                    await self._local_full_retrieval_lock.acquire()
-                    try:
-                        last_stage = "FULL_RETRIEVAL"
-                        (
-                            packet,
-                            packet_sha256,
-                            _packet_source_keys,
-                            _participant_keys,
-                            pack_cache_layer,
-                        ) = await self._layered_evidence_packet(
-                            service=service,
-                            snapshot=snapshot,
-                            normalized=normalized,
-                            query=bounded_query,
-                            resolve_query_aliases=True,
-                            include_participant_activity=False,
-                            use_cache=False,
-                        )
-                    finally:
-                        self._local_full_retrieval_lock.release()
+                    finish_stage("FULL_RETRIEVAL_PRECHECK")
+                    begin_stage("FULL_RETRIEVAL")
+                    (
+                        packet,
+                        packet_sha256,
+                        _packet_source_keys,
+                        _participant_keys,
+                        pack_cache_layer,
+                    ) = await self._layered_evidence_packet(
+                        service=service,
+                        snapshot=snapshot,
+                        normalized=normalized,
+                        query=bounded_query,
+                        resolve_query_aliases=True,
+                        include_participant_activity=False,
+                        use_cache=False,
+                        finalize_packet=False,
+                        stage_elapsed_ms=stage_elapsed_ms,
+                    )
+                    finish_stage("FULL_RETRIEVAL")
                 last_stage = "PACKET_RETRIEVED"
+                begin_stage("PACKET_MATERIALIZE")
                 materialized = materialize_reconstruction_packet(
                     packet,
                     query=bounded_query,
                     max_items=self.local_serving_max_items,
                 )
+                finish_stage("PACKET_MATERIALIZE")
                 last_stage = "PACKET_MATERIALIZED"
+                begin_stage("ENVELOPE_COMPILE")
                 envelope = compile_local_serving_envelope(
                     packet,
                     materialized,
@@ -5643,18 +5894,27 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         else self.local_serving_max_chars
                     ),
                 )
+                finish_stage("ENVELOPE_COMPILE")
                 last_stage = "ENVELOPE_COMPILED"
+                begin_stage("SOURCE_AUDIT")
                 await service.audit_snapshot_sources(
                     snapshot_id=snapshot.snapshot_id,
                     umo=snapshot.umo,
-                    source_keys=envelope.source_keys,
+                    # Audit every source that influenced retrieval and
+                    # materialization, including items later omitted by the
+                    # prompt budget.  The envelope is only a selected subset.
+                    source_keys=_packet_source_keys,
                     fail_closed=True,
                 )
                 await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
+                finish_stage("SOURCE_AUDIT")
                 last_stage = "SOURCES_AUDITED"
-                elapsed_ms = (time.perf_counter() - started) * 1000
                 envelope_value = json.loads(envelope.json_text)
                 memory_brief = envelope_value.get("memory_brief")
+                reconstruction_elapsed_ms = (
+                    time.perf_counter() - started
+                ) * 1000
+                begin_stage("LEDGER_RECORD")
                 await service.record_reconstruction_step(
                     run_id=run_id,
                     step_index=0,
@@ -5667,8 +5927,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     },
                     evidence_keys=list(envelope.source_keys),
                     result_text=envelope.json_text,
-                    elapsed_ms=elapsed_ms,
+                    elapsed_ms=reconstruction_elapsed_ms,
                 )
+                finish_stage("LEDGER_RECORD")
+                last_stage = "LEDGER_RECORDED"
+                elapsed_ms = (time.perf_counter() - started) * 1000
                 ledger_result: dict[str, object] = {
                     "operational_status": "COMPLETED",
                     "semantic_status": envelope.semantic_status,
@@ -5695,6 +5958,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "memory_provider_external_api_cost": 0,
                     "main_model_incremental_cost": "UNKNOWN_NOT_MEASURED",
                     "elapsed_ms": elapsed_ms,
+                    "hang_guard_seconds": self.local_serving_timeout_seconds,
+                    "stage_elapsed_ms": dict(stage_elapsed_ms),
                     "last_stage": "COMPLETED",
                 }
                 last_stage = "COMPLETED"
@@ -5723,12 +5988,12 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             raise
         except (TimeoutError, asyncio.TimeoutError):
             detail = (
-                "Local memory serving exceeded its hard deadline: "
+                "Local memory serving exceeded its abnormal-hang guard: "
                 f"{self.local_serving_timeout_seconds:.2f}s at {last_stage}"
             )
             logger.error(
                 "MR Memory local serving timed out; no memory injected | umo=%s | "
-                "run=%s | deadline=%.2fs | last_stage=%s",
+                "run=%s | hang_guard=%.2fs | last_stage=%s",
                 scope.key if scope is not None else "unknown",
                 run_id,
                 self.local_serving_timeout_seconds,
@@ -7285,15 +7550,6 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         query = str(event.message_obj.message_str or req.prompt or "").strip()
         if not query:
             return
-        service = self._services.get(scope.key)
-        if service is None or self._service_scopes.get(scope.key) != scope:
-            logger.error(
-                "MR Memory preloaded local service is unavailable; "
-                "no memory injected | umo=%s",
-                scope.key,
-            )
-            return
-
         async def finalize_outcome(
             outcome: _LocalMemoryOutcome,
             *,
@@ -7310,6 +7566,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 result_value["operational_status"] = "FAILED"
                 result_value["error_detail"] = str(error_detail)[:1000]
             try:
+                service = self._service_for_scope(scope)
                 await service.finish_experiment(
                     run_id=outcome.run_id,
                     status=status,
@@ -7327,16 +7584,17 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             return True
 
         try:
-            if self.feedback_learning_enabled:
-                await self._begin_interaction_trace(
-                    event=event,
-                    scope=scope,
-                    service=service,
-                    query=query,
-                )
             if not self.local_serving_enabled:
+                if self.feedback_learning_enabled:
+                    service = self._service_for_scope(scope)
+                    await self._begin_interaction_trace(
+                        event=event,
+                        scope=scope,
+                        service=service,
+                        query=query,
+                    )
                 return
-            # _execute_local_memory_serving owns the only retrieval deadline.
+            # _execute_local_memory_serving owns the only retrieval hang guard.
             # A second hook-level timeout used to cancel the producer first,
             # misclassifying retrieval timeouts as external cancellation.
             outcome = await self._local_memory_for_request(event, query)

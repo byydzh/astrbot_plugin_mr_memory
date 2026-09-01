@@ -190,6 +190,20 @@ class MemoryService:
             self.storage.query_participant_activity, **kwargs
         )
 
+    async def query_participant_history(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.query_participant_history, **kwargs
+        )
+
+    async def query_identity_semantic_evidence(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.query_identity_semantic_evidence, **kwargs
+        )
+
     async def list_participants(self, **kwargs: object) -> list[dict[str, object]]:
         return await asyncio.to_thread(self.storage.list_participants, **kwargs)
 
@@ -442,12 +456,14 @@ class MemoryService:
         umo: str,
         query: str,
         embedding_backend: EmbeddingBackend,
+        query_vector: list[float] | None = None,
         limit: int = 12,
         min_score: float = -1.0,
         before_sent_at: int | None = None,
         message_upper_bound: int | None = None,
     ) -> dict[str, list[dict[str, object]]]:
-        query_vector = await embedding_backend.embed_query(query)
+        if query_vector is None:
+            query_vector = await embedding_backend.embed_query(query)
         matches = await asyncio.to_thread(
             self.storage.search_memory_embeddings,
             umo=umo,

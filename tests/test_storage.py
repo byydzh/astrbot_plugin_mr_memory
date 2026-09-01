@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import unittest
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from mr_memory.feedback import FeedbackDecision
+from mr_memory.identity import normalize_alias
 from mr_memory.models import NormalizedMessage
 from mr_memory.plasticity import parse_graph_mutation
 from mr_memory.storage import FeedbackEvidenceUnavailableError, MemoryStorage
@@ -96,6 +97,236 @@ class MemoryStorageTests(unittest.TestCase):
 
 
 
+
+
+    def test_enumerated_identity_parser_preserves_connectors_inside_aliases(self) -> None:
+        umo = "shadow:GroupMessage:group-connector-alias"
+        for index, alias in enumerate(("和尚", "老王"), start=1):
+            self.storage.upsert_message(
+                self.message(
+                    f"connector-{index}",
+                    "身份观察",
+                    umo=umo,
+                    sender_id=f"connector-account-{index}",
+                    sender_name=alias,
+                    sent_at=100 + index,
+                )
+            )
+        upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+            ).fetchone()[0]
+        )
+
+        result = self.storage.resolve_query_participants(
+            umo=umo,
+            query="/chat 分辨一下和尚和老王是几个人",
+            before_sent_at=200,
+            message_upper_bound=upper_bound,
+        )
+
+        self.assertEqual(
+            [(item["alias"], item["status"]) for item in result["mentions"]],
+            [("和尚", "RESOLVED"), ("老王", "RESOLVED")],
+        )
+        self.assertEqual(len(result["participants"]), 2)
+        self.assertEqual(result["unresolved_aliases"], [])
+
+
+    def test_participant_history_reports_total_before_its_limit(self) -> None:
+        umo = "shadow:GroupMessage:group-history-count"
+        for index in range(5):
+            self.storage.upsert_message(
+                self.message(
+                    f"history-count-{index}",
+                    f"历史消息{index}",
+                    umo=umo,
+                    sender_id="history-account",
+                    sender_name="历史成员",
+                    sent_at=100 + index,
+                )
+            )
+        participant = self.storage.resolve_participants(
+            umo=umo,
+            reference="历史成员",
+            before_sent_at=200,
+            message_upper_bound=int(
+                self.storage._connection.execute(
+                    "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+                ).fetchone()[0]
+            ),
+        )["participants"][0]
+        upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+            ).fetchone()[0]
+        )
+
+        history = self.storage.query_participant_history(
+            umo=umo,
+            participant_key=str(participant["canonical_key"]),
+            before_sent_at=200,
+            message_upper_bound=upper_bound,
+            limit=2,
+        )
+
+        self.assertEqual(len(history["messages"]), 2)
+        self.assertEqual(history["source_count_total"], 5)
+        self.assertTrue(history["messages_truncated"])
+
+
+    def _insert_semantic_self_alias(
+        self,
+        *,
+        umo: str,
+        account_id: str,
+        source_message_id: str,
+        alias: str,
+        aspect: str,
+        content: str,
+        sent_at: int,
+        evidence_role: str = "SUPPORT",
+    ) -> str:
+        message = self.message(
+            source_message_id,
+            content,
+            umo=umo,
+            sender_id=account_id,
+            sender_name=f"成员-{account_id}",
+            sent_at=sent_at,
+        )
+        self.storage.upsert_message(message)
+        with self.storage._lock, self.storage._connection:
+            row = self.storage._connection.execute(
+                "SELECT id, sender_participant_id FROM messages WHERE umo=? AND source_key=?",
+                (umo, message.resolved_source_key()),
+            ).fetchone()
+            cursor = self.storage._connection.execute(
+                """
+                INSERT INTO semantic_memories(
+                    umo, person_cue, aspect_tag, content, source_message_id,
+                    confidence, extractor_version, stable_key,
+                    subject_participant_id, subject_text, claim_type,
+                    epistemic_status, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0.9, 'test', ?, ?, ?, 'FACT',
+                          'ASSERTED', 'ACTIVE', ?, ?)
+                """,
+                (
+                    umo, alias, aspect, content, int(row["id"]),
+                    f"semantic-{source_message_id}",
+                    int(row["sender_participant_id"]), account_id,
+                datetime.fromtimestamp(sent_at, UTC).strftime("%Y-%m-%d %H:%M:%S"),
+                datetime.fromtimestamp(sent_at, UTC).strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            self.storage._connection.execute(
+                """
+                INSERT INTO semantic_memory_sources(
+                    semantic_memory_id, message_id, evidence_role, confidence
+                ) VALUES (?, ?, ?, 0.9)
+                """,
+                (int(cursor.lastrowid), int(row["id"]), evidence_role),
+            )
+        return message.resolved_source_key()
+
+
+
+    def test_semantic_alias_rejects_role_and_weight_statements_as_nicknames(
+        self,
+    ) -> None:
+        umo = "shadow:GroupMessage:semantic-non-alias-self-statements"
+        self._insert_semantic_self_alias(
+            umo=umo,
+            account_id="account-admin",
+            source_message_id="admin-role",
+            alias="管理员",
+            aspect="role",
+            content="本人是管理员",
+            sent_at=100,
+        )
+        self._insert_semantic_self_alias(
+            umo=umo,
+            account_id="account-weight",
+            source_message_id="weight-change",
+            alias="体重下降",
+            aspect="weight_drop",
+            content="称自己体重下降",
+            sent_at=101,
+        )
+        upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+            ).fetchone()[0]
+        )
+
+        result = self.storage.resolve_query_participants(
+            umo=umo,
+            query="/chat 分辨管理员和体重下降是谁",
+            before_sent_at=200,
+            message_upper_bound=upper_bound,
+        )
+
+        self.assertEqual(result["participants"], [])
+        self.assertEqual(
+            [(item["alias"], item["status"]) for item in result["mentions"]],
+            [("管理员", "UNRESOLVED"), ("体重下降", "UNRESOLVED")],
+        )
+
+
+
+
+
+
+    def test_one_ambiguous_alias_does_not_delete_another_unique_alias(self) -> None:
+        umo = "shadow:GroupMessage:alias-isolation"
+        self.storage.upsert_message(self.message(
+            "p-a", "观察", umo=umo, sender_id="p", sender_name="老王", sent_at=80,
+        ))
+        for account in ("p", "q"):
+            self.storage.upsert_message(self.message(
+                f"shared-{account}", "观察", umo=umo, sender_id=account,
+                sender_name="和尚", sent_at=90,
+            ))
+        upper = int(self.storage._connection.execute(
+            "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+        ).fetchone()[0])
+        result = self.storage.resolve_query_participants(
+            umo=umo, query="/chat 分辨老王，和尚分别是谁", before_sent_at=200,
+            message_upper_bound=upper,
+        )
+        self.assertEqual(
+            [(item["alias"], item["status"]) for item in result["mentions"]],
+            [("老王", "RESOLVED"), ("和尚", "AMBIGUOUS")],
+        )
+        self.assertEqual([item["account_id"] for item in result["participants"]], ["p"])
+
+    def test_semantic_alias_rejects_contradict_and_hides_future_display_name(self) -> None:
+        umo = "shadow:GroupMessage:semantic-snapshot"
+        self._insert_semantic_self_alias(
+            umo=umo, account_id="monk", source_message_id="monk-source",
+            alias="和尚", aspect="nickname", content="本人名字叫和尚", sent_at=100,
+        )
+        self._insert_semantic_self_alias(
+            umo=umo, account_id="fake", source_message_id="contradict-source",
+            alias="老王", aspect="nickname", content="本人名字叫老王", sent_at=101,
+            evidence_role="CONTRADICT",
+        )
+        upper = int(self.storage._connection.execute(
+            "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+        ).fetchone()[0])
+        self.storage.upsert_message(self.message(
+            "future-name", "未来", umo=umo, sender_id="monk",
+            sender_name="未来改名", sent_at=150,
+        ))
+        result = self.storage.resolve_query_participants(
+            umo=umo, query="/chat 分辨和尚和老王分别是谁", before_sent_at=200,
+            message_upper_bound=upper,
+        )
+        self.assertEqual(
+            [(item["alias"], item["status"]) for item in result["mentions"]],
+            [("和尚", "RESOLVED"), ("老王", "UNRESOLVED")],
+        )
+        self.assertEqual(result["participants"][0]["current_display_name"], "成员-monk")
 
 
     def test_activity_statistics_use_only_bounded_daily_spanning_sources(self) -> None:

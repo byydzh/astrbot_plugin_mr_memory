@@ -4,6 +4,7 @@ import asyncio
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mr_memory.embedding import (
     LocalFastEmbedBackend,
@@ -88,7 +89,28 @@ class LocalFastEmbedBackendTests(unittest.TestCase):
             asyncio.run(backend.embed_texts(["valid", " "]))
         self.assertEqual(created, 0)
 
-    def test_cancelled_waiter_keeps_backend_busy_until_native_inference_exits(self) -> None:
+    def test_executor_submission_failure_releases_inference_slot(self) -> None:
+        backend = LocalFastEmbedBackend(
+            model_name="BAAI/bge-small-zh-v1.5",
+            cache_dir="unused",
+            model_factory=lambda **_kwargs: _FakeFastEmbedModel(),
+        )
+
+        async def exercise() -> None:
+            loop = asyncio.get_running_loop()
+            with patch.object(
+                loop,
+                "run_in_executor",
+                side_effect=RuntimeError("executor unavailable"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "executor unavailable"):
+                    await backend.embed_query("first")
+            result = await backend.embed_query("second")
+            self.assertEqual(len(result), 3)
+
+        asyncio.run(exercise())
+
+    def test_cancelled_waiter_queues_next_request_until_native_inference_exits(self) -> None:
         started = threading.Event()
         release = threading.Event()
 
@@ -114,13 +136,16 @@ class LocalFastEmbedBackendTests(unittest.TestCase):
             first.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await first
-            with self.assertRaisesRegex(RuntimeError, "busy; request not queued"):
-                await backend.embed_query("second")
+            second = asyncio.create_task(backend.embed_query("second"))
+            await asyncio.sleep(0.01)
+            self.assertFalse(second.done())
             release.set()
-            while backend._inference_gate.busy:
-                await asyncio.sleep(0)
-            result = await backend.embed_query("third")
+            result = await second
             self.assertEqual(len(result), 3)
+            self.assertEqual(
+                backend._model.query_calls,
+                [(["first"], 1), (["second"], 1)],
+            )
 
         asyncio.run(exercise())
 
@@ -146,6 +171,47 @@ class _FakeSentenceTransformerModel:
 
 
 class LocalSentenceTransformerBackendTests(unittest.TestCase):
+    def test_query_runs_between_bounded_passage_chunks(self) -> None:
+        first_chunk_started = threading.Event()
+        release_first_chunk = threading.Event()
+
+        class ChunkedModel(_FakeSentenceTransformerModel):
+            def encode(self, texts, **kwargs):
+                values = list(texts)
+                self.calls.append((values, kwargs))
+                if values == ["p1", "p2"]:
+                    first_chunk_started.set()
+                    if not release_first_chunk.wait(timeout=2):
+                        raise TimeoutError("test did not release first passage chunk")
+                return [[1.0, 1.0, 0.0] for _text in values]
+
+        model = ChunkedModel()
+        backend = LocalSentenceTransformerBackend(
+            model_name="microsoft/harrier-oss-v1-270m",
+            cache_dir="unused",
+            batch_size=2,
+            model_factory=lambda *args, **kwargs: model,
+        )
+
+        async def exercise() -> None:
+            passages = asyncio.create_task(
+                backend.embed_texts(["p1", "p2", "p3", "p4"])
+            )
+            while not first_chunk_started.is_set():
+                await asyncio.sleep(0)
+            query = asyncio.create_task(backend.embed_query("query"))
+            await asyncio.sleep(0)
+            release_first_chunk.set()
+            passage_vectors, query_vector = await asyncio.gather(passages, query)
+            self.assertEqual(len(passage_vectors), 4)
+            self.assertEqual(len(query_vector), 3)
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            [call[0] for call in model.calls],
+            [["p1", "p2"], ["query"], ["p3", "p4"]],
+        )
+
     def test_applies_query_prompt_only_to_queries_and_caps_length(self) -> None:
         created: list[tuple[tuple[object, ...], dict[str, object], object]] = []
 

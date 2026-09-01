@@ -22,11 +22,11 @@
     "hint": "只读取本群 SQLite、稳定账号、原始消息、关系图和本地向量；回答前不调用第二个远程模型。"
   },
   "local_serving_timeout_seconds": {
-    "description": "本地记忆硬超时（秒）",
+    "description": "本地记忆异常卡死保护（秒）",
     "type": "float",
-    "default": 2,
+    "default": 180,
     "condition": {"local_serving_enabled": true},
-    "hint": "超过时间会记录明确错误并停止本次记忆注入，不会切换模型、数据源或继续后台查询。"
+    "hint": "仅用于终止异常卡死的完整本地读取，默认 180 秒、可设 1-600 秒；正常慢路径通过阶段耗时观测，不会因短延迟目标丢弃记忆。超时不会切换模型、数据源或继续后台查询。"
   },
   "local_serving_max_chars": {
     "description": "注入主模型的证据字符上限",

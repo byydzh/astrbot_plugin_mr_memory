@@ -25,8 +25,14 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 - `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
   分数的宿主门禁约束，默认提交阈值为 `0.65`；反馈未先被宿主提交时不能修改可塑图。
 - `local_serving_enabled=true`：回答前只读取本地证据，不调用插件专属远程模型。
-- `local_serving_timeout_seconds=2`、`local_serving_max_chars=12000`：普通聊天仍限制为
+- `local_serving_timeout_seconds=180` 只用于异常卡死保护（可设 1-600 秒），不再把
+  正常慢检索当成缺失记忆；运行账本分别记录 runtime/service readiness、interaction trace、
+  snapshot、direct/full retrieval、materialize、compile、audit 和本地账本写入的实际耗时。
+  `local_serving_max_chars=12000`：普通聊天仍限制为
   3000 字符，显式历史回忆才可使用更大证据预算；本地读取超时会明确记为错误且不注入。
+- 在线检索不再用插件级全局锁串行所有请求；本地 embedding 按公平队列执行，后台文档
+  索引会在批次间释放推理槽。普通聊天跳过仅供明确人物枚举使用的语义身份全表扫描，
+  引用来源使用一次批量 fail-closed 审计。
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：只供后台消息整理和反馈维护使用。
 - `distillation_thinking_mode=enabled`：图构建保留模型完整思考能力；长调用采用流式接收，
   关闭思考只作为显式诊断选项，不作为省时默认值。

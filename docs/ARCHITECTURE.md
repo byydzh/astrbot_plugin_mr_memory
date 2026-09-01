@@ -68,22 +68,36 @@ or a controlled on/off measurement exists.
 
 ### Deadline and readiness
 
-- `_execute_local_memory_serving` owns the single
-  `local_serving_timeout_seconds` deadline. It bounds snapshot capture, retrieval,
-  validation, and compilation; feedback-trace setup and terminal ledger persistence
-  are outside that retrieval deadline.
+- `_execute_local_memory_serving` owns one `local_serving_timeout_seconds`
+  abnormal-hang guard for the request-local evidence pipeline. It defaults to 180
+  seconds and is configurable from 1 to 600 seconds. It is not a response-latency
+  gate: runtime readiness, per-group service opening, interaction tracing, experiment
+  setup, snapshot, direct/full retrieval, materialization, compilation, source audit,
+  and reconstruction-ledger durations are recorded separately so slow work remains
+  observable without being converted into absent memory. No alternate source or
+  background result is used. Only the final experiment status write is outside that
+  guard so a terminal result can still be persisted after expiry.
 - A timeout or local error is logged and injects nothing. AstrBot continues its own
   configured reply; MR Memory does not select another provider, data source, cache
   approximation, or substitute answer.
 - A cancelled native SQLite or embedding call can finish in its executor thread;
   the request does not use its late result. Terminal failure persistence is awaited
-  outside the retrieval deadline and records the last completed stage.
+  outside the retrieval hang guard and records the last completed stage.
 - Production deployments that require semantic retrieval can explicitly set
-  `embedding_preload_on_startup=true`. A query fails clearly while that preload is
-  in progress or after preload failure; preload is not enabled by default because
-  its memory cost is deployment-specific.
+  `embedding_preload_on_startup=true`. A request waits for the same startup task
+  within the 180-second guard instead of treating an in-progress preload as missing
+  memory. A completed preload failure remains an explicit error; preload is not
+  enabled by default because its memory cost is deployment-specific.
 - Repeated hooks for the same source/query join one local task. A different query
   cancels the obsolete task. Retained outcomes are bounded and cleaned after send.
+- Full retrieval is not protected by a plugin-wide lock. SQLite keeps its own
+  connection lock around each database operation, while local embedding uses a fair,
+  cancellation-safe inference slot. Passage indexing releases that slot between
+  configured batches so an online query is not trapped behind an entire maintenance
+  batch.
+- Ordinary alias lookup does not scan semantic self-claim rows; that bounded scan is
+  reserved for explicit identity enumeration. Source validation reads all cited rows
+  in one bounded query and each online request performs one final fail-closed audit.
 
 ## Envelope contract
 

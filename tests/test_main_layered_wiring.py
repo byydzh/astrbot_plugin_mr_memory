@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,15 @@ class MainLayeredWiringTests(unittest.TestCase):
             returns=activity_method.returns,
             type_comment=activity_method.type_comment,
         )
+        identity_method = self._method("_explicit_identity_intent")
+        isolated_identity = ast.FunctionDef(
+            name="_explicit_identity_intent",
+            args=identity_method.args,
+            body=identity_method.body,
+            decorator_list=[],
+            returns=identity_method.returns,
+            type_comment=identity_method.type_comment,
+        )
         method = self._method("_runtime_request_kind")
         isolated_classifier = ast.FunctionDef(
             name="classify",
@@ -42,28 +52,50 @@ class MainLayeredWiringTests(unittest.TestCase):
             returns=method.returns,
             type_comment=method.type_comment,
         )
-        module = ast.fix_missing_locations(
+        namespace: dict[str, object] = {"re": re}
+        helpers = ast.fix_missing_locations(
             ast.Module(
-                body=[isolated_activity, isolated_classifier],
+                body=[isolated_activity, isolated_identity],
                 type_ignores=[],
             )
         )
-        namespace: dict[str, object] = {}
-        activity_only = ast.fix_missing_locations(
-            ast.Module(body=[isolated_activity], type_ignores=[])
-        )
-        exec(compile(activity_only, "<runtime-activity-analysis>", "exec"), namespace)
+        exec(compile(helpers, "<runtime-request-helpers>", "exec"), namespace)
         namespace["MrMemoryPlugin"] = type(
             "MrMemoryPlugin",
             (),
             {
                 "_runtime_activity_analysis": staticmethod(
                     namespace["_runtime_activity_analysis"]
-                )
+                ),
+                "_explicit_identity_intent": staticmethod(
+                    namespace["_explicit_identity_intent"]
+                ),
             },
         )
-        exec(compile(module, "<runtime-request-kind>", "exec"), namespace)
+        classifier_module = ast.fix_missing_locations(
+            ast.Module(body=[isolated_classifier], type_ignores=[])
+        )
+        exec(
+            compile(classifier_module, "<runtime-request-kind>", "exec"),
+            namespace,
+        )
         return namespace["classify"]
+
+    def test_production_local_outcome_keeps_unresolved_identity_injectable(self) -> None:
+        outcome_class = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "_LocalMemoryOutcome"
+        )
+        usable = next(
+            node
+            for node in outcome_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "usable"
+        )
+        body = ast.unparse(usable)
+        self.assertIn("EVIDENCE_AVAILABLE", body)
+        self.assertIn("IDENTITY_AMBIGUOUS", body)
+        self.assertIn("IDENTITY_UNRESOLVED", body)
 
     def test_host_return_decision_cannot_fall_through_to_provider(self) -> None:
         method = self._method("_run_layered_subconscious")
@@ -233,7 +265,6 @@ class MainLayeredWiringTests(unittest.TestCase):
 
         method = self._method("inject_subconscious_memory")
         hook_body = ast.unparse(method)
-        self.assertIn("await self._begin_interaction_trace", hook_body)
         self.assertIn("await self._local_memory_for_request(event, query)", hook_body)
         self.assertNotIn(
             "asyncio.timeout(self.local_serving_timeout_seconds)",
@@ -246,7 +277,35 @@ class MainLayeredWiringTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertIn("await self._begin_interaction_trace", executor_body)
+        self.assertNotIn("serving_deadline.reschedule", executor_body)
         self.assertIn("'last_stage': last_stage", executor_body)
+
+    def test_full_retrieval_has_no_short_stage_deadline(self) -> None:
+        body = ast.unparse(self._method("_execute_local_memory_serving"))
+        full_branch = body[body.index("begin_stage('FULL_RETRIEVAL_PRECHECK')") :]
+
+        self.assertNotIn("serving_deadline.reschedule", full_branch)
+        self.assertNotIn("self.local_serving_timeout_seconds * 4.0", full_branch)
+        self.assertIn("'stage_elapsed_ms': dict(stage_elapsed_ms)", body)
+        for stage in (
+            "SNAPSHOT_CAPTURE",
+            "RUNTIME_READY",
+            "SERVICE_READY",
+            "INTERACTION_TRACE",
+            "EXPERIMENT_START",
+            "DIRECT_RETRIEVAL",
+            "FULL_RETRIEVAL",
+            "PACKET_MATERIALIZE",
+            "ENVELOPE_COMPILE",
+            "SOURCE_AUDIT",
+            "LEDGER_RECORD",
+        ):
+            self.assertIn(f"begin_stage('{stage}')", body)
+            self.assertIn(f"finish_stage('{stage}')", body)
+        self.assertNotIn("_local_full_retrieval_lock", body)
+        self.assertIn("finalize_packet=False", full_branch)
+        self.assertIn("stage_elapsed_ms=stage_elapsed_ms", full_branch)
         local_method = ast.unparse(self._method("_local_memory_for_request"))
         self.assertIn("self._local_serving_outcomes.get(event_key)", local_method)
         self.assertIn("self._local_serving_tasks.get(event_key)", local_method)
