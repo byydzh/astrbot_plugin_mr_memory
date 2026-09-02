@@ -307,7 +307,14 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertEqual(keywords["resolve_query_aliases"], "False")
         self.assertEqual(keywords["use_cache"], "False")
         self.assertEqual(keywords["finalize_packet"], "False")
-        self.assertEqual(keywords["include_participant_activity"], "True")
+        self.assertEqual(
+            keywords["include_participant_activity"],
+            "include_participant_activity",
+        )
+        self.assertIn(
+            "include_participant_activity = self._runtime_activity_analysis(bounded_query)",
+            body,
+        )
         for forbidden in (
             "_local_identity_evidence_packet",
             "_local_direct_identity_question",
@@ -355,6 +362,7 @@ class MainLayeredWiringTests(unittest.TestCase):
             "FULL_RETRIEVAL",
             "SOURCE_AUDIT",
             "RESIDENT_READER",
+            "SOURCE_REAUDIT",
             "SURFACE_COMPILE",
             "LEDGER_RECORD",
         ):
@@ -630,13 +638,16 @@ class MainLayeredWiringTests(unittest.TestCase):
 
     def test_reply_target_is_snapshot_bounded_packet_evidence(self) -> None:
         revision = ast.unparse(self._method("_runtime_inference_revision"))
-        self.assertIn("host-prefetch.snapshot.v7", revision)
-        self.assertIn("lexical-plus-embedding-plus-resident-reader.v6", revision)
+        self.assertIn("host-prefetch.snapshot.v8.compact", revision)
+        self.assertIn(
+            "fts5-plus-bigram-plus-embedding-plus-resident-reader.v8",
+            revision,
+        )
 
         method = self._method("_layered_evidence_packet")
         body = ast.unparse(method)
         reply_lookup = body.index("await service.message_for_source")
-        packet_hash = body.index("packet_sha256 = stable_sha256(packet)")
+        packet_hash = body.rindex("packet_sha256 = stable_sha256(packet)")
         cache_write = body.index("await service.put_evidence_pack_cache")
         self.assertIn("packet['reply_context']", body)
         self.assertIn("source_key=snapshot.reply_source_key", body)
@@ -676,18 +687,29 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("service.query_participant_history", packet)
         self.assertIn("service.query_participant_activity", packet)
         self.assertIn("if include_participant_activity", packet)
-        self.assertIn("limit=12", packet)
+        self.assertIn("self.local_serving_max_items", packet)
         self.assertIn("days=7", packet)
-        self.assertIn("limit=32", packet)
+        self.assertIn(
+            "max(4, min(24, int(self.local_serving_max_items)))",
+            packet,
+        )
         self.assertIn("packet['query_alias_resolution']", packet)
         self.assertIn("packet['participant_activity']", packet)
         self.assertIn("packet['participant_history']", packet)
         self.assertIn("packet['person_reasoning_candidates']", packet)
         self.assertIn("service.query_person_reference_candidates", packet)
+        self.assertLess(
+            packet.index("add_candidate_participant_keys(explicit_participants)"),
+            packet.index("add_candidate_participant_keys(person_reference_candidates)"),
+        )
         self.assertIn("service.count_snapshot_messages", packet)
         self.assertIn("exclude_source_keys=sorted(preexisting_source_keys)", packet)
         self.assertIn("packet['retrieval_coverage']", packet)
-        self.assertIn("packet['participant_source_keys']", packet)
+        self.assertIn("await service.messages_for_sources", packet)
+        self.assertIn(
+            "packet = hydrate_evidence_atom_pack(packet, hydrated_messages)",
+            packet,
+        )
         self.assertIn("'host_decision': 'NONE'", packet)
         self.assertIn(
             "packet['source_count'] = len(packet_source_keys)",
@@ -695,6 +717,7 @@ class MainLayeredWiringTests(unittest.TestCase):
         )
         self.assertIn("before_sent_at=snapshot.cutoff_at", packet)
         self.assertIn("message_upper_bound=snapshot.message_upper_bound", packet)
+        self.assertIn("cached evidence packet hash does not match payload", packet)
 
     def test_lexical_and_embedding_candidates_are_combined_without_fallback(
         self,
@@ -718,7 +741,7 @@ class MainLayeredWiringTests(unittest.TestCase):
             "embedding errors must reach the existing ERROR/failed-ledger path",
         )
 
-    def test_l2_reader_is_one_pass_with_configured_thinking_and_output_cap(
+    def test_l2_reader_is_one_pass_with_independent_thinking_and_output_cap(
         self,
     ) -> None:
         method = self._method("_read_l2_certificate")
@@ -735,10 +758,50 @@ class MainLayeredWiringTests(unittest.TestCase):
             for item in calls[0].keywords
             if item.arg
         }
-        self.assertEqual(keywords["thinking_mode"], "self.distillation_thinking_mode")
+        self.assertEqual(
+            keywords["thinking_mode"],
+            "self.local_serving_reader_thinking_mode",
+        )
         self.assertEqual(keywords["max_output_tokens"], "8192")
         self.assertEqual(keywords["phase"], "'resident_evidence_reader'")
         self.assertEqual(keywords["usage_source"], "'resident_reader_one_pass'")
+
+        plugin_class = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MrMemoryPlugin"
+        )
+        plugin_init = next(
+            node
+            for node in plugin_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        init_body = ast.unparse(plugin_init)
+        self.assertIn(
+            "self.config.get('local_serving_reader_thinking_mode', 'disabled')",
+            init_body,
+        )
+        self.assertIn(
+            "Unsupported MR Memory local_serving_reader_thinking_mode",
+            init_body,
+        )
+
+        distillation_method = self._method("_distill_scope")
+        distillation_call = next(
+            node
+            for node in ast.walk(distillation_method)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "distillation_generation_options"
+        )
+        distillation_keywords = {
+            item.arg: ast.unparse(item.value)
+            for item in distillation_call.keywords
+            if item.arg
+        }
+        self.assertEqual(
+            distillation_keywords["thinking_mode"],
+            "self.distillation_thinking_mode",
+        )
         prompt_call = next(
             node
             for node in ast.walk(method)
@@ -769,7 +832,10 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertNotIn("reasoning_content", body)
         self.assertIn("certificate = parse_l2_reader_response", body)
         self.assertIn("allow_l3=allow_l3", body)
-        self.assertIn("return (certificate, False, 'completion', first_chunk_ms)", body)
+        self.assertIn(
+            "return (certificate, False, 'completion', first_chunk_ms, request_metrics)",
+            body,
+        )
         self.assertNotIn("parse_repair", body)
         self.assertNotIn("_run_l3_certificate", body)
         self.assertFalse(

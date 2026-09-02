@@ -44,6 +44,13 @@ from .mr_memory.embedding import (
     LocalFastEmbedBackend,
     LocalSentenceTransformerBackend,
 )
+from .mr_memory.evidence_pack import (
+    EVIDENCE_ATOM_PACK_FORMAT,
+    compile_evidence_atom_pack,
+    hydrate_evidence_atom_pack,
+    participant_speaker_source_bindings,
+    participant_source_bindings,
+)
 from .mr_memory.feedback import (
     FEEDBACK_MAINTENANCE_SYSTEM_PROMPT,
     parse_feedback_decision,
@@ -284,7 +291,11 @@ def _collect_source_keys(value: Any) -> set[str]:
     found: set[str] = set()
     if isinstance(value, dict):
         for key, item in value.items():
-            if key == "source_key" and isinstance(item, str):
+            if (
+                key != "request_source_key"
+                and (key == "source_key" or key.endswith("_source_key"))
+                and isinstance(item, str)
+            ):
                 if item:
                     found.add(item)
             elif (key == "source_keys" or key.endswith("_source_keys")) and isinstance(
@@ -408,84 +419,17 @@ def _collect_participant_keys_in_order(value: Any) -> list[str]:
 
 
 def _participant_source_bindings(value: Any) -> dict[str, list[str]]:
-    """Bind participant candidates to the raw sources that expose them.
+    """Compatibility name for the shared compact-pack attribution contract."""
 
-    The result is an allowlist for the Evidence Reader, not an identity verdict.
-    A source inherited from a containing raw-message record may support nested
-    mention/reply participants; participant history and semantic subject records
-    may additionally bind to the source keys inside their own evidence subtree.
-    """
+    return participant_source_bindings(value)
 
-    collected: dict[str, set[str]] = {}
 
-    def direct_sources(node: dict[str, Any]) -> set[str]:
-        sources: set[str] = set()
-        source_key = node.get("source_key")
-        if isinstance(source_key, str) and source_key:
-            sources.add(source_key)
-        for key, item in node.items():
-            if (
-                (key == "source_keys" or key.endswith("_source_keys"))
-                and isinstance(item, list)
-            ):
-                sources.update(str(source) for source in item if str(source))
-        return sources
+def _participant_speaker_source_bindings(
+    value: Any,
+) -> dict[str, list[str]]:
+    """Return direct authorship bindings from same-record sender fields only."""
 
-    def visit(node: Any, inherited_sources: set[str]) -> None:
-        if isinstance(node, dict):
-            local_sources = direct_sources(node)
-            effective_sources = {*inherited_sources, *local_sources}
-            participant_keys: set[str] = set()
-            for key in (
-                "participant_key",
-                "sender_participant_key",
-                "subject_participant_key",
-            ):
-                item = node.get(key)
-                if isinstance(item, str) and item:
-                    participant_keys.add(item)
-            canonical_key = node.get("canonical_key")
-            if (
-                isinstance(canonical_key, str)
-                and canonical_key
-                and any(
-                    marker in node
-                    for marker in (
-                        "account_id",
-                        "current_display_name",
-                        "subject_display_name",
-                        "platform_id",
-                    )
-                )
-            ):
-                participant_keys.add(canonical_key)
-            if participant_keys:
-                # Never grant a participant every source in an arbitrary
-                # subtree: sibling candidates can live under the same parent.
-                # Only relation-specific evidence containers are known to be
-                # exclusively about the participant carried by this node.
-                relation_sources: set[str] = set()
-                for relation_key in ("alias_observations", "messages"):
-                    relation_value = node.get(relation_key)
-                    if isinstance(relation_value, list):
-                        relation_sources.update(
-                            _collect_source_keys(relation_value)
-                        )
-                admissible = {*effective_sources, *relation_sources}
-                for participant_key in participant_keys:
-                    collected.setdefault(participant_key, set()).update(admissible)
-            for item in node.values():
-                visit(item, effective_sources)
-        elif isinstance(node, (list, tuple)):
-            for item in node:
-                visit(item, inherited_sources)
-
-    visit(value, set())
-    return {
-        participant_key: sorted(source_keys)
-        for participant_key, source_keys in sorted(collected.items())
-        if source_keys
-    }
+    return participant_speaker_source_bindings(value)
 
 
 def _request_snapshot_from_row(value: dict[str, object]) -> RequestSnapshot:
@@ -993,6 +937,21 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "Unsupported MR Memory distillation_thinking_mode: "
                 f"{self.distillation_thinking_mode!r}"
             )
+        self.local_serving_reader_thinking_mode = (
+            str(
+                self.config.get(
+                    "local_serving_reader_thinking_mode",
+                    "disabled",
+                )
+            )
+            .strip()
+            .casefold()
+        )
+        if self.local_serving_reader_thinking_mode not in {"enabled", "disabled"}:
+            raise ValueError(
+                "Unsupported MR Memory local_serving_reader_thinking_mode: "
+                f"{self.local_serving_reader_thinking_mode!r}"
+            )
         self.embedding_enabled = bool(self.config.get("embedding_enabled", True))
         self.embedding_backend_name = (
             str(self.config.get("embedding_backend", "fastembed"))
@@ -1278,7 +1237,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         logger.info(
             "MR Memory plugin loaded | capture=%s | feedback=%s | local_serving=%s | "
             "subconscious=%s | provider=%s | local_embedding=%s/%s | "
-            "local_timeout=%.2fs | scope_db_dir=%s",
+            "reader_thinking=%s | local_timeout=%.2fs | scope_db_dir=%s",
             self.capture_enabled,
             self.feedback_learning_enabled,
             self.local_serving_enabled,
@@ -1286,6 +1245,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self.subconscious_provider_id,
             self.embedding_backend_name,
             self.embedding_model_name if self.embedding_enabled else "disabled",
+            self.local_serving_reader_thinking_mode,
             self.local_serving_timeout_seconds,
             self.scope_database_dir,
         )
@@ -2194,6 +2154,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "subconscious_enabled": self.subconscious_enabled,
                 "subconscious_provider_id": self.subconscious_provider_id,
                 "distillation_thinking_mode": self.distillation_thinking_mode,
+                "local_serving_reader_thinking_mode": (
+                    self.local_serving_reader_thinking_mode
+                ),
                 "subconscious_provider_ready": bool(
                     self.context.get_provider_by_id(self.subconscious_provider_id)
                 ),
@@ -3529,13 +3492,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             self._last_reader_model_revision = f"{provider_id}|model={provider_model}"
         reader_model_revision = self._last_reader_model_revision
         return {
-            # v7 leaves nickname equivalence to the resident reader and adds
-            # source-bound semantic-subject/history/activity candidates.
-            "retriever": "host-prefetch.snapshot.v7",
+            # v8 adds snapshot-bounded raw FTS, source-deduplicated atom packs,
+            # and restricts participant expansion to actual identity candidates.
+            "retriever": "host-prefetch.snapshot.v8.compact",
             "embedding_model": (
                 self.embedding_model_name if self.embedding_enabled else "disabled"
             ),
-            "fusion_policy": "lexical-plus-embedding-plus-resident-reader.v6",
+            "fusion_policy": (
+                "fts5-plus-bigram-plus-embedding-plus-resident-reader.v8"
+            ),
             # Bind certificates to the actual configured model when observable,
             # while retaining that revision through a transient lookup outage.
             # Provider ids alone are not guaranteed to be model-specific after
@@ -3883,6 +3848,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         *,
         resolve_query_aliases: bool,
         include_participant_activity: bool,
+        max_sources: int,
     ) -> str:
         return stable_sha256(
             {
@@ -3899,6 +3865,8 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "include_participant_activity": bool(
                     include_participant_activity
                 ),
+                "evidence_pack_format": EVIDENCE_ATOM_PACK_FORMAT,
+                "max_sources": int(max_sources),
             }
         )
 
@@ -3930,6 +3898,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             snapshot,
             resolve_query_aliases=resolve_query_aliases,
             include_participant_activity=include_participant_activity,
+            max_sources=self.local_serving_max_items,
         )
         cached = (
             await service.get_evidence_pack_cache(
@@ -3950,7 +3919,11 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             if not isinstance(packet_value, dict):
                 raise ValueError("cached evidence packet is not a JSON object")
             packet = packet_value
-            packet_sha256 = str(cached.get("packet_hash") or stable_sha256(packet))
+            computed_packet_sha256 = stable_sha256(packet)
+            cached_packet_sha256 = str(cached.get("packet_hash") or "").strip()
+            if cached_packet_sha256 != computed_packet_sha256:
+                raise ValueError("cached evidence packet hash does not match payload")
+            packet_sha256 = computed_packet_sha256
         else:
             initial: dict[str, list[dict[str, object]]] = {
                 "participants": [],
@@ -4081,6 +4054,43 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     dict(item)
                     for item in lexical_matches
                     if isinstance(item, dict)
+                ]
+                lexical_query = query.strip()
+                if lexical_query.casefold().startswith("/chat"):
+                    lexical_query = lexical_query[5:].strip()
+                raw_lexical_started = time.perf_counter()
+                raw_matches = (
+                    await service.search_messages(
+                        umo=snapshot.umo,
+                        query=lexical_query,
+                        limit=self.local_serving_max_items,
+                        before_sent_at=snapshot.cutoff_at,
+                        message_upper_bound=snapshot.message_upper_bound,
+                        match_mode="recall",
+                        exclude_source_key=snapshot.request_source_key,
+                    )
+                    if lexical_query
+                    else []
+                )
+                if stage_elapsed_ms is not None:
+                    stage_elapsed_ms["FULL_RAW_LEXICAL_RECALL"] = (
+                        time.perf_counter() - raw_lexical_started
+                    ) * 1000
+                initial["raw_messages"] = [
+                    {
+                        "source_key": message.source_key,
+                        "sent_at": message.sent_at,
+                        "sender_id": message.sender_id,
+                        "sender_name": message.sender_name,
+                        "sender_participant_key": message.sender_participant_key,
+                        "role": message.role,
+                        "plain_text": message.plain_text,
+                        "reply_to_source_key": message.reply_to_source_key,
+                        "mentions": list(message.mentions),
+                        "revision_no": message.revision_no,
+                        "retrieval_channel": "FTS5",
+                    }
+                    for message in raw_matches
                 ]
 
             backend = self._embedding_backend()
@@ -4229,6 +4239,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             # storage facade applies the same frozen-snapshot bounds as every
             # other evidence source.
             packet = dict(packet)
+            packet["lexical_messages"] = list(initial.get("raw_messages") or [])
             packet["request_identity_context"] = request_identity_context
             packet["query_alias_resolution"] = query_alias_resolution
 
@@ -4306,14 +4317,20 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     if participant_key not in all_candidate_participant_keys:
                         all_candidate_participant_keys.append(participant_key)
 
-            add_candidate_participant_keys(person_reference_candidates)
             add_candidate_participant_keys(explicit_participants)
+            add_candidate_participant_keys(person_reference_candidates)
             add_candidate_participant_keys(packet.get("semantic_evidence"))
-            add_candidate_participant_keys(packet.get("candidates"))
-            add_candidate_participant_keys(packet.get("expanded_episodes"))
+            candidate_packet = packet.get("candidates")
+            if isinstance(candidate_packet, dict):
+                # Only participant retrieval hits are eligible for participant
+                # expansion.  Walking the complete candidate/episode packet
+                # promotes every incidental episode speaker into a person of
+                # interest and multiplies history/activity reads for an ordinary
+                # one-person query.
+                add_candidate_participant_keys(candidate_packet.get("participants"))
             participant_context_limit = max(
-                6,
-                min(12, int(self.embedding_top_k)),
+                2,
+                min(6, int(self.local_serving_max_items) // 2),
             )
             candidate_participant_keys = all_candidate_participant_keys[
                 :participant_context_limit
@@ -4328,7 +4345,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         participant_key=participant_key,
                         before_sent_at=snapshot.cutoff_at,
                         message_upper_bound=snapshot.message_upper_bound,
-                        limit=12,
+                        limit=max(
+                            2,
+                            min(6, int(self.local_serving_max_items) // 2),
+                        ),
                     )
                 )
                 activity_task = (
@@ -4339,7 +4359,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                             before_sent_at=snapshot.cutoff_at,
                             message_upper_bound=snapshot.message_upper_bound,
                             days=7,
-                            limit=32,
+                            limit=max(4, min(24, int(self.local_serving_max_items))),
                         )
                     )
                     if include_participant_activity
@@ -4445,9 +4465,36 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 "participant_activity_truncated": participant_activity_truncated,
                 "semantic_none_allowed": semantic_none_allowed,
             }
-            packet["participant_source_keys"] = _participant_source_bindings(packet)
-            packet["source_count"] = len(packet_source_keys)
-            packet_sha256 = stable_sha256(packet)
+        if packet.get("format") != EVIDENCE_ATOM_PACK_FORMAT:
+            packet = compile_evidence_atom_pack(
+                packet,
+                max_sources=self.local_serving_max_items,
+                activity_mode=include_participant_activity,
+            )
+        hydration_started = time.perf_counter()
+        selected_catalog = packet.get("sources")
+        selected_source_keys = [
+            str(source.get("source_key") or "").strip()
+            for source in (
+                selected_catalog if isinstance(selected_catalog, list) else []
+            )
+            if isinstance(source, dict)
+            and str(source.get("source_key") or "").strip()
+        ]
+        hydrated_messages = await service.messages_for_sources(
+            umo=snapshot.umo,
+            source_keys=selected_source_keys,
+            before_sent_at=snapshot.cutoff_at,
+            message_upper_bound=snapshot.message_upper_bound,
+        )
+        packet = hydrate_evidence_atom_pack(packet, hydrated_messages)
+        if stage_elapsed_ms is not None:
+            stage_elapsed_ms["PACK_SOURCE_HYDRATION"] = (
+                time.perf_counter() - hydration_started
+            ) * 1000
+        packet_source_keys = _collect_source_keys(packet)
+        packet["source_count"] = len(packet_source_keys)
+        packet_sha256 = stable_sha256(packet)
         source_keys = _collect_source_keys(packet)
         if finalize_packet or write_cache:
             await service.audit_snapshot_sources(
@@ -4618,7 +4665,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         participant_keys: set[str],
         allow_l3: bool = True,
         enforce_budget: bool = True,
-    ) -> tuple[EvidenceCertificateV2, bool, str, float]:
+    ) -> tuple[EvidenceCertificateV2, bool, str, float, dict[str, int]]:
         retrieval_coverage = packet.get("retrieval_coverage")
         if not isinstance(retrieval_coverage, dict):
             retrieval_coverage = {}
@@ -4637,15 +4684,43 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             semantic_none_allowed=bool(
                 retrieval_coverage.get("semantic_none_allowed", False)
             ),
+            person_candidates_complete=bool(
+                retrieval_coverage.get("person_candidates_complete", True)
+            ),
             participant_source_keys=participant_source_keys,
         )
+        request_metrics = {
+            "evidence_packet_chars": len(
+                json.dumps(
+                    packet,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ),
+            "reader_system_prompt_chars": len(request.system_prompt),
+            "reader_user_prompt_chars": len(request.user_prompt),
+            "reader_total_prompt_chars": (
+                len(request.system_prompt) + len(request.user_prompt)
+            ),
+            "reader_source_count": len(request.allowed_source_keys),
+            "reader_participant_count": len(request.allowed_participant_keys),
+        }
+        for key in (
+            "input_unique_sources",
+            "output_unique_sources",
+            "dropped",
+        ):
+            value = retrieval_coverage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                request_metrics[f"retrieval_{key}"] = value
         response, first_chunk_ms = await self._run_fast_reconstruction_with_ledger(
             provider=provider,
             service=service,
             run_id=run_id,
             prompt=request.user_prompt,
             system_prompt=request.system_prompt,
-            thinking_mode=self.distillation_thinking_mode,
+            thinking_mode=self.local_serving_reader_thinking_mode,
             max_output_tokens=8192,
             phase="resident_evidence_reader",
             usage_source="resident_reader_one_pass",
@@ -4658,7 +4733,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             str(getattr(response, "completion_text", "") or ""),
             request,
         )
-        return certificate, False, "completion", first_chunk_ms
+        return certificate, False, "completion", first_chunk_ms, request_metrics
 
     async def _run_l3_certificate(
         self,
@@ -4862,6 +4937,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
         packet_sha256: str,
         participant_keys: set[str],
         participant_source_keys: dict[str, list[str]],
+        participant_speaker_source_keys: dict[str, list[str]],
     ) -> tuple[EvidenceCertificateV2, tuple[int, ...], tuple[int, ...]] | None:
         row = await service.get_memory_certificate(
             umo=snapshot.umo,
@@ -4928,6 +5004,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
             validate_certificate_source_bindings(
                 certificate,
                 participant_source_keys=participant_source_keys,
+                participant_speaker_source_keys=(
+                    participant_speaker_source_keys
+                ),
             )
             await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
             dependencies = list(row.get("dependencies") or [])
@@ -5304,6 +5383,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         repair_attempted,
                         response_source,
                         first_chunk_ms,
+                        reader_request_metrics,
                     ) = await self._read_l2_certificate(
                         provider=provider,
                         service=service,
@@ -5317,6 +5397,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 trace_value = {
                     "reader_status": certificate.status,
                     "first_chunk_ms": first_chunk_ms,
+                    "reader_request_metrics": reader_request_metrics,
                     "response_source": response_source,
                     "repair_attempted": repair_attempted,
                 }
@@ -5717,6 +5798,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     force=False,
                     has_structured_reference=has_structured_reference,
                 )
+                include_participant_activity = self._runtime_activity_analysis(
+                    bounded_query
+                )
                 begin_stage("INTERACTION_TRACE")
                 if self.feedback_learning_enabled:
                     await self._begin_interaction_trace(
@@ -5792,7 +5876,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     # retrieves candidates; the one resident reader below jointly
                     # resolves references and memory meaning.
                     resolve_query_aliases=False,
-                    include_participant_activity=True,
+                    include_participant_activity=include_participant_activity,
                     use_cache=False,
                     finalize_packet=False,
                     stage_elapsed_ms=stage_elapsed_ms,
@@ -5800,7 +5884,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 finish_stage("FULL_RETRIEVAL")
                 last_stage = "PACKET_RETRIEVED"
                 begin_stage("SOURCE_AUDIT")
-                await service.audit_snapshot_sources(
+                initial_source_audit = await service.audit_snapshot_sources(
                     snapshot_id=snapshot.snapshot_id,
                     umo=snapshot.umo,
                     source_keys=_packet_source_keys,
@@ -5817,6 +5901,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     repair_attempted,
                     _response_source,
                     first_chunk_ms,
+                    reader_request_metrics,
                 ) = await self._read_l2_certificate(
                     provider=provider,
                     service=service,
@@ -5840,7 +5925,30 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     raise RuntimeError(
                         "resident Evidence Reader requested unavailable L3 escalation"
                     )
+                begin_stage("SOURCE_REAUDIT")
+                final_source_audit = await service.audit_snapshot_sources(
+                    snapshot_id=snapshot.snapshot_id,
+                    umo=snapshot.umo,
+                    source_keys=_packet_source_keys,
+                    fail_closed=True,
+                )
+                initial_fingerprints = (
+                    initial_source_audit.get("source_fingerprints", {})
+                    if isinstance(initial_source_audit, dict)
+                    else {}
+                )
+                final_fingerprints = (
+                    final_source_audit.get("source_fingerprints", {})
+                    if isinstance(final_source_audit, dict)
+                    else {}
+                )
+                if initial_fingerprints != final_fingerprints:
+                    raise DistillationSnapshotChanged(
+                        "selected evidence changed while the resident Reader was running"
+                    )
                 await self._assert_snapshot_fresh(service=service, snapshot=snapshot)
+                finish_stage("SOURCE_REAUDIT")
+                last_stage = "SOURCES_REAUDITED"
 
                 surface_text = ""
                 surface_omitted_optional = 0
@@ -5869,11 +5977,15 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     arguments={
                         "request_kind": request_kind,
                         "packet_sha256": packet_sha256,
-                        "retrieval_mode": "FRESH",
+                        "retrieval_mode": (
+                            "CACHE" if _pack_cache_layer == "L1A" else "FRESH"
+                        ),
+                        "cache_layer": _pack_cache_layer,
                         "protocol": L2_READER_PROTOCOL,
                         "reader_calls": 1,
                         "repair_attempted": False,
                         "l3_attempted": False,
+                        "reader_request_metrics": reader_request_metrics,
                     },
                     evidence_keys=sorted(_packet_source_keys)[:160],
                     # Never persist the reader's semantic answer here.  Usage and
@@ -5900,8 +6012,10 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                     "snapshot_id": snapshot.snapshot_id,
                     "snapshot_sha256": snapshot.digest,
                     "packet_sha256": packet_sha256,
-                    "retrieval_mode": "FRESH",
-                    "cache_layer": "NONE",
+                    "retrieval_mode": (
+                        "CACHE" if _pack_cache_layer == "L1A" else "FRESH"
+                    ),
+                    "cache_layer": _pack_cache_layer,
                     "visited_source_keys": sorted(_packet_source_keys),
                     "presented_source_keys": sorted(surface_source_keys),
                     # The resident Reader certificate and compiled surface do not
@@ -5919,6 +6033,7 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                         "UNKNOWN_NO_BILLING_EVIDENCE"
                     ),
                     "reader_first_chunk_ms": first_chunk_ms,
+                    "reader_request_metrics": reader_request_metrics,
                     "surface_chars": len(surface_text),
                     "surface_omitted_optional": surface_omitted_optional,
                     "surface_truncated": surface_omitted_optional > 0,
@@ -6172,6 +6287,9 @@ class MrMemoryPlugin(Star, WebConsoleMixin):
                 packet_sha256=packet_sha256,
                 participant_keys=participant_keys,
                 participant_source_keys=_participant_source_bindings(packet),
+                participant_speaker_source_keys=(
+                    _participant_speaker_source_bindings(packet)
+                ),
             )
         )
         cached = cached_entry[0] if cached_entry is not None else None

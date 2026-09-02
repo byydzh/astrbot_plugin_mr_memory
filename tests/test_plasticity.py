@@ -134,6 +134,69 @@ class PlasticGraphTests(unittest.TestCase):
             2,
         )
 
+    def test_plastic_seed_expansion_batches_heads_and_evidence(self) -> None:
+        first_message = self.message("batch-edge-1", "first evidence", sent_at=100)
+        second_message = self.message("batch-edge-2", "second evidence", sent_at=110)
+        self.storage.upsert_message(first_message)
+        self.storage.upsert_message(second_message)
+        first_payload = self.edge_payload(first_message.resolved_source_key())
+        first_payload["statement"] = "Synthetic edge one."
+        first_payload["source"]["label"] = "Synthetic source one"
+        first_payload["target"]["label"] = "Synthetic target one"
+        second_payload = self.edge_payload(second_message.resolved_source_key())
+        second_payload["statement"] = "Synthetic edge two."
+        second_payload["source"]["label"] = "Synthetic source two"
+        second_payload["target"]["label"] = "Synthetic target two"
+        first = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(first_payload),
+            model="test-model",
+            allowed_evidence_keys={first_message.resolved_source_key()},
+        )
+        second = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            mutation=parse_graph_mutation(second_payload),
+            model="test-model",
+            allowed_evidence_keys={second_message.resolved_source_key()},
+        )
+        matches = [
+            {
+                "owner_type": "plastic_edge",
+                "owner_key": str(first["target_id"]),
+                "score": 0.9,
+            },
+            {
+                "owner_type": "plastic_edge",
+                "owner_key": str(second["target_id"]),
+                "score": 0.8,
+            },
+        ]
+        traced: list[str] = []
+        self.storage._connection.set_trace_callback(traced.append)
+        try:
+            expanded = self.storage.expand_seed_candidates(
+                umo=self.umo,
+                matches=matches,
+            )
+        finally:
+            self.storage._connection.set_trace_callback(None)
+
+        self.assertEqual(
+            [item["id"] for item in expanded["associations"]],
+            [int(first["target_id"]), int(second["target_id"])],
+        )
+        self.assertEqual(
+            [len(item["evidence"]) for item in expanded["associations"]],
+            [1, 1],
+        )
+        graph_selects = [
+            statement
+            for statement in traced
+            if "FROM plastic_edges AS e" in statement
+            or "FROM plastic_edge_evidence AS pe" in statement
+        ]
+        self.assertEqual(len(graph_selects), 2)
+
     def test_upsert_reuses_active_relation_definition_until_explicit_revision(self) -> None:
         first = self.message("e-1", "鉴定为好女孩", sent_at=100)
         second = self.message("e-2", "这里也是群内反话", sent_at=110)

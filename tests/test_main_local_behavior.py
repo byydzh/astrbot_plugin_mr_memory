@@ -11,8 +11,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+from mr_memory.evidence_pack import (
+    EVIDENCE_ATOM_PACK_FORMAT,
+    compile_evidence_atom_pack,
+    hydrate_evidence_atom_pack,
+    participant_source_bindings as compile_participant_source_bindings,
+)
 from mr_memory.identity import build_request_identity_context
+from mr_memory.reader import build_l2_reader_prompt
 from mr_memory.snapshot import stable_sha256
+from tests.test_certificate_v2 import _snapshot as l2_snapshot
 
 MAIN_SOURCE = (
     Path(__file__).resolve().parents[1] / "main.py"
@@ -139,8 +147,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         participant_source_bindings = _main_method(
             "_participant_source_bindings",
-            Any=object,
-            _collect_source_keys=collect_source_keys,
+            participant_source_bindings=compile_participant_source_bindings,
         )
         method = _main_method(
             "_layered_evidence_packet",
@@ -153,14 +160,21 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             _collect_participant_keys=collect_participant_keys,
             _collect_participant_keys_in_order=collect_participant_keys_in_order,
             _participant_source_bindings=participant_source_bindings,
+            EVIDENCE_ATOM_PACK_FORMAT=EVIDENCE_ATOM_PACK_FORMAT,
+            compile_evidence_atom_pack=compile_evidence_atom_pack,
+            hydrate_evidence_atom_pack=hydrate_evidence_atom_pack,
             stable_sha256=stable_sha256,
         )
         recent_participant = 'participant:["synthetic","recent-account"]'
+        incidental_episode_speaker = (
+            'participant:["synthetic","incidental-episode-speaker"]'
+        )
 
         class Service:
             def __init__(self) -> None:
                 self.history_keys: list[str] = []
                 self.activity_keys: list[str] = []
+                self.search_calls: list[dict[str, object]] = []
                 self.resolve_query_participants = AsyncMock(
                     side_effect=AssertionError(
                         "text alias parser must not decide resident identity"
@@ -173,13 +187,32 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             async def query_matching_cues(self, **_kwargs: object) -> list:
                 return []
 
+            async def search_messages(self, **kwargs: object) -> list:
+                self.search_calls.append(dict(kwargs))
+                return []
+
             async def reconstruction_evidence_packet(
                 self, **_kwargs: object
             ) -> dict[str, object]:
                 return {
                     "candidates": {"participants": []},
                     "semantic_evidence": [],
-                    "expanded_episodes": [],
+                    "expanded_episodes": [
+                        {
+                            "id": 7,
+                            "title": "合成事件",
+                            "messages": [
+                                {
+                                    "source_key": "synthetic-episode-source",
+                                    "sent_at": 40,
+                                    "sender_participant_key": (
+                                        incidental_episode_speaker
+                                    ),
+                                    "plain_text": "旁观成员在事件里说过一句话",
+                                }
+                            ],
+                        }
+                    ],
                 }
 
             async def query_recent_context(
@@ -267,11 +300,63 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             async def message_for_source(self, **_kwargs: object) -> None:
                 return None
 
+            async def messages_for_sources(
+                self, **kwargs: object
+            ) -> list[dict[str, object]]:
+                requested = set(kwargs["source_keys"])
+                authoritative = {
+                    "synthetic-episode-source": {
+                        "source_key": "synthetic-episode-source",
+                        "sent_at": 40,
+                        "sender_id": "incidental-account",
+                        "sender_name": "旁观成员",
+                        "sender_participant_key": incidental_episode_speaker,
+                        "role": "user",
+                        "plain_text": "旁观成员在事件里说过一句话",
+                        "components": [
+                            {
+                                "type": "plain",
+                                "text": "旁观成员在事件里说过一句话",
+                            }
+                        ],
+                    },
+                    "synthetic-history-source": {
+                        "source_key": "synthetic-history-source",
+                        "sent_at": 50,
+                        "sender_id": "recent-account",
+                        "sender_name": "近期成员",
+                        "sender_participant_key": recent_participant,
+                        "role": "user",
+                        "plain_text": "一条合成历史消息",
+                        "components": [
+                            {"type": "plain", "text": "一条合成历史消息"}
+                        ],
+                    },
+                    "synthetic-recent-source": {
+                        "source_key": "synthetic-recent-source",
+                        "sent_at": 90,
+                        "sender_id": "recent-account",
+                        "sender_name": "近期成员",
+                        "sender_participant_key": recent_participant,
+                        "role": "user",
+                        "plain_text": "一条合成近期消息",
+                        "components": [
+                            {"type": "plain", "text": "一条合成近期消息"}
+                        ],
+                    },
+                }
+                return [
+                    authoritative[source_key]
+                    for source_key in kwargs["source_keys"]
+                    if source_key in requested and source_key in authoritative
+                ]
+
         service = Service()
         host = SimpleNamespace(
             _layered_pack_key=lambda *_args, **_kwargs: "synthetic-pack",
             feedback_learning_enabled=False,
             embedding_top_k=8,
+            local_serving_max_items=12,
             candidate_seed_floor=0.0,
             _embedding_backend=lambda: None,
         )
@@ -306,6 +391,8 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         service.resolve_query_participants.assert_not_awaited()
         self.assertEqual(service.history_keys, [recent_participant])
         self.assertEqual(service.activity_keys, [recent_participant])
+        self.assertNotIn(incidental_episode_speaker, service.history_keys)
+        self.assertNotIn(incidental_episode_speaker, service.activity_keys)
         self.assertEqual(
             packet["person_reasoning_candidates"]["participant_keys"],
             [recent_participant],
@@ -317,24 +404,85 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             source_keys,
-            {"synthetic-history-source", "synthetic-recent-source"},
+            {
+                "synthetic-episode-source",
+                "synthetic-history-source",
+                "synthetic-recent-source",
+            },
         )
         self.assertEqual(
             packet["participant_source_keys"][recent_participant],
             ["synthetic-history-source", "synthetic-recent-source"],
         )
+        self.assertEqual(
+            packet["participant_speaker_source_keys"][recent_participant],
+            ["synthetic-history-source", "synthetic-recent-source"],
+        )
+        self.assertEqual(
+            packet["retrieval_coverage"]["source_hydration_returned"],
+            3,
+        )
         self.assertTrue(packet["retrieval_coverage"]["semantic_none_allowed"])
         self.assertIn(recent_participant, participant_keys)
         self.assertEqual(cache_layer, "LOCAL_FRESH")
+        self.assertEqual(
+            service.search_calls,
+            [
+                {
+                    "umo": snapshot.umo,
+                    "query": "合成人物问题",
+                    "limit": host.local_serving_max_items,
+                    "before_sent_at": snapshot.cutoff_at,
+                    "message_upper_bound": snapshot.message_upper_bound,
+                    "match_mode": "recall",
+                    "exclude_source_key": snapshot.request_source_key,
+                }
+            ],
+        )
+
+    def test_identity_canonical_key_is_aliased_across_main_and_reader(self) -> None:
+        collect_participant_keys = _main_method("_collect_participant_keys")
+        participant_key = 'participant:["synthetic","account-a"]'
+        graph_key = "graph-node:synthetic-topic"
+        packet = {
+            "identity_candidates": [
+                {
+                    "canonical_key": participant_key,
+                    "account_id": "account-a",
+                    "current_display_name": "合成成员甲",
+                }
+            ],
+            "graph_metadata": {
+                "canonical_key": graph_key,
+                "kind": "topic",
+            },
+        }
+
+        participant_keys = collect_participant_keys(packet)
+        self.assertEqual(participant_keys, {participant_key})
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys=(),
+            allowed_participant_keys=participant_keys,
+            pack_read_complete=True,
+        )
+        prompt_packet = json.loads(request.user_prompt)["evidence_packet"]
+
+        self.assertEqual(
+            prompt_packet["identity_candidates"][0]["canonical_key"],
+            "p1",
+        )
+        self.assertEqual(prompt_packet["graph_metadata"]["canonical_key"], graph_key)
+        self.assertNotIn(participant_key, request.user_prompt)
 
     def test_participant_source_bindings_do_not_cross_candidate_siblings(
         self,
     ) -> None:
-        collect_source_keys = _main_method("_collect_source_keys")
         method = _main_method(
             "_participant_source_bindings",
-            Any=object,
-            _collect_source_keys=collect_source_keys,
+            participant_source_bindings=compile_participant_source_bindings,
         )
 
         bindings = method(

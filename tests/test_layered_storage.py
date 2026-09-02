@@ -65,11 +65,11 @@ class LayeredStorageTests(unittest.TestCase):
             sender_participant_key=f"shadow:{request.sender_id}",
         )
 
-    def test_schema_16_contains_layered_and_long_graph_tables(self) -> None:
+    def test_schema_17_contains_layered_and_search_index_tables(self) -> None:
         version = self.storage._connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        self.assertEqual(version["value"], "16")
+        self.assertEqual(version["value"], "17")
         expected = {
             "revision_heads",
             "request_snapshots",
@@ -83,6 +83,7 @@ class LayeredStorageTests(unittest.TestCase):
             "derived_edge_evidence_groups",
             "behavior_policy_revisions",
             "mutation_proposals",
+            "participant_alias_observations",
         }
         actual = {
             str(row["name"])
@@ -91,6 +92,28 @@ class LayeredStorageTests(unittest.TestCase):
             ).fetchall()
         }
         self.assertTrue(expected <= actual)
+        expected_indexes = {
+            "idx_messages_umo_participant_time": (
+                "umo",
+                "sender_participant_id",
+                "sent_at",
+                "id",
+            ),
+            "idx_message_participants_participant": (
+                "participant_id",
+                "relation",
+                "message_id",
+                "position",
+            ),
+        }
+        for index_name, expected_columns in expected_indexes.items():
+            columns = tuple(
+                str(row["name"])
+                for row in self.storage._connection.execute(
+                    f"PRAGMA index_info({index_name})"
+                ).fetchall()
+            )
+            self.assertEqual(columns, expected_columns)
 
         with self.storage._connection:
             edge = self.storage._connection.execute(
@@ -303,6 +326,25 @@ class LayeredStorageTests(unittest.TestCase):
         self.assertEqual(
             reasons,
             {"CURRENT_REQUEST_SOURCE", "AFTER_MESSAGE_UPPER_BOUND"},
+        )
+        frozen_fingerprint = audit["source_fingerprints"][
+            previous.resolved_source_key()
+        ]
+        edited_previous = self.message(
+            "previous",
+            "上一条已编辑",
+            sent_at=200,
+        )
+        self.storage.upsert_message(edited_previous)
+        repeated_audit = self.storage.audit_snapshot_sources(
+            snapshot_id=snapshot.snapshot_id,
+            umo=self.UMO,
+            source_keys=(previous.resolved_source_key(),),
+            fail_closed=True,
+        )
+        self.assertNotEqual(
+            repeated_audit["source_fingerprints"][previous.resolved_source_key()],
+            frozen_fingerprint,
         )
 
     def test_packet_and_media_reads_obey_cutoff_and_message_upper_bound(self) -> None:
@@ -881,6 +923,145 @@ class LayeredStorageTests(unittest.TestCase):
         for forbidden_decision in ("resolved", "unique", "ambiguous"):
             self.assertNotIn(forbidden_decision, serialized)
 
+    def test_person_reference_observations_are_indexed_bounded_and_synchronized(
+        self,
+    ) -> None:
+        alias = "Bounded Synthetic Alias"
+        account_id = "bounded-synthetic-account"
+        messages = [
+            NormalizedMessage(
+                platform="aiocqhttp",
+                platform_id="shadow",
+                umo=self.UMO,
+                group_id="layered",
+                message_id=f"bounded-{index}",
+                sender_id=account_id,
+                sender_name=alias,
+                sent_at=100 + index,
+                plain_text=f"observation {index}",
+                content=[{"type": "plain", "text": f"observation {index}"}],
+            )
+            for index in range(12)
+        ]
+        request = self.message(
+            "bounded-request",
+            f"Recall {alias}",
+            sent_at=200,
+            sender_id="bounded-requester",
+        )
+        for message in (*messages, request):
+            self.storage.upsert_message(message)
+        snapshot = self.capture(request=request, cutoff_at=201)
+        result = self.storage.query_person_reference_candidates(
+            umo=self.UMO,
+            text=request.plain_text,
+            before_sent_at=201,
+            message_upper_bound=int(snapshot["message_upper_bound"]),
+        )
+        candidate = result["references"][0]["candidate_participants"][0]
+        self.assertEqual(candidate["source_count_total"], 12)
+        self.assertEqual(len(candidate["alias_observations"]), 8)
+        self.assertTrue(candidate["observations_truncated"])
+
+        participant_id = self.storage._connection.execute(
+            """
+            SELECT id FROM participants
+            WHERE umo=? AND platform_id='shadow' AND account_id=?
+            """,
+            (self.UMO, account_id),
+        ).fetchone()["id"]
+        plan = " ".join(
+            str(row["detail"])
+            for row in self.storage._connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT observation.alias, message.source_key
+                FROM participant_alias_observations AS observation
+                     INDEXED BY idx_alias_observations_snapshot
+                JOIN messages AS message ON message.id=observation.message_id
+                WHERE observation.umo=?
+                  AND observation.participant_id=?
+                  AND observation.normalized_alias=?
+                  AND observation.sent_at<?
+                  AND observation.message_id<=?
+                  AND message.is_deleted=0
+                ORDER BY observation.sent_at DESC,
+                         observation.message_id DESC,
+                         observation.position
+                LIMIT 8
+                """,
+                (
+                    self.UMO,
+                    int(participant_id),
+                    alias.casefold(),
+                    201,
+                    int(snapshot["message_upper_bound"]),
+                ),
+            ).fetchall()
+        )
+        self.assertIn("idx_alias_observations_snapshot", plan)
+        self.assertIn("SEARCH message USING INTEGER PRIMARY KEY", plan)
+
+        edited = NormalizedMessage(
+            platform=messages[-1].platform,
+            platform_id=messages[-1].platform_id,
+            umo=messages[-1].umo,
+            group_id=messages[-1].group_id,
+            message_id=messages[-1].message_id,
+            sender_id=messages[-1].sender_id,
+            sender_name="Edited Synthetic Alias",
+            sent_at=messages[-1].sent_at,
+            plain_text=messages[-1].plain_text,
+            content=messages[-1].content,
+            role=messages[-1].role,
+            source_key=messages[-1].source_key,
+        )
+        self.storage.upsert_message(edited)
+        old_count = self.storage._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM participant_alias_observations
+            WHERE participant_id=? AND normalized_alias=?
+            """,
+            (int(participant_id), alias.casefold()),
+        ).fetchone()["count"]
+        self.assertEqual(old_count, 11)
+        self.assertTrue(
+            self.storage.mark_message_deleted(
+                umo=self.UMO,
+                platform_id="shadow",
+                platform_message_id=edited.message_id,
+                deleted_at=250,
+            )
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM participant_alias_observations
+                WHERE message_id=(SELECT id FROM messages WHERE source_key=?)
+                """,
+                (edited.resolved_source_key(),),
+            ).fetchone()["count"],
+            0,
+        )
+        self.storage.forget_account(
+            umo=self.UMO,
+            platform_id="shadow",
+            account_id=account_id,
+            requested_at=260,
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM participant_alias_observations WHERE participant_id=?
+                """,
+                (int(participant_id),),
+            ).fetchone()["count"],
+            0,
+        )
+
     def test_semantic_seed_exposes_source_bound_subject_candidate(self) -> None:
         old = NormalizedMessage(
             platform="aiocqhttp",
@@ -1011,11 +1192,40 @@ class LayeredStorageTests(unittest.TestCase):
     def test_recent_context_is_ordered_bounded_and_excludes_current_request(
         self,
     ) -> None:
-        first = self.message("recent-first", "first", sent_at=100, sender_id="a")
+        first = self.message(
+            "recent-first",
+            "first",
+            sent_at=100,
+            sender_id="a",
+            content=[
+                {"type": "plain", "text": "first"},
+                {
+                    "type": "mention",
+                    "account_id": "mentioned-account",
+                    "display_name": "Mentioned Synthetic",
+                },
+            ],
+        )
         deleted = self.message(
             "recent-deleted", "deleted", sent_at=150, sender_id="deleted"
         )
-        second = self.message("recent-second", "second", sent_at=180, sender_id="b")
+        second = self.message(
+            "recent-second",
+            "second",
+            sent_at=180,
+            sender_id="b",
+            content=[
+                {
+                    "type": "response_to",
+                    "message_id": first.message_id,
+                    "sender_id": first.sender_id,
+                    "sender_name": first.sender_name,
+                    "sent_at": first.sent_at,
+                    "plain_text": first.plain_text,
+                },
+                {"type": "plain", "text": "second"},
+            ],
+        )
         third = self.message("recent-third", "third", sent_at=200, sender_id="c")
         fourth = self.message("recent-fourth", "fourth", sent_at=250, sender_id="d")
         request = self.message(
@@ -1048,17 +1258,22 @@ class LayeredStorageTests(unittest.TestCase):
             4,
         )
 
-        recent = self.storage.query_recent_context(
-            umo=self.UMO,
-            before_sent_at=301,
-            message_upper_bound=upper_bound,
-            exclude_source_key=request.resolved_source_key(),
-            exclude_source_keys=(
-                fourth.resolved_source_key(),
-                third.resolved_source_key(),
-            ),
-            limit=2,
-        )
+        traced: list[str] = []
+        self.storage._connection.set_trace_callback(traced.append)
+        try:
+            recent = self.storage.query_recent_context(
+                umo=self.UMO,
+                before_sent_at=301,
+                message_upper_bound=upper_bound,
+                exclude_source_key=request.resolved_source_key(),
+                exclude_source_keys=(
+                    fourth.resolved_source_key(),
+                    third.resolved_source_key(),
+                ),
+                limit=2,
+            )
+        finally:
+            self.storage._connection.set_trace_callback(None)
 
         self.assertEqual(
             [item["source_key"] for item in recent],
@@ -1072,6 +1287,270 @@ class LayeredStorageTests(unittest.TestCase):
             future.resolved_source_key(),
             {item["source_key"] for item in recent},
         )
+        self.assertEqual(
+            recent[0]["mentions"][0]["account_id"], "mentioned-account"
+        )
+        self.assertEqual(
+            recent[1]["reply_to_source_key"], first.resolved_source_key()
+        )
+        hydration_selects = [
+            statement
+            for statement in traced
+            if any(
+                marker in statement
+                for marker in (
+                    "SELECT id, canonical_key FROM participants",
+                    "FROM message_relations\n            WHERE source_message_id IN",
+                    "FROM message_participants AS mp\n"
+                    "            JOIN participants AS p",
+                )
+            )
+        ]
+        self.assertEqual(len(hydration_selects), 3)
+
+    def test_message_search_honors_snapshot_for_fts_and_short_substring(self) -> None:
+        visible = self.message(
+            "search-visible", "needle xy visible", sent_at=100, sender_id="search-a"
+        )
+        request = self.message(
+            "search-request", "search now", sent_at=200, sender_id="requester"
+        )
+        for message in (visible, request):
+            self.storage.upsert_message(message)
+        snapshot = self.capture(request=request, cutoff_at=201)
+        late_backfill = self.message(
+            "search-late-backfill",
+            "needle xy late",
+            sent_at=90,
+            sender_id="search-b",
+        )
+        self.storage.upsert_message(late_backfill)
+
+        traced: list[str] = []
+        self.storage._connection.set_trace_callback(traced.append)
+        try:
+            fts_rows = self.storage.search_messages(
+                umo=self.UMO,
+                query="needle",
+                before_sent_at=201,
+                message_upper_bound=int(snapshot["message_upper_bound"]),
+            )
+        finally:
+            self.storage._connection.set_trace_callback(None)
+        self.assertEqual(
+            [message.source_key for message in fts_rows],
+            [visible.resolved_source_key()],
+        )
+        self.assertTrue(
+            any("ORDER BY rank" in statement for statement in traced)
+        )
+        short_rows = self.storage.search_messages(
+            umo=self.UMO,
+            query="xy",
+            before_sent_at=201,
+            message_upper_bound=int(snapshot["message_upper_bound"]),
+        )
+        self.assertEqual(
+            [message.source_key for message in short_rows],
+            [visible.resolved_source_key()],
+        )
+
+        recall = self.message(
+            "search-recall",
+            "作品态度后来发生变化",
+            sent_at=110,
+            sender_id="search-c",
+        )
+        self.storage.upsert_message(recall)
+        recall_rows = self.storage.search_messages(
+            umo=self.UMO,
+            query="请回忆这个成员最近的作品态度",
+            before_sent_at=201,
+            match_mode="recall",
+            exclude_source_key=request.resolved_source_key(),
+        )
+        self.assertIn(
+            recall.resolved_source_key(),
+            {message.source_key for message in recall_rows},
+        )
+        excluded = self.storage.search_messages(
+            umo=self.UMO,
+            query="search now",
+            before_sent_at=201,
+            message_upper_bound=int(snapshot["message_upper_bound"]),
+            exclude_source_key=request.resolved_source_key(),
+        )
+        self.assertNotIn(
+            request.resolved_source_key(),
+            {message.source_key for message in excluded},
+        )
+
+    def test_recall_search_preserves_bm25_order(self) -> None:
+        strongest = self.message(
+            "rank-strong",
+            "作品态度发生变化",
+            sent_at=100,
+        )
+        weaker = self.message(
+            "rank-weak",
+            "作品态度",
+            sent_at=200,
+        )
+        for message in (strongest, weaker):
+            self.storage.upsert_message(message)
+
+        rows = self.storage.search_messages(
+            umo=self.UMO,
+            query="作品态度发生变化",
+            match_mode="recall",
+        )
+
+        self.assertEqual(rows[0].source_key, strongest.resolved_source_key())
+
+    def test_recall_search_keeps_two_character_cjk_entities(self) -> None:
+        entity_message = self.message(
+            "short-cjk-entity",
+            "小禾今天值班",
+            sent_at=100,
+        )
+        question_noise = self.message(
+            "short-cjk-noise",
+            "这是谁留下的",
+            sent_at=200,
+        )
+        for message in (entity_message, question_noise):
+            self.storage.upsert_message(message)
+
+        rows = self.storage.search_messages(
+            umo=self.UMO,
+            query="小禾是谁",
+            match_mode="recall",
+            limit=4,
+        )
+
+        self.assertIn(
+            entity_message.resolved_source_key(),
+            {message.source_key for message in rows},
+        )
+
+    def test_recall_does_not_lose_an_old_two_character_entity_to_common_bigrams(
+        self,
+    ) -> None:
+        limit = 4
+        entity_message = self.message(
+            "short-entity-before-common-noise",
+            "小禾今天值班",
+            sent_at=100,
+        )
+        newer_common_bigram_messages = [
+            self.message(
+                f"common-bigram-noise-{index}",
+                f"这是谁留下的第 {index} 条记录",
+                sent_at=200 + index,
+            )
+            for index in range(limit)
+        ]
+        for message in (entity_message, *newer_common_bigram_messages):
+            self.storage.upsert_message(message)
+
+        rows = self.storage.search_messages(
+            umo=self.UMO,
+            query="小禾是谁",
+            match_mode="recall",
+            limit=limit,
+        )
+
+        self.assertIn(
+            entity_message.resolved_source_key(),
+            {message.source_key for message in rows},
+        )
+
+    def test_recall_term_coverage_is_monotone_and_prefers_lower_frequency_terms(
+        self,
+    ) -> None:
+        limit = 12
+        entity_term = "小禾"
+        entity_messages = [
+            self.message(
+                f"coverage-entity-{index}",
+                entity_term,
+                sent_at=100 + index,
+            )
+            for index in range(5)
+        ]
+        common_terms = ("今天", "是谁", "留下", "消息")
+        common_messages = [
+            self.message(
+                f"coverage-common-{term_index}-{index}",
+                term,
+                sent_at=200 + term_index * 10 + index,
+            )
+            for term_index, term in enumerate(common_terms)
+            for index in range(4)
+        ]
+        for message in (*entity_messages, *common_messages):
+            self.storage.upsert_message(message)
+
+        with self.subTest("all_terms_fit_the_result_budget"):
+            rows = self.storage.search_messages(
+                umo=self.UMO,
+                query=" ".join((entity_term, *common_terms)),
+                match_mode="recall",
+                limit=limit,
+            )
+            returned = {message.source_key for message in rows}
+            self.assertTrue(
+                returned.intersection(
+                    message.resolved_source_key() for message in entity_messages
+                )
+            )
+
+        rare_terms = (
+            "甲乙",
+            "丙丁",
+            "戊己",
+            "庚辛",
+            "壬癸",
+            "子丑",
+            "寅卯",
+            "辰巳",
+            "午未",
+            "申酉",
+            "戌亥",
+            "天地",
+        )
+        common_over_budget_term = "玄黄"
+        rare_messages = [
+            self.message(
+                f"coverage-rare-{index}",
+                term,
+                sent_at=400 + index,
+            )
+            for index, term in enumerate(rare_terms)
+        ]
+        over_budget_common_messages = [
+            self.message(
+                f"coverage-over-budget-common-{index}",
+                common_over_budget_term,
+                sent_at=500 + index,
+            )
+            for index in range(4)
+        ]
+        for message in (*rare_messages, *over_budget_common_messages):
+            self.storage.upsert_message(message)
+
+        with self.subTest("more_terms_than_budget_prefers_lower_document_frequency"):
+            rows = self.storage.search_messages(
+                umo=self.UMO,
+                query=" ".join((*rare_terms, common_over_budget_term)),
+                match_mode="recall",
+                limit=limit,
+            )
+            returned = {message.source_key for message in rows}
+            self.assertEqual(
+                returned,
+                {message.resolved_source_key() for message in rare_messages},
+            )
 
     def test_reply_source_is_resolved_inside_snapshot_boundary(self) -> None:
         original = self.message("original", "原话", sent_at=100)
@@ -1258,7 +1737,7 @@ class LayeredStorageTests(unittest.TestCase):
             )
         )
 
-    def test_synthetic_schema_15_migrates_to_16_without_data_loss(self) -> None:
+    def test_synthetic_schema_15_migrates_to_17_without_data_loss(self) -> None:
         database_path = self.database_path.with_name(f"{uuid.uuid4().hex}.db")
         storage = MemoryStorage(database_path)
         try:
@@ -1287,6 +1766,10 @@ class LayeredStorageTests(unittest.TestCase):
             connection.execute(
                 "UPDATE schema_meta SET value='15' WHERE key='schema_version'"
             )
+            connection.execute(
+                "DELETE FROM schema_meta WHERE key='alias_observations_v17'"
+            )
+            connection.execute("DROP TABLE participant_alias_observations")
             connection.commit()
         finally:
             connection.close()
@@ -1296,7 +1779,7 @@ class LayeredStorageTests(unittest.TestCase):
             version = migrated._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()["value"]
-            self.assertEqual(version, "16")
+            self.assertEqual(version, "17")
             self.assertEqual(
                 migrated._connection.execute(
                     "SELECT COUNT(*) AS count FROM messages"
@@ -1316,6 +1799,66 @@ class LayeredStorageTests(unittest.TestCase):
             self.assertIn("request_snapshots", tables)
             self.assertIn("memory_certificates", tables)
             self.assertIn("derived_edge_evidence_groups", tables)
+            self.assertIn("participant_alias_observations", tables)
+            self.assertEqual(
+                migrated._connection.execute(
+                    "SELECT COUNT(*) AS count FROM participant_alias_observations"
+                ).fetchone()["count"],
+                1,
+            )
+        finally:
+            migrated.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
+
+    def test_schema_16_alias_backfill_crosses_the_500_message_batch(self) -> None:
+        database_path = self.database_path.with_name(f"{uuid.uuid4().hex}.db")
+        storage = MemoryStorage(database_path)
+        try:
+            for index in range(501):
+                storage.upsert_message(
+                    self.message(
+                        f"schema-16-{index}",
+                        f"合成消息 {index}",
+                        sent_at=index + 1,
+                    )
+                )
+        finally:
+            storage.close()
+
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("DELETE FROM participant_alias_observations")
+            connection.execute(
+                "DELETE FROM schema_meta WHERE key='alias_observations_v17'"
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value='16' WHERE key='schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = MemoryStorage(database_path)
+        try:
+            version = migrated._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()["value"]
+            marker = migrated._connection.execute(
+                "SELECT value FROM schema_meta WHERE key='alias_observations_v17'"
+            ).fetchone()["value"]
+            observations = migrated._connection.execute(
+                """
+                SELECT COUNT(*) AS count,
+                       COUNT(DISTINCT message_id) AS message_count
+                FROM participant_alias_observations
+                """
+            ).fetchone()
+
+            self.assertEqual(version, "17")
+            self.assertEqual(marker, "completed")
+            self.assertEqual(observations["count"], 501)
+            self.assertEqual(observations["message_count"], 501)
         finally:
             migrated.close()
             for suffix in ("", "-wal", "-shm"):
@@ -1346,6 +1889,141 @@ class LayeredStorageTests(unittest.TestCase):
             self.assertFalse(audit["valid"])
 
         asyncio.run(exercise())
+
+
+class SelectedSourceHydrationStorageTests(unittest.TestCase):
+    UMO = "synthetic:GroupMessage:selected-source-hydration"
+
+    @classmethod
+    def message(
+        cls,
+        message_id: str,
+        text: str,
+        *,
+        sent_at: int,
+        sender_id: str,
+    ) -> NormalizedMessage:
+        return NormalizedMessage(
+            platform="synthetic",
+            platform_id="selected-source-hydration",
+            umo=cls.UMO,
+            group_id="selected-source-hydration",
+            message_id=message_id,
+            sender_id=sender_id,
+            sender_name=f"name-{sender_id}",
+            sent_at=sent_at,
+            plain_text=text,
+            content=[{"type": "plain", "text": text}],
+        )
+
+    def test_messages_for_sources_preserves_order_and_snapshot_visibility(
+        self,
+    ) -> None:
+        storage = MemoryStorage(":memory:")
+        try:
+            first = self.message(
+                "visible-first",
+                "first visible payload",
+                sent_at=100,
+                sender_id="first",
+            )
+            after_cutoff = self.message(
+                "after-cutoff",
+                "must be excluded by cutoff",
+                sent_at=300,
+                sender_id="future",
+            )
+            second = self.message(
+                "visible-second",
+                "second visible payload",
+                sent_at=110,
+                sender_id="second",
+            )
+            deleted = self.message(
+                "deleted",
+                "must be excluded as deleted",
+                sent_at=120,
+                sender_id="deleted",
+            )
+            request = self.message(
+                "current-request",
+                "must be excluded as the current request",
+                sent_at=200,
+                sender_id="requester",
+            )
+            for message in (first, after_cutoff, deleted, second, request):
+                storage.upsert_message(message)
+            self.assertTrue(
+                storage.mark_message_deleted(
+                    umo=self.UMO,
+                    platform_id=deleted.platform_id,
+                    platform_message_id=deleted.message_id,
+                    deleted_at=190,
+                )
+            )
+            snapshot = storage.capture_request_snapshot(
+                umo=self.UMO,
+                cutoff_at=201,
+                query=request.plain_text,
+                request_source_key=request.resolved_source_key(),
+            )
+            late_backfill = self.message(
+                "late-backfill",
+                "old timestamp inserted after the snapshot",
+                sent_at=90,
+                sender_id="late",
+            )
+            storage.upsert_message(late_backfill)
+            row_ids = {
+                str(row["source_key"]): int(row["id"])
+                for row in storage._connection.execute(
+                    "SELECT id, source_key FROM messages WHERE umo=?",
+                    (self.UMO,),
+                ).fetchall()
+            }
+            upper_bound = int(snapshot["message_upper_bound"])
+            self.assertLessEqual(
+                row_ids[after_cutoff.resolved_source_key()],
+                upper_bound,
+            )
+            self.assertLessEqual(
+                row_ids[deleted.resolved_source_key()],
+                upper_bound,
+            )
+            self.assertGreater(
+                row_ids[request.resolved_source_key()],
+                upper_bound,
+            )
+            self.assertGreater(
+                row_ids[late_backfill.resolved_source_key()],
+                upper_bound,
+            )
+
+            records = storage.messages_for_sources(
+                umo=self.UMO,
+                source_keys=(
+                    second.resolved_source_key(),
+                    request.resolved_source_key(),
+                    after_cutoff.resolved_source_key(),
+                    first.resolved_source_key(),
+                    deleted.resolved_source_key(),
+                    late_backfill.resolved_source_key(),
+                    second.resolved_source_key(),
+                ),
+                before_sent_at=int(snapshot["cutoff_at"]),
+                message_upper_bound=upper_bound,
+            )
+
+            self.assertEqual(
+                [record["source_key"] for record in records],
+                [second.resolved_source_key(), first.resolved_source_key()],
+            )
+            self.assertEqual(
+                [record["plain_text"] for record in records],
+                ["second visible payload", "first visible payload"],
+            )
+        finally:
+            storage.close()
 
 
 if __name__ == "__main__":

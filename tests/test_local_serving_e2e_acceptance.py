@@ -141,6 +141,7 @@ def synthetic_packet() -> dict[str, object]:
                         "sent_at": 1_000,
                         "sender_id": "account-a",
                         "sender_name": "参与者甲",
+                        "sender_participant_key": "participant:a",
                         "role": "USER",
                         "plain_text": "我暂时没有兴趣。",
                     },
@@ -149,6 +150,7 @@ def synthetic_packet() -> dict[str, object]:
                         "sent_at": 1_500,
                         "sender_id": "account-a",
                         "sender_name": "参与者甲",
+                        "sender_participant_key": "participant:a",
                         "role": "USER",
                         "plain_text": "现在愿意试试看。",
                     },
@@ -238,7 +240,7 @@ def synthetic_certificate_response(
             {
                 "id": "attitude_change",
                 "statement": "参与者甲的表达从保留变为愿意尝试。",
-                "speaker_participant_key": "participant:a",
+                "speaker_participant_key": "",
                 "subject_participant_key": "participant:a",
                 "attribution": "DERIVED_INTERPRETATION",
                 "stance": "SUPPORTED",
@@ -265,6 +267,68 @@ def synthetic_certificate_response(
     }
 
 
+_READER_HOST_FIELDS = {
+    "schema_version",
+    "scope_snapshot",
+    "data_revision",
+    "inference_revision",
+    "packet_sha256",
+    "validation",
+}
+
+
+def synthetic_reader_delta(
+    certificate: dict[str, object],
+) -> dict[str, object]:
+    """Encode a model-owned v3 response using the prompt's short ids."""
+
+    source_aliases = {
+        source_key: f"s{index}"
+        for index, source_key in enumerate(sorted(SOURCE_KEYS), start=1)
+    }
+    participant_aliases = {
+        participant_key: f"p{index}"
+        for index, participant_key in enumerate(sorted(PARTICIPANT_KEYS), start=1)
+    }
+
+    def aliased(value: object, *, field: str = "") -> object:
+        if isinstance(value, dict):
+            return {
+                str(key): aliased(nested, field=str(key))
+                for key, nested in value.items()
+                if str(key) != "speaker_participant_key"
+            }
+        if isinstance(value, list):
+            if field == "source_keys" or field.endswith("_source_keys"):
+                return [
+                    source_aliases.get(item, item) if isinstance(item, str) else item
+                    for item in value
+                ]
+            if field == "participant_keys" or field.endswith("_participant_keys"):
+                return [
+                    participant_aliases.get(item, item)
+                    if isinstance(item, str)
+                    else item
+                    for item in value
+                ]
+            return [aliased(item) for item in value]
+        if isinstance(value, str):
+            if field == "source_key" or field.endswith("_source_key"):
+                return source_aliases.get(value, value)
+            if field == "participant_key" or field.endswith("_participant_key"):
+                return participant_aliases.get(value, value)
+        return value
+
+    semantic = {
+        key: copy.deepcopy(value)
+        for key, value in certificate.items()
+        if key not in _READER_HOST_FIELDS
+    }
+    result = aliased(semantic)
+    assert isinstance(result, dict)
+    return result
+
+
 def production_execute_method():
     return main_method(
         "_execute_local_memory_serving",
@@ -280,6 +344,7 @@ def production_execute_method():
         compile_surface_packet=compile_surface_packet,
         validate_surface_packet=validate_surface_packet,
         L2_READER_PROTOCOL=L2_READER_PROTOCOL,
+        DistillationSnapshotChanged=RuntimeError,
         logger=SimpleNamespace(
             error=lambda *args, **kwargs: None,
             exception=lambda *args, **kwargs: None,
@@ -290,6 +355,7 @@ def production_execute_method():
 def production_reader_method():
     return main_method(
         "_read_l2_certificate",
+        json=json,
         build_l2_reader_prompt=build_l2_reader_prompt,
         parse_l2_reader_response=parse_l2_reader_response,
         stable_sha256=stable_sha256,
@@ -322,7 +388,9 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         packet_sha256 = stable_sha256(packet)
         response = SimpleNamespace(
             completion_text=json.dumps(
-                synthetic_certificate_response(snapshot, packet_sha256),
+                synthetic_reader_delta(
+                    synthetic_certificate_response(snapshot, packet_sha256)
+                ),
                 ensure_ascii=False,
             )
         )
@@ -359,6 +427,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             _service_for_scope=lambda scope: service,
             _normalize_event=lambda event: normalized,
             _runtime_request_kind=lambda query, **kwargs: "MEMORY_QUERY",
+            _runtime_activity_analysis=lambda query: False,
             _capture_layered_snapshot=AsyncMock(return_value=snapshot),
             _layered_evidence_packet=AsyncMock(
                 return_value=(
@@ -366,11 +435,12 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     packet_sha256,
                     set(SOURCE_KEYS),
                     set(PARTICIPANT_KEYS),
-                    "NONE",
+                    "LOCAL_FRESH",
                 )
             ),
             _assert_snapshot_fresh=AsyncMock(),
             distillation_thinking_mode="enabled",
+            local_serving_reader_thinking_mode="disabled",
             _run_fast_reconstruction_with_ledger=AsyncMock(
                 return_value=(response, 8.5)
             ),
@@ -425,7 +495,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         host._layered_evidence_packet.assert_awaited_once()
         retrieval = host._layered_evidence_packet.await_args.kwargs
         self.assertFalse(retrieval["resolve_query_aliases"])
-        self.assertTrue(retrieval["include_participant_activity"])
+        self.assertFalse(retrieval["include_participant_activity"])
         self.assertFalse(retrieval["use_cache"])
         self.assertFalse(retrieval["finalize_packet"])
 
@@ -443,7 +513,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         ledger = outcome.ledger_result
         self.assertEqual(ledger["path"], "resident_reader_one_pass")
         self.assertEqual(ledger["retrieval_mode"], "FRESH")
-        self.assertEqual(ledger["cache_layer"], "NONE")
+        self.assertEqual(ledger["cache_layer"], "LOCAL_FRESH")
         self.assertEqual(ledger["memory_provider_calls"], 1)
         self.assertFalse(ledger["repair_attempted"])
         self.assertFalse(ledger["l3_attempted"])
@@ -469,7 +539,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("FULL_RETRIEVAL", ledger["stage_elapsed_ms"])
         self.assertIn("RESIDENT_READER", ledger["stage_elapsed_ms"])
-        service.audit_snapshot_sources.assert_awaited_once()
+        self.assertEqual(service.audit_snapshot_sources.await_count, 2)
         self.assertEqual(
             service.audit_snapshot_sources.await_args.kwargs["source_keys"],
             SOURCE_KEYS,
@@ -557,7 +627,10 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         host._run_fast_reconstruction_with_ledger = AsyncMock(
             return_value=(
                 SimpleNamespace(
-                    completion_text=json.dumps(raw_certificate, ensure_ascii=False)
+                    completion_text=json.dumps(
+                        synthetic_reader_delta(raw_certificate),
+                        ensure_ascii=False,
+                    )
                 ),
                 8.5,
             )
@@ -584,6 +657,44 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         terminal = service.finish_experiment.await_args.kwargs["result"]
         self.assertEqual(terminal["surface_omitted_optional"], 1)
         self.assertTrue(terminal["surface_truncated"])
+
+    async def test_selected_source_edit_during_reader_fails_closed(self) -> None:
+        snapshot = synthetic_snapshot()
+        packet = synthetic_packet()
+        normalized = self.normalized_message(snapshot)
+        first = {
+            "source_fingerprints": {
+                "source-old": {
+                    "message_id": 1,
+                    "sent_at": 1_000,
+                    "revision_no": 1,
+                    "content_sha256": "a" * 64,
+                }
+            }
+        }
+        changed = copy.deepcopy(first)
+        changed["source_fingerprints"]["source-old"]["revision_no"] = 2
+        service = SimpleNamespace(
+            start_experiment=AsyncMock(),
+            finish_experiment=AsyncMock(),
+            audit_snapshot_sources=AsyncMock(side_effect=[first, changed]),
+            record_reconstruction_step=AsyncMock(),
+        )
+        host = self.production_host(
+            normalized=normalized,
+            snapshot=snapshot,
+            packet=packet,
+            service=service,
+        )
+
+        event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
+        outcome = await production_execute_method()(host, event, QUERY)
+
+        self.assertFalse(outcome.usable)
+        self.assertEqual(outcome.operational_status, "FAILED")
+        self.assertIn("selected evidence changed", outcome.detail)
+        host._run_fast_reconstruction_with_ledger.assert_awaited_once()
+        self.assertEqual(service.audit_snapshot_sources.await_count, 2)
 
     async def test_180_seconds_is_only_an_abnormal_hang_guard(self) -> None:
         snapshot = synthetic_snapshot()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 
 from .distillation import (
     DistillationBatch,
@@ -213,6 +214,11 @@ class MemoryService:
         self, **kwargs: object
     ) -> list[dict[str, object]]:
         return await asyncio.to_thread(self.storage.query_recent_context, **kwargs)
+
+    async def search_messages(self, **kwargs: object) -> list[StoredMessage]:
+        """Run snapshot-bounded raw-message lexical retrieval off the event loop."""
+
+        return await asyncio.to_thread(self.storage.search_messages, **kwargs)
 
     async def query_identity_semantic_evidence(
         self, **kwargs: object
@@ -619,9 +625,36 @@ class MemoryService:
         )
 
     async def message_for_source(
-        self, **kwargs: object
+        self,
+        *,
+        umo: str,
+        source_key: str,
+        before_sent_at: int,
+        message_upper_bound: int,
     ) -> dict[str, object] | None:
-        return await asyncio.to_thread(self.storage.message_for_source, **kwargs)
+        return await asyncio.to_thread(
+            self.storage.message_for_source,
+            umo=umo,
+            source_key=source_key,
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
+
+    async def messages_for_sources(
+        self,
+        *,
+        umo: str,
+        source_keys: Iterable[str],
+        before_sent_at: int,
+        message_upper_bound: int,
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(
+            self.storage.messages_for_sources,
+            umo=umo,
+            source_keys=source_keys,
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
 
     async def query_personal_information(
         self,

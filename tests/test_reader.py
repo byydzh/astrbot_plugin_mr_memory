@@ -9,17 +9,17 @@ import unittest
 from dataclasses import replace
 
 from mr_memory.evidence_closure import parse_contract_turn
+from mr_memory.evidence_pack import compile_evidence_atom_pack
 from mr_memory.certificate import (
     MAX_CERTIFICATE_CONFLICTS,
     MAX_CERTIFICATE_SOURCE_KEYS,
     MAX_CERTIFICATE_UNRESOLVED,
 )
 from mr_memory.reader import (
+    _alias_evidence_packet,
     build_l2_reader_prompt,
-    build_single_repair_prompt,
     certificate_from_contract_turn,
     evidence_certificate_v2_schema,
-    normalize_l2_reader_response,
     parse_l2_reader_response,
     validate_certificate_source_bindings,
 )
@@ -27,11 +27,111 @@ from mr_memory.snapshot import (
     DataRevisionVector,
     InferenceRevisionVector,
     RequestSnapshot,
+    canonical_json,
     stable_sha256,
 )
 from mr_memory.surface import compile_surface_packet, validate_surface_packet
 from tests.test_certificate_v2 import _raw_certificate, _snapshot as l2_snapshot
 from tests import test_evidence_closure as closure_fixtures
+
+
+_HOST_CERTIFICATE_FIELDS = {
+    "schema_version",
+    "scope_snapshot",
+    "data_revision",
+    "inference_revision",
+    "packet_sha256",
+    "validation",
+}
+
+
+def _semantic_delta(
+    raw: dict[str, object],
+    request: object,
+) -> dict[str, object]:
+    semantic = {
+        key: copy.deepcopy(value)
+        for key, value in raw.items()
+        if key not in _HOST_CERTIFICATE_FIELDS
+    }
+    for atom in semantic.get("atoms", []):
+        if isinstance(atom, dict):
+            atom.pop("speaker_participant_key", None)
+    aliased = _alias_evidence_packet(
+        semantic,
+        source_aliases=request.source_key_to_alias,
+        participant_aliases=request.participant_key_to_alias,
+    )
+    if not isinstance(aliased, dict):  # pragma: no cover - helper guard
+        raise AssertionError("semantic response must be an object")
+    return aliased
+
+
+def _large_prompt_char_counts() -> tuple[int, int]:
+    """Reconstruct the v2 prompt baseline and compare the compact v3 prompt."""
+
+    source_keys = [
+        f"source-key-{index:04d}-with-a-realistically-long-host-namespace"
+        for index in range(512)
+    ]
+    participant_keys = [
+        f"participant-key-{index:04d}-with-a-long-canonical-namespace"
+        for index in range(128)
+    ]
+    packet = {
+        "messages": [
+            {
+                "source_key": source_key,
+                "sender_participant_key": participant_keys[index % 128],
+                "text": f"synthetic evidence {index}",
+            }
+            for index, source_key in enumerate(source_keys)
+        ]
+    }
+    participant_sources = {
+        participant: source_keys[index * 4 : (index + 1) * 4]
+        for index, participant in enumerate(participant_keys)
+    }
+    request = build_l2_reader_prompt(
+        query="好女孩是什么意思",
+        evidence_packet=packet,
+        snapshot=l2_snapshot(),
+        allowed_source_keys=source_keys,
+        allowed_participant_keys=participant_keys,
+        participant_source_keys=participant_sources,
+        pack_read_complete=True,
+    )
+    schema = evidence_certificate_v2_schema(
+        snapshot=l2_snapshot(),
+        packet_sha256=request.packet_sha256,
+        allowed_source_keys=source_keys,
+        allowed_participant_keys=participant_keys,
+        pack_read_complete=True,
+    )
+    legacy_system_prefix = request.system_prompt.split(
+        "\nCompact semantic contract:\n",
+        1,
+    )[0].replace("compact semantic contract", "host-bound JSON Schema")
+    legacy_system = (
+        legacy_system_prefix
+        + "\nJSON Schema:\n"
+        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    )
+    legacy_payload = {
+        "protocol": "evidence-reader.v2",
+        "query": "好女孩是什么意思",
+        "scope_snapshot": l2_snapshot().as_dict(),
+        "packet_sha256": request.packet_sha256,
+        "allowed_source_keys": source_keys,
+        "allowed_participant_keys": participant_keys,
+        "participant_source_keys": participant_sources,
+        "pack_read_complete": True,
+        "semantic_none_allowed": True,
+        "evidence_packet": packet,
+    }
+    old_chars = len(legacy_system) + len(canonical_json(legacy_payload))
+    new_chars = len(request.system_prompt) + len(request.user_prompt)
+    return old_chars, new_chars
 
 
 def _eccr_snapshot() -> RequestSnapshot:
@@ -129,29 +229,81 @@ class L2ReaderPromptTests(unittest.TestCase):
             json.loads(outputs[0]), ["source-a", "source-m", "source-z"]
         )
 
-    def test_prompt_contains_full_host_bound_schema_and_packet(self) -> None:
+    def test_prompt_uses_compact_alias_protocol_and_keeps_host_fields_local(
+        self,
+    ) -> None:
         packet = {
             "messages": [
-                {"source_key": "s1", "text": "类魂玩吐了"},
-                {"source_key": "s2", "text": "我可能会买"},
+                {
+                    "source_key": "source-one-canonical",
+                    "sender_participant_key": "participant-one-canonical",
+                    "text": "类魂玩吐了",
+                },
+                {
+                    "source_key": "source-two-canonical",
+                    "sender_participant_key": "participant-one-canonical",
+                    "text": "我可能会买",
+                },
             ]
         }
         request = build_l2_reader_prompt(
             query="好女孩是什么意思",
             evidence_packet=packet,
             snapshot=l2_snapshot(),
-            allowed_source_keys={"s1", "s2"},
-            allowed_participant_keys={"p1"},
-            participant_source_keys={"p1": {"s2", "s1"}},
+            allowed_source_keys={
+                "source-one-canonical",
+                "source-two-canonical",
+            },
+            allowed_participant_keys={"participant-one-canonical"},
+            participant_source_keys={
+                "participant-one-canonical": {
+                    "source-two-canonical",
+                    "source-one-canonical",
+                }
+            },
             pack_read_complete=True,
         )
         self.assertEqual(request.packet_sha256, stable_sha256(packet))
-        self.assertIn("host-bound JSON Schema", request.system_prompt)
+        self.assertIn("compact semantic contract", request.system_prompt)
+        self.assertNotIn("\nJSON Schema:\n", request.system_prompt)
         self.assertIn("must_not_upgrade", request.system_prompt)
         payload = json.loads(request.user_prompt)
-        self.assertEqual(payload["scope_snapshot"], l2_snapshot().as_dict())
-        self.assertEqual(payload["evidence_packet"], packet)
+        for host_field in (
+            "scope_snapshot",
+            "packet_sha256",
+            "allowed_source_keys",
+            "allowed_participant_keys",
+        ):
+            self.assertNotIn(host_field, payload)
+        self.assertEqual(
+            payload["evidence_packet"],
+            {
+                "messages": [
+                    {
+                        "source_key": "s1",
+                        "sender_participant_key": "p1",
+                        "text": "类魂玩吐了",
+                    },
+                    {
+                        "source_key": "s2",
+                        "sender_participant_key": "p1",
+                        "text": "我可能会买",
+                    },
+                ]
+            },
+        )
         self.assertEqual(payload["participant_source_keys"], {"p1": ["s1", "s2"]})
+        self.assertEqual(
+            dict(request.source_alias_to_key),
+            {
+                "s1": "source-one-canonical",
+                "s2": "source-two-canonical",
+            },
+        )
+        self.assertEqual(
+            dict(request.participant_alias_to_key),
+            {"p1": "participant-one-canonical"},
+        )
         self.assertTrue(payload["semantic_none_allowed"])
         self.assertEqual(request.messages()[0]["role"], "system")
 
@@ -209,6 +361,98 @@ class L2ReaderPromptTests(unittest.TestCase):
             certified_atoms["items"]["properties"]["source_keys"]["minItems"],
             1,
         )
+
+    def test_compact_semantic_response_restores_aliases_and_injects_host_fields(
+        self,
+    ) -> None:
+        source_one = "source-one-with-a-long-canonical-host-key"
+        source_two = "source-two-with-a-long-canonical-host-key"
+        participant = "participant-with-a-long-canonical-host-key"
+        packet = {
+            "messages": [
+                {
+                    "source_key": source_one,
+                    "sender_participant_key": participant,
+                    "text": "synthetic one",
+                },
+                {
+                    "source_key": source_two,
+                    "sender_participant_key": participant,
+                    "text": "synthetic two",
+                },
+            ]
+        }
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={source_one, source_two},
+            allowed_participant_keys={participant},
+            participant_source_keys={participant: {source_one, source_two}},
+            pack_read_complete=True,
+        )
+        source_alias = request.source_key_to_alias[source_one]
+        participant_alias = request.participant_key_to_alias[participant]
+        response = {
+            "status": "CERTIFIED",
+            "subjects": [
+                {
+                    "reference": "synthetic subject",
+                    "participant_key": participant_alias,
+                    "reference_mode": "UNIQUE_ALIAS",
+                    "candidate_participant_keys": [],
+                    "source_keys": [source_alias],
+                    "valid_at": None,
+                }
+            ],
+            "atoms": [
+                {
+                    "id": "synthetic-atom-1",
+                    "statement": "A synthetic supported statement.",
+                    "subject_participant_key": participant_alias,
+                    "attribution": "DIRECT_SPEAKER_STATEMENT",
+                    "stance": "SUPPORTED",
+                    "source_keys": [source_alias],
+                    "source_spans": ["synthetic one"],
+                    "importance": "REQUIRED",
+                    "confidence": 0.9,
+                }
+            ],
+            "must_include": ["synthetic-atom-1"],
+            "must_not_upgrade": [],
+            "conflicts": [],
+            "unresolved": [],
+            "open_obligations": [],
+            "stop_reason": "CERTIFIED_CLOSE",
+        }
+
+        certificate = parse_l2_reader_response(response, request)
+
+        self.assertEqual(certificate.scope_snapshot, l2_snapshot())
+        self.assertEqual(certificate.packet_sha256, stable_sha256(packet))
+        self.assertEqual(certificate.subjects[0].participant_key, participant)
+        self.assertEqual(certificate.subjects[0].source_keys, (source_one,))
+        self.assertEqual(
+            certificate.atoms[0].speaker_participant_key,
+            participant,
+        )
+        self.assertEqual(certificate.atoms[0].source_keys, (source_one,))
+
+        supplied_speaker = copy.deepcopy(response)
+        supplied_speaker["atoms"][0]["speaker_participant_key"] = participant_alias
+        with self.assertRaisesRegex(ValueError, "speaker_participant_key is host-owned"):
+            parse_l2_reader_response(supplied_speaker, request)
+
+        supplied_host_fields = copy.deepcopy(response)
+        supplied_host_fields["scope_snapshot"] = {"tampered": True}
+        supplied_host_fields["packet_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "host-owned fields"):
+            parse_l2_reader_response(supplied_host_fields, request)
+
+    def test_compact_prompt_is_smaller_for_the_same_large_allowlist(self) -> None:
+        old_chars, new_chars = _large_prompt_char_counts()
+        self.assertLess(new_chars, old_chars)
+        self.assertLess(new_chars / old_chars, 0.35)
 
     def test_resident_one_pass_schema_excludes_l3_and_bounds_uncertainty(
         self,
@@ -280,6 +524,134 @@ class L2ReaderPromptTests(unittest.TestCase):
                 allowed_source_keys=(),
                 pack_read_complete=True,
             )
+
+    def test_prompt_rejects_packet_identifiers_outside_host_allowlists(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outside the source allowlist"):
+            build_l2_reader_prompt(
+                query="好女孩是什么意思",
+                evidence_packet={
+                    "messages": [{"source_key": "source-outside"}]
+                },
+                snapshot=l2_snapshot(),
+                allowed_source_keys={"source-allowed"},
+                pack_read_complete=True,
+            )
+
+    def test_only_identity_shaped_canonical_keys_are_participant_aliased(self) -> None:
+        participant_key = 'participant:["synthetic","account-a"]'
+        packet = {
+            "identity_candidates": [
+                {
+                    "canonical_key": participant_key,
+                    "account_id": "account-a",
+                    "current_display_name": "测试成员甲",
+                }
+            ],
+            "graph_metadata": {
+                "canonical_key": "graph-node:synthetic-topic",
+                "kind": "topic",
+            },
+        }
+        aliased = _alias_evidence_packet(
+            packet,
+            source_aliases={},
+            participant_aliases={participant_key: "p1"},
+        )
+        self.assertEqual(
+            aliased["identity_candidates"][0]["canonical_key"],
+            "p1",
+        )
+        self.assertEqual(
+            aliased["graph_metadata"]["canonical_key"],
+            "graph-node:synthetic-topic",
+        )
+
+    def test_incomplete_person_coverage_forbids_unique_alias(self) -> None:
+        packet = compile_evidence_atom_pack(
+            {
+                "person_reference_candidates": {
+                    "references": [
+                        {
+                            "reference": "合成称呼",
+                            "candidate_participants": [
+                                {
+                                    "participant_key": "p1",
+                                    "alias_observations": [
+                                        {
+                                            "source_key": "s1",
+                                            "sent_at": 1,
+                                            "sender_id": "account-a",
+                                            "plain_text": "第一条合成观察",
+                                            "alias": "合成称呼",
+                                            "relation": "SPEAKER",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "participant_key": "p2",
+                                    "alias_observations": [
+                                        {
+                                            "source_key": "s2",
+                                            "sent_at": 2,
+                                            "sender_id": "account-b",
+                                            "plain_text": "第二条合成观察",
+                                            "alias": "合成称呼",
+                                            "relation": "SPEAKER",
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    ]
+                },
+                "retrieval_coverage": {
+                    "person_reference_coverage": {"truncated": True}
+                },
+            },
+            max_sources=2,
+        )
+        coverage = packet["retrieval_coverage"]
+        self.assertEqual(coverage["person_candidate_groups_total"], 2)
+        self.assertEqual(coverage["person_candidate_groups_covered"], 2)
+        self.assertFalse(coverage["truncated"])
+        self.assertFalse(coverage["person_candidates_complete"])
+
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet=packet,
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1", "p2"},
+            participant_source_keys={"p1": {"s1"}, "p2": {"s2"}},
+            person_candidates_complete=bool(
+                coverage["person_candidates_complete"]
+            ),
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw["packet_sha256"] = request.packet_sha256
+        raw["subjects"][0].update(
+            {"reference_mode": "UNIQUE_ALIAS", "source_keys": ["s1"]}
+        )
+        with self.assertRaisesRegex(ValueError, "UNIQUE_ALIAS is forbidden"):
+            parse_l2_reader_response(_semantic_delta(raw, request), request)
+        self.assertIn("禁止输出 UNIQUE_ALIAS", request.system_prompt)
+
+    def test_reader_rejects_markdown_fenced_json(self) -> None:
+        request = build_l2_reader_prompt(
+            query="好女孩是什么意思",
+            evidence_packet={"messages": [{"source_key": "s1"}]},
+            snapshot=l2_snapshot(),
+            allowed_source_keys={"s1", "s2"},
+            allowed_participant_keys={"p1"},
+            participant_source_keys={"p1": {"s1", "s2"}},
+            pack_read_complete=True,
+        )
+        raw = _raw_certificate()
+        raw["packet_sha256"] = request.packet_sha256
+        fenced = "```json\n" + json.dumps(_semantic_delta(raw, request)) + "\n```"
+        with self.assertRaisesRegex(ValueError, "exactly one JSON object"):
+            parse_l2_reader_response(fenced, request)
         with self.assertRaisesRegex(ValueError, "does not match"):
             build_l2_reader_prompt(
                 query="好女孩是什么意思",
@@ -291,7 +663,12 @@ class L2ReaderPromptTests(unittest.TestCase):
             )
 
     def test_response_parser_uses_request_allowlists_and_host_bindings(self) -> None:
-        packet = {"sources": ["s1", "s2"]}
+        packet = {
+            "sources": [
+                {"source_key": "s1", "sender_participant_key": "p1"},
+                {"source_key": "s2", "sender_participant_key": "p1"},
+            ]
+        }
         request = build_l2_reader_prompt(
             query="好女孩是什么意思",
             evidence_packet=packet,
@@ -303,19 +680,28 @@ class L2ReaderPromptTests(unittest.TestCase):
         )
         raw = _raw_certificate()
         raw["packet_sha256"] = request.packet_sha256
-        certificate = parse_l2_reader_response(raw, request)
+        certificate = parse_l2_reader_response(_semantic_delta(raw, request), request)
         self.assertEqual(certificate.packet_sha256, request.packet_sha256)
         provider_degraded = copy.deepcopy(raw)
         provider_degraded["status"] = "PARTIAL"
         provider_degraded["stop_reason"] = "PROTOCOL_DEGRADED"
         with self.assertRaisesRegex(ValueError, "stop_reason is unsupported"):
-            parse_l2_reader_response(provider_degraded, request)
-        raw["atoms"][0]["source_keys"] = ["outside"]
-        with self.assertRaisesRegex(ValueError, "allowlist"):
-            parse_l2_reader_response(raw, request)
+            parse_l2_reader_response(
+                _semantic_delta(provider_degraded, request),
+                request,
+            )
+        invalid_delta = _semantic_delta(raw, request)
+        invalid_delta["atoms"][0]["source_keys"] = ["s999"]
+        with self.assertRaisesRegex(ValueError, "outside the source alias map"):
+            parse_l2_reader_response(invalid_delta, request)
 
     def test_resident_one_pass_rejects_l3_response_and_repair(self) -> None:
-        packet = {"sources": ["s1", "s2"]}
+        packet = {
+            "sources": [
+                {"source_key": "s1", "sender_participant_key": "p1"},
+                {"source_key": "s2", "sender_participant_key": "p1"},
+            ]
+        }
         offline_request = build_l2_reader_prompt(
             query="好女孩是什么意思",
             evidence_packet=packet,
@@ -344,7 +730,10 @@ class L2ReaderPromptTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            parse_l2_reader_response(raw, offline_request).status,
+            parse_l2_reader_response(
+                _semantic_delta(raw, offline_request),
+                offline_request,
+            ).status,
             "REQUEST_L3",
         )
 
@@ -359,18 +748,20 @@ class L2ReaderPromptTests(unittest.TestCase):
             allow_l3=False,
         )
         with self.assertRaisesRegex(ValueError, "cannot request L3"):
-            parse_l2_reader_response(raw, resident_request)
-        with self.assertRaisesRegex(ValueError, "does not support repair"):
-            build_single_repair_prompt(
+            parse_l2_reader_response(
+                _semantic_delta(raw, resident_request),
                 resident_request,
-                invalid_response="not-json",
-                validation_error="invalid certificate",
             )
 
-    def test_l2_host_normalizes_only_exact_singleton_and_safe_identity_downgrade(
+    def test_l2_reader_fails_closed_on_redundant_or_ambiguous_identity(
         self,
     ) -> None:
-        packet = {"sources": ["s1", "s2"]}
+        packet = {
+            "sources": [
+                {"source_key": "s1", "sender_participant_key": "p1"},
+                {"source_key": "s2", "sender_participant_key": "p1"},
+            ]
+        }
         request = build_l2_reader_prompt(
             query="好女孩是什么意思",
             evidence_packet=packet,
@@ -386,76 +777,32 @@ class L2ReaderPromptTests(unittest.TestCase):
         raw = _raw_certificate()
         raw["packet_sha256"] = request.packet_sha256
         raw["subjects"][0]["candidate_participant_keys"] = ["p1"]
-        raw["subjects"].extend(
-            [
-                {
-                    "reference": "第二个确定称呼",
-                    "participant_key": "p2",
-                    "reference_mode": "UNIQUE_ALIAS",
-                    "candidate_participant_keys": ["p2"],
-                    "source_keys": ["s2"],
-                    "valid_at": None,
-                },
-                {
-                    "reference": "未绑定称呼一",
-                    "participant_key": "",
-                    "reference_mode": "UNBOUND",
-                    "candidate_participant_keys": [],
-                    "source_keys": ["s2"],
-                    "valid_at": None,
-                },
-                {
-                    "reference": "未绑定称呼二",
-                    "participant_key": "",
-                    "reference_mode": "UNBOUND",
-                    "candidate_participant_keys": [],
-                    "source_keys": ["s2"],
-                    "valid_at": None,
-                },
-            ]
-        )
-        frozen_raw = copy.deepcopy(raw)
-        audit: list[dict[str, object]] = []
-        certificate = parse_l2_reader_response(
-            raw, request, normalization_audit=audit
-        )
-        self.assertEqual(certificate.subjects[0].candidate_participant_keys, ())
-        self.assertEqual(certificate.subjects[1].candidate_participant_keys, ())
-        self.assertEqual(certificate.subjects[2].reference_mode, "UNBOUND")
-        self.assertEqual(certificate.subjects[3].reference_mode, "UNBOUND")
-        self.assertEqual(certificate.status, "SAFETY_ABSTAIN")
-        self.assertEqual(certificate.stop_reason, "SAFETY_ABSTAIN")
-        self.assertEqual(raw, frozen_raw)
-        self.assertEqual(
-            [item["action"] for item in audit],
-            [
-                "canonicalize_redundant_singleton",
-                "canonicalize_redundant_singleton",
-                "downgrade_identity_ambiguity",
-            ],
-        )
-        normalized, repeated_audit = normalize_l2_reader_response(raw)
-        self.assertEqual(repeated_audit, audit)
-        self.assertEqual(normalized["status"], "SAFETY_ABSTAIN")
-        self.assertEqual(normalized["subjects"][0]["candidate_participant_keys"], [])
-        self.assertEqual(normalized["subjects"][1]["candidate_participant_keys"], [])
-
-        mismatched = copy.deepcopy(raw)
-        mismatched["subjects"][0]["candidate_participant_keys"] = ["p2"]
         with self.assertRaisesRegex(ValueError, "resolved mode requires"):
-            parse_l2_reader_response(mismatched, request)
+            parse_l2_reader_response(_semantic_delta(raw, request), request)
 
-        multiple = copy.deepcopy(raw)
-        multiple["subjects"][0]["candidate_participant_keys"] = ["p1", "p2"]
-        with self.assertRaisesRegex(ValueError, "resolved mode requires"):
-            parse_l2_reader_response(multiple, request)
+        ambiguous = copy.deepcopy(raw)
+        ambiguous["subjects"][0].update(
+            {
+                "participant_key": "",
+                "reference_mode": "AMBIGUOUS",
+                "candidate_participant_keys": ["p1", "p2"],
+                "source_keys": ["s1", "s2"],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "identity ambiguity"):
+            parse_l2_reader_response(_semantic_delta(ambiguous, request), request)
 
-    def test_l2_host_rebuilds_must_include_from_required_atoms_in_atom_order(
+    def test_l2_reader_preserves_valid_must_include_and_rejects_missing_ids(
         self,
     ) -> None:
         request = build_l2_reader_prompt(
             query="好女孩是什么意思",
-            evidence_packet={"sources": ["s1", "s2"]},
+            evidence_packet={
+                "sources": [
+                    {"source_key": "s1", "sender_participant_key": "p1"},
+                    {"source_key": "s2", "sender_participant_key": "p1"},
+                ]
+            },
             snapshot=l2_snapshot(),
             allowed_source_keys={"s1", "s2"},
             allowed_participant_keys={"p1"},
@@ -466,33 +813,21 @@ class L2ReaderPromptTests(unittest.TestCase):
         raw["packet_sha256"] = request.packet_sha256
         raw["atoms"][1]["importance"] = "REQUIRED"
         raw["must_include"] = ["a2", "a1"]
-        frozen_atoms = copy.deepcopy(raw["atoms"])
-        audit: list[dict[str, object]] = []
-
         certificate = parse_l2_reader_response(
-            raw,
+            _semantic_delta(raw, request),
             request,
-            normalization_audit=audit,
         )
+        self.assertEqual(certificate.must_include, ("a2", "a1"))
 
-        self.assertEqual(certificate.must_include, ("a1", "a2"))
-        self.assertEqual(raw["atoms"], frozen_atoms)
-        self.assertEqual(
-            audit,
-            [
-                {
-                    "action": "canonicalize_must_include_from_atoms",
-                    "classification": "semantic_preserving_canonicalization",
-                    "changed_paths": ["must_include"],
-                    "required_atom_ids": ["a1", "a2"],
-                }
-            ],
-        )
+        missing = copy.deepcopy(raw)
+        missing["must_include"] = ["a1"]
+        with self.assertRaisesRegex(ValueError, "every and only REQUIRED"):
+            parse_l2_reader_response(_semantic_delta(missing, request), request)
 
         invalid_atom = copy.deepcopy(raw)
         invalid_atom["atoms"][0]["id"] = "invalid atom id"
         with self.assertRaisesRegex(ValueError, "bounded identifier"):
-            parse_l2_reader_response(invalid_atom, request)
+            parse_l2_reader_response(_semantic_delta(invalid_atom, request), request)
 
     def test_certified_atoms_require_a_source_during_parsing(self) -> None:
         request = build_l2_reader_prompt(
@@ -510,9 +845,9 @@ class L2ReaderPromptTests(unittest.TestCase):
         raw["atoms"][0]["source_spans"] = []
         with self.assertRaisesRegex(
             ValueError,
-            r"atoms\[0\]\.source_keys must not be empty",
+            r"atoms\[0\] DIRECT_SPEAKER_STATEMENT requires one host-bound speaker",
         ):
-            parse_l2_reader_response(raw, request)
+            parse_l2_reader_response(_semantic_delta(raw, request), request)
 
     def test_semantic_none_policy_is_bound_into_schema_prompt_and_parser(
         self,
@@ -573,17 +908,33 @@ class L2ReaderPromptTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            parse_l2_reader_response(raw, allowed_request).status,
+            parse_l2_reader_response(
+                _semantic_delta(raw, allowed_request),
+                allowed_request,
+            ).status,
             "SEMANTIC_NONE",
         )
         with self.assertRaisesRegex(ValueError, "retrieval coverage is insufficient"):
-            parse_l2_reader_response(raw, forbidden_request)
+            parse_l2_reader_response(
+                _semantic_delta(raw, forbidden_request),
+                forbidden_request,
+            )
 
-    def test_participant_sources_bind_unique_alias_and_atom_subjects(self) -> None:
+    def test_participant_sources_bind_aliases_and_speakers_not_atom_subjects(
+        self,
+    ) -> None:
         packet = {
             "messages": [
-                {"source_key": "source-alpha", "text": "synthetic alpha"},
-                {"source_key": "source-beta", "text": "synthetic beta"},
+                {
+                    "source_key": "source-alpha",
+                    "sender_participant_key": "participant-alpha",
+                    "text": "synthetic alpha",
+                },
+                {
+                    "source_key": "source-beta",
+                    "sender_participant_key": "participant-beta",
+                    "text": "synthetic beta",
+                },
             ]
         }
         request = build_l2_reader_prompt(
@@ -608,8 +959,15 @@ class L2ReaderPromptTests(unittest.TestCase):
         self.assertEqual(
             json.loads(request.user_prompt)["participant_source_keys"],
             {
-                "participant-alpha": ["source-alpha"],
-                "participant-beta": ["source-beta"],
+                "p1": ["s1"],
+                "p2": ["s2"],
+            },
+        )
+        self.assertEqual(
+            json.loads(request.user_prompt)["participant_speaker_source_keys"],
+            {
+                "p1": ["s1"],
+                "p2": ["s2"],
             },
         )
 
@@ -648,26 +1006,63 @@ class L2ReaderPromptTests(unittest.TestCase):
                 "open_obligations": [],
             }
         )
-        self.assertEqual(parse_l2_reader_response(raw, request).status, "CERTIFIED")
+        self.assertEqual(
+            parse_l2_reader_response(_semantic_delta(raw, request), request).status,
+            "CERTIFIED",
+        )
 
         cross_alias = copy.deepcopy(raw)
         cross_alias["subjects"][0]["source_keys"] = ["source-beta"]
         with self.assertRaisesRegex(ValueError, r"subjects\[0\].*not admissible"):
-            parse_l2_reader_response(cross_alias, request)
+            parse_l2_reader_response(_semantic_delta(cross_alias, request), request)
 
-        cross_atom = copy.deepcopy(raw)
-        cross_atom["atoms"][0]["source_keys"] = ["source-beta"]
-        cross_atom["atoms"][0]["source_spans"] = ["synthetic beta"]
-        with self.assertRaisesRegex(ValueError, r"atoms\[0\].*not admissible"):
-            parse_l2_reader_response(cross_atom, request)
+        third_party_about_subject = copy.deepcopy(raw)
+        third_party_about_subject["subjects"] = [
+            {
+                "reference": "synthetic-alias-beta",
+                "participant_key": "participant-beta",
+                "reference_mode": "UNIQUE_ALIAS",
+                "candidate_participant_keys": [],
+                "source_keys": ["source-beta"],
+                "valid_at": None,
+            }
+        ]
+        third_party_about_subject["atoms"][0][
+            "subject_participant_key"
+        ] = "participant-beta"
+        self.assertEqual(
+            parse_l2_reader_response(
+                _semantic_delta(third_party_about_subject, request),
+                request,
+            ).status,
+            "CERTIFIED",
+        )
 
-        cross_speaker = copy.deepcopy(raw)
-        cross_speaker["atoms"][0]["speaker_participant_key"] = "participant-beta"
-        with self.assertRaisesRegex(
-            ValueError,
-            r"atoms\[0\].*speaker participant",
-        ):
-            parse_l2_reader_response(cross_speaker, request)
+        source_owned_by_beta = copy.deepcopy(raw)
+        source_owned_by_beta["atoms"][0]["source_keys"] = ["source-beta"]
+        rebound = parse_l2_reader_response(
+            _semantic_delta(source_owned_by_beta, request),
+            request,
+        )
+        self.assertEqual(
+            rebound.atoms[0].speaker_participant_key,
+            "participant-beta",
+        )
+
+        model_owned_speaker = _semantic_delta(raw, request)
+        model_owned_speaker["atoms"][0]["speaker_participant_key"] = "p2"
+        with self.assertRaisesRegex(ValueError, "speaker_participant_key is host-owned"):
+            parse_l2_reader_response(model_owned_speaker, request)
+
+        unresolved_subject = copy.deepcopy(raw)
+        unresolved_subject["atoms"][0][
+            "subject_participant_key"
+        ] = "participant-beta"
+        with self.assertRaisesRegex(ValueError, r"subject participant is not resolved"):
+            parse_l2_reader_response(
+                _semantic_delta(unresolved_subject, request),
+                request,
+            )
 
         unbound_request = build_l2_reader_prompt(
             query="好女孩是什么意思",
@@ -678,7 +1073,10 @@ class L2ReaderPromptTests(unittest.TestCase):
             pack_read_complete=True,
         )
         with self.assertRaisesRegex(ValueError, r"subjects\[0\].*not admissible"):
-            parse_l2_reader_response(raw, unbound_request)
+            parse_l2_reader_response(
+                _semantic_delta(raw, unbound_request),
+                unbound_request,
+            )
 
         with self.assertRaisesRegex(ValueError, "participant outside the allowlist"):
             build_l2_reader_prompt(
@@ -706,7 +1104,14 @@ class L2ReaderPromptTests(unittest.TestCase):
     ) -> None:
         request = build_l2_reader_prompt(
             query="好女孩是什么意思",
-            evidence_packet={"messages": [{"source_key": "source-alpha"}]},
+            evidence_packet={
+                "messages": [
+                    {
+                        "source_key": "source-alpha",
+                        "sender_participant_key": "participant-alpha",
+                    }
+                ]
+            },
             snapshot=l2_snapshot(),
             allowed_source_keys={"source-alpha", "source-beta"},
             allowed_participant_keys={"participant-alpha"},
@@ -719,7 +1124,16 @@ class L2ReaderPromptTests(unittest.TestCase):
         raw.update(
             {
                 "packet_sha256": request.packet_sha256,
-                "subjects": [],
+                "subjects": [
+                    {
+                        "reference": "current structured participant",
+                        "participant_key": "participant-alpha",
+                        "reference_mode": "HOST",
+                        "candidate_participant_keys": [],
+                        "source_keys": [],
+                        "valid_at": None,
+                    }
+                ],
                 "atoms": [
                     {
                         "id": "synthetic-fact-1",
@@ -741,7 +1155,7 @@ class L2ReaderPromptTests(unittest.TestCase):
                 "open_obligations": [],
             }
         )
-        certificate = parse_l2_reader_response(raw, request)
+        certificate = parse_l2_reader_response(_semantic_delta(raw, request), request)
         inadmissible = {"participant-alpha": {"source-beta"}}
 
         speaker_only = replace(
@@ -756,7 +1170,8 @@ class L2ReaderPromptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"speaker participant"):
             validate_certificate_source_bindings(
                 speaker_only,
-                participant_source_keys=inadmissible,
+                participant_source_keys=request.participant_source_keys,
+                participant_speaker_source_keys=inadmissible,
             )
 
         subject_only = replace(
@@ -768,42 +1183,20 @@ class L2ReaderPromptTests(unittest.TestCase):
                 ),
             ),
         )
-        with self.assertRaisesRegex(ValueError, r"subject participant"):
+        self.assertIs(
             validate_certificate_source_bindings(
                 subject_only,
                 participant_source_keys=inadmissible,
-            )
-
-    def test_repair_prompt_is_available_exactly_once(self) -> None:
-        request = build_l2_reader_prompt(
-            query="好女孩是什么意思",
-            evidence_packet={},
-            snapshot=l2_snapshot(),
-            allowed_source_keys=(),
-            pack_read_complete=True,
+            ),
+            subject_only,
         )
-        repaired = build_single_repair_prompt(
-            request,
-            invalid_response="not-json",
-            validation_error=ValueError("certificate is invalid"),
-        )
-        self.assertEqual(repaired.repair_attempt, 1)
-        payload = json.loads(repaired.user_prompt)
-        self.assertEqual(payload["invalid_response"], "not-json")
-        self.assertEqual(payload["original_request"], json.loads(request.user_prompt))
-        self.assertIn("source_spans", payload["instruction"])
-        self.assertIn("不得超过 source_keys", payload["instruction"])
-        self.assertIn("source_spans", request.system_prompt)
-        self.assertIn("participant_activity", request.system_prompt)
-        self.assertIn("全部 source_key", request.system_prompt)
-        self.assertIn("participant_activity", payload["instruction"])
-        with self.assertRaisesRegex(ValueError, "already been used"):
-            build_single_repair_prompt(
-                repaired,
-                invalid_response="still-invalid",
-                validation_error="bad",
-            )
 
+        orphan_subject = replace(subject_only, subjects=())
+        with self.assertRaisesRegex(ValueError, r"subject participant is not resolved"):
+            validate_certificate_source_bindings(
+                orphan_subject,
+                participant_source_keys=inadmissible,
+            )
 
 class EccrCertificateAdapterTests(unittest.TestCase):
     def test_terminal_brief_maps_to_host_bound_derived_certificate(self) -> None:
@@ -829,7 +1222,7 @@ class EccrCertificateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(certificate.scope_snapshot, _eccr_snapshot())
 
-    def test_adapter_enforces_participant_source_bindings(self) -> None:
+    def test_adapter_allows_third_party_evidence_about_resolved_subject(self) -> None:
         certificate = certificate_from_contract_turn(
             _terminal_turn(),
             snapshot=_eccr_snapshot(),
@@ -845,23 +1238,20 @@ class EccrCertificateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(certificate.status, "CERTIFIED")
 
-        with self.assertRaisesRegex(
-            ValueError,
-            r"atoms\[0\].*subject participant",
-        ):
-            certificate_from_contract_turn(
-                _terminal_turn(),
-                snapshot=_eccr_snapshot(),
-                packet_sha256="b" * 64,
-                allowed_source_keys={"source-1", "source-2"},
-                allowed_participant_keys={"participant:a", "participant:b"},
-                participant_source_keys={
-                    "participant:a": {"source-2"},
-                    "participant:b": {"source-1"},
-                },
-                stop_reason="CERTIFIED_CLOSE",
-                pack_read_complete=True,
-            )
+        third_party = certificate_from_contract_turn(
+            _terminal_turn(),
+            snapshot=_eccr_snapshot(),
+            packet_sha256="b" * 64,
+            allowed_source_keys={"source-1", "source-2"},
+            allowed_participant_keys={"participant:a", "participant:b"},
+            participant_source_keys={
+                "participant:a": {"source-2"},
+                "participant:b": {"source-1"},
+            },
+            stop_reason="CERTIFIED_CLOSE",
+            pack_read_complete=True,
+        )
+        self.assertEqual(third_party.status, "CERTIFIED")
 
     def test_ambiguous_contract_maps_to_safety_abstain(self) -> None:
         turn = _terminal_turn(

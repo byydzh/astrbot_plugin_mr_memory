@@ -22,6 +22,7 @@ from mr_memory.certificate import (
     parse_evidence_certificate,
 )
 from mr_memory.evidence_closure import compile_or_update_contract
+from mr_memory.evidence_pack import participant_source_bindings
 from mr_memory.orchestrator import (
     ECCR_RUNTIME_PROTOCOL,
     EccrLimits,
@@ -31,9 +32,7 @@ from mr_memory.reader import (
     L2_READER_PROTOCOL,
     L2ReaderPrompt,
     build_l2_reader_prompt,
-    build_single_repair_prompt,
     certificate_from_contract_turn,
-    normalize_l2_reader_response,
     parse_l2_reader_response,
 )
 from mr_memory.runtime import parse_structured_response, structured_response_candidates
@@ -684,6 +683,7 @@ async def _run_l2(
         allowed_participant_keys=participant_keys,
         pack_read_complete=True,
         packet_sha256=packet_hash,
+        participant_source_keys=participant_source_bindings(packet),
     )
     stages: list[dict[str, Any]] = []
     completion = await complete(
@@ -694,51 +694,26 @@ async def _run_l2(
     )
     record, _candidate, _reasoning = _completion_record(completion)
     stages.append({"phase": "reader_initial", "call_index": 0, **record})
-    normalization_audit: list[dict[str, Any]] = []
     try:
         certificate = parse_l2_reader_response(
             record["provider_visible_completion"],
             request,
-            normalization_audit=normalization_audit,
         )
-        response_source = "completion"
-        repaired = False
     except ValueError as exc:
-        stages[0]["normalization_audit"] = list(normalization_audit)
         stages[0]["validation_error"] = str(exc)[:2000]
-        repair = build_single_repair_prompt(
-            request,
-            invalid_response=record["provider_visible_completion"],
-            validation_error=exc,
-        )
-        completion = await complete(
-            repair.system_prompt,
-            repair.user_prompt,
-            1,
-            "reader_repair",
-        )
-        record, _candidate, _reasoning = _completion_record(completion)
-        stages.append({"phase": "reader_repair", "call_index": 1, **record})
-        normalization_audit = []
-        certificate = parse_l2_reader_response(
-            record["provider_visible_completion"],
-            repair,
-            normalization_audit=normalization_audit,
-        )
-        response_source = "completion"
-        repaired = True
-    stages[-1]["normalization_audit"] = list(normalization_audit)
+        raise
     stages[-1]["raw_completion_sha256"] = stages[-1][
         "provider_visible_completion_sha256"
     ]
-    stages[-1]["normalized_certificate_sha256"] = certificate.digest
+    stages[-1]["certificate_sha256"] = certificate.digest
     return certificate, stages, {
         "route": "L2",
-        "repair_attempted": repaired,
-        "response_source": response_source,
-        "normalization_audit": list(normalization_audit),
+        "reader_protocol": L2_READER_PROTOCOL,
+        "provider_calls": 1,
+        "strict_parse": True,
+        "response_source": "completion",
         "raw_completion_sha256": stages[-1]["raw_completion_sha256"],
-        "normalized_certificate_sha256": certificate.digest,
+        "certificate_sha256": certificate.digest,
         "packet_sha256": packet_hash,
     }
 
@@ -892,7 +867,7 @@ def _l2_text_prompt_audit(
     *,
     system_prompt: str,
     user_prompt: str,
-    repair_attempt: int,
+    call_index: int,
     model: str,
     provider_extra_body: Mapping[str, Any],
     max_output_tokens: int,
@@ -900,15 +875,10 @@ def _l2_text_prompt_audit(
     payload = json.loads(user_prompt)
     if not isinstance(payload, Mapping):
         raise ValueError("L2 prompt audit payload is not an object")
-    original = payload.get("original_request", payload)
-    if not isinstance(original, Mapping):
-        raise ValueError("L2 repair prompt has no original request")
-    sources = original.get("allowed_source_keys")
-    participants = original.get("allowed_participant_keys")
-    if not isinstance(sources, list) or not isinstance(participants, list):
-        raise ValueError("L2 prompt audit has no ordered allowlists")
-    if sources != sorted(set(sources)) or participants != sorted(set(participants)):
-        raise ValueError("L2 prompt allowlists are not canonical sorted sets")
+    if int(call_index) != 0:
+        raise ValueError("L2 Reader permits exactly one call at index 0")
+    if payload.get("protocol") != L2_READER_PROTOCOL:
+        raise ValueError("L2 prompt audit protocol mismatch")
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -921,11 +891,10 @@ def _l2_text_prompt_audit(
         json_object=True,
     )
     return {
-        "schema_version": "mr-memory.l2-prompt-audit.v1",
+        "schema_version": "mr-memory.l2-prompt-audit.v2",
         "protocol": L2_READER_PROTOCOL,
-        "repair_attempt": int(repair_attempt),
-        "ordered_source_keys": list(sources),
-        "ordered_participant_keys": list(participants),
+        "call_index": 0,
+        "execution_contract": "ONE_CALL_STRICT_PARSE_NO_REPAIR",
         "system_prompt_sha256": hashlib.sha256(
             system_prompt.encode("utf-8")
         ).hexdigest(),
@@ -947,7 +916,7 @@ def _l2_prompt_audit(
     return _l2_text_prompt_audit(
         system_prompt=prompt.system_prompt,
         user_prompt=prompt.user_prompt,
-        repair_attempt=prompt.repair_attempt,
+        call_index=0,
         model=model,
         provider_extra_body=provider_extra_body,
         max_output_tokens=max_output_tokens,
@@ -987,11 +956,10 @@ def _replay_l2_completed_stages(
     provider_extra_body: Mapping[str, Any],
     max_output_tokens: int,
 ) -> tuple[EvidenceCertificateV2, list[dict[str, Any]], dict[str, Any]]:
-    if len(stages) != 2 or [item.get("phase") for item in stages] != [
+    if len(stages) != 1 or [item.get("phase") for item in stages] != [
         "reader_initial",
-        "reader_repair",
     ]:
-        raise ValueError("L2 stage import requires initial then repair")
+        raise ValueError("L2 stage import requires exactly one Reader completion")
     request = build_l2_reader_prompt(
         query=str(case["query"]),
         evidence_packet=packet,
@@ -1000,9 +968,10 @@ def _replay_l2_completed_stages(
         allowed_participant_keys=participant_keys,
         pack_read_complete=True,
         packet_sha256=stable_sha256(packet),
+        participant_source_keys=participant_source_bindings(packet),
     )
 
-    def validate_payload(index: int, prompt: L2ReaderPrompt) -> None:
+    def validate_payload(prompt: L2ReaderPrompt) -> None:
         options_sha, payload_sha = _provider_request_hashes(
             model=model,
             messages=[
@@ -1013,139 +982,35 @@ def _replay_l2_completed_stages(
             max_output_tokens=max_output_tokens,
             json_object=True,
         )
-        attempted = ledger_rows[index * 2]
+        attempted = ledger_rows[0]
         if (
             attempted.get("options_sha256") != options_sha
             or attempted.get("payload_sha256") != payload_sha
         ):
-            raise ValueError(f"L2 stage {index} prompt/options/payload hash mismatch")
+            raise ValueError("L2 stage 0 prompt/options/payload hash mismatch")
 
-    validate_payload(0, request)
+    validate_payload(request)
     initial_content = str(stages[0]["provider_visible_completion"])
     initial_source, initial_candidate = structured_response_candidates(
         initial_content, ""
     )[0]
     if initial_source != "completion":
         raise ValueError("L2 initial replay cannot depend on hidden reasoning")
-
-    def legacy_failure(candidate: str) -> str:
-        try:
-            parse_evidence_certificate(
-                candidate,
-                expected_snapshot=request.snapshot,
-                expected_packet_sha256=request.packet_sha256,
-                allowed_source_keys=request.allowed_source_keys,
-                allowed_participant_keys=request.allowed_participant_keys,
-                pack_read_complete=request.pack_read_complete,
-                host_validated=True,
-            )
-        except ValueError as exc:
-            return str(exc)
-        raise ValueError("L2 historical repair was not justified by the frozen parser")
-
-    legacy_error = legacy_failure(initial_candidate)
-    if legacy_error != "subjects[0] resolved mode requires one participant_key":
-        raise ValueError("L2 historical repair reason differs from the frozen failure")
-    initial_audit: list[dict[str, Any]] = []
     initial_certificate = parse_l2_reader_response(
         initial_candidate,
         request,
-        normalization_audit=initial_audit,
     )
-    repair = build_single_repair_prompt(
-        request,
-        invalid_response=initial_candidate,
-        validation_error=legacy_error,
-    )
-    validate_payload(1, repair)
-    repair_content = str(stages[1]["provider_visible_completion"])
-    repair_source, repair_candidate = structured_response_candidates(
-        repair_content, ""
-    )[0]
-    if repair_source != "completion":
-        raise ValueError("L2 repair replay cannot depend on hidden reasoning")
-    if legacy_failure(repair_candidate) != legacy_error:
-        raise ValueError("L2 repair raw response has a different frozen failure")
-    if stages[0]["provider_visible_completion_sha256"] != stages[1][
-        "provider_visible_completion_sha256"
-    ]:
-        raise ValueError("L2 initial and repair raw completions differ")
-    repair_audit: list[dict[str, Any]] = []
-    repair_certificate = parse_l2_reader_response(
-        repair_candidate,
-        repair,
-        normalization_audit=repair_audit,
-    )
-    if repair_certificate.as_dict() != initial_certificate.as_dict():
-        raise ValueError("L2 initial and repair stages do not canonicalize identically")
-
-    def parsed_object(candidate: str) -> dict[str, Any]:
-        value = json.loads(candidate)
-        if not isinstance(value, dict):
-            raise ValueError("L2 replay completion is not a JSON object")
-        return value
-
-    def changed_paths(before: Any, after: Any, prefix: str = "") -> list[str]:
-        if isinstance(before, Mapping) and isinstance(after, Mapping):
-            paths: list[str] = []
-            for key in sorted(set(before) | set(after)):
-                path = f"{prefix}/{key}" if prefix else str(key)
-                if key not in before or key not in after:
-                    paths.append(path)
-                else:
-                    paths.extend(changed_paths(before[key], after[key], path))
-            return paths
-        if isinstance(before, list) and isinstance(after, list):
-            paths = []
-            for index in range(max(len(before), len(after))):
-                path = f"{prefix}/{index}" if prefix else str(index)
-                if index >= len(before) or index >= len(after):
-                    paths.append(path)
-                else:
-                    paths.extend(changed_paths(before[index], after[index], path))
-            return paths
-        return [] if before == after else [prefix]
-
-    initial_raw = parsed_object(initial_candidate)
-    initial_normalized, independently_computed_audit = normalize_l2_reader_response(
-        initial_raw
-    )
-    exact_changed_paths = changed_paths(initial_raw, initial_normalized)
-    expected_changed_paths = [
-        "status",
-        "stop_reason",
-        "subjects/0/candidate_participant_keys",
-        "subjects/1/candidate_participant_keys",
-    ]
-    if sorted(exact_changed_paths) != sorted(expected_changed_paths):
-        raise ValueError("L2 normalization changed fields outside the four-field whitelist")
-    if independently_computed_audit != initial_audit:
-        raise ValueError("L2 normalization audit is not reproducible")
-    actions = [item.get("action") for item in initial_audit]
-    if actions != [
-        "canonicalize_redundant_singleton",
-        "canonicalize_redundant_singleton",
-        "downgrade_identity_ambiguity",
-    ]:
-        raise ValueError("L2 normalization did not follow the approved two-step audit")
     return initial_certificate, stages, {
         "route": "L2",
-        "repair_attempted": True,
+        "reader_protocol": L2_READER_PROTOCOL,
+        "provider_calls": 1,
+        "strict_parse": True,
         "selected_stage": "reader_initial",
         "response_source": "provider_stage_import_completion",
-        "normalization_audit": initial_audit,
-        "normalization_raw_sha256": stable_sha256(initial_raw),
-        "normalization_result_sha256": stable_sha256(initial_normalized),
-        "normalization_changed_paths": exact_changed_paths,
-        "unused_repair": {
-            "preserved": True,
-            "reason": "same canonical certificate as reader_initial",
-            "raw_completion_sha256": stages[1][
-                "provider_visible_completion_sha256"
-            ],
-            "certificate_sha256": repair_certificate.digest,
-            "normalization_audit": repair_audit,
-        },
+        "raw_completion_sha256": stages[0][
+            "provider_visible_completion_sha256"
+        ],
+        "certificate_sha256": initial_certificate.digest,
         "packet_sha256": stable_sha256(packet),
     }
 
@@ -1292,7 +1157,7 @@ async def _prepare_provider_stage_import(
         for line in ledger_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    expected_calls = 3 if route == "l3" else 2
+    expected_calls = 3 if route == "l3" else 1
     if all_rows != ledger_rows or len(ledger_rows) != expected_calls * 2:
         raise ValueError(
             f"provider-stage source ledger must contain exactly {expected_calls} calls"
@@ -2216,7 +2081,7 @@ async def _generate(args: argparse.Namespace) -> dict[str, Any]:
     if route not in {"l2", "l3"}:
         raise ValueError("route must be l2 or l3")
     provider_calls_upper_bound = (
-        int(args.l3_max_model_calls) + 1 if route == "l3" else 3
+        int(args.l3_max_model_calls) + 1 if route == "l3" else 2
     )
     if int(args.max_provider_calls) < provider_calls_upper_bound:
         raise ValueError(
@@ -2277,6 +2142,7 @@ async def _generate(args: argparse.Namespace) -> dict[str, Any]:
             allowed_participant_keys=participant_keys,
             pack_read_complete=True,
             packet_sha256=stable_sha256(packet),
+            participant_source_keys=participant_source_bindings(packet),
         )
         l2_initial_prompt_audit = _l2_prompt_audit(
             prompt=l2_initial_request,
@@ -2522,13 +2388,14 @@ async def _generate(args: argparse.Namespace) -> dict[str, Any]:
         ) -> Any:
             prompt_audit = None
             if route == "l2":
-                expected_phase = "reader_initial" if call_index == 0 else "reader_repair"
-                if phase != expected_phase or call_index not in {0, 1}:
-                    raise ValueError("L2 prompt phase/call index is not canonical")
+                if phase != "reader_initial" or call_index != 0:
+                    raise ValueError(
+                        "L2 Reader permits one reader_initial call at index 0"
+                    )
                 prompt_audit = _l2_text_prompt_audit(
                     system_prompt=system_prompt,
                     user_prompt=prompt,
-                    repair_attempt=call_index,
+                    call_index=call_index,
                     model=memory_model,
                     provider_extra_body=memory_extra,
                     max_output_tokens=int(args.max_output_tokens),

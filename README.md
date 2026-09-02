@@ -3,11 +3,13 @@
 面向 AstrBot 群聊的证据可追溯记忆插件原型。目标是逐步替代
 AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提供原始消息
 真值层、后台 LLM 图构建、本地 embedding 候选初始化、来源审计和离线回放能力。
-回答时每次请求先固定 `RequestSnapshot`，只在本群 SQLite 中完成稳定账号解析、本地检索、
-有界图/原始消息展开和来源校验，再把候选证据交给 AstrBot 主模型。普通聊天最多
-3000 字符；显式历史回忆最多 12000 字符，以保留跨事件证据而不把不同历史片段压成一段。
-回答关键路径没有第二个记忆模型、修复调用或自动深挖；主模型在一次正常生成中同时完成
-证据相关性判断、综合和最终回答。局部梗义、反话和委婉语可以保留多条竞争路径，并显式
+回答时每次请求先固定 `RequestSnapshot`，只在本群 SQLite 中并行检索别名观察、FTS5、
+本地 embedding、情节和可塑图，再编译为全局来源有界、原文不重复的 EvidenceAtomPack。
+插件配置的 resident Reader 进行一次人物指代与记忆语义的联合推理，宿主严格校验后才把
+最多 12000 字符的语义简报交给 AstrBot 主模型。人物、作品、实体和主题保留独立指称，
+说话者与陈述对象分别记录；原始摘录、来源键与内部审计证书不进入主模型提示。
+在线没有修复调用、provider 切换或
+自动深挖；局部梗义、反话和委婉语可以保留多条竞争路径，并显式
 标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED` 或 `CONFIRMED`。embedding 只排序候选，
 稳定账号、作用域、cutoff 和来源仍由宿主约束。
 
@@ -24,18 +26,26 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 - `capture_enabled=false`：不采集任何线上消息。
 - `feedback_learning_enabled=false`：反馈闭环默认关闭；开启时仍受群/发送者/时间和证据
   分数的宿主门禁约束，默认提交阈值为 `0.65`；反馈未先被宿主提交时不能修改可塑图。
-- `local_serving_enabled=true`：回答前只读取本地证据，不调用插件专属远程模型。
+- `local_serving_enabled=true`：回答前本地检索后调用一次插件 resident Reader；失败时不注入。
 - `local_serving_timeout_seconds=180` 只用于异常卡死保护（可设 1-600 秒），不再把
   正常慢检索当成缺失记忆；运行账本分别记录 runtime/service readiness、interaction trace、
-  snapshot、direct/full retrieval、materialize、compile、audit 和本地账本写入的实际耗时。
-  `local_serving_max_chars=12000`：普通聊天仍限制为
-  3000 字符，显式历史回忆才可使用更大证据预算；本地读取超时会明确记为错误且不注入。
+  snapshot、混合词法召回、其余 retrieval、Reader TTFB/总时长、双重 source audit、compile
+  和账本写入的实际耗时。
+  `local_serving_max_chars=12000` 只限制最终注入主模型的语义简报；Reader 输入由
+  `local_serving_max_items=12` 的全局来源上限、来源去重和分层边际选择控制，不设置会把正常
+  证据直接砍掉的 12k prompt 硬门槛。来源上限不等于字符上限，长消息及 compaction 之前的
+  向量、episode 与人物扩展成本会分别记账。本地读取超时会明确记为错误且不注入。
 - 在线检索不再用插件级全局锁串行所有请求；本地 embedding 按公平队列执行，后台文档
   索引会在批次间释放推理槽。普通聊天跳过仅供明确人物枚举使用的语义身份全表扫描，
   引用来源使用一次批量 fail-closed 审计。
-- `subconscious_provider_id=deepseek/deepseek-v4-flash`：只供后台消息整理和反馈维护使用。
+- `subconscious_provider_id=deepseek/deepseek-v4-flash`：默认供一次在线 resident Reader 以及
+  后台消息整理、反馈维护使用；不继承或替换 AstrBot 当前会话的主模型。
 - `distillation_thinking_mode=enabled`：图构建保留模型完整思考能力；长调用采用流式接收，
-  关闭思考只作为显式诊断选项，不作为省时默认值。
+  该设置只作用于后台消息整理。
+- `feedback_thinking_mode=enabled`：反馈判读独立配置思考模式；切换模式后仍需通过原有
+  归因、来源和提交阈值校验。有正文或合法 JSON 不等于正确学习了反馈。
+- `local_serving_reader_thinking_mode=disabled`：在线 Reader 默认直接生成严格 JSON，避免
+  隐藏推理耗尽输出预算。它仍是同一 provider 的一次调用；没有 repair、retry 或模型切换。
 - `embedding_model_name=BAAI/bge-small-zh-v1.5`：插件本地运行的中文 ONNX
   embedding 模型，不经过 AstrBot Embedding Provider 或远程推理 API。
 - 主 LLM 始终看不到 MR Memory 的遍历、反馈或咨询工具；旧配置也不能重新开启。
@@ -43,7 +53,8 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 - 新消息达到 `auto_distillation_min_pending=150` 时立即整理；不足 150 条时，最迟由
   `maintenance_interval_minutes=1440`（一天）的后台轮询触发。
 - 后台新消息整理使用 `private_daily_token_budget`，反馈学习使用独立的
-  `feedback_daily_token_budget`；回答前本地检索的插件 Provider 调用与 Token 均为 0。
+  `feedback_daily_token_budget`；回答前 resident Reader 的一次调用单独记录 usage，
+  没有账单证据时 cost 明确为 `UNKNOWN_NO_BILLING_EVIDENCE`。
   外部运维工具一次性写入的旧历史只保留独立审计账本，
   不设伪装成日常策略的每日额度，也不会挤占这两类在线预算。
 - 数据库固定写入本插件的 `plugin_data` 目录。
@@ -79,21 +90,21 @@ SQLite truth store + FTS5 + layered memory graph
 L0 RequestSnapshot (scope / cutoff / row bound / revision vectors)
         |
         v
-local identity / reply / activity fast path
+host-bound identity/reply anchors + query-aware activity retrieval
         |
         v
-local cue + embedding candidate retrieval
+snapshot-bounded alias + trigram FTS + embedding candidate retrieval
         |
 bounded episode / semantic / graph expansion
         |
         v
-source audit + local-evidence.v1 envelope
+deduplicated EvidenceAtomPack + source fingerprint audit
         |
         v
-stable identity + raw excerpts + qualified derived candidates
+one strict evidence-reader.compact-host-speaker semantic pass
         |
         v
-bounded memory context for the main AstrBot LLM
+source re-audit + bounded memory surface for the main AstrBot LLM
         |
         +-- bounded background distillation and feedback maintenance
         +-- persistent bounded operational state and resumable maintenance jobs
@@ -107,15 +118,17 @@ bounded memory context for the main AstrBot LLM
 插件调用自己配置的 provider，不继承当前会话主 LLM。后台增量整理与反馈学习由该独立模型
 维护情节、人物事实、竞争释义和行为通路；普通回答在不可变 `RequestSnapshot` 下由本群
 SQLite 与本地 embedding 生成候选包。查询人物时以 `platform_id + account_id` 为身份真值，
-同名保持歧义；时间分析只使用 envelope 中可审计的 Asia/Shanghai 样本。相似查询不会复用
+文本称呼在 Reader 内和其他证据一起推理、同名保持歧义；时间分析只使用 surface 中可审计的
+Asia/Shanghai 样本。相似查询不会复用
 旧答案，同一个 AstrBot event 的重复 hook 只复用一次本地读取结果。
 
 embedding 只提供候选先验，不用相似度裁决语义。派生记忆、episode 摘要和图连接必须带原始
-来源，主模型看到相应说话人、时间和短文本后再决定是否采用。`NO_LOCAL_EVIDENCE`、
+来源，Reader 先产出严格 source-backed 证书，主模型再决定如何回答。`NO_LOCAL_EVIDENCE`、
 `IDENTITY_AMBIGUOUS` 与运行错误分别记录；本地读取错误不会被写成“没有记忆”。每次调用记录
-本地耗时、包长度、来源、图连接，并明确记录 query-time Provider calls/Token/cost 为 0。
+本地阶段耗时、Reader prompt 长度、来源、截断和 provider usage；没有账单证据不估算 cost。
 
-schema 16 新增请求快照、证据包缓存、语义证书、证书依赖和重建任务的持久化生命周期；
+schema 17 新增 snapshot-indexed alias observations 与关键复合索引，并保留请求快照、
+证据包缓存、语义证书、证书依赖和重建任务的持久化生命周期；
 升级只迁移插件自己的按群 SQLite。`requirements.txt` 直接声明 NumPy，用于对 SQLite 中
 完整候选向量做精确本地评分；Harrier 部署再额外使用 `requirements-harrier.txt`。可部署文件边界见
 [运行时文件清单](docs/RUNTIME_FILES.md)。

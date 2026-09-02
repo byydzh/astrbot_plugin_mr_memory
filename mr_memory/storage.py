@@ -52,7 +52,7 @@ from .snapshot import (
     stable_sha256,
 )
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 TRUTH_V2_BACKFILL_VERSION = 8
 MEDIA_HEAVY_HITTER_LIMIT = 512
 MEDIA_SAMPLE_SOURCE_LIMIT = 8
@@ -559,6 +559,32 @@ class MemoryStorage:
                     evidence TEXT NOT NULL DEFAULT 'host',
                     PRIMARY KEY (message_id, participant_id, relation, position)
                 );
+                CREATE INDEX IF NOT EXISTS idx_message_participants_participant
+                    ON message_participants (
+                        participant_id, relation, message_id, position
+                    );
+
+                CREATE TABLE IF NOT EXISTS participant_alias_observations (
+                    message_id INTEGER NOT NULL REFERENCES messages(id)
+                        ON DELETE CASCADE,
+                    participant_id INTEGER NOT NULL REFERENCES participants(id)
+                        ON DELETE CASCADE,
+                    umo TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    sent_at INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        message_id, participant_id, normalized_alias,
+                        relation
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_alias_observations_snapshot
+                    ON participant_alias_observations (
+                        umo, participant_id, normalized_alias,
+                        sent_at DESC, message_id DESC, position
+                    );
 
                 CREATE TABLE IF NOT EXISTS message_relations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1469,6 +1495,10 @@ class MemoryStorage:
                 "sender_participant_id",
                 "INTEGER REFERENCES participants(id)",
             )
+            self._connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_umo_participant_time
+                ON messages (umo, sender_participant_id, sent_at, id)
+                """)
             ensure_column("messages", "content_sha256", "TEXT NOT NULL DEFAULT ''")
             ensure_column("messages", "revision_no", "INTEGER NOT NULL DEFAULT 1")
             ensure_column("messages", "deleted_at", "INTEGER")
@@ -1634,6 +1664,38 @@ class MemoryStorage:
                 self._connection.execute("""
                     INSERT INTO schema_meta(key, value)
                     VALUES ('maintenance_terminal_v15', 'completed')
+                    """)
+            alias_observation_migration = self._connection.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key='alias_observations_v17'"
+            ).fetchone()
+            if alias_observation_migration is None:
+                last_message_id = 0
+                while True:
+                    rows = self._connection.execute(
+                        """
+                        SELECT id, umo, sender_name, sent_at, content_json
+                        FROM messages
+                        WHERE id>? AND is_deleted=0
+                        ORDER BY id
+                        LIMIT 500
+                        """,
+                        (last_message_id,),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row in rows:
+                        self._refresh_alias_observations_locked(
+                            message_id=int(row["id"]),
+                            umo=str(row["umo"]),
+                            sender_name=str(row["sender_name"] or ""),
+                            sent_at=int(row["sent_at"]),
+                            content=self._parse_content_json(row["content_json"]),
+                        )
+                    last_message_id = int(rows[-1]["id"])
+                self._connection.execute("""
+                    INSERT INTO schema_meta(key, value)
+                    VALUES ('alias_observations_v17', 'completed')
                     """)
             self._connection.execute(
                 """
@@ -2003,6 +2065,76 @@ class MemoryStorage:
             ),
         )
 
+    def _refresh_alias_observations_locked(
+        self,
+        *,
+        message_id: int,
+        umo: str,
+        sender_name: str,
+        sent_at: int,
+        content: list[dict[str, object]],
+    ) -> None:
+        """Materialize exact alias sightings without making identity decisions."""
+
+        self._connection.execute(
+            "DELETE FROM participant_alias_observations WHERE message_id=?",
+            (int(message_id),),
+        )
+        links = self._connection.execute(
+            """
+            SELECT participant_id, relation, position
+            FROM message_participants
+            WHERE message_id=?
+              AND relation IN ('SPEAKER', 'MENTIONED', 'REPLY_TARGET')
+            ORDER BY CASE relation
+                         WHEN 'SPEAKER' THEN 0
+                         WHEN 'MENTIONED' THEN 1
+                         ELSE 2
+                     END,
+                     position, participant_id
+            """,
+            (int(message_id),),
+        ).fetchall()
+        mentions = {
+            position: mention
+            for position, mention in enumerate(extract_mentions(content), start=1)
+        }
+        reply = extract_reply(content)
+        for link in links:
+            relation = str(link["relation"])
+            position = int(link["position"])
+            alias = ""
+            if relation == "SPEAKER":
+                alias = str(sender_name or "")
+            elif relation == "MENTIONED":
+                mention = mentions.get(position)
+                if mention is not None:
+                    alias = str(mention.display_name or "")
+            elif relation == "REPLY_TARGET" and reply is not None:
+                alias = str(reply.sender_name or "")
+            display = alias.strip()[:300]
+            normalized = normalize_alias(display)
+            if not normalized:
+                continue
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO participant_alias_observations(
+                    message_id, participant_id, umo, alias,
+                    normalized_alias, relation, position, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(message_id),
+                    int(link["participant_id"]),
+                    umo,
+                    display,
+                    normalized,
+                    relation,
+                    position,
+                    int(sent_at),
+                ),
+            )
+
     def _refresh_message_links_locked(
         self,
         *,
@@ -2012,9 +2144,11 @@ class MemoryStorage:
         source_key: str,
         platform_message_id: str,
         sender_participant_id: int | None,
+        sender_name: str,
         sent_at: int,
         content: list[dict[str, object]],
         refresh_media_fingerprints: bool = True,
+        is_deleted: bool = False,
     ) -> None:
         previous_media = {
             (str(row["attachment_type"]), str(row["reference_sha256"]))
@@ -2156,6 +2290,20 @@ class MemoryStorage:
                     (int(message_id), int(target_participant_id)),
                 )
 
+        if is_deleted:
+            self._connection.execute(
+                "DELETE FROM participant_alias_observations WHERE message_id=?",
+                (int(message_id),),
+            )
+        else:
+            self._refresh_alias_observations_locked(
+                message_id=message_id,
+                umo=umo,
+                sender_name=sender_name,
+                sent_at=sent_at,
+                content=content,
+            )
+
         attachments = attachment_metadata(content)
         for attachment in attachments:
             self._connection.execute(
@@ -2261,8 +2409,10 @@ class MemoryStorage:
                 sender_participant_id=(
                     int(participant_id) if participant_id is not None else None
                 ),
+                sender_name=str(row["sender_name"] or ""),
                 sent_at=int(row["sent_at"]),
                 content=content,
+                is_deleted=bool(row["is_deleted"]),
             )
 
         self._connection.execute("""
@@ -2684,6 +2834,7 @@ class MemoryStorage:
                 source_key=source_key,
                 platform_message_id=message.message_id,
                 sender_participant_id=participant_id,
+                sender_name=message.sender_name,
                 sent_at=message.sent_at,
                 content=content,
                 refresh_media_fingerprints=refresh_media_fingerprints,
@@ -2794,6 +2945,10 @@ class MemoryStorage:
                 WHERE id = ?
                 """,
                 (when, revision_no + 1, message_id),
+            )
+            self._connection.execute(
+                "DELETE FROM participant_alias_observations WHERE message_id=?",
+                (message_id,),
             )
             self._connection.execute(
                 """
@@ -3044,7 +3199,7 @@ class MemoryStorage:
             reference_rows = self._connection.execute(
                 f"""
                 SELECT DISTINCT m.id, m.source_key, m.platform_id, m.message_id,
-                       m.sender_id, m.sender_participant_id, m.sent_at,
+                       m.sender_id, m.sender_name, m.sender_participant_id, m.sent_at,
                        m.plain_text, m.content_json, m.role
                 FROM messages AS m
                 LEFT JOIN message_participants AS mp ON mp.message_id = m.id
@@ -3408,6 +3563,7 @@ class MemoryStorage:
                         if row["sender_participant_id"] is not None
                         else None
                     ),
+                    sender_name=str(row["sender_name"] or ""),
                     sent_at=int(row["sent_at"]),
                     content=content,
                 )
@@ -4587,149 +4743,114 @@ class MemoryStorage:
                 "coverage": empty_coverage,
             }
 
-        with self._lock:
-            alias_rows = self._connection.execute(
-                """
-                SELECT pa.normalized_alias, p.id AS participant_id,
-                       p.canonical_key, p.platform_id, p.account_id,
-                       p.account_type
-                FROM participant_aliases AS pa
-                JOIN participants AS p ON p.id=pa.participant_id
-                WHERE p.umo=? AND pa.is_active=1
-                  AND pa.normalized_alias<>''
-                  AND instr(?, pa.normalized_alias)>0
-                ORDER BY instr(?, pa.normalized_alias),
-                         length(pa.normalized_alias) DESC,
-                         pa.normalized_alias, p.canonical_key
-                """,
-                (umo, normalized_text, normalized_text),
-            ).fetchall()
-            matched_references = tuple(
-                dict.fromkeys(str(row["normalized_alias"]) for row in alias_rows)
-            )
-            if not matched_references:
-                return {
-                    "host_decision": "NONE",
-                    "references": [],
-                    "coverage": empty_coverage,
-                }
-
-            candidates_by_reference: dict[
-                str, dict[int, dict[str, object]]
-            ] = {reference: {} for reference in matched_references}
-            account_id_by_participant: dict[int, str] = {}
-            for row in alias_rows:
-                reference = str(row["normalized_alias"])
-                participant_id = int(row["participant_id"])
-                account_id_by_participant[participant_id] = str(row["account_id"])
-                candidates_by_reference[reference][participant_id] = {
-                    "participant_key": str(row["canonical_key"]),
-                    "platform_id": str(row["platform_id"]),
-                    "account_id": str(row["account_id"]),
-                    "account_type": str(row["account_type"]),
-                    "display_name": "",
-                    "alias_observations": [],
-                    "source_count_total": 0,
-                    "observations_truncated": False,
-                }
-
-            observation_rows = self._connection.execute(
-                """
-                SELECT mp.participant_id, mp.relation, m.source_key, m.sent_at,
-                       m.sender_name, m.content_json
-                FROM message_participants AS mp
-                JOIN messages AS m ON m.id=mp.message_id
-                WHERE m.umo=? AND m.is_deleted=0
-                  AND m.sent_at<? AND m.id<=?
-                  AND mp.relation IN ('SPEAKER', 'MENTIONED', 'REPLY_TARGET')
-                  AND EXISTS (
-                      SELECT 1
-                      FROM participant_aliases AS matched_alias
-                      WHERE matched_alias.participant_id=mp.participant_id
-                        AND matched_alias.is_active=1
-                        AND matched_alias.normalized_alias<>''
-                        AND instr(?, matched_alias.normalized_alias)>0
-                  )
-                ORDER BY m.sent_at DESC, m.id DESC, mp.position
-                """,
-                (
-                    umo,
-                    cutoff,
-                    upper_bound,
-                    normalized_text,
-                ),
-            ).fetchall()
-
         observation_cap = 8
-        seen_observations: set[tuple[int, str, str, str]] = set()
-        for row in observation_rows:
-            participant_id = int(row["participant_id"])
-            relation = str(row["relation"])
-            content = self._parse_content_json(row["content_json"])
-            observed_aliases: list[str] = []
-            if relation == "SPEAKER":
-                observed_aliases.append(str(row["sender_name"] or ""))
-            elif relation == "MENTIONED":
-                account_id = account_id_by_participant.get(participant_id, "")
-                observed_aliases.extend(
-                    mention.display_name
-                    for mention in extract_mentions(content)
-                    if mention.account_id == account_id
+        with self._lock:
+            candidate_rows = self._connection.execute(
+                """
+                WITH matched AS (
+                    SELECT pa.normalized_alias, p.id AS participant_id,
+                           p.canonical_key, p.platform_id, p.account_id,
+                           p.account_type
+                    FROM participant_aliases AS pa
+                    JOIN participants AS p ON p.id=pa.participant_id
+                    WHERE p.umo=:umo AND pa.is_active=1
+                      AND pa.normalized_alias<>''
+                      AND instr(:text, pa.normalized_alias)>0
                 )
-            elif relation == "REPLY_TARGET":
-                reply = extract_reply(content)
-                if reply is not None:
-                    if reply.sender_id == account_id_by_participant.get(
-                        participant_id, ""
-                    ):
-                        observed_aliases.append(reply.sender_name)
+                SELECT matched.*,
+                       COALESCE((
+                           SELECT json_group_array(json_object(
+                               'alias', bounded.alias,
+                               'normalized_alias', bounded.normalized_alias,
+                               'source_key', bounded.source_key,
+                               'sent_at', bounded.sent_at,
+                               'relation', bounded.relation,
+                               'source_count_total', bounded.source_count_total
+                           ))
+                           FROM (
+                               SELECT observation.alias,
+                                      observation.normalized_alias,
+                                      message.source_key,
+                                      observation.sent_at,
+                                      observation.relation,
+                                      COUNT(*) OVER () AS source_count_total
+                               FROM participant_alias_observations AS observation
+                                    INDEXED BY idx_alias_observations_snapshot
+                               JOIN messages AS message
+                                 ON message.id=observation.message_id
+                               WHERE observation.umo=:umo
+                                 AND observation.participant_id=
+                                     matched.participant_id
+                                 AND observation.normalized_alias=
+                                     matched.normalized_alias
+                                 AND observation.sent_at<:cutoff
+                                 AND observation.message_id<=:upper_bound
+                                 AND message.umo=:umo
+                                 AND message.is_deleted=0
+                               ORDER BY observation.sent_at DESC,
+                                        observation.message_id DESC,
+                                        observation.position
+                               LIMIT :observation_cap
+                           ) AS bounded
+                       ), '[]') AS observations_json
+                FROM matched
+                ORDER BY instr(:text, matched.normalized_alias),
+                         length(matched.normalized_alias) DESC,
+                         matched.normalized_alias, matched.canonical_key
+                """,
+                {
+                    "umo": umo,
+                    "text": normalized_text,
+                    "cutoff": cutoff,
+                    "upper_bound": upper_bound,
+                    "observation_cap": observation_cap,
+                },
+            ).fetchall()
 
-            for alias in observed_aliases:
-                normalized_alias = normalize_alias(alias)
-                candidates = candidates_by_reference.get(normalized_alias)
-                if not normalized_alias or candidates is None:
-                    continue
-                candidate = candidates.get(participant_id)
-                if candidate is None:
-                    continue
-                observation_key = (
-                    participant_id,
-                    normalized_alias,
-                    str(row["source_key"]),
-                    relation,
-                )
-                if observation_key in seen_observations:
-                    continue
-                seen_observations.add(observation_key)
-                candidate["source_count_total"] = (
-                    int(candidate["source_count_total"]) + 1
-                )
-                observations = candidate["alias_observations"]
-                assert isinstance(observations, list)
-                if not candidate["display_name"]:
-                    candidate["display_name"] = str(alias or "")
-                if len(observations) < observation_cap:
-                    observations.append(
-                        {
-                            "alias": str(alias or ""),
-                            "normalized_alias": normalized_alias,
-                            "source_key": str(row["source_key"]),
-                            "sent_at": int(row["sent_at"] or 0),
-                            "relation": relation,
-                        }
-                    )
+        matched_references: list[str] = []
+        candidates_by_reference: dict[str, dict[int, dict[str, object]]] = {}
+        for row in candidate_rows:
+            try:
+                raw_observations = json.loads(str(row["observations_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                raw_observations = []
+            observations = [
+                dict(item) for item in raw_observations if isinstance(item, dict)
+            ]
+            if not observations:
+                continue
+            reference = str(row["normalized_alias"])
+            participant_id = int(row["participant_id"])
+            if reference not in candidates_by_reference:
+                matched_references.append(reference)
+                candidates_by_reference[reference] = {}
+            source_count_total = int(
+                observations[0].pop("source_count_total", 0) or 0
+            )
+            for observation in observations[1:]:
+                observation.pop("source_count_total", None)
+            candidates_by_reference[reference][participant_id] = {
+                "participant_key": str(row["canonical_key"]),
+                "platform_id": str(row["platform_id"]),
+                "account_id": str(row["account_id"]),
+                "account_type": str(row["account_type"]),
+                "display_name": str(observations[0].get("alias") or ""),
+                "alias_observations": observations,
+                "source_count_total": source_count_total,
+                "observations_truncated": source_count_total > len(observations),
+            }
+
+        if not matched_references:
+            return {
+                "host_decision": "NONE",
+                "references": [],
+                "coverage": empty_coverage,
+            }
 
         all_references: list[dict[str, object]] = []
         for reference in matched_references:
             candidates = []
             for candidate in candidates_by_reference[reference].values():
-                observations = candidate["alias_observations"]
-                assert isinstance(observations, list)
-                if not observations:
-                    continue
-                candidate["observations_truncated"] = (
-                    int(candidate["source_count_total"]) > len(observations)
-                )
                 candidates.append(candidate)
             if candidates:
                 all_references.append(
@@ -4935,7 +5056,7 @@ class MemoryStorage:
                 """,
                 parameters,
             ).fetchall()
-            messages = [self._stored_message_from_row(row) for row in reversed(rows)]
+            messages = self._stored_messages_from_rows(reversed(rows))
         return [
             {
                 "source_key": message.source_key,
@@ -6240,7 +6361,8 @@ class MemoryStorage:
                 placeholders = ",".join("?" for _ in requested)
                 rows = self._connection.execute(
                     f"""
-                    SELECT id, umo, sent_at, source_key, is_deleted
+                    SELECT id, umo, sent_at, source_key, is_deleted,
+                           revision_no, content_sha256
                     FROM messages WHERE source_key IN ({placeholders})
                     """,
                     requested,
@@ -6294,6 +6416,19 @@ class MemoryStorage:
             "umo": umo,
             "valid": not violations,
             "accepted_source_keys": accepted,
+            "source_fingerprints": {
+                source_key: {
+                    "message_id": int(rows_by_source[source_key]["id"]),
+                    "sent_at": int(rows_by_source[source_key]["sent_at"]),
+                    "revision_no": int(
+                        rows_by_source[source_key]["revision_no"] or 0
+                    ),
+                    "content_sha256": str(
+                        rows_by_source[source_key]["content_sha256"] or ""
+                    ),
+                }
+                for source_key in accepted
+            },
             "violations": violations,
         }
         if violations and fail_closed:
@@ -10807,6 +10942,7 @@ class MemoryStorage:
             "semantic_memories": [],
             "associations": [],
         }
+        plastic_seeds: list[tuple[int, float]] = []
         with self._lock:
             for match in matches:
                 owner_type = str(match["owner_type"])
@@ -11103,22 +11239,24 @@ class MemoryStorage:
                             semantic.pop("subject_participant_key", None)
                         result["semantic_memories"].append(semantic)
                 elif owner_type == "plastic_edge" and owner_key.isdigit():
-                    associations = self.query_plastic_associations(
-                        umo=umo,
-                        limit=100,
-                        before_sent_at=before_sent_at,
-                        message_upper_bound=message_upper_bound,
-                    )
-                    selected = next(
-                        (
-                            item
-                            for item in associations
-                            if int(item["id"]) == int(owner_key)
-                        ),
-                        None,
-                    )
-                    if selected is not None:
-                        result["associations"].append({**selected, "score": score})
+                    plastic_seeds.append((int(owner_key), score))
+        if plastic_seeds:
+            edge_ids = tuple(dict.fromkeys(edge_id for edge_id, _ in plastic_seeds))
+            associations = self.query_plastic_associations(
+                umo=umo,
+                edge_ids=edge_ids,
+                limit=min(100, len(edge_ids)),
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
+            association_by_id = {
+                int(association["id"]): association
+                for association in associations
+            }
+            for edge_id, score in plastic_seeds:
+                selected = association_by_id.get(edge_id)
+                if selected is not None:
+                    result["associations"].append({**selected, "score": score})
         return result
 
     def reconstruction_evidence_packet(
@@ -12037,6 +12175,9 @@ class MemoryStorage:
         sender: str = "",
         limit: int = 20,
         before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+        match_mode: str = "exact",
+        exclude_source_key: str = "",
     ) -> list[StoredMessage]:
         safe_limit = max(1, min(500, int(limit)))
         sender_filter = sender.strip().casefold()
@@ -12044,8 +12185,15 @@ class MemoryStorage:
         parameters: list[object] = [umo]
         cutoff_sql = ""
         if before_sent_at is not None:
-            cutoff_sql = " AND m.sent_at < ?"
+            cutoff_sql += " AND m.sent_at < ?"
             parameters.append(int(before_sent_at))
+        if message_upper_bound is not None:
+            cutoff_sql += " AND m.id <= ?"
+            parameters.append(max(0, int(message_upper_bound)))
+        excluded_source = str(exclude_source_key or "").strip()
+        if excluded_source:
+            cutoff_sql += " AND m.source_key <> ?"
+            parameters.append(excluded_source)
         sender_sql = ""
         if sender_filter:
             sender_sql = (
@@ -12054,8 +12202,229 @@ class MemoryStorage:
             )
             parameters.extend((sender_filter, sender_filter))
 
+        normalized_match_mode = str(match_mode or "exact").strip().casefold()
+        if normalized_match_mode not in {"exact", "recall"}:
+            raise ValueError("match_mode must be exact or recall")
+        if query and normalized_match_mode == "recall":
+            fts_query = self._make_fts_recall_query(query)
+            short_terms = self._make_short_recall_terms(query)
+            if fts_query or short_terms:
+                with self._lock:
+                    fts_rows: list[sqlite3.Row] = []
+                    if fts_query:
+                        fts_rows = self._connection.execute(
+                            f"""
+                            SELECT m.*
+                            FROM messages_fts
+                            JOIN messages AS m ON m.id = messages_fts.rowid
+                            WHERE messages_fts MATCH ?
+                              AND m.umo = ?
+                              AND m.is_deleted = 0
+                              {cutoff_sql}
+                              {sender_sql}
+                            ORDER BY rank, m.sent_at DESC, m.id DESC
+                            LIMIT ?
+                            """,
+                            [fts_query, *parameters, safe_limit],
+                        ).fetchall()
+                    short_rows: list[sqlite3.Row] = []
+                    if short_terms:
+                        term_values_sql = ", ".join("(?, ?)" for _term in short_terms)
+                        short_candidates = self._connection.execute(
+                            f"""
+                            WITH recall_terms(term, term_index) AS (
+                                VALUES {term_values_sql}
+                            ),
+                            visible_matches AS (
+                                SELECT m.id AS message_id,
+                                       recall_terms.term AS term,
+                                       recall_terms.term_index AS term_index
+                                FROM messages AS m
+                                JOIN recall_terms
+                                  ON instr(m.plain_text, recall_terms.term) > 0
+                                WHERE m.umo = ?
+                                  AND m.is_deleted = 0
+                                  {cutoff_sql}
+                                  {sender_sql}
+                            ),
+                            term_statistics AS (
+                                SELECT term,
+                                       COUNT(DISTINCT message_id) AS document_frequency
+                                FROM visible_matches
+                                GROUP BY term
+                            ),
+                            ranked_matches AS (
+                                SELECT visible_matches.message_id AS message_id,
+                                       MAX(
+                                           1.0 / term_statistics.document_frequency
+                                       ) AS rarest_term_score,
+                                       SUM(
+                                           1.0 / term_statistics.document_frequency
+                                       ) AS rarity_score,
+                                       COUNT(*) AS recall_overlap,
+                                       MIN(visible_matches.term_index) AS first_term_index
+                                FROM visible_matches
+                                JOIN term_statistics
+                                  ON term_statistics.term = visible_matches.term
+                                GROUP BY visible_matches.message_id
+                            ),
+                            term_representatives AS (
+                                SELECT visible_matches.message_id AS message_id,
+                                       visible_matches.term_index AS term_index,
+                                       term_statistics.document_frequency
+                                           AS document_frequency,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY visible_matches.term
+                                           ORDER BY
+                                               ranked_matches.rarest_term_score DESC,
+                                               ranked_matches.rarity_score DESC,
+                                               ranked_matches.recall_overlap DESC,
+                                               m.sent_at DESC,
+                                               m.id DESC
+                                       ) AS representative_rank
+                                FROM visible_matches
+                                JOIN term_statistics
+                                  ON term_statistics.term = visible_matches.term
+                                JOIN ranked_matches
+                                  ON ranked_matches.message_id = visible_matches.message_id
+                                JOIN messages AS m
+                                  ON m.id = visible_matches.message_id
+                            ),
+                            globally_ranked AS (
+                                SELECT ranked_matches.message_id AS message_id,
+                                       ranked_matches.rarest_term_score
+                                           AS rarest_term_score,
+                                       ranked_matches.rarity_score AS rarity_score,
+                                       ranked_matches.recall_overlap AS recall_overlap,
+                                       ranked_matches.first_term_index AS first_term_index
+                                FROM ranked_matches
+                                JOIN messages AS m
+                                  ON m.id = ranked_matches.message_id
+                                ORDER BY
+                                    ranked_matches.rarest_term_score DESC,
+                                    ranked_matches.rarity_score DESC,
+                                    ranked_matches.recall_overlap DESC,
+                                    ranked_matches.first_term_index ASC,
+                                    m.sent_at DESC,
+                                    m.id DESC
+                                LIMIT ?
+                            ),
+                            candidate_rows AS (
+                                SELECT term_representatives.message_id AS message_id,
+                                       0 AS selection_class,
+                                       term_representatives.document_frequency
+                                           AS coverage_frequency,
+                                       term_representatives.term_index
+                                           AS coverage_term_index,
+                                       ranked_matches.rarest_term_score
+                                           AS rarest_term_score,
+                                       ranked_matches.rarity_score AS rarity_score,
+                                       ranked_matches.recall_overlap AS recall_overlap
+                                FROM term_representatives
+                                JOIN ranked_matches
+                                  ON ranked_matches.message_id =
+                                     term_representatives.message_id
+                                WHERE term_representatives.representative_rank = 1
+                                UNION ALL
+                                SELECT globally_ranked.message_id AS message_id,
+                                       1 AS selection_class,
+                                       0 AS coverage_frequency,
+                                       globally_ranked.first_term_index
+                                           AS coverage_term_index,
+                                       globally_ranked.rarest_term_score
+                                           AS rarest_term_score,
+                                       globally_ranked.rarity_score AS rarity_score,
+                                       globally_ranked.recall_overlap AS recall_overlap
+                                FROM globally_ranked
+                            )
+                            SELECT m.*,
+                                   candidate_rows.selection_class AS selection_class,
+                                   candidate_rows.coverage_frequency
+                                       AS coverage_frequency,
+                                   candidate_rows.coverage_term_index
+                                       AS coverage_term_index,
+                                   candidate_rows.rarest_term_score
+                                       AS rarest_term_score,
+                                   candidate_rows.rarity_score AS rarity_score,
+                                   candidate_rows.recall_overlap AS recall_overlap
+                            FROM candidate_rows
+                            JOIN messages AS m ON m.id = candidate_rows.message_id
+                            ORDER BY
+                                candidate_rows.selection_class ASC,
+                                candidate_rows.coverage_frequency ASC,
+                                candidate_rows.coverage_term_index ASC,
+                                candidate_rows.rarest_term_score DESC,
+                                candidate_rows.rarity_score DESC,
+                                candidate_rows.recall_overlap DESC,
+                                m.sent_at DESC,
+                                m.id DESC
+                            """,
+                            [
+                                *(
+                                    value
+                                    for index, term in enumerate(short_terms)
+                                    for value in (term, index)
+                                ),
+                                umo,
+                                *parameters[1:],
+                                safe_limit,
+                            ],
+                        ).fetchall()
+                        # Coverage yields one representative per term, ordered
+                        # from lowest document frequency to highest.  Stable
+                        # deduplication therefore keeps every term when the cap
+                        # permits and the rarest terms when it does not.  The
+                        # global ranking only fills slots left by that contract.
+                        selected_short_ids: set[int] = set()
+                        for row in short_candidates:
+                            message_id = int(row["id"])
+                            if message_id in selected_short_ids:
+                                continue
+                            selected_short_ids.add(message_id)
+                            short_rows.append(row)
+                            if len(short_rows) >= safe_limit:
+                                break
+                    # Reciprocal-rank fusion gives the two independently ranked
+                    # recall channels one deterministic relevance order.  A row
+                    # supported by both channels is promoted, while neither a
+                    # substring hit nor a duplicate can arbitrarily jump ahead
+                    # merely because it happened to be interleaved first.
+                    fused_rows: dict[int, sqlite3.Row] = {}
+                    fused_scores: dict[int, float] = {}
+                    fused_ranks: dict[int, list[int]] = {}
+                    rank_constant = 60.0
+                    absent_rank = safe_limit + 1
+                    for branch_index, batch in enumerate((fts_rows, short_rows)):
+                        for rank_index, row in enumerate(batch, start=1):
+                            message_id = int(row["id"])
+                            fused_rows.setdefault(message_id, row)
+                            fused_scores[message_id] = fused_scores.get(
+                                message_id, 0.0
+                            ) + (1.0 / (rank_constant + rank_index))
+                            branch_ranks = fused_ranks.setdefault(
+                                message_id, [absent_rank, absent_rank]
+                            )
+                            branch_ranks[branch_index] = rank_index
+                    ordered_ids = sorted(
+                        fused_rows,
+                        key=lambda message_id: (
+                            -fused_scores[message_id],
+                            min(fused_ranks[message_id]),
+                            fused_ranks[message_id][0],
+                            fused_ranks[message_id][1],
+                            -int(fused_rows[message_id]["sent_at"]),
+                            -int(fused_rows[message_id]["id"]),
+                        ),
+                    )
+                    rows = [fused_rows[message_id] for message_id in ordered_ids[:safe_limit]]
+                    messages = self._stored_messages_from_rows(rows)
+                return messages
+            if len(query) >= 3:
+                return []
         if query and len(query) >= 3:
             fts_query = self._make_fts_query(query)
+            if not fts_query:
+                return []
             sql = f"""
                 SELECT m.*
                 FROM messages_fts
@@ -12065,7 +12434,7 @@ class MemoryStorage:
                   AND m.is_deleted = 0
                   {cutoff_sql}
                   {sender_sql}
-                ORDER BY bm25(messages_fts), m.sent_at DESC, m.id DESC
+                ORDER BY rank, m.sent_at DESC, m.id DESC
                 LIMIT ?
             """
             parameters = [fts_query, *parameters, safe_limit]
@@ -12084,6 +12453,10 @@ class MemoryStorage:
             parameters = [umo, query]
             if before_sent_at is not None:
                 parameters.append(int(before_sent_at))
+            if message_upper_bound is not None:
+                parameters.append(max(0, int(message_upper_bound)))
+            if excluded_source:
+                parameters.append(excluded_source)
             if sender_filter:
                 parameters.extend((sender_filter, sender_filter))
             parameters.append(safe_limit)
@@ -12102,7 +12475,9 @@ class MemoryStorage:
 
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
-        messages = [self._stored_message_from_row(row) for row in rows]
+            messages = self._stored_messages_from_rows(rows)
+        if normalized_match_mode == "recall" and query:
+            return messages
         return sorted(messages, key=lambda item: (item.sent_at, item.id))
 
     @staticmethod
@@ -12287,7 +12662,7 @@ class MemoryStorage:
                 """,
                 parameters,
             ).fetchall()
-            messages = [self._stored_message_from_row(row) for row in rows]
+            messages = self._stored_messages_from_rows(rows)
         return [
             {
                 "source_key": message.source_key,
@@ -12348,38 +12723,74 @@ class MemoryStorage:
         *,
         umo: str,
         source_key: str,
-        before_sent_at: int | None = None,
-        message_upper_bound: int | None = None,
+        before_sent_at: int,
+        message_upper_bound: int,
     ) -> dict[str, object] | None:
         """Return one raw message only when it belongs to the frozen snapshot."""
 
+        messages = self.messages_for_sources(
+            umo=umo,
+            source_keys=(source_key,),
+            before_sent_at=before_sent_at,
+            message_upper_bound=message_upper_bound,
+        )
+        return messages[0] if messages else None
+
+    def messages_for_sources(
+        self,
+        *,
+        umo: str,
+        source_keys: Iterable[str],
+        before_sent_at: int,
+        message_upper_bound: int,
+    ) -> list[dict[str, object]]:
+        """Batch-hydrate selected evidence sources inside one frozen snapshot."""
+
         self._assert_scope(umo)
-        normalized_source = str(source_key).strip()
-        if not normalized_source:
-            return None
-        visibility_sql = ""
-        parameters: list[object] = [umo, normalized_source]
-        if before_sent_at is not None:
-            visibility_sql += " AND sent_at<?"
-            parameters.append(int(before_sent_at))
-        if message_upper_bound is not None:
-            visibility_sql += " AND id<=?"
-            parameters.append(max(0, int(message_upper_bound)))
+        normalized_sources = tuple(
+            dict.fromkeys(
+                str(source_key).strip()
+                for source_key in source_keys
+                if str(source_key or "").strip()
+            )
+        )
+        if not normalized_sources:
+            return []
+        if len(normalized_sources) > 128:
+            raise ValueError("source hydration exceeds 128 messages")
+        placeholders = ",".join("?" for _ in normalized_sources)
+        cutoff = int(before_sent_at)
+        upper_bound = max(0, int(message_upper_bound))
+        if cutoff <= 0:
+            raise ValueError("source hydration requires a positive cutoff")
+        visibility_sql = " AND sent_at<? AND id<=?"
+        parameters: list[object] = [umo, *normalized_sources]
+        parameters.extend((cutoff, upper_bound))
         with self._lock:
-            row = self._connection.execute(
+            rows = self._connection.execute(
                 f"""
                 SELECT * FROM messages
-                WHERE umo=? AND source_key=? AND is_deleted=0
+                WHERE umo=? AND source_key IN ({placeholders}) AND is_deleted=0
                 {visibility_sql}
-                LIMIT 1
                 """,
                 parameters,
-            ).fetchone()
-            if row is None:
-                return None
-            message = self._stored_message_from_row(row)
+            ).fetchall()
+            messages = self._stored_messages_from_rows(rows)
+        by_source = {message.source_key: message for message in messages}
+        return [
+            self._message_evidence_record(by_source[source_key])
+            for source_key in normalized_sources
+            if source_key in by_source
+        ]
+
+    @staticmethod
+    def _message_evidence_record(message: StoredMessage) -> dict[str, object]:
+        component_evidence = MemoryStorage._component_evidence(
+            json.dumps(message.content, ensure_ascii=False)
+        )
         return {
             "source_key": message.source_key,
+            "message_row_id": message.id,
             "sent_at": message.sent_at,
             "sender_id": message.sender_id,
             "sender_name": message.sender_name,
@@ -12389,6 +12800,7 @@ class MemoryStorage:
             "reply_to_source_key": message.reply_to_source_key,
             "mentions": list(message.mentions),
             "components": message.content,
+            "component_types": component_evidence["component_types"],
             "revision_no": message.revision_no,
         }
 
@@ -13627,6 +14039,7 @@ class MemoryStorage:
         include_dormant: bool = False,
         before_sent_at: int | None = None,
         message_upper_bound: int | None = None,
+        edge_ids: Iterable[int] | None = None,
     ) -> list[dict[str, object]]:
         """Traverse the learned graph through one generic, versioned relation API."""
 
@@ -13645,6 +14058,19 @@ class MemoryStorage:
         status_placeholders = ",".join("?" for _ in statuses)
         clauses = ["e.umo = ?", f"e.status IN ({status_placeholders})"]
         parameters: list[object] = [umo, *statuses]
+        requested_edge_ids = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in (edge_ids or ())
+                if int(value) > 0
+            )
+        )
+        if edge_ids is not None:
+            if not requested_edge_ids:
+                return []
+            edge_placeholders = ",".join("?" for _ in requested_edge_ids)
+            clauses.append(f"e.id IN ({edge_placeholders})")
+            parameters.extend(requested_edge_ids)
         if node_key:
             if normalized_direction == "out":
                 clauses.append("src.node_key = ?")
@@ -13755,34 +14181,68 @@ class MemoryStorage:
                 """,
                 parameters,
             ).fetchall()
-            results: list[dict[str, object]] = []
-            for row in rows:
-                evidence_parameters: list[object] = [int(row["id"]), umo]
-                cutoff = ""
-                if before_sent_at is not None:
-                    cutoff += " AND m.sent_at < ?"
-                    evidence_parameters.append(int(before_sent_at))
-                if message_upper_bound is not None:
-                    cutoff += " AND m.id <= ?"
-                    evidence_parameters.append(max(0, int(message_upper_bound)))
-                evidence_rows = self._connection.execute(
-                    f"""
-                    SELECT m.source_key, m.sent_at, m.sender_id, m.sender_name,
-                           m.plain_text, pe.evidence_role, pe.confidence
+            if not rows:
+                return []
+            selected_edge_ids = tuple(int(row["id"]) for row in rows)
+            selected_placeholders = ",".join("?" for _ in selected_edge_ids)
+            evidence_parameters: list[object] = [*selected_edge_ids, umo]
+            evidence_cutoff = ""
+            if before_sent_at is not None:
+                evidence_cutoff += " AND m.sent_at < ?"
+                evidence_parameters.append(int(before_sent_at))
+            if message_upper_bound is not None:
+                evidence_cutoff += " AND m.id <= ?"
+                evidence_parameters.append(max(0, int(message_upper_bound)))
+            evidence_rows = self._connection.execute(
+                f"""
+                SELECT edge_id, source_key, sent_at, sender_id, sender_name,
+                       plain_text, evidence_role, confidence
+                FROM (
+                    SELECT pe.edge_id, m.source_key, m.sent_at, m.sender_id,
+                           m.sender_name, m.plain_text, pe.evidence_role,
+                           pe.confidence,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY pe.edge_id
+                               ORDER BY m.sent_at, m.id
+                           ) AS evidence_rank
                     FROM plastic_edge_evidence AS pe
                     JOIN messages AS m ON m.id=pe.message_id
-                    WHERE pe.edge_id=? AND m.umo=? AND m.is_deleted=0{cutoff}
-                    ORDER BY m.sent_at, m.id LIMIT 24
-                    """,
-                    evidence_parameters,
-                ).fetchall()
+                    WHERE pe.edge_id IN ({selected_placeholders})
+                      AND m.umo=? AND m.is_deleted=0{evidence_cutoff}
+                ) AS ranked_evidence
+                WHERE evidence_rank<=24
+                ORDER BY edge_id, evidence_rank
+                """,
+                evidence_parameters,
+            ).fetchall()
+            evidence_by_edge: dict[int, list[dict[str, object]]] = {
+                edge_id: [] for edge_id in selected_edge_ids
+            }
+            for evidence in evidence_rows:
+                evidence_by_edge[int(evidence["edge_id"])].append(
+                    {
+                        key: evidence[key]
+                        for key in (
+                            "source_key",
+                            "sent_at",
+                            "sender_id",
+                            "sender_name",
+                            "plain_text",
+                            "evidence_role",
+                            "confidence",
+                        )
+                    }
+                )
+            results: list[dict[str, object]] = []
+            for row in rows:
+                evidence = evidence_by_edge[int(row["id"])]
                 results.append(
                     {
                         **dict(row),
                         "symmetric": bool(row["symmetric"]),
-                        "evidence": [dict(item) for item in evidence_rows],
+                        "evidence": evidence,
                         "source_keys": [
-                            str(item["source_key"]) for item in evidence_rows
+                            str(item["source_key"]) for item in evidence
                         ],
                     }
                 )
@@ -16046,7 +16506,178 @@ class MemoryStorage:
     def _make_fts_query(query: str) -> str:
         return f'"{query.replace(chr(34), chr(34) * 2)}"'
 
-    def _stored_message_from_row(self, row: sqlite3.Row) -> StoredMessage:
+    @staticmethod
+    def _make_fts_recall_query(query: str, *, max_terms: int = 32) -> str:
+        """Build a bounded OR query for the trigram raw-message index.
+
+        Exact phrase search is useful for user-facing search, but an online
+        memory question rarely repeats a historical sentence verbatim.  The
+        recall channel therefore searches independent ASCII terms and CJK
+        trigrams, leaving BM25/rank to prefer messages matching more terms.
+        This is retrieval only; it does not resolve names or infer identity.
+        """
+
+        candidates: list[str] = []
+        for run in re.findall(
+            r"[0-9A-Za-z_]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+",
+            str(query or "").casefold(),
+        ):
+            if len(run) < 3:
+                continue
+            pieces = (
+                [run]
+                if run.isascii()
+                else [run[index : index + 3] for index in range(len(run) - 2)]
+            )
+            for piece in pieces:
+                if piece not in candidates:
+                    candidates.append(piece)
+        safe_limit = max(1, min(64, int(max_terms)))
+        if len(candidates) > safe_limit:
+            # Even sampling preserves both the beginning and end of long
+            # questions instead of silently dropping a late entity/topic.
+            last = len(candidates) - 1
+            indexes = {
+                round(index * last / (safe_limit - 1))
+                for index in range(safe_limit)
+            } if safe_limit > 1 else {0}
+            candidates = [
+                candidate
+                for index, candidate in enumerate(candidates)
+                if index in indexes
+            ]
+        return " OR ".join(
+            f'"{candidate.replace(chr(34), chr(34) * 2)}"'
+            for candidate in candidates
+        )
+
+    @staticmethod
+    def _make_short_recall_terms(query: str, *, max_terms: int = 16) -> tuple[str, ...]:
+        """Return bounded CJK bigrams for the recall channel.
+
+        SQLite FTS5's trigram tokenizer cannot match terms shorter than three
+        Unicode characters.  A parallel, snapshot-bounded substring branch is
+        therefore part of recall for two-character entities and phrases.  It
+        retrieves source rows only; the resident Reader still decides meaning
+        and identity.
+        """
+
+        candidates: list[str] = []
+        for run in re.findall(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+",
+            str(query or ""),
+        ):
+            for index in range(max(0, len(run) - 1)):
+                piece = run[index : index + 2]
+                if piece and piece not in candidates:
+                    candidates.append(piece)
+        safe_limit = max(1, min(32, int(max_terms)))
+        if len(candidates) > safe_limit:
+            last = len(candidates) - 1
+            indexes = (
+                {
+                    round(index * last / (safe_limit - 1))
+                    for index in range(safe_limit)
+                }
+                if safe_limit > 1
+                else {0}
+            )
+            candidates = [
+                candidate
+                for index, candidate in enumerate(candidates)
+                if index in indexes
+            ]
+        return tuple(candidates)
+
+    def _stored_messages_from_rows(
+        self, rows: Iterable[sqlite3.Row]
+    ) -> list[StoredMessage]:
+        """Hydrate a message batch with three fixed-size relation queries."""
+
+        materialized_rows = list(rows)
+        if not materialized_rows:
+            return []
+        message_ids = tuple(int(row["id"]) for row in materialized_rows)
+        sender_ids = tuple(
+            dict.fromkeys(
+                int(row["sender_participant_id"])
+                for row in materialized_rows
+                if "sender_participant_id" in row.keys()
+                and row["sender_participant_id"] is not None
+            )
+        )
+        sender_keys: dict[int, str] = {}
+        if sender_ids:
+            placeholders = ",".join("?" for _ in sender_ids)
+            sender_keys = {
+                int(row["id"]): str(row["canonical_key"])
+                for row in self._connection.execute(
+                    f"""
+                    SELECT id, canonical_key FROM participants
+                    WHERE id IN ({placeholders})
+                    """,
+                    sender_ids,
+                ).fetchall()
+            }
+        message_placeholders = ",".join("?" for _ in message_ids)
+        replies: dict[int, str] = {}
+        for row in self._connection.execute(
+            f"""
+            SELECT source_message_id, target_source_key
+            FROM message_relations
+            WHERE source_message_id IN ({message_placeholders})
+              AND relation IN ('REPLY_TO', 'RESPONDS_TO')
+            ORDER BY source_message_id, id
+            """,
+            message_ids,
+        ).fetchall():
+            replies.setdefault(
+                int(row["source_message_id"]), str(row["target_source_key"])
+            )
+        mentions_by_message: dict[int, list[dict[str, str]]] = {
+            message_id: [] for message_id in message_ids
+        }
+        for row in self._connection.execute(
+            f"""
+            SELECT mp.message_id, p.canonical_key, p.account_id,
+                   COALESCE(p.current_display_name, '') AS display_name
+            FROM message_participants AS mp
+            JOIN participants AS p ON p.id=mp.participant_id
+            WHERE mp.message_id IN ({message_placeholders})
+              AND mp.relation='MENTIONED'
+            ORDER BY mp.message_id, mp.position, p.id
+            """,
+            message_ids,
+        ).fetchall():
+            mentions_by_message[int(row["message_id"])].append(
+                {
+                    "canonical_key": str(row["canonical_key"]),
+                    "account_id": str(row["account_id"]),
+                    "display_name": str(row["display_name"]),
+                }
+            )
+        return [
+            self._stored_message_from_row(
+                row,
+                sender_keys=sender_keys,
+                replies=replies,
+                mentions_by_message=mentions_by_message,
+            )
+            for row in materialized_rows
+        ]
+
+    def _stored_message_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        sender_keys: Mapping[int, str] | None = None,
+        replies: Mapping[int, str] | None = None,
+        mentions_by_message: Mapping[
+            int, list[dict[str, str]]
+        ]
+        | None = None,
+    ) -> StoredMessage:
+        message_id = int(row["id"])
         sender_participant_id = (
             int(row["sender_participant_id"])
             if "sender_participant_id" in row.keys()
@@ -16055,34 +16686,46 @@ class MemoryStorage:
         )
         sender_key = ""
         if sender_participant_id is not None:
-            participant = self._connection.execute(
-                "SELECT canonical_key FROM participants WHERE id = ?",
-                (sender_participant_id,),
+            if sender_keys is not None:
+                sender_key = str(sender_keys.get(sender_participant_id, ""))
+            else:
+                participant = self._connection.execute(
+                    "SELECT canonical_key FROM participants WHERE id = ?",
+                    (sender_participant_id,),
+                ).fetchone()
+                if participant is not None:
+                    sender_key = str(participant["canonical_key"])
+        if replies is not None:
+            reply_source_key = str(replies.get(message_id, ""))
+        else:
+            reply = self._connection.execute(
+                """
+                SELECT target_source_key FROM message_relations
+                WHERE source_message_id = ?
+                  AND relation IN ('REPLY_TO', 'RESPONDS_TO')
+                ORDER BY id LIMIT 1
+                """,
+                (message_id,),
             ).fetchone()
-            if participant is not None:
-                sender_key = str(participant["canonical_key"])
-        reply = self._connection.execute(
-            """
-            SELECT target_source_key FROM message_relations
-            WHERE source_message_id = ?
-              AND relation IN ('REPLY_TO', 'RESPONDS_TO')
-            ORDER BY id LIMIT 1
-            """,
-            (int(row["id"]),),
-        ).fetchone()
-        mentions = self._connection.execute(
-            """
-            SELECT p.canonical_key, p.account_id,
-                   COALESCE(p.current_display_name, '') AS display_name
-            FROM message_participants AS mp
-            JOIN participants AS p ON p.id = mp.participant_id
-            WHERE mp.message_id = ? AND mp.relation = 'MENTIONED'
-            ORDER BY mp.position, p.id
-            """,
-            (int(row["id"]),),
-        ).fetchall()
+            reply_source_key = (
+                str(reply["target_source_key"]) if reply is not None else ""
+            )
+        if mentions_by_message is not None:
+            mentions = mentions_by_message.get(message_id, [])
+        else:
+            mentions = self._connection.execute(
+                """
+                SELECT p.canonical_key, p.account_id,
+                       COALESCE(p.current_display_name, '') AS display_name
+                FROM message_participants AS mp
+                JOIN participants AS p ON p.id = mp.participant_id
+                WHERE mp.message_id = ? AND mp.relation = 'MENTIONED'
+                ORDER BY mp.position, p.id
+                """,
+                (message_id,),
+            ).fetchall()
         return StoredMessage(
-            id=int(row["id"]),
+            id=message_id,
             source_key=str(row["source_key"]),
             platform=str(row["platform"]),
             platform_id=str(row["platform_id"]),
@@ -16105,9 +16748,7 @@ class MemoryStorage:
                 if "content_sha256" in row.keys()
                 else ""
             ),
-            reply_to_source_key=(
-                str(reply["target_source_key"]) if reply is not None else ""
-            ),
+            reply_to_source_key=reply_source_key,
             mentions=tuple(
                 {
                     "participant_key": str(item["canonical_key"]),

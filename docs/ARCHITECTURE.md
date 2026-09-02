@@ -1,10 +1,12 @@
 # Architecture
 
 MR Memory keeps the existing per-group truth store and rewrites the answer-time
-path as a local evidence service. The plugin does not call a private reader,
-alternate provider, repair model, or deep-research model while `/chat` is waiting.
-AstrBot's already-selected main model is the only query-time model: it receives one
-bounded, source-backed JSON envelope and decides how to use that evidence.
+path as a bounded evidence reconstruction service. While `/chat` is waiting, the
+plugin performs exactly one call to its configured resident Evidence Reader. That
+Reader jointly resolves textual references and memory meaning from a compact,
+source-backed packet; it cannot call tools, repair its response, switch providers,
+or request a deeper route. AstrBot's selected main model then receives the compiled
+memory surface and answers normally.
 
 ## Non-negotiable group isolation
 
@@ -36,33 +38,35 @@ every storage/graph operation, and freezes a cutoff plus message-row upper bound
 ```text
 AstrBot on_llm_request
   -> freeze one RequestSnapshot for this event
-  -> deterministic current/reply identity resolution
-  -> choose local route
-       direct identity/activity question: bounded deterministic local query
-       other CHAT: lexical + local embedding + bounded graph/raw expansion (<= 3000 chars)
-       explicit memory question: same local retrieval with the larger configured budget
-  -> audit every selected source against the frozen snapshot
-  -> compile <= local_serving_max_chars JSON envelope
+  -> retrieve aliases + trigram FTS5/bounded CJK bigrams + embeddings + graph
+  -> expand history/activity only for actual identity candidates
+  -> compile one globally bounded, source-deduplicated EvidenceAtomPack
+  -> audit selected source revisions/content against the frozen snapshot
+  -> one strict evidence-reader.compact-host-speaker semantic pass
+  -> re-audit the same source fingerprints
+  -> compile <= local_serving_max_chars memory surface
   -> append exactly once to the main-model request
   -> AstrBot main model answers normally
 ```
 
-Answer-time MR Memory provider calls, provider tokens, and external API cost are
-exactly zero. The envelope adds input to the main model, so its incremental Token,
-latency, and billing impact remain `UNKNOWN_NOT_MEASURED` unless actual host usage
-or a controlled on/off measurement exists.
+Each non-empty answer-time reconstruction starts one MR Memory provider call. Its
+usage and phase timings are written to the ledger. Monetary cost remains
+`UNKNOWN_NO_BILLING_EVIDENCE` unless the provider supplies billing evidence; the
+main model's incremental cost is also unknown without an on/off measurement.
 
 ### Route rules
 
-- Ordinary chat uses the full local serving plane, so enabling the plugin can
-  actually affect answers without adding a second query-time model. Its envelope
-  remains capped at 3000 characters.
-- Explicit identity and participant-activity questions use the smaller
-  deterministic route when the target can be bound to snapshot evidence.
-- Strong recall cues (`回忆`, `记得`, `之前`, `历史`, `谁说过`, `记忆`) select the
-  larger explicit-memory envelope budget; they do not enable a remote reader.
-- A quoted “这些人是谁” request resolves names from both the current query and the
-  frozen reply text, while preserving multiple-account ambiguity.
+- Textual identity is never pre-decided by a string resolver. Structured current
+  sender/mention/reply accounts are host anchors; nicknames, semantic subjects and
+  historical observations remain competing candidates for the Reader.
+- Participant activity is fetched only for activity-analysis requests. Incidental
+  episode speakers do not trigger per-person history/activity expansion.
+- Raw lexical recall always combines bounded trigram FTS/BM25 with a bounded CJK
+  bigram substring branch so two-character entities are not structurally invisible.
+  Both branches exclude the current request and obey cutoff plus row upper bounds;
+  they only retrieve sources and never decide identity or meaning.
+- Query-bound EvidenceAtomPack reuse is disabled: the current request changes the
+  exact snapshot watermark, so the old cache normally added I/O without hits.
 - `CHAT` can receive source-backed learned patterns whose deterministic cues match;
   opening an interaction trace alone never counts as activation.
 
@@ -95,33 +99,59 @@ or a controlled on/off measurement exists.
   cancellation-safe inference slot. Passage indexing releases that slot between
   configured batches so an online query is not trapped behind an entire maintenance
   batch.
-- Ordinary alias lookup does not scan semantic self-claim rows; that bounded scan is
-  reserved for explicit identity enumeration. Source validation reads all cited rows
-  in one bounded query and each online request performs one final fail-closed audit.
+- Alias observations are write-side materialized and snapshot-indexed. Candidate
+  coverage is explicit; incomplete coverage forbids `UNIQUE_ALIAS`.
+- Source validation reads cited rows in one bounded query and performs fail-closed
+  pre/post comparison of `revision_no` and `content_sha256`. An edit during the
+  Reader call cannot mix old text with new relation metadata.
 
 ## Envelope contract
 
-`mr-local-serving.v1` contains current-event identity, bounded alias resolution,
-source-backed claims/conflicts/unresolved items, selected graph connections,
-applicable learned patterns, activity/reply context, short source aliases, raw
-source records, truncation, and stage-specific cost accounting.
+`MR_MEMORY_EVIDENCE_ATOM_PACK_V1` contains a strict global source catalog plus
+source-key views for identity candidates, semantic/feedback evidence, lexical hits,
+episodes, history, activity and recent context. Raw payload appears once even when
+several views reference the same message. `evidence-reader.compact-host-speaker` exposes
+canonical identifiers as `sN`/`pN`; the model returns semantic fields only and the
+host injects snapshot/revision/hash/validation fields before strict parsing.
 
 The compiler applies these rules:
 
-1. A row with at least one retained source remains visible when other citations do
-   not fit; it exposes total source count and `sources_truncated=true`.
-2. A source absent from actual packet records never becomes a placeholder.
-3. Conflicts and unresolved items receive capacity before extra ordinary claims.
-   Tight profiles remove derived graph connections before source-backed brief rows.
-4. Sources are allocated round-robin across evidence items/episodes.
-5. Identity/ambiguity lists shrink with the profile and expose `*_truncated=true`.
-6. Temporal adjacency is not reply. Bot text is not independent human truth.
-   Anonymous speaker tokens or matching nicknames are not stable accounts.
-7. Top-level `retrieval.truncated` is true whenever any item, text, alias, source,
-   candidate, or profile was reduced.
+1. Reply anchors are mandatory. Every present, query-relevant stratum (person,
+   semantic, lexical, episode, history, recent, and activity only for activity
+   questions) first competes for one minimum-coverage source. A source shared by
+   several still-uncovered strata wins by marginal coverage; remaining slots use
+   the stable relevance order. Repeated aliases or lexical hits therefore cannot
+   erase the episodic and recent layers.
+2. The source cap is global and deterministic. Available/selected counts are
+   recorded per stratum. Truncation disables
+   `SEMANTIC_NONE`; incomplete identity candidate coverage also disables
+   `UNIQUE_ALIAS`.
+3. Derived views are pruned to selected sources. Conflicting immutable payloads for
+   a selected source fail closed instead of choosing one copy.
+4. The compiler derives two independent provenance relations from the selected
+   compact pack. `participant_source_keys` is the identity/alias evidence
+   allowlist: each candidate may cite only its explicit alias observations,
+   participant-scoped messages or same-record sender sources, never a sibling
+   candidate's or semantic subject's sources. `participant_speaker_source_keys`
+   is stricter and comes only from a record carrying both `source_key` and
+   `sender_participant_key`. A mention or third-party statement can therefore be
+   evidence *about* a resolved subject without becoming that subject's direct
+   speech. These maps constrain provenance; the Reader still performs joint
+   natural-language identity resolution.
+5. Temporal adjacency is not reply. Bot text is not independent human truth.
+6. Reader output is one unfenced JSON object. Unknown aliases, host-owned fields,
+   missing provenance and invalid state coupling are terminal protocol errors; the
+   host does not silently normalize or repair them.
 
 True source keys stay host-side for audit/feedback traces and become `s1`, `s2`, …
 inside model-visible JSON. Source text is explicitly untrusted data, not instruction.
+
+The source cap bounds distinct raw messages, not characters or upstream retrieval
+work. Long selected messages can still produce a large Reader prompt, and episode,
+graph and exact-vector candidate expansion occurs before pack compaction. The
+current raw lexical path is bounded and batched, while complete retrieval remains
+data-dependent; measurements must label the stage they cover rather than reporting
+raw search latency as end-to-end retrieval latency.
 
 ## Feedback attribution
 
@@ -137,11 +167,18 @@ of use or correctness.
 
 ## Background semantic work
 
-The configured MR Memory provider remains available only to bounded background
-construction and feedback maintenance. Legacy L2 certificates, L3 ECCR,
-query-bound reconstruction, provider repair, and `mr_consult_subconscious` are not
-part of the online route. The consult tool is deactivated and returns an explicit
-removal error if stale framework state invokes it.
+The configured MR Memory provider serves bounded background construction/feedback
+maintenance and the single online resident Reader. L3 ECCR, provider repair and
+`mr_consult_subconscious` are not part of the online route. The consult tool is
+deactivated and returns an explicit removal error if stale framework state invokes
+it.
+
+Background construction and the online Reader have separate thinking controls.
+Background distillation may keep full reasoning enabled; the resident Reader
+defaults to thinking disabled because its bounded evidence contract requires a
+visible JSON result, and hidden reasoning must not consume the response budget or
+answer latency. This changes only generation options for the same single provider
+call; it is not a retry, alternate model or degraded route.
 
 Background work uses per-group budgets and bounded queues, keeps provider failures
 as terminal failures, cannot block/replace AstrBot's main reply, and never turns

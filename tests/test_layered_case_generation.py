@@ -83,12 +83,14 @@ def _packet() -> dict[str, object]:
             {
                 "source_key": "s1",
                 "participant_key": "p1",
+                "sender_participant_key": "p1",
                 "sent_at": 1_900,
                 "plain_text": "第一条证据",
             },
             {
                 "source_key": "s2",
                 "participant_key": "p1",
+                "sender_participant_key": "p1",
                 "sent_at": 1_950,
                 "plain_text": "第二条反例",
             },
@@ -98,13 +100,21 @@ def _packet() -> dict[str, object]:
 
 def _certificate_value(snapshot, packet) -> dict[str, object]:
     raw = _raw_certificate()
-    raw["scope_snapshot"] = snapshot.as_dict()
-    raw["data_revision"] = snapshot.data_revision.as_dict()
-    raw["inference_revision"] = snapshot.inference_revision.as_dict()
-    raw["packet_sha256"] = stable_sha256(packet)
     raw["atoms"] = [raw["atoms"][0]]
     raw["must_include"] = ["a1"]
     raw["must_not_upgrade"][0]["atom_ids"] = ["a1"]
+    for key in (
+        "schema_version",
+        "scope_snapshot",
+        "data_revision",
+        "inference_revision",
+        "packet_sha256",
+        "validation",
+    ):
+        raw.pop(key, None)
+    for atom in raw.get("atoms", []):
+        if isinstance(atom, dict):
+            atom.pop("speaker_participant_key", None)
     return raw
 
 
@@ -270,8 +280,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
                 provider_limits[phase] = int(kwargs["max_output_tokens"])
                 if bool(kwargs["json_object"]):
                     payload = json.loads(kwargs["messages"][1]["content"])
-                    snapshot = RequestSnapshot.from_value(payload["scope_snapshot"])
-                    raw = _certificate_value(snapshot, payload["evidence_packet"])
+                    raw = _certificate_value(None, payload["evidence_packet"])
                     completion = _completion(raw)
                 else:
                     completion = _completion("这是主模型基于证据约束生成的完整回答。")
@@ -388,13 +397,16 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
             manifest = json.loads((output_dir / "manifest.json").read_text("utf-8"))
             prompt_audit = manifest["l2_initial_prompt_audit"]
             self.assertEqual(
-                prompt_audit["ordered_source_keys"],
-                sorted(prompt_audit["ordered_source_keys"]),
+                prompt_audit["protocol"],
+                "evidence-reader.compact-host-speaker",
             )
             self.assertEqual(
-                prompt_audit["ordered_participant_keys"],
-                sorted(prompt_audit["ordered_participant_keys"]),
+                prompt_audit["execution_contract"],
+                "ONE_CALL_STRICT_PARSE_NO_REPAIR",
             )
+            self.assertEqual(prompt_audit["call_index"], 0)
+            self.assertNotIn("ordered_source_keys", prompt_audit)
+            self.assertNotIn("ordered_participant_keys", prompt_audit)
             self.assertEqual(len(prompt_audit["payload_sha256"]), 64)
             stages = json.loads(
                 (output_dir / "memory-stages.private.json").read_text("utf-8")
@@ -402,7 +414,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
             self.assertEqual(stages[0]["prompt_audit"], prompt_audit)
             self.assertEqual(manifest["limits"], {
                 "max_provider_calls": 3,
-                "provider_calls_upper_bound": 3,
+                "provider_calls_upper_bound": 2,
                 "subconscious_max_output_tokens": 384_000,
                 "surface_max_output_tokens": 65_536,
                 "deadline_seconds": 30.0,
@@ -497,9 +509,8 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
                     )
                 if bool(kwargs["json_object"]):
                     payload = json.loads(kwargs["messages"][1]["content"])
-                    snapshot = RequestSnapshot.from_value(payload["scope_snapshot"])
                     return _completion(
-                        _certificate_value(snapshot, payload["evidence_packet"])
+                        _certificate_value(None, payload["evidence_packet"])
                     )
                 return _completion("导入记忆后仅重新生成表层回答。")
 
@@ -704,7 +715,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
 
 
 class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
-    async def test_real_v7_q_stages_fail_closed_when_prompt_order_was_not_frozen(
+    async def test_legacy_multi_call_l2_stage_import_is_rejected(
         self,
     ) -> None:
         source = (
@@ -722,7 +733,10 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         case = dict(effective_case)
         case.pop("recent_context", None)
         packet = json.loads((source / "evidence.input.json").read_text("utf-8"))
-        with self.assertRaisesRegex(ValueError, "prompt/options/payload hash mismatch"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "source ledger must contain exactly 1 calls",
+        ):
             await _prepare_provider_stage_import(
                 source / "memory.private.json",
                 target_manifest=manifest,
@@ -786,7 +800,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
                     memory_provider_extra={},
                 )
 
-    async def test_l2_repair_yields_certificate_v2_and_compiled_surface_packet(self) -> None:
+    async def test_l2_single_reader_yields_certificate_v2_and_surface_packet(self) -> None:
         case = _case()
         packet = _packet()
         recent_context = [{"role": "user", "content": "上文"}]
@@ -801,8 +815,6 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
 
         async def complete(_system: str, _prompt: str, index: int, phase: str):
             calls.append((index, phase))
-            if index == 0:
-                return _completion("not-json")
             return _completion(_certificate_value(snapshot, packet))
 
         certificate, stages, detail = await _run_l2(
@@ -813,10 +825,18 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
             participant_keys={"p1", "p2"},
             complete=complete,
         )
-        self.assertEqual(calls, [(0, "reader_initial"), (1, "reader_repair")])
+        self.assertEqual(calls, [(0, "reader_initial")])
         self.assertEqual(detail["route"], "L2")
-        self.assertTrue(detail["repair_attempted"])
-        self.assertEqual(len(stages), 2)
+        self.assertEqual(
+            detail["reader_protocol"],
+            "evidence-reader.compact-host-speaker",
+        )
+        self.assertEqual(detail["provider_calls"], 1)
+        self.assertTrue(detail["strict_parse"])
+        self.assertNotIn("repair_attempted", detail)
+        self.assertNotIn("normalization_audit", detail)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0]["certificate_sha256"], certificate.digest)
         packet_for_surface = compile_surface_packet(certificate)
         validate_surface_packet(packet_for_surface, certificate)
         messages = _surface_messages(
@@ -837,7 +857,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(injected["certificate_sha256"], certificate.digest)
         self.assertEqual(surface_payload["current_message"], case["query"])
 
-    async def test_l2_normalization_is_audited_and_reasoning_never_controls_flow(
+    async def test_l2_invalid_visible_response_stops_without_normalization_or_repair(
         self,
     ) -> None:
         case = _case()
@@ -862,57 +882,48 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        async def normalized_complete(_system: str, _prompt: str, index: int, _phase: str):
-            self.assertEqual(index, 0)
+        calls: list[tuple[int, str]] = []
+
+        async def invalid_complete(_system: str, _prompt: str, index: int, phase: str):
+            calls.append((index, phase))
             return _completion(raw)
 
-        certificate, stages, detail = await _run_l2(
-            case=case,
-            packet=packet,
-            snapshot=snapshot,
-            source_keys={"s1", "s2"},
-            participant_keys={"p1", "p2"},
-            complete=normalized_complete,
-        )
-        self.assertEqual(certificate.status, "SAFETY_ABSTAIN")
-        self.assertEqual(
-            [item["action"] for item in detail["normalization_audit"]],
-            [
-                "canonicalize_redundant_singleton",
-                "downgrade_identity_ambiguity",
-            ],
-        )
-        self.assertEqual(
-            stages[0]["normalized_certificate_sha256"], certificate.digest
-        )
+        with self.assertRaises(ValueError):
+            await _run_l2(
+                case=case,
+                packet=packet,
+                snapshot=snapshot,
+                source_keys={"s1", "s2"},
+                participant_keys={"p1", "p2"},
+                complete=invalid_complete,
+            )
+        self.assertEqual(calls, [(0, "reader_initial")])
 
-        repair_prompts: list[str] = []
+        reasoning_calls: list[tuple[int, str]] = []
 
-        async def reasoning_complete(_system: str, prompt: str, index: int, _phase: str):
-            repair_prompts.append(prompt)
-            if index == 0:
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content="not-json",
-                                reasoning_content=json.dumps(raw, ensure_ascii=False),
-                            )
+        async def reasoning_complete(_system: str, _prompt: str, index: int, phase: str):
+            reasoning_calls.append((index, phase))
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="not-json",
+                            reasoning_content=json.dumps(raw, ensure_ascii=False),
                         )
-                    ]
-                )
-            return _completion(raw)
+                    )
+                ]
+            )
 
-        _certificate, _stages, repaired_detail = await _run_l2(
-            case=case,
-            packet=packet,
-            snapshot=snapshot,
-            source_keys={"s1", "s2"},
-            participant_keys={"p1", "p2"},
-            complete=reasoning_complete,
-        )
-        self.assertTrue(repaired_detail["repair_attempted"])
-        self.assertEqual(json.loads(repair_prompts[1])["invalid_response"], "not-json")
+        with self.assertRaisesRegex(ValueError, "exactly one JSON object"):
+            await _run_l2(
+                case=case,
+                packet=packet,
+                snapshot=snapshot,
+                source_keys={"s1", "s2"},
+                participant_keys={"p1", "p2"},
+                complete=reasoning_complete,
+            )
+        self.assertEqual(reasoning_calls, [(0, "reader_initial")])
 
     async def test_l3_uses_bounded_orchestrator_then_certificate_v2(self) -> None:
         case = _case()

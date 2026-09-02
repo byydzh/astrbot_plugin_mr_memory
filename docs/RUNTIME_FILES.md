@@ -23,12 +23,13 @@
 - `mr_memory/snapshot.py`：L0 `RequestSnapshot` 与 revision vector；
 - `mr_memory/routing.py`：宿主持有的 L0–L3 路由策略；
 - `mr_memory/reader.py`：L2 Evidence Reader 协议；
+- `mr_memory/evidence_pack.py`：按来源去重、分层保留并严格限额的 Reader 证据包；
 - `mr_memory/orchestrator.py`：生产/实验共用的有界 L3 ECCR；
 - `mr_memory/certificate.py`：`EvidenceCertificateV2`；
 - `mr_memory/surface.py`：表层编译与回答验证；
 - `mr_memory/singleflight.py`：请求内并发合并；
 - `mr_memory/evidence_closure.py`、`mr_memory/storage.py`、`mr_memory/service.py`：
-  ECCR 契约、schema 16 持久化和异步服务边界。
+  ECCR 契约、schema 17 持久化和异步服务边界。
 
 ## 条件文件
 
@@ -44,5 +45,5 @@
 - Git 元数据及研究报告中的真实实验产物。
 
 部署只复制本次实际修改且已验证的运行时文件，并确认其现有依赖文件仍存在；校验也只覆盖
-这些文件。schema 15→16 由新代码首次打开各群数据库时执行。只热重载 MR Memory，
+这些文件。旧 schema→17 由新代码首次打开各群数据库时执行。只热重载 MR Memory，
 不应因此重启 AstrBot 或消息适配器。
