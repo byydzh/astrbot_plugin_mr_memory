@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -247,6 +248,92 @@ class DistillationPipelineTests(unittest.TestCase):
             ).fetchall()
         }
         self.assertEqual(statuses, {"DISTILLED"})
+
+        self.storage.finish_distillation_batch(
+            work_item=work_item, error="post-commit indexing failure"
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM message_processing WHERE status='DISTILLED'"
+            ).fetchone()[0],
+            work_item.target_count,
+        )
+        completed = self.storage._connection.execute(
+            "SELECT status,error FROM distillation_batches WHERE batch_key=?",
+            (work_item.batch_key,),
+        ).fetchone()
+        self.assertEqual((completed["status"], completed["error"]), ("COMPLETED", ""))
+
+    def test_cancelled_commit_settles_database_thread_before_propagating(self) -> None:
+        work_item = self.storage.next_distillation_batch(umo=self.umo, limit=4, overlap=0)
+        batch = parse_distillation_response(
+            self._response(), work_item.messages, target_source_keys=work_item.target_source_keys
+        )
+        from mr_memory.distillation import commit_distillation_batch as real_commit
+
+        release = threading.Event()
+
+        async def scenario() -> None:
+            loop = asyncio.get_running_loop()
+            started = asyncio.Event()
+
+            def delayed_commit(*args, **kwargs):
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise AssertionError("test did not release the database thread")
+                return real_commit(*args, **kwargs)
+
+            with mock.patch("mr_memory.service.commit_distillation_batch", delayed_commit):
+                task = asyncio.create_task(self.service.commit_distillation_batch(
+                    batch, work_item=work_item, extractor_version="cancel-test"
+                ))
+                await started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            release.set()
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM message_processing WHERE status='DISTILLED'"
+            ).fetchone()[0], work_item.target_count,
+        )
+
+    def test_embedding_index_database_work_does_not_run_on_event_loop(self) -> None:
+        batch = parse_distillation_response(self._response(), self._messages())
+        loop_thread = threading.get_ident()
+        reads = self.storage.participant_embedding_documents
+        writes = self.storage.upsert_memory_embedding
+
+        def checked_read(**kwargs):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return reads(**kwargs)
+
+        def checked_write(**kwargs):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return writes(**kwargs)
+
+        with mock.patch.object(
+            self.storage, "participant_embedding_documents", side_effect=checked_read
+        ) as read, mock.patch.object(
+            self.storage, "upsert_memory_embedding", side_effect=checked_write
+        ) as write:
+            _persisted, indexed = asyncio.run(
+                self.service.apply_distillation(
+                    batch,
+                    extractor_version="event-loop-isolation",
+                    embedding_backend=HashEmbeddingBackend(dimensions=128),
+                )
+            )
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(write.call_count, indexed)
+        self.assertGreater(indexed, 0)
 
     def test_reproduces_construction_embedding_seed_and_graph_traversal(self) -> None:
         messages = self._messages()

@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 .dev/
 .test-artifacts/
+*.private.*
 /pytest-cache-files-*/
 /tmp*/
 dist/

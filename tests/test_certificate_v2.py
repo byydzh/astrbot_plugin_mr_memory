@@ -3,6 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from mr_memory.activity_statistics import activity_aggregate_id
 
 from mr_memory.certificate import (
     MAX_CERTIFICATE_CONFLICTS,
@@ -19,14 +23,14 @@ from mr_memory.snapshot import (
 
 def _snapshot() -> RequestSnapshot:
     return RequestSnapshot.create(
-        snapshot_id="snap-good-girl",
+        snapshot_id="snap-synthetic-plan",
         umo="aiocqhttp:GroupMessage:42",
         cutoff_at=2_000,
         message_upper_bound=99,
         request_source_key="msg:100",
         sender_participant_key="p1",
         reply_source_key="msg:90",
-        query="好女孩是什么意思",
+        query="纸鹤计划进展如何",
         context={"reply": "msg:90"},
         data_revision=DataRevisionVector.from_value(
             {
@@ -65,7 +69,7 @@ def _raw_certificate() -> dict[str, object]:
         "packet_sha256": "a" * 64,
         "subjects": [
             {
-                "reference": "byy",
+                "reference": "合成人物甲",
                 "participant_key": "p1",
                 "reference_mode": "HOST",
                 "candidate_participant_keys": [],
@@ -76,13 +80,13 @@ def _raw_certificate() -> dict[str, object]:
         "atoms": [
             {
                 "id": "a1",
-                "statement": "byy早期明确说自己已经玩腻类魂。",
+                "statement": "合成人物甲曾表示自己已经玩腻拼图。",
                 "speaker_participant_key": "p1",
                 "subject_participant_key": "p1",
                 "attribution": "DIRECT_SPEAKER_STATEMENT",
                 "stance": "SUPPORTED",
                 "source_keys": ["s1"],
-                "source_spans": ["类魂玩吐了"],
+                "source_spans": ["拼图玩腻了"],
                 "importance": "REQUIRED",
                 "confidence": 0.94,
             },
@@ -119,7 +123,7 @@ def _raw_certificate() -> dict[str, object]:
     }
 
 
-def _parse(raw: object):
+def _parse(raw: object, *, allowed_aggregates=None, source_roles=None):
     return parse_evidence_certificate(
         raw,
         expected_snapshot=_snapshot(),
@@ -128,10 +132,211 @@ def _parse(raw: object):
         allowed_participant_keys={"p1", "p2", "p3"},
         pack_read_complete=True,
         host_validated=True,
+        allowed_aggregates=allowed_aggregates,
+        source_roles=source_roles,
     )
 
 
+def _raw_typed_certificate():
+    raw = _raw_certificate()
+    raw["subjects"] = [{
+        "reference": "合成记录员", "participant_key": "p1", "reference_mode": "HOST",
+        "candidate_participant_keys": [], "source_keys": ["s1"], "valid_at": 1800,
+    }]
+    raw["referents"] = [
+        {"id": "referent-person", "referent_type": "PARTICIPANT", **raw["subjects"][0]},
+        *[{
+            "id": f"referent-{kind.casefold()}", "reference": "灯塔",
+            "referent_type": kind, "participant_key": "", "reference_mode": "EVIDENCE_REF",
+            "candidate_participant_keys": [], "source_keys": ["s2"], "valid_at": 1850,
+        } for kind in ("WORK", "ENTITY", "TOPIC")],
+    ]
+    raw["atoms"] = [{
+        "id": f"typed-{index}", "statement": f"合成事实 {index} 的对象有独立指称。",
+        "speaker_participant_key": "p1", "subject_participant_key": item["participant_key"],
+        "subject_referent_id": item["id"], "attribution": "DIRECT_SPEAKER_STATEMENT",
+        "stance": "SUPPORTED", "source_keys": ["s1"], "source_spans": ["仅供内部审计的合成原文"],
+        "importance": "REQUIRED", "confidence": 0.8,
+    } for index, item in enumerate(raw["referents"])]
+    raw["must_include"] = [item["id"] for item in raw["atoms"]]
+    raw["must_not_upgrade"] = []
+    return raw
+
+
+def _raw_packet_gap_certificate():
+    raw = _raw_certificate()
+    raw.update(status="PARTIAL", stop_reason="FRONTIER_EXHAUSTED", must_not_upgrade=[])
+    raw["atoms"] = [raw["atoms"][0]]
+    raw["atoms"][0].update(statement="合成人物甲表示纸鹤活动的纸张已经到齐。", source_spans=["纸张已经到齐"])
+    raw["unresolved"] = [{
+        "statement": "本次证据包不足以判断纸鹤活动的场地是否已经确认。",
+        "source_keys": [], "atom_ids": [],
+    }]
+    raw["open_obligations"] = [{
+        "id": "venue-confirmation", "question": "纸鹤活动的场地是否已经确认？", "critical": True,
+        "competing_interpretation_ids": [], "discriminator": "", "expected_information_gain": "",
+    }]
+    return raw
+
+
+def _activity_descriptor():
+    zone = ZoneInfo("Asia/Shanghai")
+    first, last = 1000, 1900
+    descriptor = {
+        "schema_version": "mr-memory.activity-window.v1", "authority": "HOST_SQLITE_SNAPSHOT",
+        "basis": "all_snapshot_visible_direct_speaker_messages", "timezone": "Asia/Shanghai",
+        "scope": {"umo": _snapshot().umo, "participant_key": "p1", "start_sent_at": 0,
+                  "end_sent_at_exclusive": _snapshot().cutoff_at, "message_upper_bound": _snapshot().message_upper_bound},
+        "source_count": 3, "hour_histogram": {f"{hour:02}": 3 if hour == 8 else 0 for hour in range(24)},
+        "daily": [{"local_date": "1970-01-01", "source_count": 3, "first_sent_at": first, "last_sent_at": last,
+                   "first_local_datetime": datetime.fromtimestamp(first, zone).isoformat(),
+                   "last_local_datetime": datetime.fromtimestamp(last, zone).isoformat()}],
+        "source_revision_sha256": "c" * 64,
+    }
+    descriptor["aggregate_id"] = activity_aggregate_id(descriptor)
+    return descriptor
+
+
+def _raw_activity_certificate():
+    raw = _raw_certificate()
+    descriptor = _activity_descriptor()
+    raw["aggregates"] = [descriptor]
+    raw["atoms"] = [raw["atoms"][0]]
+    raw["atoms"][0].update(
+        statement="该观察窗口内共有三条本人发言。", attribution="HOST_ACTIVITY_STATISTIC",
+        speaker_participant_key="", source_keys=[], source_spans=[], aggregate_ids=[descriptor["aggregate_id"]],
+    )
+    raw["must_not_upgrade"] = []
+    return raw, {descriptor["aggregate_id"]: descriptor}
+
+
 class EvidenceCertificateV2Tests(unittest.TestCase):
+    def test_source_roles_round_trip_and_missing_legacy_roles_remain_unknown(self) -> None:
+        raw = _raw_certificate()
+        self.assertEqual(_parse(raw).atoms[0].evidence_roles, ("UNKNOWN",))
+        raw["atoms"][0]["evidence_roles"] = ["BOT"]
+        raw["atoms"][1]["evidence_roles"] = ["USER"]
+        roles = {"s1": "BOT", "s2": "USER"}
+        certificate = _parse(raw, source_roles=roles)
+        self.assertEqual(_parse(certificate.as_dict()), certificate)
+        raw["atoms"][0]["evidence_roles"] = ["USER"]
+        with self.assertRaisesRegex(ValueError, "differ from host source metadata"):
+            _parse(raw, source_roles=roles)
+
+    def test_host_activity_aggregate_is_snapshot_bound_without_fabricated_raw_sources(self) -> None:
+        raw, allowlist = _raw_activity_certificate()
+        certificate = _parse(raw, allowed_aggregates=allowlist)
+        self.assertEqual(certificate.atoms[0].source_keys, ())
+        self.assertEqual(certificate.atoms[0].speaker_participant_key, "")
+        self.assertEqual(certificate.aggregates[0].as_dict(), raw["aggregates"][0])
+        self.assertEqual(_parse(certificate.as_dict(), allowed_aggregates=allowlist), certificate)
+        self.assertEqual(_parse(_raw_certificate()).as_dict(), _raw_certificate())
+        with self.assertRaisesRegex(ValueError, "host allowlist"):
+            _parse(raw)
+
+    def test_activity_aggregate_rejects_tampering_cross_scope_subject_and_direct_speech(self) -> None:
+        raw, allowlist = _raw_activity_certificate()
+        raw["aggregates"][0]["source_count"] = 4
+        with self.assertRaisesRegex(ValueError, "content hash"):
+            _parse(raw, allowed_aggregates=allowlist)
+        raw, allowlist = _raw_activity_certificate()
+        raw["atoms"][0]["subject_participant_key"] = "p2"
+        with self.assertRaisesRegex(ValueError, "subject differs"):
+            _parse(raw, allowed_aggregates=allowlist)
+        raw, allowlist = _raw_activity_certificate()
+        raw["atoms"][0]["attribution"] = "DIRECT_SPEAKER_STATEMENT"
+        with self.assertRaisesRegex(ValueError, "requires HOST_ACTIVITY_STATISTIC"):
+            _parse(raw, allowed_aggregates=allowlist)
+        raw, allowlist = _raw_activity_certificate()
+        descriptor = raw["aggregates"][0]
+        descriptor["scope"]["umo"] = "synthetic-other-scope"
+        descriptor["aggregate_id"] = activity_aggregate_id(descriptor)
+        with self.assertRaisesRegex(ValueError, "scope differs"):
+            _parse(raw, allowed_aggregates=allowlist)
+
+    def test_aggregate_backed_derivation_retains_host_evidence_and_derived_attribution(self) -> None:
+        raw, allowlist = _raw_activity_certificate()
+        raw["atoms"][0].update(attribution="DERIVED_INTERPRETATION",
+            statement="观察窗口内的发言集中在早间；其线下活动时间仍不确定。")
+        certificate = _parse(raw, allowed_aggregates=allowlist)
+        self.assertEqual(certificate.atoms[0].attribution, "DERIVED_INTERPRETATION")
+        self.assertEqual(certificate.aggregates[0].as_dict(), raw["aggregates"][0])
+        self.assertEqual(_parse(certificate.as_dict(), allowed_aggregates=allowlist), certificate)
+        for field, value, error in (
+            ("aggregate_ids", ["activity-window:" + "e" * 64], "host allowlist"),
+            ("speaker_participant_key", "p1", "cannot assert a speaker"),
+            ("subject_participant_key", "p2", "subject differs"),
+        ):
+            changed = copy.deepcopy(raw)
+            changed["atoms"][0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                _parse(changed, allowed_aggregates=allowlist)
+
+    def test_uncited_unresolved_round_trips_as_a_packet_bound_coverage_gap(self) -> None:
+        raw = _raw_packet_gap_certificate()
+        certificate = _parse(raw)
+        gap = certificate.unresolved[0]
+        self.assertEqual(gap.basis, "PACKET_COVERAGE_GAP")
+        self.assertEqual((gap.source_keys, gap.atom_ids), ((), ()))
+        self.assertEqual(gap.statement, raw["unresolved"][0]["statement"])
+        self.assertEqual(_parse(certificate.as_dict()), certificate)
+        self.assertEqual(certificate.scope_snapshot, _snapshot())
+        self.assertEqual(certificate.packet_sha256, "a" * 64)
+        tampered = certificate.as_dict()
+        tampered["packet_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "packet_sha256"):
+            _parse(tampered)
+
+    def test_coverage_gaps_cannot_be_certified_conflicts_or_cited_facts(self) -> None:
+        raw = _raw_packet_gap_certificate()
+        raw.update(status="CERTIFIED", stop_reason="CERTIFIED_CLOSE")
+        with self.assertRaisesRegex(ValueError, "CERTIFIED cannot retain packet coverage gaps"):
+            _parse(raw)
+        raw = _raw_packet_gap_certificate()
+        raw["conflicts"] = copy.deepcopy(raw["unresolved"])
+        with self.assertRaisesRegex(ValueError, "conflicts.*requires source_keys or atom_ids"):
+            _parse(raw)
+        raw = _raw_packet_gap_certificate()
+        raw["unresolved"][0].update(basis="PACKET_COVERAGE_GAP", source_keys=["s1"])
+        with self.assertRaisesRegex(ValueError, "gap cannot carry evidence references"):
+            _parse(raw)
+        raw["unresolved"][0].update(basis="EVIDENCE", source_keys=[])
+        with self.assertRaisesRegex(ValueError, "requires source_keys or atom_ids"):
+            _parse(raw)
+
+    def test_certified_cannot_claim_success_with_only_optional_evidence(self) -> None:
+        raw = _raw_certificate()
+        for atom in raw["atoms"]:
+            atom["importance"] = "OPTIONAL"
+        raw["must_include"] = []
+        with self.assertRaisesRegex(ValueError, "at least one REQUIRED atom"):
+            _parse(raw)
+
+    def test_typed_referents_round_trip_without_rebinding_same_named_subjects(self) -> None:
+        raw = _raw_typed_certificate()
+        certificate = _parse(raw)
+        self.assertEqual(_parse(certificate.as_dict()), certificate)
+        self.assertEqual([item.referent_type for item in certificate.referents],
+                         ["PARTICIPANT", "WORK", "ENTITY", "TOPIC"])
+        self.assertEqual([atom.subject_referent_id for atom in certificate.atoms],
+                         [item["id"] for item in raw["referents"]])
+        self.assertEqual(certificate.referents[1].valid_at, 1850)
+        # The extension does not change old persisted certificate digests.
+        legacy = _raw_certificate()
+        self.assertEqual(_parse(legacy).as_dict(), legacy)
+
+    def test_typed_subject_links_reject_orphans_cross_binding_and_person_coercion(self) -> None:
+        for mutate, error in (
+            (lambda raw: raw["atoms"][1].update(subject_referent_id="missing"), "unknown referent"),
+            (lambda raw: raw["atoms"][1].update(subject_participant_key="p1"), "differs from its typed"),
+            (lambda raw: raw["referents"][1].update(participant_key="p1"), "non-participant"),
+            (lambda raw: raw["subjects"][0].update(reference="changed label"), "typed participant projection"),
+        ):
+            raw = _raw_typed_certificate()
+            mutate(raw)
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                _parse(raw)
+
     def test_valid_certificate_round_trips_with_required_anchor(self) -> None:
         certificate = _parse(_raw_certificate())
         self.assertEqual(certificate.status, "CERTIFIED")

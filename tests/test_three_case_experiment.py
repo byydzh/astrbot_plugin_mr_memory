@@ -111,13 +111,13 @@ class SurfacePreparationTest(unittest.TestCase):
                 },
             )
             shapes = {
-                "call-726-top-level": {
+                "case-a-top-level": {
                     "status": "COMPLETED",
                     "brief": _brief(),
-                    "raw_response": {"completion": "#726 完整原始输出"},
+                    "raw_response": {"completion": "案例 A 完整原始输出"},
                     "gold_score": {"legacy": True},
                 },
-                "good-girl-multi-round": {
+                "case-b-multi-round": {
                     "status": "COMPLETED",
                     "result": {
                         "brief": _brief(),
@@ -125,23 +125,23 @@ class SurfacePreparationTest(unittest.TestCase):
                             {
                                 "phase": "audit_compile",
                                 "call_index": 0,
-                                "raw_response": {"completion": "好女孩第一轮完整输出"},
+                                "raw_response": {"completion": "蓝色纸签第一轮完整输出"},
                             },
                             {
                                 "phase": "audit_review",
                                 "call_index": 1,
-                                "raw_response": {"completion": "好女孩第二轮完整输出"},
+                                "raw_response": {"completion": "蓝色纸签第二轮完整输出"},
                                 "brief": _brief(),
                             },
                         ],
                     },
                     "evaluation": {"legacy": True},
                 },
-                "q0030-one-pass": {
+                "case-c-one-pass": {
                     "status": "COMPLETED",
                     "result": {
                         "brief": _brief(),
-                        "raw_response": {"completion": "q0030 完整原始输出"},
+                        "raw_response": {"completion": "case-c 完整原始输出"},
                     },
                 },
             }
@@ -460,7 +460,7 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
             / "three-case-layered-v7-partial"
         )
         dev_root = plugin_root.parent / ".dev"
-        if not (source / "cases" / "good-girl" / "result.private.json").is_file():
+        if not (source / "cases" / "case-b" / "result.private.json").is_file():
             self.skipTest("private v7 completed cases are not present")
         args = type(
             "Args",
@@ -481,10 +481,10 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
                 "surface_max_output_tokens": 65536,
                 "import_memory_checkpoint": [],
                 "import_completed_case": [
-                    "call-726="
-                    + str(source / "cases" / "call-726" / "result.private.json"),
-                    "good-girl="
-                    + str(source / "cases" / "good-girl" / "result.private.json"),
+                    "case-a="
+                    + str(source / "cases" / "case-a" / "result.private.json"),
+                    "case-b="
+                    + str(source / "cases" / "case-b" / "result.private.json"),
                 ],
                 "import_provider_stages_checkpoint": [],
                 "authorize_provider_calls": False,
@@ -529,9 +529,9 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
         )
         dev_root = plugin_root.parent / ".dev"
         if not (
-            stage_source / "cases" / "good-girl" / "memory.private.json"
+            stage_source / "cases" / "case-b" / "memory.private.json"
         ).is_file() or not (
-            completed_source / "cases" / "call-726" / "result.private.json"
+            completed_source / "cases" / "case-a" / "result.private.json"
         ).is_file():
             self.skipTest("private v6 import fixtures are not present")
         args = type(
@@ -553,20 +553,20 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
                 "surface_max_output_tokens": 65536,
                 "import_memory_checkpoint": [],
                 "import_completed_case": [
-                    "call-726="
+                    "case-a="
                     + str(
                         completed_source
                         / "cases"
-                        / "call-726"
+                        / "case-a"
                         / "result.private.json"
                     )
                 ],
                 "import_provider_stages_checkpoint": [
-                    "good-girl="
+                    "case-b="
                     + str(
                         stage_source
                         / "cases"
-                        / "good-girl"
+                        / "case-b"
                         / "memory.private.json"
                     )
                 ],
@@ -596,10 +596,10 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
     def test_dry_run_lists_production_chain_and_no_gold_provider_input(self) -> None:
         with _workspace_tempdir() as root:
             dev = root / ".dev"
-            call = dev / "experiments" / "masked-call-726"
-            good = dev / "eccr_cases" / "good_girl"
-            q = dev / "experiments" / "layered-three-case" / "fixtures" / "q0030"
-            imported_memory = root / "v5-call-726-memory.private.json"
+            call = dev / "experiments" / "masked-case-a"
+            good = dev / "eccr_cases" / "case_b"
+            q = dev / "experiments" / "layered-three-case" / "fixtures" / "case-c"
+            imported_memory = root / "v5-case-a-memory.private.json"
             required = [
                 root / "config.json",
                 imported_memory,
@@ -670,7 +670,7 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
                     "max_output_tokens": 384000,
                     "surface_max_output_tokens": 65536,
                     "import_memory_checkpoint": [
-                        f"call-726={imported_memory}"
+                        f"case-a={imported_memory}"
                     ],
                     "authorize_provider_calls": False,
                 },
@@ -697,11 +697,11 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
             self.assertNotIn("--import-memory-checkpoint", provider_argv[1])
             self.assertNotIn("--import-memory-checkpoint", provider_argv[2])
             self.assertEqual(
-                plan["memory_checkpoint_imports"]["call-726"]["sha256"],
+                plan["memory_checkpoint_imports"]["case-a"]["sha256"],
                 _file_sha256(imported_memory),
             )
             self.assertEqual(
-                plan["memory_checkpoint_imports"]["call-726"]["calls"], 1
+                plan["memory_checkpoint_imports"]["case-a"]["calls"], 1
             )
             self.assertTrue(
                 all(
@@ -740,7 +740,7 @@ class SuiteRunnerDryRunTest(unittest.TestCase):
             database_index = provider_argv[0].index("--database") + 1
             self.assertTrue(
                 provider_argv[0][database_index].endswith(
-                    str(Path("prepared-input") / "call-726" / "scope.db")
+                    str(Path("prepared-input") / "case-a" / "scope.db")
                 )
             )
 

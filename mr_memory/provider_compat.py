@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -7,6 +8,23 @@ from typing import Any
 
 class ProviderCompatibilityError(RuntimeError):
     """The provider cannot preserve the private request option contract."""
+
+
+class ProviderStreamError(RuntimeError):
+    """A failed stream with any provider-reported usage retained for accounting."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_usage: Any,
+        chunk_count: int,
+        failure_kind: str,
+    ) -> None:
+        super().__init__(message)
+        self.partial_usage = partial_usage
+        self.chunk_count = chunk_count
+        self.failure_kind = failure_kind
 
 
 def _supports_private_call(
@@ -85,23 +103,57 @@ async def generate_with_enforced_options(
         if stream:
             final_response = None
             chunk_count = 0
-            async for response in query_stream(
-                payload,
-                None,
-                request_max_retries=0,
-            ):
-                chunk_count += 1
-                final_response = response
-                if on_stream_progress is not None:
-                    on_stream_progress(chunk_count, response)
+            partial_usage = None
+            try:
+                async for response in query_stream(
+                    payload,
+                    None,
+                    request_max_retries=1,
+                ):
+                    chunk_count += 1
+                    final_response = response
+                    if getattr(response, "usage", None) is not None:
+                        partial_usage = response.usage
+                    if on_stream_progress is not None:
+                        on_stream_progress(chunk_count, response)
+            except BaseException as exc:
+                # AstrBot can update its last chunk in place on a usage-only
+                # event without yielding it again. Inspect it after termination.
+                last_usage = getattr(final_response, "usage", None)
+                if last_usage is not None:
+                    partial_usage = last_usage
+                if isinstance(exc, asyncio.CancelledError):
+                    exc.partial_usage = partial_usage
+                    exc.chunk_count = chunk_count
+                    raise
+                if not isinstance(exc, Exception):
+                    raise
+                raise ProviderStreamError(
+                    f"provider stream failed: {type(exc).__name__}: {exc}",
+                    partial_usage=partial_usage,
+                    chunk_count=chunk_count,
+                    failure_kind="stream_error",
+                ) from exc
+            last_usage = getattr(final_response, "usage", None)
+            if last_usage is not None:
+                partial_usage = last_usage
             if final_response is None:
-                raise RuntimeError("provider stream ended without a response")
+                raise ProviderStreamError(
+                    "provider stream ended without a response",
+                    partial_usage=partial_usage,
+                    chunk_count=chunk_count,
+                    failure_kind="no_response",
+                )
             if bool(getattr(final_response, "is_chunk", False)):
-                raise RuntimeError(
-                    "provider stream ended before assembling a final response"
+                raise ProviderStreamError(
+                    "provider stream ended before assembling a final response; "
+                    "the provider did not expose its termination reason",
+                    partial_usage=partial_usage,
+                    chunk_count=chunk_count,
+                    failure_kind="incomplete_stream",
                 )
             return final_response
-        return await query(payload, None, request_max_retries=0)
+        return await query(payload, None, request_max_retries=1)
 
     incompatible = []
     if not prepare_compatible:

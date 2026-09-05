@@ -7,7 +7,8 @@ from pathlib import Path
 
 from mr_memory.feedback import FeedbackDecision, parse_feedback_decision
 from mr_memory.models import NormalizedMessage
-from mr_memory.storage import MemoryStorage
+from mr_memory.plasticity import parse_graph_mutation
+from mr_memory.storage import FeedbackEvidenceUnavailableError, MemoryStorage
 
 
 class FeedbackMemoryTests(unittest.TestCase):
@@ -123,6 +124,801 @@ class FeedbackMemoryTests(unittest.TestCase):
                 activation_mode="semantic" if triggers else "always",
             ),
         )
+
+    def downgrade_feedback_proposals_to_legacy_schema(self) -> None:
+        """Recreate only the pre-revision proposal table for migration tests."""
+
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "DELETE FROM schema_meta "
+                "WHERE key='feedback_proposal_revision_binding'"
+            )
+            self.storage._connection.execute(
+                "DROP INDEX IF EXISTS idx_feedback_proposals_pending"
+            )
+            self.storage._connection.execute(
+                "DROP INDEX IF EXISTS idx_feedback_proposals_current"
+            )
+            self.storage._connection.execute(
+                "ALTER TABLE feedback_proposals "
+                "RENAME TO feedback_proposals_bound"
+            )
+            self.storage._connection.execute(
+                """
+                CREATE TABLE feedback_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    umo TEXT NOT NULL,
+                    feedback_source_key TEXT NOT NULL,
+                    feedback_sent_at INTEGER NOT NULL,
+                    candidate_trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                    surface_score REAL NOT NULL DEFAULT 0,
+                    candidate_reason TEXT NOT NULL DEFAULT '',
+                    decision_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    decided_at TEXT,
+                    UNIQUE (umo, feedback_source_key)
+                )
+                """
+            )
+            self.storage._connection.execute(
+                """
+                INSERT INTO feedback_proposals(
+                    id, umo, feedback_source_key, feedback_sent_at,
+                    candidate_trace_ids_json, surface_score, candidate_reason,
+                    decision_json, status, error, created_at, decided_at
+                )
+                SELECT id, umo, feedback_source_key, feedback_sent_at,
+                       candidate_trace_ids_json, surface_score,
+                       candidate_reason, decision_json, status, error,
+                       created_at, decided_at
+                FROM feedback_proposals_bound
+                """
+            )
+            self.storage._connection.execute(
+                "DROP TABLE feedback_proposals_bound"
+            )
+
+    def test_legacy_revision_one_proposal_migration_binds_exact_source(self) -> None:
+        self.open_trace(
+            "trace-legacy-revision-one",
+            request_id="request-legacy-revision-one",
+            query="继续",
+            sender_id="user-a",
+            sent_at=50,
+            response="还需要继续吗？",
+        )
+        feedback = self.message(
+            "feedback-legacy-revision-one",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=60,
+        )
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        message = self.storage._connection.execute(
+            "SELECT id, content_sha256 FROM messages WHERE source_key=?",
+            (feedback.resolved_source_key(),),
+        ).fetchone()
+        self.downgrade_feedback_proposals_to_legacy_schema()
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        proposal = self.storage._connection.execute(
+            """
+            SELECT feedback_message_id, feedback_revision_no,
+                   feedback_content_sha256, is_current, invalidation_reason
+            FROM feedback_proposals WHERE id=?
+            """,
+            (int(proposal_id or 0),),
+        ).fetchone()
+        self.assertEqual(int(proposal["feedback_message_id"]), int(message["id"]))
+        self.assertEqual(int(proposal["feedback_revision_no"]), 1)
+        self.assertEqual(
+            str(proposal["feedback_content_sha256"]),
+            str(message["content_sha256"]),
+        )
+        self.assertEqual(int(proposal["is_current"]), 1)
+        self.assertEqual(str(proposal["invalidation_reason"]), "")
+        edited = self.message(
+            "feedback-legacy-revision-one",
+            "谢谢，这样可以了。",
+            sender_id="user-a",
+            sent_at=60,
+        )
+        self.storage.upsert_message_with_outcome(edited)
+        next_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=edited.resolved_source_key(),
+        )
+        self.assertIsNotNone(next_proposal_id)
+        self.assertGreater(int(next_proposal_id or 0), int(proposal_id or 0))
+        migrated_rows = self.storage._connection.execute(
+            """
+            SELECT id, feedback_revision_no, is_current
+            FROM feedback_proposals WHERE feedback_source_key=? ORDER BY id
+            """,
+            (edited.resolved_source_key(),),
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    int(row["id"]),
+                    int(row["feedback_revision_no"]),
+                    int(row["is_current"]),
+                )
+                for row in migrated_rows
+            ],
+            [
+                (int(proposal_id or 0), 1, 0),
+                (int(next_proposal_id or 0), 2, 1),
+            ],
+        )
+
+    def test_terminal_feedback_edit_creates_a_new_revision_proposal(self) -> None:
+        self.open_trace(
+            "trace-edit-terminal",
+            request_id="request-edit-terminal",
+            query="继续",
+            sender_id="user-a",
+            sent_at=100,
+            response="要不要继续？",
+        )
+        original = self.message(
+            "feedback-edit-terminal",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=110,
+        )
+        self.storage.upsert_message(original)
+        old_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=original.resolved_source_key(),
+        )
+        committed = self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(old_proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="trace-edit-terminal",
+                mutation="upsert",
+                feedback_valence=-1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="style",
+                statement="不要反问",
+                prospective_cue="直接完成回答。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        hypothesis_id = int(committed["hypothesis_id"])
+        graph_mutation = parse_graph_mutation(
+            {
+                "operation": "upsert_edge",
+                "evidence_source_keys": [original.resolved_source_key()],
+                "confidence": 0.85,
+                "utility_delta": 0.5,
+                "statement": "回答应直接完成。",
+                "source": {"kind": "behavior", "label": "回答"},
+                "relation": {
+                    "key": "prefers_response_style",
+                    "name": "偏好回答风格",
+                    "description": "回答方式偏好",
+                    "source_kinds": ["behavior"],
+                    "target_kinds": ["preference"],
+                },
+                "target": {"kind": "preference", "label": "直接完成"},
+            }
+        )
+        graph_result = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            feedback_proposal_id=int(old_proposal_id or 0),
+            mutation=graph_mutation,
+        )
+        graph_mutation_id = int(graph_result["mutation_id"])
+        graph_edge_id = int(graph_result["target_id"])
+
+        edited = self.message(
+            "feedback-edit-terminal",
+            "谢谢，这样可以了。",
+            sender_id="user-a",
+            sent_at=110,
+        )
+        outcome = self.storage.upsert_message_with_outcome(edited)
+        self.assertTrue(outcome.needs_processing)
+        new_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=edited.resolved_source_key(),
+        )
+
+        self.assertIsNotNone(new_proposal_id)
+        self.assertNotEqual(old_proposal_id, new_proposal_id)
+        proposals = self.storage._connection.execute(
+            """
+            SELECT id, feedback_revision_no, is_current, invalidation_reason
+            FROM feedback_proposals
+            WHERE umo=? AND feedback_source_key=? ORDER BY id
+            """,
+            (self.umo, edited.resolved_source_key()),
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    int(row["id"]),
+                    int(row["feedback_revision_no"]),
+                    int(row["is_current"]),
+                )
+                for row in proposals
+            ],
+            [
+                (int(old_proposal_id or 0), 1, 0),
+                (int(new_proposal_id or 0), 2, 1),
+            ],
+        )
+        self.assertTrue(str(proposals[0]["invalidation_reason"]))
+        pending = self.storage.pending_feedback_proposals(umo=self.umo, limit=10)
+        self.assertEqual([int(item["id"]) for item in pending], [new_proposal_id])
+        hypothesis = self.storage._connection.execute(
+            """
+            SELECT status, invalidation_reason FROM feedback_hypotheses
+            WHERE id=?
+            """,
+            (hypothesis_id,),
+        ).fetchone()
+        self.assertEqual(str(hypothesis["status"]), "DORMANT")
+        self.assertTrue(str(hypothesis["invalidation_reason"]))
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM hypothesis_evidence WHERE hypothesis_id=?",
+                (hypothesis_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM feedback_links WHERE feedback_source_key=?",
+                (edited.resolved_source_key(),),
+            ).fetchone()[0],
+            0,
+        )
+        graph_receipt = self.storage._connection.execute(
+            """
+            SELECT status, error, feedback_proposal_id FROM graph_mutations
+            WHERE id=?
+            """,
+            (graph_mutation_id,),
+        ).fetchone()
+        self.assertEqual(str(graph_receipt["status"]), "INVALIDATED")
+        self.assertTrue(str(graph_receipt["error"]))
+        self.assertEqual(
+            int(graph_receipt["feedback_proposal_id"]),
+            int(old_proposal_id or 0),
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT status FROM plastic_edges WHERE id=?",
+                (graph_edge_id,),
+            ).fetchone()[0],
+            "DORMANT",
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM plastic_edge_evidence WHERE edge_id=?",
+                (graph_edge_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.storage.compact_plastic_graph(
+            umo=self.umo,
+            now=2_000_000_000,
+        )
+        still_invalidated = self.storage._connection.execute(
+            "SELECT status, invalidation_reason FROM plastic_edges WHERE id=?",
+            (graph_edge_id,),
+        ).fetchone()
+        self.assertEqual(str(still_invalidated["status"]), "DORMANT")
+        self.assertTrue(str(still_invalidated["invalidation_reason"]))
+        self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(new_proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="trace-edit-terminal",
+                mutation="upsert",
+                feedback_valence=1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="style",
+                statement="直接完成回答很好",
+                prospective_cue="直接完成回答。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        rebuilt_graph = self.storage.apply_graph_mutation(
+            umo=self.umo,
+            feedback_proposal_id=int(new_proposal_id or 0),
+            mutation=graph_mutation,
+        )
+        self.assertNotEqual(
+            int(rebuilt_graph["mutation_id"]),
+            graph_mutation_id,
+        )
+        rebuilt_edge = self.storage._connection.execute(
+            """
+            SELECT status, utility, support_count, invalidation_reason
+            FROM plastic_edges WHERE id=?
+            """,
+            (graph_edge_id,),
+        ).fetchone()
+        self.assertEqual(str(rebuilt_edge["status"]), "ACTIVE")
+        self.assertEqual(float(rebuilt_edge["utility"]), 0.5)
+        self.assertEqual(int(rebuilt_edge["support_count"]), 1)
+        self.assertEqual(str(rebuilt_edge["invalidation_reason"]), "")
+
+    def test_stale_inflight_feedback_decision_is_rejected_after_edit(self) -> None:
+        self.open_trace(
+            "trace-stale-inflight",
+            request_id="request-stale-inflight",
+            query="继续",
+            sender_id="user-a",
+            sent_at=200,
+            response="还要继续吗？",
+        )
+        original = self.message(
+            "feedback-stale-inflight",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=210,
+        )
+        self.storage.upsert_message(original)
+        old_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=original.resolved_source_key(),
+        )
+        self.storage.inspect_feedback_proposal(
+            umo=self.umo,
+            proposal_id=int(old_proposal_id or 0),
+        )
+
+        edited = self.message(
+            "feedback-stale-inflight",
+            "不错，这样可以了。",
+            sender_id="user-a",
+            sent_at=210,
+        )
+        self.storage.upsert_message_with_outcome(edited)
+        new_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=edited.resolved_source_key(),
+        )
+        self.assertNotEqual(old_proposal_id, new_proposal_id)
+        with self.assertRaisesRegex(
+            FeedbackEvidenceUnavailableError,
+            "source revision is stale",
+        ):
+            self.storage.inspect_feedback_proposal(
+                umo=self.umo,
+                proposal_id=int(old_proposal_id or 0),
+            )
+        with self.assertRaisesRegex(ValueError, "source revision is stale"):
+            self.storage.apply_feedback_decision(
+                umo=self.umo,
+                proposal_id=int(old_proposal_id or 0),
+                decision=FeedbackDecision(
+                    target_trace_id="trace-stale-inflight",
+                    mutation="upsert",
+                    feedback_valence=-1.0,
+                    confidence=0.9,
+                    scope_type="sender",
+                    scope_key="user-a",
+                    aspect="style",
+                    statement="不要反问",
+                    prospective_cue="直接完成回答。",
+                    trigger_cues=(),
+                    activation_mode="always",
+                ),
+            )
+        with self.assertRaisesRegex(
+            FeedbackEvidenceUnavailableError,
+            "source revision is stale",
+        ):
+            self.storage.reject_feedback_proposal(
+                umo=self.umo,
+                proposal_id=int(old_proposal_id or 0),
+                error="stale worker result",
+            )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM feedback_hypotheses"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM feedback_links"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_edit_below_surface_gate_retracts_without_replacement(self) -> None:
+        self.open_trace(
+            "trace-edit-no-replacement",
+            request_id="request-edit-no-replacement",
+            query="继续",
+            sender_id="user-a",
+            sent_at=300,
+            response="要不要继续？",
+        )
+        original = self.message(
+            "feedback-edit-no-replacement",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=310,
+        )
+        self.storage.upsert_message(original)
+        old_proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=original.resolved_source_key(),
+        )
+        committed = self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(old_proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="trace-edit-no-replacement",
+                mutation="upsert",
+                feedback_valence=-1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="style",
+                statement="不要反问",
+                prospective_cue="直接完成回答。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        edited = self.message(
+            "feedback-edit-no-replacement",
+            "今天阳光很好",
+            sender_id="user-a",
+            sent_at=310,
+        )
+        self.storage.upsert_message_with_outcome(edited)
+        self.assertIsNone(
+            self.storage.enqueue_feedback_candidate(
+                umo=self.umo,
+                feedback_source_key=edited.resolved_source_key(),
+            )
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT is_current FROM feedback_proposals WHERE id=?",
+                (int(old_proposal_id or 0),),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT status FROM feedback_hypotheses WHERE id=?",
+                (int(committed["hypothesis_id"]),),
+            ).fetchone()[0],
+            "DORMANT",
+        )
+        self.assertEqual(
+            self.storage.pending_feedback_proposals(umo=self.umo, limit=10),
+            [],
+        )
+
+    def test_same_feedback_revision_enqueue_is_exactly_once(self) -> None:
+        self.open_trace(
+            "trace-same-revision",
+            request_id="request-same-revision",
+            query="继续",
+            sender_id="user-a",
+            sent_at=400,
+            response="还需要继续吗？",
+        )
+        feedback = self.message(
+            "feedback-same-revision",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=410,
+        )
+        self.storage.upsert_message(feedback)
+        first = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        second = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertEqual(first, second)
+        rows = self.storage._connection.execute(
+            """
+            SELECT id, feedback_revision_no, is_current
+            FROM feedback_proposals WHERE umo=? AND feedback_source_key=?
+            """,
+            (self.umo, feedback.resolved_source_key()),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(int(rows[0]["feedback_revision_no"]), 1)
+        self.assertEqual(int(rows[0]["is_current"]), 1)
+
+    def test_pending_feedback_rejects_revision_binding_drift(self) -> None:
+        self.open_trace(
+            "trace-pending-binding",
+            request_id="request-pending-binding",
+            query="继续",
+            sender_id="user-a",
+            sent_at=450,
+            response="还需要继续吗？",
+        )
+        feedback = self.message(
+            "feedback-pending-binding",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=460,
+        )
+        self.storage.upsert_message(feedback)
+        self.assertIsNotNone(
+            self.storage.enqueue_feedback_candidate(
+                umo=self.umo,
+                feedback_source_key=feedback.resolved_source_key(),
+            )
+        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE messages SET revision_no=revision_no+1 "
+                "WHERE source_key=?",
+                (feedback.resolved_source_key(),),
+            )
+        with self.assertRaisesRegex(
+            FeedbackEvidenceUnavailableError,
+            "source revision is stale",
+        ):
+            self.storage.pending_feedback_proposals(umo=self.umo, limit=10)
+
+    def test_legacy_deleted_revision_one_proposal_migration_fails_closed(
+        self,
+    ) -> None:
+        self.open_trace(
+            "trace-legacy-deleted",
+            request_id="request-legacy-deleted",
+            query="继续",
+            sender_id="user-a",
+            sent_at=470,
+            response="还需要继续吗？",
+        )
+        feedback = self.message(
+            "feedback-legacy-deleted",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=480,
+        )
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        committed = self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="trace-legacy-deleted",
+                mutation="upsert",
+                feedback_valence=-1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="style",
+                statement="不要反问",
+                prospective_cue="直接完成回答。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        hypothesis_id = int(committed["hypothesis_id"])
+        with self.storage._connection:
+            # Reproduce an old database whose deleted head never advanced its
+            # revision counter.  Migration must not infer that revision one is
+            # still live merely because the number and hash look bindable.
+            self.storage._connection.execute(
+                """
+                UPDATE messages SET is_deleted=1, deleted_at=490
+                WHERE source_key=?
+                """,
+                (feedback.resolved_source_key(),),
+            )
+        self.downgrade_feedback_proposals_to_legacy_schema()
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        proposal = self.storage._connection.execute(
+            """
+            SELECT feedback_message_id, feedback_revision_no,
+                   feedback_content_sha256, is_current, invalidation_reason
+            FROM feedback_proposals WHERE id=?
+            """,
+            (int(proposal_id or 0),),
+        ).fetchone()
+        self.assertGreater(int(proposal["feedback_message_id"]), 0)
+        self.assertEqual(int(proposal["feedback_revision_no"]), 0)
+        self.assertEqual(str(proposal["feedback_content_sha256"]), "")
+        self.assertEqual(int(proposal["is_current"]), 0)
+        self.assertIn("legacy_unbound_revision", proposal["invalidation_reason"])
+        hypothesis = self.storage._connection.execute(
+            """
+            SELECT status, invalidation_reason FROM feedback_hypotheses
+            WHERE id=?
+            """,
+            (hypothesis_id,),
+        ).fetchone()
+        self.assertEqual(str(hypothesis["status"]), "DORMANT")
+        self.assertIn("legacy_unbound_revision", hypothesis["invalidation_reason"])
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM hypothesis_evidence WHERE hypothesis_id=?",
+                (hypothesis_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        rebound = self.storage._connection.execute(
+            """
+            SELECT feedback_revision_no, feedback_content_sha256,
+                   is_current, invalidation_reason
+            FROM feedback_proposals WHERE id=?
+            """,
+            (int(proposal_id or 0),),
+        ).fetchone()
+        self.assertEqual(int(rebound["feedback_revision_no"]), 0)
+        self.assertEqual(str(rebound["feedback_content_sha256"]), "")
+        self.assertEqual(int(rebound["is_current"]), 0)
+        self.assertIn("legacy_unbound_revision", rebound["invalidation_reason"])
+
+    def test_legacy_revised_feedback_proposal_migration_fails_closed(self) -> None:
+        self.open_trace(
+            "trace-legacy-revision",
+            request_id="request-legacy-revision",
+            query="继续",
+            sender_id="user-a",
+            sent_at=500,
+            response="还需要继续吗？",
+        )
+        feedback = self.message(
+            "feedback-legacy-revision",
+            "不要反问",
+            sender_id="user-a",
+            sent_at=510,
+        )
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=self.umo,
+            feedback_source_key=feedback.resolved_source_key(),
+        )
+        committed = self.storage.apply_feedback_decision(
+            umo=self.umo,
+            proposal_id=int(proposal_id or 0),
+            decision=FeedbackDecision(
+                target_trace_id="trace-legacy-revision",
+                mutation="upsert",
+                feedback_valence=-1.0,
+                confidence=0.9,
+                scope_type="sender",
+                scope_key="user-a",
+                aspect="style",
+                statement="不要反问",
+                prospective_cue="直接完成回答。",
+                trigger_cues=(),
+                activation_mode="always",
+            ),
+        )
+        hypothesis_id = int(committed["hypothesis_id"])
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE messages SET revision_no=2 WHERE source_key=?",
+                (feedback.resolved_source_key(),),
+            )
+        self.downgrade_feedback_proposals_to_legacy_schema()
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        proposal = self.storage._connection.execute(
+            """
+            SELECT feedback_revision_no, feedback_content_sha256,
+                   is_current, invalidation_reason
+            FROM feedback_proposals WHERE id=?
+            """,
+            (int(proposal_id or 0),),
+        ).fetchone()
+        self.assertEqual(int(proposal["feedback_revision_no"]), 0)
+        self.assertEqual(str(proposal["feedback_content_sha256"]), "")
+        self.assertEqual(int(proposal["is_current"]), 0)
+        self.assertIn("legacy_unbound_revision", proposal["invalidation_reason"])
+        hypothesis = self.storage._connection.execute(
+            """
+            SELECT status, invalidation_reason FROM feedback_hypotheses
+            WHERE id=?
+            """,
+            (hypothesis_id,),
+        ).fetchone()
+        self.assertEqual(str(hypothesis["status"]), "DORMANT")
+        self.assertIn("legacy_unbound_revision", hypothesis["invalidation_reason"])
+        self.assertEqual(
+            self.storage._connection.execute(
+                "SELECT COUNT(*) FROM hypothesis_evidence WHERE hypothesis_id=?",
+                (hypothesis_id,),
+            ).fetchone()[0],
+            0,
+        )
+        unique_indexes = []
+        for index in self.storage._connection.execute(
+            "PRAGMA index_list(feedback_proposals)"
+        ).fetchall():
+            if not int(index["unique"] or 0):
+                continue
+            name = str(index["name"]).replace('"', '""')
+            unique_indexes.append(
+                (
+                    tuple(
+                        str(row["name"])
+                        for row in self.storage._connection.execute(
+                            f'PRAGMA index_info("{name}")'
+                        ).fetchall()
+                    ),
+                    int(index["partial"] or 0),
+                    str(index["origin"] or ""),
+                )
+            )
+        self.assertIn(
+            (
+                ("umo", "feedback_source_key", "feedback_revision_no"),
+                0,
+                "u",
+            ),
+            unique_indexes,
+        )
+        self.assertIn(
+            (("umo", "feedback_source_key"), 1, "c"),
+            unique_indexes,
+        )
+        self.assertNotIn(
+            (("umo", "feedback_source_key"), 0, "u"),
+            unique_indexes,
+        )
+        self.assertIsNone(
+            self.storage._connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='feedback_proposals_legacy'"
+            ).fetchone()
+        )
+        self.assertEqual(
+            self.storage._connection.execute("PRAGMA foreign_key_check").fetchall(),
+            [],
+        )
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        rebound = self.storage._connection.execute(
+            """
+            SELECT feedback_revision_no, feedback_content_sha256,
+                   is_current, invalidation_reason
+            FROM feedback_proposals WHERE id=?
+            """,
+            (int(proposal_id or 0),),
+        ).fetchone()
+        self.assertEqual(int(rebound["feedback_revision_no"]), 0)
+        self.assertEqual(str(rebound["feedback_content_sha256"]), "")
+        self.assertEqual(int(rebound["is_current"]), 0)
+        self.assertIn("legacy_unbound_revision", rebound["invalidation_reason"])
 
     def test_decision_parser_rejects_unbounded_or_ambiguous_mutations(self) -> None:
         parsed = parse_feedback_decision(

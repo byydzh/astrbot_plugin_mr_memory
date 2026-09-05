@@ -26,8 +26,12 @@ from mr_memory.snapshot import (
     stable_sha256,
 )
 from mr_memory.surface import (
+    ANSWER_CONTEXT_SCHEMA_VERSION,
     SURFACE_SCHEMA_VERSION,
+    SurfaceCompilationError,
+    compile_answer_context_packet,
     compile_surface_packet,
+    validate_answer_context_packet,
     validate_surface_packet,
 )
 from scripts.local_serving_e2e_acceptance import provider_turn_report
@@ -65,6 +69,7 @@ class LocalOutcome:
     operational_status: str
     semantic_status: str = "UNKNOWN"
     envelope_text: str = ""
+    certificate: object | None = None
     run_id: str = ""
     detail: str = ""
     elapsed_ms: float = 0.0
@@ -324,6 +329,52 @@ def synthetic_reader_delta(
         for key, value in certificate.items()
         if key not in _READER_HOST_FIELDS
     }
+    subjects = semantic.pop("subjects", [])
+    referents: list[dict[str, object]] = []
+    referent_by_participant: dict[str, str] = {}
+    for index, subject in enumerate(subjects, start=1):
+        if not isinstance(subject, dict):
+            continue
+        referent_id = f"referent-{index}"
+        participant_key = str(subject.get("participant_key") or "")
+        if participant_key:
+            referent_by_participant[participant_key] = referent_id
+        referents.append(
+            {
+                "id": referent_id,
+                "reference": subject.get("reference"),
+                "referent_type": "PARTICIPANT",
+                "participant_key": participant_key,
+                "reference_mode": subject.get("reference_mode"),
+                "candidate_participant_keys": subject.get(
+                    "candidate_participant_keys"
+                ),
+                "source_keys": subject.get("source_keys"),
+                "valid_at": subject.get("valid_at"),
+            }
+        )
+    semantic["referents"] = referents
+    reasoning_by_attribution = {
+        "DIRECT_SPEAKER_STATEMENT": "EVIDENCE_STATEMENT",
+        "OTHER_SPEAKER_REPORT": "EVIDENCE_STATEMENT",
+        "OBSERVER_SUMMARY": "EVIDENCE_SUMMARY",
+        "DERIVED_INTERPRETATION": "DERIVED_INFERENCE",
+        "HOST_IDENTITY": "HOST_IDENTITY",
+        "BEHAVIORAL_FEEDBACK": "BEHAVIORAL_FEEDBACK",
+    }
+    for atom in semantic.get("atoms", []):
+        if not isinstance(atom, dict):
+            continue
+        atom.pop("speaker_participant_key", None)
+        subject_participant_key = str(
+            atom.pop("subject_participant_key", "") or ""
+        )
+        attribution = str(atom.pop("attribution", "") or "").strip().upper()
+        atom["subject_referent_id"] = referent_by_participant.get(
+            subject_participant_key,
+            "",
+        )
+        atom["reasoning_kind"] = reasoning_by_attribution[attribution]
     result = aliased(semantic)
     assert isinstance(result, dict)
     return result
@@ -366,7 +417,11 @@ def production_inject_method():
     return main_method(
         "inject_subconscious_memory",
         json=json,
+        ANSWER_CONTEXT_SCHEMA_VERSION=ANSWER_CONTEXT_SCHEMA_VERSION,
         SURFACE_SCHEMA_VERSION=SURFACE_SCHEMA_VERSION,
+        SurfaceCompilationError=SurfaceCompilationError,
+        compile_answer_context_packet=compile_answer_context_packet,
+        validate_answer_context_packet=validate_answer_context_packet,
         TextPart=FakeTextPart,
         logger=SimpleNamespace(
             error=lambda *args, **kwargs: None,
@@ -418,6 +473,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             _embedding_preload_complete=True,
             _embedding_preload_error="",
             _active_interaction_traces={},
+            _active_surface_certificates={},
             _begin_interaction_trace=AsyncMock(),
             _local_serving_guard=lambda event: "",
             _group_scope=lambda event: SimpleNamespace(
@@ -489,7 +545,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
         outcome = await production_execute_method()(host, event, QUERY)
 
-        self.assertTrue(outcome.usable)
+        self.assertTrue(outcome.usable, outcome.detail)
         self.assertEqual(outcome.operational_status, "COMPLETED")
         self.assertEqual(outcome.semantic_status, "CERTIFIED")
         host._layered_evidence_packet.assert_awaited_once()
@@ -562,14 +618,19 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(request.extra_user_content_parts), 1)
         injected = request.extra_user_content_parts[0].text
-        marker = "<mr_memory_surface>"
+        marker = "<mr_memory_answer_context>"
         self.assertIn(marker, injected)
-        surface_text = injected.split(marker, 1)[1].split(
-            "</mr_memory_surface>", 1
+        context_text = injected.split(marker, 1)[1].split(
+            "</mr_memory_answer_context>", 1
         )[0]
-        surface = json.loads(surface_text)
-        self.assertEqual(surface["schema_version"], SURFACE_SCHEMA_VERSION)
-        self.assertEqual(surface["status"], "CERTIFIED")
+        answer_context = json.loads(context_text)
+        self.assertEqual(
+            answer_context["schema_version"],
+            ANSWER_CONTEXT_SCHEMA_VERSION,
+        )
+        self.assertEqual(answer_context["memory_state"], "supported")
+        self.assertNotIn("source_spans", context_text)
+        self.assertNotIn("certificate_sha256", context_text)
         self.assertIn(id(event), host._local_serving_injected)
         service.finish_experiment.assert_awaited_once()
         terminal = service.finish_experiment.await_args.kwargs
@@ -579,6 +640,12 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             "INJECTED_IN_REQUEST_HOOK",
         )
         self.assertEqual(terminal["result"]["memory_provider_calls"], 1)
+        self.assertFalse(terminal["result"]["raw_surface_injected"])
+        self.assertGreater(terminal["result"]["answer_context_chars"], 0)
+        self.assertEqual(
+            terminal["result"]["answer_context_required_facts"],
+            len(outcome.certificate.required_atoms),
+        )
 
     async def test_surface_optional_omission_is_reported_as_truncation(self) -> None:
         snapshot = synthetic_snapshot()
@@ -639,7 +706,7 @@ class OnlineResidentServingAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(message_obj=SimpleNamespace(message_str=QUERY))
         outcome = await production_execute_method()(host, event, QUERY)
 
-        self.assertTrue(outcome.usable)
+        self.assertTrue(outcome.usable, outcome.detail)
         self.assertTrue(outcome.truncated)
         self.assertEqual(outcome.ledger_result["surface_omitted_optional"], 1)
         self.assertTrue(outcome.ledger_result["surface_truncated"])

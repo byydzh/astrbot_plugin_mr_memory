@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -33,21 +31,9 @@ class NormalizedMessage:
             return "|".join(
                 (self.platform_id, self.umo, self.message_id.strip())
             )
-        fallback = json.dumps(
-            {
-                "platform_id": self.platform_id,
-                "umo": self.umo,
-                "sender_id": self.sender_id,
-                "sent_at": self.sent_at,
-                "plain_text": self.plain_text,
-                "content": self.content,
-                "role": self.role,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return f"sha256:{hashlib.sha256(fallback).hexdigest()}"
+        raise ValueError(
+            "message source identity requires platform message_id or explicit source_key"
+        )
 
     @classmethod
     def from_mapping(cls, value: dict[str, Any]) -> "NormalizedMessage":

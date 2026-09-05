@@ -64,11 +64,11 @@ class LocalServingMainModelCaseTests(unittest.TestCase):
         )
 
     def test_messages_preserve_query_and_full_local_envelope(self) -> None:
-        case = load_case(self.acceptance, "call-726")
+        case = load_case(self.acceptance, "case-a")
         messages = build_messages(case)
         self.assertEqual(len(messages), 2)
         payload = json.loads(messages[1]["content"])
-        self.assertEqual(payload["current_message"], "问题 call-726")
+        self.assertEqual(payload["current_message"], "问题 case-a")
         self.assertIn("<mr_memory_local_evidence>", payload["extra_user_content"])
         self.assertIn("保留不确定性", payload["extra_user_content"])
 

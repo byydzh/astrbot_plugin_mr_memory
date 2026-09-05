@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from mr_memory.activity_statistics import validate_activity_window_statistics
+from mr_memory.certificate import MAX_CERTIFICATE_AGGREGATES
+from mr_memory.evidence_pack import compile_evidence_atom_pack
 from mr_memory.feedback import FeedbackDecision
 from mr_memory.identity import normalize_alias
 from mr_memory.models import NormalizedMessage
 from mr_memory.plasticity import parse_graph_mutation
+from mr_memory.service import MemoryService
 from mr_memory.storage import FeedbackEvidenceUnavailableError, MemoryStorage
 
 
@@ -68,6 +75,151 @@ class MemoryStorageTests(unittest.TestCase):
             [],
         )
 
+    def test_unchanged_redelivery_does_not_inflate_alias_observations(self) -> None:
+        message = self.message(
+            "same-source",
+            "同一条适配器消息",
+            sender_id="synthetic-account",
+            sender_name="SyntheticAlias",
+        )
+
+        first = self.storage.upsert_message_with_outcome(message)
+        second = self.storage.upsert_message_with_outcome(message)
+
+        self.assertEqual(first.status, "INSERTED")
+        self.assertEqual(second.status, "UNCHANGED")
+        row = self.storage._connection.execute(
+            """
+            SELECT observation_count
+            FROM participant_aliases AS a
+            JOIN participants AS p ON p.id=a.participant_id
+            WHERE p.umo=? AND p.account_id=? AND a.normalized_alias=?
+            """,
+            (message.umo, message.sender_id, normalize_alias(message.sender_name)),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(int(row["observation_count"]), 1)
+
+    def test_source_edit_reconciles_alias_observation_summary(self) -> None:
+        original = self.message(
+            "edited-source",
+            "同一条适配器消息",
+            sender_id="synthetic-account",
+            sender_name="OldSyntheticAlias",
+        )
+        edited = self.message(
+            "edited-source",
+            "同一条适配器消息",
+            sender_id="synthetic-account",
+            sender_name="NewSyntheticAlias",
+        )
+
+        inserted = self.storage.upsert_message_with_outcome(original)
+        identity_update = self.storage.upsert_message_with_outcome(edited)
+        self.assertEqual(inserted.status, "INSERTED")
+        self.assertTrue(inserted.needs_processing)
+        self.assertEqual(identity_update.status, "UPDATED")
+        self.assertFalse(identity_update.needs_processing)
+
+        rows = self.storage._connection.execute(
+            """
+            SELECT normalized_alias, observation_count, is_active
+            FROM participant_aliases AS a
+            JOIN participants AS p ON p.id=a.participant_id
+            WHERE p.umo=? AND p.account_id=?
+            ORDER BY normalized_alias
+            """,
+            (edited.umo, edited.sender_id),
+        ).fetchall()
+        by_alias = {
+            str(row["normalized_alias"]): (
+                int(row["observation_count"]),
+                int(row["is_active"]),
+            )
+            for row in rows
+        }
+        self.assertEqual(
+            by_alias[normalize_alias(original.sender_name)],
+            (0, 0),
+        )
+        self.assertEqual(
+            by_alias[normalize_alias(edited.sender_name)],
+            (1, 1),
+        )
+        observations = self.storage._connection.execute(
+            """
+            SELECT normalized_alias
+            FROM participant_alias_observations
+            WHERE umo=?
+            """,
+            (edited.umo,),
+        ).fetchall()
+        self.assertEqual(
+            [str(row["normalized_alias"]) for row in observations],
+            [normalize_alias(edited.sender_name)],
+        )
+
+    def test_message_source_identity_must_be_platform_or_caller_supplied(self) -> None:
+        without_identity = self.message("", "不能静默合并")
+        with self.assertRaisesRegex(ValueError, "source identity"):
+            without_identity.resolved_source_key()
+
+        explicit = NormalizedMessage(
+            **{
+                field: getattr(without_identity, field)
+                for field in without_identity.__dataclass_fields__
+                if field != "source_key"
+            },
+            source_key="external:test:source-1",
+        )
+        self.assertEqual(explicit.resolved_source_key(), "external:test:source-1")
+
+    def test_explicit_source_key_cannot_cross_an_immutable_message_envelope(self) -> None:
+        first = replace(
+            self.message(
+                "platform-one",
+                "first scope payload",
+                sender_id="scope-a-account",
+            ),
+            source_key="external:collision",
+        )
+        collision = replace(
+            self.message(
+                "platform-two",
+                "second scope payload",
+                umo="shadow:GroupMessage:group-b",
+                sender_id="scope-b-account",
+            ),
+            source_key="external:collision",
+        )
+
+        self.assertTrue(self.storage.upsert_message(first))
+        with self.assertRaisesRegex(ValueError, "immutable message envelope"):
+            self.storage.upsert_message_with_outcome(collision)
+
+        stored = self.storage._connection.execute(
+            """
+            SELECT umo, group_id, message_id, sender_id, plain_text
+            FROM messages WHERE source_key='external:collision'
+            """
+        ).fetchone()
+        self.assertIsNotNone(stored)
+        self.assertEqual(
+            tuple(stored),
+            (
+                first.umo,
+                first.group_id,
+                first.message_id,
+                first.sender_id,
+                first.plain_text,
+            ),
+        )
+        leaked_participant = self.storage._connection.execute(
+            "SELECT 1 FROM participants WHERE umo=? OR account_id=?",
+            (collision.umo, collision.sender_id),
+        ).fetchone()
+        self.assertIsNone(leaked_participant)
+
     def test_search_is_scoped_to_umo(self) -> None:
         self.storage.upsert_message(self.message("1", "秘密决策"))
         self.storage.upsert_message(
@@ -93,6 +245,94 @@ class MemoryStorageTests(unittest.TestCase):
             limit=2,
         )
         self.assertEqual([item.plain_text for item in results], ["早", "晚"])
+
+    def test_lexical_context_reads_snapshot_neighbors_through_service(self) -> None:
+        earlier = [self.message(f"earlier-{index}", "合成早期记录", sent_at=index + 1)
+                   for index in range(13)]
+        previous = self.message("neighbor-before", "合成前文", sent_at=1000)
+        anchor = self.message("neighbor-anchor", "合成检索锚点", sent_at=1000)
+        request = self.message("neighbor-request", "当前问题", sent_at=1000)
+        deleted = self.message("neighbor-deleted", "已撤回原文", sent_at=1001)
+        foreign = self.message("neighbor-foreign", "其他群原文", sent_at=1001,
+                               umo="shadow:GroupMessage:other-group")
+        following = self.message("neighbor-after", "合成后文", sent_at=1700,
+                                 sender_id="synthetic-other-speaker")
+        cutoff_row = self.message("neighbor-cutoff", "截止时刻原文", sent_at=2000)
+        for message in [*earlier, previous, anchor, request, deleted, foreign, following, cutoff_row]:
+            self.storage.upsert_message(message)
+        self.storage.mark_message_deleted(umo=anchor.umo, platform_id=anchor.platform_id,
+                                          platform_message_id=deleted.message_id, deleted_at=1900)
+        upper_bound = self.storage._connection.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+        late = self.message("neighbor-late", "快照后到达的旧时间消息", sent_at=1001)
+        self.storage.upsert_message(late)
+        arguments = dict(umo=anchor.umo, before_sent_at=2000, message_upper_bound=upper_bound,
+                         exclude_source_key=request.resolved_source_key())
+        groups = asyncio.run(MemoryService(self.storage).query_lexical_context(
+            **arguments, source_keys=[item.resolved_source_key()
+                                     for item in (anchor, following, deleted, foreign, late, cutoff_row, request)],
+        ))
+        self.assertEqual([item["anchor_source_key"] for item in groups],
+                         [anchor.resolved_source_key(), following.resolved_source_key()])
+        self.assertTrue(all(item["context_relation"] == "chronological_neighbor_not_reply" for item in groups))
+        self.assertEqual([item["source_key"] for item in groups[0]["messages"]],
+                         [previous.resolved_source_key(), anchor.resolved_source_key(), following.resolved_source_key()])
+        self.assertEqual([item["relative_seconds"] for item in groups[0]["messages"]], [0, 0, 700])
+        self.assertEqual([item["relative_seconds"] for item in groups[1]["messages"]], [-700, 0])
+        evidence = groups[0]["messages"][-1]
+        self.assertEqual(evidence["sender_id"], following.sender_id)
+        self.assertEqual(evidence["sent_at"], following.sent_at)
+        self.assertEqual(evidence["components"], [{"type": "text", "text": following.plain_text}])
+        self.assertEqual(evidence["reply_to_source_key"], "")
+        capped = self.storage.query_lexical_context(
+            **arguments, source_keys=[item.resolved_source_key() for item in earlier],
+        )
+        self.assertEqual(len(capped), 12)
+        self.assertTrue(all(len(item["messages"]) <= 3 for item in capped))
+
+    def test_lexical_term_representative_keeps_old_structured_source(self) -> None:
+        reply_target = self.message("reply-target", "合成开场记录", sent_at=10,
+                                    sender_id="synthetic-target")
+        anchor = self.message("structured-old", "璃舟 lumen", sent_at=100)
+        anchor = replace(anchor, content=[*anchor.content,
+                                          {"type": "mention", "account_id": "synthetic-target"}])
+        alternative = self.message("structured-other-account", "璃舟 lumen", sent_at=90)
+        alternative = replace(alternative, content=[*alternative.content,
+                                                    {"type": "mention", "account_id": "synthetic-alternative"}])
+        newer_reply = self.message("structured-newer-reply", "璃舟 lumen", sent_at=300)
+        newer_reply = replace(newer_reply, content=[*newer_reply.content, {
+            "type": "reply", "message_id": reply_target.message_id,
+            "sender_id": reply_target.sender_id, "sent_at": reply_target.sent_at,
+            "plain_text": reply_target.plain_text,
+        }])
+        other_term = self.message("other-term", "铜铃 lumen", sent_at=110)
+        unrelated = self.message("unrelated-mention", "无关原文", sent_at=400)
+        unrelated = replace(unrelated, content=[*unrelated.content,
+                                                {"type": "mention", "account_id": "synthetic-target"}])
+        for message in (reply_target, anchor, alternative, other_term, unrelated, newer_reply):
+            self.storage.upsert_message(message)
+        for index in range(24):
+            self.storage.upsert_message(self.message(f"newer-chatter-{index}", "璃舟 lumen", sent_at=200 + index))
+        upper_bound = self.storage._connection.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+        arguments = dict(umo=anchor.umo, match_mode="recall", before_sent_at=500,
+                         message_upper_bound=upper_bound)
+        selected = self.storage.search_messages(**arguments, query="璃舟 铜铃", limit=2)
+        self.assertEqual({item.source_key for item in selected},
+                         {anchor.resolved_source_key(), other_term.resolved_source_key()})
+        self.assertEqual(next(item for item in selected if item.source_key == anchor.resolved_source_key()).mentions[0]["account_id"],
+                         "synthetic-target")
+        expanded = self.storage.search_messages(**arguments, query="璃舟 铜铃", limit=3)
+        self.assertEqual({item.source_key for item in expanded}, {
+            anchor.resolved_source_key(), alternative.resolved_source_key(), other_term.resolved_source_key(),
+        })
+        self.assertEqual(len(expanded), 3)
+        reply_evidence = self.storage.message_for_source(
+            umo=anchor.umo, source_key=newer_reply.resolved_source_key(),
+            before_sent_at=500, message_upper_bound=upper_bound,
+        )
+        self.assertEqual(reply_evidence["reply_to_source_key"], reply_target.resolved_source_key())
+        self.assertEqual(reply_evidence["mentions"], [])
+        fts_selected = self.storage.search_messages(**arguments, query="lumen", limit=1)
+        self.assertEqual([item.source_key for item in fts_selected], [anchor.resolved_source_key()])
 
 
 
@@ -173,6 +413,68 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertEqual(len(history["messages"]), 2)
         self.assertEqual(history["source_count_total"], 5)
         self.assertTrue(history["messages_truncated"])
+
+    def test_participant_history_count_and_rows_share_snapshot_boundaries(self) -> None:
+        umo = "shadow:GroupMessage:synthetic-history-boundaries"
+        records = [
+            self.message(
+                f"synthetic-history-{index}",
+                f"synthetic transcript {index}",
+                umo=umo,
+                sender_id="synthetic-history-account",
+                sent_at=100 + index,
+            )
+            for index in range(6)
+        ]
+        for message in records:
+            self.storage.upsert_message(message)
+        participant = self.storage._connection.execute(
+            "SELECT canonical_key FROM participants WHERE umo=? AND account_id=?",
+            (umo, "synthetic-history-account"),
+        ).fetchone()
+        upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?", (umo,)
+            ).fetchone()[0]
+        )
+        self.storage.upsert_message(
+            self.message(
+                "synthetic-history-late-import",
+                "historical timestamp inserted after snapshot",
+                umo=umo,
+                sender_id="synthetic-history-account",
+                sent_at=102,
+            )
+        )
+        self.storage.upsert_message(
+            self.message(
+                "synthetic-history-other-account",
+                "another account in the same group",
+                umo=umo,
+                sender_id="synthetic-other-account",
+                sent_at=103,
+            )
+        )
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE messages SET is_deleted=1 WHERE umo=? AND source_key=?",
+                (umo, records[3].resolved_source_key()),
+            )
+
+        history = self.storage.query_participant_history(
+            umo=umo,
+            participant_key=str(participant["canonical_key"]),
+            before_sent_at=104,
+            message_upper_bound=upper_bound,
+            limit=2,
+        )
+
+        self.assertEqual(history["source_count_total"], 3)
+        self.assertTrue(history["messages_truncated"])
+        self.assertEqual(
+            [row["source_key"] for row in history["messages"]],
+            [records[1].resolved_source_key(), records[2].resolved_source_key()],
+        )
 
 
     def _insert_semantic_self_alias(
@@ -352,6 +654,14 @@ class MemoryStorageTests(unittest.TestCase):
                 self.storage.upsert_message(message)
                 if hour in {0, 19}:
                     expected_boundaries.add(message.resolved_source_key())
+        for message in (
+            self.message("other-scope", "excluded", umo="shadow:GroupMessage:group-b",
+                         sender_id="account-active", sent_at=epoch(20, 1)),
+            self.message("other-author", "excluded", sender_id="account-other", sent_at=epoch(20, 1)),
+            self.message("before-window", "excluded", sender_id="account-active", sent_at=epoch(14, 23)),
+            self.message("at-cutoff", "excluded", sender_id="account-active", sent_at=epoch(22, 0)),
+        ):
+            self.storage.upsert_message(message)
         message_upper_bound = int(
             self.storage._connection.execute(
                 "SELECT MAX(id) FROM messages WHERE umo=?",
@@ -365,6 +675,10 @@ class MemoryStorageTests(unittest.TestCase):
             message_upper_bound=message_upper_bound,
         )
         participant_key = str(resolved["participants"][0]["canonical_key"])
+
+        self.storage.upsert_message(self.message(
+            "after-id-snapshot", "excluded", sender_id="account-active", sent_at=epoch(20, 1),
+        ))
 
         activity = self.storage.query_participant_activity(
             umo=umo,
@@ -383,6 +697,37 @@ class MemoryStorageTests(unittest.TestCase):
         self.assertEqual(sum(activity["hour_histogram"].values()), 4)
         self.assertTrue(activity["messages_truncated"])
         self.assertEqual(activity["statistics_basis"], "returned_source_messages_only")
+        aggregate = validate_activity_window_statistics(activity["window_statistics"])
+        self.assertEqual(aggregate["source_count"], 40)
+        self.assertEqual(sum(aggregate["hour_histogram"].values()), 40)
+        self.assertEqual([day["source_count"] for day in aggregate["daily"]], [20, 20])
+        self.assertEqual(aggregate["daily"][0]["first_sent_at"], epoch(20, 0))
+        self.assertEqual(aggregate["daily"][-1]["last_sent_at"], epoch(21, 19))
+        self.assertEqual(aggregate["scope"]["message_upper_bound"], message_upper_bound)
+        smaller_sample = self.storage.query_participant_activity(
+            umo=umo, participant_key=participant_key, before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound, days=7, limit=1,
+        )
+        self.assertEqual(smaller_sample["window_statistics"], aggregate)
+        compact = compile_evidence_atom_pack(
+            {"participant_activity": [activity], "reply_context": {"source_key": "direct-reply"}},
+            max_sources=1, activity_mode=True,
+        )
+        self.assertEqual(len(compact["sources"]), 1)
+        compact_activity = compact["participant_activity"][0]
+        self.assertEqual(compact_activity["sample_count"], 0)
+        self.assertEqual(compact_activity["window_statistics"], aggregate)
+        self.storage.upsert_message(self.message(
+            "activity-20-1", "edited source", sender_id="account-active",
+            sender_name="活跃成员", sent_at=epoch(20, 1),
+        ))
+        revised = self.storage.query_participant_activity(
+            umo=umo, participant_key=participant_key, before_sent_at=epoch(22, 0),
+            message_upper_bound=message_upper_bound, days=7, limit=1,
+        )["window_statistics"]
+        self.assertEqual(revised["source_count"], aggregate["source_count"])
+        self.assertNotEqual(revised["source_revision_sha256"], aggregate["source_revision_sha256"])
+        self.assertNotEqual(revised["aggregate_id"], aggregate["aggregate_id"])
 
     def test_timestamp_correction_is_a_revision_and_requeues_distillation(self) -> None:
         umo = "shadow:GroupMessage:group-a"
@@ -396,7 +741,11 @@ class MemoryStorageTests(unittest.TestCase):
         assert work_item is not None
         self.storage.finish_distillation_batch(work_item=work_item)
 
-        self.storage.upsert_message(self.message("time", "同一条消息", sent_at=125))
+        correction = self.storage.upsert_message_with_outcome(
+            self.message("time", "同一条消息", sent_at=125)
+        )
+        self.assertEqual(correction.status, "UPDATED")
+        self.assertTrue(correction.needs_processing)
         stored = self.storage.search_messages(umo=umo, limit=1)[0]
         self.assertEqual(stored.sent_at, 125)
         self.assertEqual(stored.revision_no, 2)
@@ -416,6 +765,152 @@ class MemoryStorageTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_alias_summary_reconciliation_rebuilds_only_observed_aliases(
+        self,
+    ) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        observed = self.message(
+            "alias-ledger-source",
+            "source-bound alias sighting",
+            sender_id="observed-account",
+            sender_name="ObservedSyntheticAlias",
+        )
+        self.storage.upsert_message(observed)
+        legacy_deleted = self.message(
+            "legacy-deleted-alias-source",
+            "legacy deleted source",
+            sender_id="legacy-deleted-account",
+            sender_name="LegacyDeletedSyntheticAlias",
+        )
+        self.storage.upsert_message(legacy_deleted)
+        self.storage.bind_participant_alias(
+            umo=umo,
+            platform_id="shadow",
+            account_id="administrator-account",
+            alias="AdministratorSyntheticAlias",
+            at=321,
+        )
+
+        observed_participant = self.storage._connection.execute(
+            "SELECT id FROM participants WHERE umo=? AND account_id=?",
+            (umo, observed.sender_id),
+        ).fetchone()
+        self.assertIsNotNone(observed_participant)
+        participant_id = int(observed_participant["id"])
+        deleted_participant = self.storage._connection.execute(
+            "SELECT id FROM participants WHERE umo=? AND account_id=?",
+            (umo, legacy_deleted.sender_id),
+        ).fetchone()
+        self.assertIsNotNone(deleted_participant)
+        deleted_participant_id = int(deleted_participant["id"])
+        stale_normalized = normalize_alias("StaleSyntheticAlias")
+        admin_before = self.storage._connection.execute(
+            """
+            SELECT alias.alias, alias.first_seen_at, alias.last_seen_at,
+                   alias.observation_count, alias.source_kind, alias.is_active
+            FROM participant_aliases AS alias
+            JOIN participants AS participant
+              ON participant.id=alias.participant_id
+            WHERE participant.umo=? AND participant.account_id=?
+              AND alias.source_kind='administrator'
+            """,
+            (umo, "administrator-account"),
+        ).fetchone()
+        self.assertIsNotNone(admin_before)
+
+        with self.storage._connection:
+            self.storage._connection.execute(
+                """
+                UPDATE participant_aliases
+                SET observation_count=9, first_seen_at=1,
+                    last_seen_at=999, is_active=1
+                WHERE participant_id=? AND normalized_alias=?
+                """,
+                (participant_id, normalize_alias(observed.sender_name)),
+            )
+            self.storage._connection.execute(
+                """
+                INSERT INTO participant_aliases(
+                    participant_id, alias, normalized_alias,
+                    first_seen_at, last_seen_at, source_kind,
+                    confidence, observation_count, is_active
+                ) VALUES (?, ?, ?, 1, 999, 'observed', 1.0, 5, 1)
+                """,
+                (
+                    participant_id,
+                    "StaleSyntheticAlias",
+                    stale_normalized,
+                ),
+            )
+            self.storage._connection.execute(
+                "DELETE FROM schema_meta "
+                "WHERE key='alias_aggregate_reconciliation_v18'"
+            )
+            self.storage._connection.execute(
+                "UPDATE messages SET is_deleted=1 "
+                "WHERE source_key=?",
+                (legacy_deleted.resolved_source_key(),),
+            )
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+
+        reconciled = self.storage._connection.execute(
+            """
+            SELECT normalized_alias, first_seen_at, last_seen_at,
+                   observation_count, is_active
+            FROM participant_aliases
+            WHERE participant_id=?
+            ORDER BY normalized_alias
+            """,
+            (participant_id,),
+        ).fetchall()
+        by_alias = {str(row["normalized_alias"]): row for row in reconciled}
+        observed_row = by_alias[normalize_alias(observed.sender_name)]
+        self.assertEqual(int(observed_row["observation_count"]), 1)
+        self.assertEqual(int(observed_row["first_seen_at"]), observed.sent_at)
+        self.assertEqual(int(observed_row["last_seen_at"]), observed.sent_at)
+        self.assertEqual(int(observed_row["is_active"]), 1)
+        stale_row = by_alias[stale_normalized]
+        self.assertEqual(int(stale_row["observation_count"]), 0)
+        self.assertEqual(int(stale_row["is_active"]), 0)
+        deleted_alias = self.storage._connection.execute(
+            """
+            SELECT observation_count, is_active
+            FROM participant_aliases
+            WHERE participant_id=? AND normalized_alias=?
+            """,
+            (
+                deleted_participant_id,
+                normalize_alias(legacy_deleted.sender_name),
+            ),
+        ).fetchone()
+        self.assertEqual(tuple(deleted_alias), (0, 0))
+        deleted_observation = self.storage._connection.execute(
+            """
+            SELECT 1
+            FROM participant_alias_observations AS observation
+            JOIN messages AS message ON message.id=observation.message_id
+            WHERE message.is_deleted=1
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNone(deleted_observation)
+
+        admin_after = self.storage._connection.execute(
+            """
+            SELECT alias.alias, alias.first_seen_at, alias.last_seen_at,
+                   alias.observation_count, alias.source_kind, alias.is_active
+            FROM participant_aliases AS alias
+            JOIN participants AS participant
+              ON participant.id=alias.participant_id
+            WHERE participant.umo=? AND participant.account_id=?
+              AND alias.source_kind='administrator'
+            """,
+            (umo, "administrator-account"),
+        ).fetchone()
+        self.assertEqual(tuple(admin_after), tuple(admin_before))
 
     def test_future_maintenance_deadline_survives_reopen(self) -> None:
         umo = "shadow:GroupMessage:group-a"
@@ -767,6 +1262,82 @@ class MemoryStorageTests(unittest.TestCase):
         recent = self.storage.recent_experiments(umo=umo)
         self.assertEqual([item["run_id"] for item in recent], [run_id])
         self.assertEqual(recent[0]["total"], 150)
+
+    def test_memory_brief_trace_preserves_full_brief_at_public_size_limit(self) -> None:
+        request = self.message(
+            "synthetic-trace-request", "synthetic question", sent_at=100
+        )
+        self.storage.upsert_message(request)
+        self.storage.start_interaction_trace(
+            trace_id="synthetic-trace-size",
+            umo=request.umo,
+            sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(),
+            request_sent_at=request.sent_at,
+            query=request.plain_text,
+        )
+        overhead = len(json.dumps({"summary": ""}, separators=(",", ":")))
+        for public_limit in (12000, 30000):
+            with self.subTest(public_limit=public_limit):
+                brief = {"summary": "x" * (public_limit - overhead)}
+                self.assertEqual(len(json.dumps(brief, separators=(",", ":"))), public_limit)
+                node_key = self.storage.record_memory_brief_trace(
+                    trace_id="synthetic-trace-size",
+                    umo=request.umo,
+                    run_id="synthetic-run-size",
+                    memory_brief=brief,
+                    source_keys=[request.resolved_source_key()],
+                    path="resident_reader_surface",
+                    presented_edge_ids=[1],
+                    presented_hypothesis_ids=[2],
+                )
+                row = self.storage._connection.execute(
+                    "SELECT content_json FROM trace_nodes WHERE trace_id=? AND node_key=?",
+                    ("synthetic-trace-size", node_key),
+                ).fetchone()
+                self.assertGreater(len(row["content_json"]), public_limit)
+                stored = json.loads(row["content_json"])
+                self.assertEqual(stored["memory_brief"], brief)
+                self.assertEqual(stored["source_keys"], [request.resolved_source_key()])
+
+    def test_memory_brief_trace_keeps_aggregate_provenance_separate_from_raw_sources(self) -> None:
+        request = self.message("aggregate-trace-request", "synthetic activity query", sent_at=100)
+        self.storage.upsert_message(request)
+        self.storage.start_interaction_trace(
+            trace_id="aggregate-trace", umo=request.umo, sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(), request_sent_at=100,
+            query=request.plain_text,
+        )
+        metadata = [{
+            "aggregate_id": "activity-window:" + f"{index:064x}",
+            "source_revision_sha256": "a" * 64,
+            "source_count": 40,
+            "scope": {"umo": request.umo, "participant_key": "synthetic-person",
+                      "start_sent_at": 1, "end_sent_at_exclusive": 100,
+                      "message_upper_bound": 1},
+        } for index in range(MAX_CERTIFICATE_AGGREGATES)]
+        overhead = len(json.dumps({"summary": ""}, separators=(",", ":")))
+        brief = {"summary": "x" * (30000 - overhead)}
+        node_key = self.storage.record_memory_brief_trace(
+            trace_id="aggregate-trace", umo=request.umo, run_id="aggregate-run",
+            memory_brief=brief, presented_aggregate_metadata=metadata,
+        )
+        row = self.storage._connection.execute(
+            "SELECT content_json FROM trace_nodes WHERE trace_id=? AND node_key=?",
+            ("aggregate-trace", node_key),
+        ).fetchone()
+        stored = json.loads(row["content_json"])
+        self.assertEqual(stored["memory_brief"], brief)
+        self.assertEqual(stored["presented_aggregate_metadata"], metadata)
+        self.assertEqual(stored["source_keys"], [])
+        self.assertEqual(self.storage._connection.execute(
+            "SELECT COUNT(*) FROM trace_nodes WHERE trace_id=? AND node_type='memory_evidence'",
+            ("aggregate-trace",),
+        ).fetchone()[0], 0)
+        self.assertEqual(self.storage._connection.execute(
+            "SELECT COUNT(*) FROM trace_edges WHERE trace_id=? AND relation='SUPPORTS_RECALL'",
+            ("aggregate-trace",),
+        ).fetchone()[0], 0)
 
     def test_experiment_detail_restores_the_exact_memory_provenance_graph(self) -> None:
         umo = "shadow:GroupMessage:group-a"
@@ -1950,6 +2521,46 @@ class MemoryStorageTests(unittest.TestCase):
                 proposal_id=proposal_id,
             )
 
+    def test_feedback_inspection_keeps_recent_context_before_feedback_row(self) -> None:
+        umo = "shadow:GroupMessage:group-a"
+        request = self.message("old-feedback-request", "合成旧话题", sent_at=100)
+        self.storage.upsert_message(request)
+        self.storage.start_interaction_trace(
+            trace_id="old-feedback-trace", umo=umo, sender_id=request.sender_id,
+            request_source_key=request.resolved_source_key(), request_sent_at=100,
+            query=request.plain_text,
+        )
+        self.storage.finish_interaction_trace(
+            trace_id="old-feedback-trace", umo=umo, response_text="旧话题回复", response_at=105,
+        )
+        neighbors = []
+        for index in range(10):
+            neighbor = self.message(f"recent-context-{index}", f"合成群友新话题{index}",
+                                    sent_at=991 + index, sender_id="synthetic-neighbor")
+            self.storage.upsert_message(neighbor)
+            neighbors.append(neighbor)
+        deleted = self.message("deleted-context", "不应进入证据", sent_at=1000)
+        self.storage.upsert_message(deleted)
+        self.storage.mark_message_deleted(umo=umo, platform_id=deleted.platform_id,
+                                         platform_message_id=deleted.message_id, deleted_at=1000)
+        self.storage.upsert_message(self.message("other-scope-context", "不同群", sent_at=1000,
+                                                umo="shadow:GroupMessage:group-b"))
+        feedback = self.message("recent-feedback", "不是说新话题吗", sent_at=1000)
+        self.storage.upsert_message(feedback)
+        proposal_id = self.storage.enqueue_feedback_candidate(
+            umo=umo, feedback_source_key=feedback.resolved_source_key(),
+        )
+        self.assertIsNotNone(proposal_id)
+        self.storage.upsert_message(self.message("same-second-future", "同秒但后到", sent_at=1000))
+        self.storage.upsert_message(self.message("future-context", "下一秒", sent_at=1001))
+        inspected = self.storage.inspect_feedback_proposal(umo=umo, proposal_id=proposal_id, context_limit=8)
+        self.assertEqual([row["source_key"] for row in inspected["context"]],
+                         [message.resolved_source_key() for message in neighbors[-8:]])
+        self.assertEqual([row["age_seconds"] for row in inspected["context"]], list(range(7, -1, -1)))
+        self.assertEqual(inspected["candidate_traces"][0]["trace_id"], "old-feedback-trace")
+        self.assertEqual(inspected["candidate_traces"][0]["request_age_seconds"], 900)
+        self.assertEqual(inspected["candidate_traces"][0]["response_age_seconds"], 895)
+
     def test_interrupted_experiment_is_closed_on_reopen(self) -> None:
         umo = "shadow:GroupMessage:group-a"
         self.storage.start_experiment(
@@ -2146,6 +2757,50 @@ class MemoryStorageTests(unittest.TestCase):
             {"BACKFILL": "FAILED", "LIVE": "FAILED"},
         )
         self.assertTrue(all(int(row["attempts"]) == 1 for row in rows))
+
+    def test_explicit_distillation_retry_preserves_failed_batch_evidence(self) -> None:
+        umo = "shadow:GroupMessage:synthetic-retry-scope"
+        self.storage.upsert_message(
+            self.message("paper-supply", "纸鹤活动的纸张已经到齐。", umo=umo)
+        )
+        first = self.storage.next_distillation_batch(umo=umo, limit=1, overlap=0)
+        assert first is not None
+        self.storage.finish_distillation_batch(
+            work_item=first, error="synthetic unresolved extraction"
+        )
+        failed_before = dict(self.storage._connection.execute(
+            "SELECT * FROM distillation_batches WHERE batch_key=?", (first.batch_key,)
+        ).fetchone())
+        self.assertIsNone(
+            self.storage.next_distillation_batch(umo=umo, limit=1, overlap=0)
+        )
+
+        # This represents an explicit recovery decision; the selector itself
+        # must never turn FAILED messages back into PENDING.
+        with self.storage._connection:
+            self.storage._connection.execute(
+                "UPDATE message_processing SET status='PENDING' WHERE status='FAILED'"
+            )
+        retry = self.storage.next_distillation_batch(umo=umo, limit=1, overlap=0)
+        assert retry is not None
+        self.assertNotEqual(retry.batch_key, first.batch_key)
+        self.assertEqual(retry.target_hashes, first.target_hashes)
+        self.assertEqual(retry.target_source_keys, first.target_source_keys)
+        self.assertEqual(retry.messages, first.messages)
+        self.assertEqual(dict(self.storage._connection.execute(
+            "SELECT * FROM distillation_batches WHERE batch_key=?", (first.batch_key,)
+        ).fetchone()), failed_before)
+        pending_attempt = self.storage._connection.execute(
+            "SELECT status,batch_key,attempts FROM message_processing"
+        ).fetchone()
+        self.assertEqual(tuple(pending_attempt), ("PROCESSING", retry.batch_key, 2))
+        self.storage.finish_distillation_batch(work_item=retry)
+        self.assertEqual(dict(self.storage._connection.execute(
+            "SELECT * FROM distillation_batches WHERE batch_key=?", (first.batch_key,)
+        ).fetchone()), failed_before)
+        self.assertEqual(self.storage._connection.execute(
+            "SELECT status FROM distillation_batches WHERE batch_key=?", (retry.batch_key,)
+        ).fetchone()[0], "COMPLETED")
 
     def test_live_provenance_wins_over_idempotent_history_sync(self) -> None:
         message = self.message("shared", "同一平台消息")

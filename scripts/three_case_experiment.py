@@ -979,7 +979,7 @@ def _module_command(module: str, *arguments: object) -> list[str]:
 
 
 def _parse_memory_checkpoint_imports(values: Sequence[str] | None) -> dict[str, Path]:
-    allowed = {"call-726", "good-girl", "q0030"}
+    allowed = {"case-a", "case-b", "case-c"}
     imports: dict[str, Path] = {}
     for raw in values or ():
         case_key, separator, raw_path = str(raw).partition("=")
@@ -987,7 +987,7 @@ def _parse_memory_checkpoint_imports(values: Sequence[str] | None) -> dict[str, 
         if separator != "=" or case_key not in allowed or not raw_path.strip():
             raise ValueError(
                 "--import-memory-checkpoint must be CASE=PATH where CASE is "
-                "call-726, good-girl, or q0030"
+                "case-a, case-b, or case-c"
             )
         if case_key in imports:
             raise ValueError(f"duplicate memory checkpoint import for {case_key}")
@@ -1255,7 +1255,7 @@ def _memory_checkpoint_plan(path: Path, *, case_key: str) -> dict[str, Any]:
 
 
 def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the frozen #726 / 好女孩 / q0030 generation pipeline.
+    """Run a caller-supplied private three-case generation pipeline.
 
     Without the acknowledgement flag this command is a pure dry run and only
     prints the exact argv vectors.  No shell is involved and gold paths do not
@@ -1275,12 +1275,12 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
     completed_case_imports = _parse_case_imports(
         getattr(args, "import_completed_case", None),
         option="--import-completed-case",
-        allowed={"call-726", "good-girl"},
+        allowed={"case-a", "case-b"},
     )
     provider_stage_imports = _parse_case_imports(
         getattr(args, "import_provider_stages_checkpoint", None),
         option="--import-provider-stages-checkpoint",
-        allowed={"good-girl", "q0030"},
+        allowed={"case-b", "case-c"},
     )
     if set(memory_imports) & (
         set(completed_case_imports) | set(provider_stage_imports)
@@ -1295,30 +1295,30 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
         for case_key, path in provider_stage_imports.items()
     }
     v7_import_mode = (
-        set(completed_case_imports) == {"call-726"}
-        and set(provider_stage_imports) == {"good-girl"}
+        set(completed_case_imports) == {"case-a"}
+        and set(provider_stage_imports) == {"case-b"}
     )
     v8_import_mode = (
-        set(completed_case_imports) == {"call-726", "good-girl"}
+        set(completed_case_imports) == {"case-a", "case-b"}
         and not provider_stage_imports
     )
     any_case_import_mode = bool(completed_case_imports or provider_stage_imports)
     if any_case_import_mode and not (v7_import_mode or v8_import_mode):
         raise ValueError(
-            "case import mode must be v7 (call-726 full + good-girl stages) "
-            "or v8 (call-726 + good-girl full; q0030 fresh)"
+            "case import mode must be v7 (case-a full + case-b stages) "
+            "or v8 (case-a + case-b full; case-c fresh)"
         )
     if v7_import_mode and (
-        set(completed_case_imports) != {"call-726"}
-        or set(provider_stage_imports) != {"good-girl"}
+        set(completed_case_imports) != {"case-a"}
+        or set(provider_stage_imports) != {"case-b"}
     ):
         raise ValueError(
-            "v7 import mode requires full call-726 and provider-stage good-girl imports"
+            "v7 import mode requires full case-a and provider-stage case-b imports"
         )
     plugin_root = Path(__file__).resolve().parents[1]
-    call_root = dev_root / "experiments" / "masked-call-726"
-    good_root = dev_root / "eccr_cases" / "good_girl"
-    q_root = dev_root / "experiments" / "layered-three-case" / "fixtures" / "q0030"
+    call_root = dev_root / "experiments" / "masked-case-a"
+    good_root = dev_root / "eccr_cases" / "case_b"
+    q_root = dev_root / "experiments" / "layered-three-case" / "fixtures" / "case-c"
     required = [
         config_path,
         call_root / "call_r4.json",
@@ -1335,17 +1335,17 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise FileNotFoundError("three-case runner inputs missing: " + ", ".join(missing))
 
-    prepared_726 = output_root / "prepared-input" / "call-726"
-    case_726 = output_root / "cases" / "call-726"
-    case_good = output_root / "cases" / "good-girl"
-    case_q = output_root / "cases" / "q0030"
-    result_726 = case_726 / "result.private.json"
+    prepared_a = output_root / "prepared-input" / "case-a"
+    case_a = output_root / "cases" / "case-a"
+    case_good = output_root / "cases" / "case-b"
+    case_q = output_root / "cases" / "case-c"
+    result_726 = case_a / "result.private.json"
     result_good = case_good / "result.private.json"
     result_q = case_q / "result.private.json"
 
     commands: list[dict[str, Any]] = [
         {
-            "phase": "prepare_frozen_packet_call_726",
+            "phase": "prepare_frozen_packet_case_a",
             "provider_calls_upper_bound": 0,
             "argv": _module_command(
                 "scripts.layered_case_generation",
@@ -1359,12 +1359,12 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 "--candidates",
                 call_root / "candidates.json",
                 "--output-dir",
-                prepared_726,
+                prepared_a,
                 "--resume",
             ),
         },
         {
-            "phase": "production_l3_and_surface_call_726",
+            "phase": "production_l3_and_surface_case_a",
             "provider_calls_upper_bound": 4,
             "argv": _module_command(
                 "scripts.layered_case_generation",
@@ -1372,11 +1372,11 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 "--case",
                 call_root / "call_r4.json",
                 "--evidence-packet",
-                prepared_726 / "evidence_packet.json",
+                prepared_a / "evidence_packet.json",
                 "--surface-case-template",
                 call_root / "surface-ab-v1-input" / "case.json",
                 "--database",
-                prepared_726 / "scope.db",
+                prepared_a / "scope.db",
                 "--config",
                 config_path,
                 "--subconscious-provider-id",
@@ -1386,7 +1386,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 "--route",
                 "l3",
                 "--output-dir",
-                case_726,
+                case_a,
                 "--max-provider-calls",
                 4,
                 "--max-output-tokens",
@@ -1404,7 +1404,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
         {
-            "phase": "production_l3_and_surface_good_girl",
+            "phase": "production_l3_and_surface_case_b",
             "provider_calls_upper_bound": 4,
             "argv": _module_command(
                 "scripts.layered_case_generation",
@@ -1440,7 +1440,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
         {
-            "phase": "production_l2_and_surface_q0030",
+            "phase": "production_l2_and_surface_case_c",
             "provider_calls_upper_bound": 3,
             "argv": _module_command(
                 "scripts.layered_case_generation",
@@ -1473,13 +1473,13 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
         },
     ]
     if v8_import_mode:
-        call_plan = completed_case_import_plans["call-726"]
-        good_plan = completed_case_import_plans["good-girl"]
+        call_plan = completed_case_import_plans["case-a"]
+        good_plan = completed_case_import_plans["case-b"]
         call_packet = Path(str(call_plan["bound_packet_path"]))
         call_database = Path(str(call_plan["bound_database_path"]))
         commands = [
             {
-                "phase": "validated_full_case_import_call_726",
+                "phase": "validated_full_case_import_case_a",
                 "provider_calls_upper_bound": 0,
                 "new_provider_calls_upper_bound": 0,
                 "limits": {
@@ -1492,7 +1492,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                     "scripts.layered_case_generation",
                     "import-completed-case",
                     "--source-result",
-                    completed_case_imports["call-726"],
+                    completed_case_imports["case-a"],
                     "--source-attempt-id",
                     call_plan["source_attempt_id"],
                     "--source-attempt-manifest",
@@ -1500,7 +1500,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                     "--source-attempt-manifest-sha256",
                     call_plan["source_attempt_manifest_sha256"],
                     "--target-dir",
-                    case_726,
+                    case_a,
                     "--case",
                     call_root / "call_r4.json",
                     "--evidence-packet",
@@ -1535,7 +1535,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             },
             {
-                "phase": "validated_full_case_import_good_girl",
+                "phase": "validated_full_case_import_case_b",
                 "provider_calls_upper_bound": 0,
                 "new_provider_calls_upper_bound": 0,
                 "limits": {
@@ -1548,7 +1548,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                     "scripts.layered_case_generation",
                     "import-completed-case",
                     "--source-result",
-                    completed_case_imports["good-girl"],
+                    completed_case_imports["case-b"],
                     "--source-attempt-id",
                     good_plan["source_attempt_id"],
                     "--source-attempt-manifest",
@@ -1598,13 +1598,13 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
             "surface_max_chars": 24000,
         }
     elif v7_import_mode:
-        source_result = completed_case_imports["call-726"]
-        source_import_plan = completed_case_import_plans["call-726"]
+        source_result = completed_case_imports["case-a"]
+        source_import_plan = completed_case_import_plans["case-a"]
         source_packet_path = Path(source_import_plan["bound_packet_path"])
         source_database_path = Path(source_import_plan["bound_database_path"])
         commands = [
             {
-                "phase": "validated_full_case_import_call_726",
+                "phase": "validated_full_case_import_case_a",
                 "provider_calls_upper_bound": 0,
                 "new_provider_calls_upper_bound": 0,
                 "limits": {
@@ -1612,7 +1612,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                     "surface_max_output_tokens": int(args.surface_max_output_tokens),
                     "surface_max_chars": 12000,
                 },
-                "completed_case_import": completed_case_import_plans["call-726"],
+                "completed_case_import": completed_case_import_plans["case-a"],
                 "argv": _module_command(
                     "scripts.layered_case_generation",
                     "import-completed-case",
@@ -1625,7 +1625,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                     "--source-attempt-manifest-sha256",
                     source_import_plan["source_attempt_manifest_sha256"],
                     "--target-dir",
-                    case_726,
+                    case_a,
                     "--case",
                     call_root / "call_r4.json",
                     "--evidence-packet",
@@ -1668,13 +1668,13 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 "--surface-max-chars",
                 "24000",
                 "--import-provider-stages-checkpoint",
-                str(provider_stage_imports["good-girl"]),
+                str(provider_stage_imports["case-b"]),
             ]
         )
         good_command["provider_calls_upper_bound"] = 1
         good_command["new_provider_calls_upper_bound"] = 1
         good_command["provider_stage_import"] = provider_stage_import_plans[
-            "good-girl"
+            "case-b"
         ]
         good_command["limits"] = {
             "subconscious_max_output_tokens": int(args.max_output_tokens),
@@ -1692,7 +1692,7 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         generation_commands = commands[1:]
-        generation_case_keys = ("call-726", "good-girl", "q0030")
+        generation_case_keys = ("case-a", "case-b", "case-c")
         for item, case_key in zip(generation_commands, generation_case_keys):
             item["limits"] = {
                 "subconscious_max_output_tokens": int(args.max_output_tokens),
@@ -1808,21 +1808,21 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": SUITE_SCHEMA_VERSION,
         "cases": [
             {
-                "case_id": "masked-call-726",
-                "title": "#726 类魂/首发/口嫌体正直",
+                "case_id": "masked-case-a",
+                "title": str(_load_json(case_a / "case.input.json").get("title") or "案例 A：历史检索"),
                 "request_provenance": "observed online /chat call at the frozen cutoff",
                 "route": "L3 bounded evidence-closure retrieval",
-                "case_path": str(case_726 / "case.input.json"),
+                "case_path": str(case_a / "case.input.json"),
                 "layer_result_path": str(result_726),
-                "layer_ledger_path": str(case_726 / "usage.jsonl"),
-                "surface_results_path": str(case_726 / "surface" / "private_results.json"),
-                "surface_ledger_path": str(case_726 / "usage.jsonl"),
+                "layer_ledger_path": str(case_a / "usage.jsonl"),
+                "surface_results_path": str(case_a / "surface" / "private_results.json"),
+                "surface_ledger_path": str(case_a / "usage.jsonl"),
                 "surface_arm_ids": ["production-l3"],
                 "gold_path": str(call_root / "gold_v2.json"),
             },
             {
-                "case_id": "good-girl-competing-meaning-v1",
-                "title": "“好女孩”竞争释义与二次玩梗",
+                "case_id": "case-b-competing-meaning-v1",
+                "title": str(_load_json(case_good / "case.input.json").get("title") or "案例 B：竞争解释"),
                 "request_provenance": "research replay over real anonymized group-chat evidence",
                 "route": "L3 fixed-packet counterexample audit",
                 "case_path": str(case_good / "case.input.json"),
@@ -1834,8 +1834,8 @@ def _run_suite_command(args: argparse.Namespace) -> dict[str, Any]:
                 "gold_path": str(good_root / "gold.json"),
             },
             {
-                "case_id": "q0030-mujica-yumemita",
-                "title": "Mujica 与梦限大关系",
+                "case_id": "case-c-entity-links",
+                "title": str(_load_json(case_q / "case.input.json").get("title") or "案例 C：实体关系"),
                 "request_provenance": "human-approved research query over real anonymized group messages; not an observed /chat call",
                 "route": "L2 blind BM25 neighborhood + fixed-packet reader",
                 "case_path": str(case_q / "case.input.json"),
@@ -1897,7 +1897,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CASE=PATH",
         help=(
             "Reuse one validated COMPLETED memory checkpoint in a new suite output. "
-            "Repeat for call-726, good-girl, or q0030."
+            "Repeat for case-a, case-b, or case-c."
         ),
     )
     run.add_argument(
@@ -1907,7 +1907,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CASE=PATH",
         help=(
             "Import a fully validated completed case without any new Provider "
-            "call. v8 accepts call-726 and good-girl result.private.json files."
+            "call. v8 accepts case-a and case-b result.private.json files."
         ),
     )
     run.add_argument(
@@ -1917,7 +1917,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CASE=PATH",
         help=(
             "Replay already-paid, exactly reproducible hashed stages into a new "
-            "case. Legacy v7 accepts good-girl; non-reconstructible q0030 stages "
+            "case. Legacy v7 accepts case-b; non-reconstructible case-c stages "
             "are rejected rather than weakening provenance."
         ),
     )

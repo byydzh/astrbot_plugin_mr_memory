@@ -97,13 +97,14 @@ def _expand_neighbors(
     return episodes, messages
 
 
-def build_q0030_fixture(
+def build_case_c_fixture(
     *,
     benchmark_dir: Path,
     output_dir: Path,
     top_k: int = 6,
     neighbor_radius: int = 10,
     secondary_neighbor_radius: int = 1,
+    answer_rubric: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if top_k <= 0:
         raise ValueError("top_k must be positive")
@@ -116,9 +117,9 @@ def build_q0030_fixture(
     benchmark_path = benchmark_dir / "benchmark_gold_final.jsonl"
     corpus = read_jsonl(corpus_path)
     benchmark = read_jsonl(benchmark_path)
-    row = _one(benchmark, field="id", value="q0030")
+    row = _one(benchmark, field="id", value="case-c")
     if not bool((row.get("provenance") or {}).get("human_approved")):
-        raise ValueError("q0030 must remain human-approved before fixture construction")
+        raise ValueError("case-c must remain human-approved before fixture construction")
 
     scope_id = str(row["scope_id"])
     cutoff_at = int(row["query_time"])
@@ -146,6 +147,17 @@ def build_q0030_fixture(
             + ", ".join(missing_positive_ids)
         )
 
+    # Semantic answers belong to the caller's private fixture, never source code.
+    if not isinstance(answer_rubric, dict):
+        raise ValueError("an explicit private answer_rubric is required")
+    rubric_fields = ("required_semantics", "required_uncertainty", "forbidden_conclusions")
+    for field in rubric_fields:
+        values = answer_rubric.get(field)
+        if not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values):
+            raise ValueError(f"answer_rubric.{field} must be a text array")
+    if not answer_rubric["required_semantics"]:
+        raise ValueError("answer_rubric.required_semantics must not be empty")
+
     participants = sorted(
         {
             _actor_token(scope_id, str(item.get("speaker") or "unknown"))
@@ -154,7 +166,7 @@ def build_q0030_fixture(
     )
     case = {
         "schema_version": CASE_SCHEMA_VERSION,
-        "case_id": "q0030-mujica-yumemita",
+        "case_id": "case-c-entity-links",
         "layer": "oracle_synthesis_diagnostic",
         "umo": scope_id,
         "cutoff_at": cutoff_at,
@@ -215,24 +227,14 @@ def build_q0030_fixture(
         "frozen_before_provider_run": True,
         "review_status": "human_approved_retrieval_evidence_pending_answer_review",
         "evidence_groups": {
-            "mujica_yumemita_relation": {
+            "entity_relation": {
                 "required_any": positive_ids,
                 "support": [],
             }
         },
-        "required_semantics": [
-            "群友回答没看过 Mujica 也可以看梦限大，并说两者其实没有什么关系。",
-            "“Mujica 正统续作”是同一讨论中的群友评价，不应升级成作品官方关系。",
-        ],
-        "required_uncertainty": [
-            "“正统续作”是群聊主观说法；“没什么关系”是对是否需要前作知识的直接回答。"
-        ],
-        "forbidden_conclusions": [
-            "把群友的“正统续作”玩笑写成官方续作关系。",
-            "声称没看过 Mujica 就不能看梦限大。",
-        ],
+        **{field: list(answer_rubric[field]) for field in rubric_fields},
         "source_annotation": {
-            "benchmark_id": "q0030",
+            "benchmark_id": "case-c",
             "positive_basis": (row.get("provenance") or {}).get("positive_basis"),
             "human_review_dataset_fingerprint": (row.get("provenance") or {}).get(
                 "human_review_dataset_fingerprint"
@@ -275,12 +277,14 @@ def build_q0030_fixture(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Build the q0030 real-group layered-memory fixture using blind BM25 "
+            "Build the case-c real-group layered-memory fixture using blind BM25 "
             "selection followed by deterministic chronological neighbor expansion."
         )
     )
     parser.add_argument("--benchmark-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--answer-rubric", type=Path, required=True,
+                        help="Private JSON containing the three semantic rubric arrays.")
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--neighbor-radius", type=int, default=10)
     parser.add_argument("--secondary-neighbor-radius", type=int, default=1)
@@ -289,12 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = build_q0030_fixture(
+    result = build_case_c_fixture(
         benchmark_dir=args.benchmark_dir.resolve(),
         output_dir=args.output_dir.resolve(),
         top_k=args.top_k,
         neighbor_radius=args.neighbor_radius,
         secondary_neighbor_radius=args.secondary_neighbor_radius,
+        answer_rubric=json.loads(args.answer_rubric.read_text(encoding="utf-8-sig")),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

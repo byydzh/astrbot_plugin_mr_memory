@@ -43,12 +43,20 @@
     "hint": "只控制后台消息整理和反馈维护；关闭它不会关闭回答前的一次证据 Reader，后者由“回答前注入本地记忆证据”单独控制。"
   },
   "subconscious_provider_id": {
-    "description": "记忆分析与证据 Reader 模型",
+    "description": "后台记忆分析与默认 Reader 模型",
     "type": "string",
     "default": "deepseek/deepseek-v4-flash",
     "_special": "select_provider",
     "obvious_hint": true,
-    "hint": "选择 AstrBot 已配置的聊天模型。启用回答前记忆时，每次请求最多调用它一次；失败会记录错误并跳过记忆注入，不会修复重试、切换 provider 或阻止 AstrBot 自己回答。"
+    "hint": "选择 AstrBot 已配置的聊天模型，供后台消息整理和反馈维护使用。回答前 Reader 的独立模型留空时，也使用此模型；不改变 AstrBot 主模型。"
+  },
+  "local_serving_reader_provider_id": {
+    "description": "回答前证据 Reader 的独立模型（可选）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "obvious_hint": true,
+    "hint": "留空沿用后台记忆分析模型；选择后只影响回答前的一次 Reader，不改变消息整理、反馈维护或 AstrBot 主模型。所选模型不可用时明确记录失败，不会自动改用其他 provider。"
   },
   "distillation_thinking_mode": {
     "description": "后台记忆整理是否完整推理",
@@ -73,6 +81,14 @@
     "obvious_hint": true,
     "condition": {"capture_enabled": true},
     "hint": "判断后续消息是否在评价刚才的回答；成立时更新行为偏好和群内语义，弱证据会先保留为待验证。"
+  },
+  "feedback_thinking_mode": {
+    "description": "反馈学习的思考模式",
+    "type": "string",
+    "options": ["enabled", "disabled"],
+    "default": "enabled",
+    "condition": {"feedback_learning_enabled": true},
+    "hint": "仅控制反馈判断，默认保留原思考模式。可显式关闭以兼容模型的正文输出；仍使用原模型、一次调用和相同证据校验，不影响历史整理或回答前 Reader。"
   },
   "feedback_window_hours": {
     "description": "可关联到多久前的回答（小时）",

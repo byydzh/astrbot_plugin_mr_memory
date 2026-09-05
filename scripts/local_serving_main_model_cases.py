@@ -21,7 +21,7 @@ from scripts.masked_ab_experiment import (
 )
 
 
-CASE_KEYS = ("call-726", "good-girl", "q0030")
+CASE_KEYS = ("case-a", "case-b", "case-c")
 SCHEMA_VERSION = "mr-memory.local-serving-main-model-cases.v1"
 DEFAULT_MAIN_PROVIDER_ID = "openai/gemini-3.5-flash"
 

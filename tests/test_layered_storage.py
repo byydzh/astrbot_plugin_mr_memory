@@ -7,7 +7,11 @@ import unittest
 import uuid
 from pathlib import Path
 
+import numpy as np
+
+from mr_memory.embedding import encode_vector, normalize_vector
 from mr_memory.models import NormalizedMessage
+from mr_memory.retrieval_terms import fts_recall_terms, recall_coverage_terms, short_recall_terms
 from mr_memory.service import MemoryService
 from mr_memory.snapshot import RequestSnapshot
 from mr_memory.storage import MemoryStorage
@@ -65,11 +69,432 @@ class LayeredStorageTests(unittest.TestCase):
             sender_participant_key=f"shadow:{request.sender_id}",
         )
 
-    def test_schema_17_contains_layered_and_search_index_tables(self) -> None:
+    def legacy_embedding_search(
+        self,
+        *,
+        model: str,
+        query_vector: list[float],
+        owner_types: tuple[str, ...],
+        limit: int,
+        min_score: float = -1.0,
+        before_sent_at: int | None = None,
+        message_upper_bound: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Reference the former fetchall/stable-sort exact search contract."""
+
+        normalized_query = normalize_vector(query_vector)
+        placeholders = ",".join("?" for _ in owner_types)
+        with self.storage._lock:
+            rows = self.storage._connection.execute(
+                f"""
+                SELECT owner_type, owner_key, dimensions, vector
+                FROM memory_embeddings
+                WHERE umo = ? AND model = ?
+                  AND owner_type IN ({placeholders})
+                """,
+                (self.UMO, model, *owner_types),
+            ).fetchall()
+            visible_keys = self.storage._visible_memory_owner_keys_locked(
+                umo=self.UMO,
+                owner_types=owner_types,
+                before_sent_at=before_sent_at,
+                message_upper_bound=message_upper_bound,
+            )
+        query_array = np.asarray(normalized_query, dtype=np.float64)
+        scored: list[dict[str, object]] = []
+        for row in rows:
+            owner_type = str(row["owner_type"])
+            owner_key = str(row["owner_key"])
+            lookup_key = owner_key.casefold() if owner_type == "cue" else owner_key
+            if lookup_key not in visible_keys.get(owner_type, set()):
+                continue
+            dimensions = int(row["dimensions"])
+            if dimensions != len(normalized_query):
+                continue
+            vector_blob = bytes(row["vector"])
+            expected_bytes = dimensions * 4
+            if dimensions <= 0 or len(vector_blob) != expected_bytes:
+                raise ValueError(
+                    "invalid embedding blob: "
+                    f"dimensions={dimensions}, bytes={len(vector_blob)}"
+                )
+            stored = np.frombuffer(vector_blob, dtype="<f4", count=dimensions)
+            score = float(np.dot(query_array, stored))
+            if score < float(min_score):
+                continue
+            scored.append(
+                {
+                    "owner_type": owner_type,
+                    "owner_key": owner_key,
+                    "score": round(score, 6),
+                }
+            )
+        safe_limit = max(1, min(100, int(limit)))
+        scored.sort(key=lambda item: float(item["score"]), reverse=True)
+        grouped = {owner_type: [] for owner_type in owner_types}
+        for item in scored:
+            grouped[str(item["owner_type"])].append(item)
+        nonempty = [owner_type for owner_type in owner_types if grouped[owner_type]]
+        if not nonempty:
+            return []
+        quota = max(1, safe_limit // len(nonempty))
+        selected: list[dict[str, object]] = []
+        selected_keys: set[tuple[str, str]] = set()
+        for owner_type in nonempty:
+            for item in grouped[owner_type][:quota]:
+                selected.append(item)
+                selected_keys.add((str(item["owner_type"]), str(item["owner_key"])))
+        if len(selected) < safe_limit:
+            for item in scored:
+                key = (str(item["owner_type"]), str(item["owner_key"]))
+                if key in selected_keys:
+                    continue
+                selected.append(item)
+                selected_keys.add(key)
+                if len(selected) >= safe_limit:
+                    break
+        selected.sort(key=lambda item: float(item["score"]), reverse=True)
+        return selected[:safe_limit]
+
+    def test_long_stream_is_bijective_and_snapshot_bounded(self) -> None:
+        messages = [
+            self.message(
+                f"stream-{index:04d}",
+                f"synthetic stream payload {index}",
+                sent_at=1000 + index,
+                sender_id=f"synthetic-account-{index % 7}",
+            )
+            for index in range(501)
+        ]
+        expected_keys = [message.resolved_source_key() for message in messages]
+        for index, message in enumerate(messages):
+            outcome = self.storage.upsert_message_with_outcome(message)
+            self.assertEqual(outcome.status, "INSERTED")
+            if index % 37 == 0:
+                duplicate = self.storage.upsert_message_with_outcome(message)
+                self.assertEqual(duplicate.status, "UNCHANGED")
+
+        table_counts = {
+            "messages": self.storage._connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE umo=?", (self.UMO,)
+            ).fetchone()[0],
+            "messages_fts": self.storage._connection.execute(
+                "SELECT COUNT(*) FROM messages_fts"
+            ).fetchone()[0],
+            "message_processing": self.storage._connection.execute(
+                """
+                SELECT COUNT(*) FROM message_processing AS p
+                JOIN messages AS m ON m.id=p.message_id WHERE m.umo=?
+                """,
+                (self.UMO,),
+            ).fetchone()[0],
+            "speaker_links": self.storage._connection.execute(
+                """
+                SELECT COUNT(*) FROM message_participants AS mp
+                JOIN messages AS m ON m.id=mp.message_id
+                WHERE m.umo=? AND mp.relation='SPEAKER'
+                """,
+                (self.UMO,),
+            ).fetchone()[0],
+            "alias_observations": self.storage._connection.execute(
+                "SELECT COUNT(*) FROM participant_alias_observations WHERE umo=?",
+                (self.UMO,),
+            ).fetchone()[0],
+        }
+        self.assertEqual(set(table_counts.values()), {501}, table_counts)
+        alias_count = self.storage._connection.execute(
+            """
+            SELECT COALESCE(SUM(a.observation_count), 0)
+            FROM participant_aliases AS a
+            JOIN participants AS p ON p.id=a.participant_id
+            WHERE p.umo=? AND a.source_kind='observed'
+            """,
+            (self.UMO,),
+        ).fetchone()[0]
+        self.assertEqual(int(alias_count), 501)
+        stored_keys = [
+            str(row["source_key"])
+            for row in self.storage._connection.execute(
+                "SELECT source_key FROM messages WHERE umo=? ORDER BY sent_at,id",
+                (self.UMO,),
+            ).fetchall()
+        ]
+        self.assertEqual(stored_keys, expected_keys)
+
+        first_batch = self.storage.next_distillation_batch(
+            umo=self.UMO, limit=500, overlap=0
+        )
+        self.assertIsNotNone(first_batch)
+        assert first_batch is not None
+        self.assertEqual(len(first_batch.target_source_keys), 500)
+        self.storage.finish_distillation_batch(work_item=first_batch)
+        second_batch = self.storage.next_distillation_batch(
+            umo=self.UMO, limit=500, overlap=8
+        )
+        self.assertIsNotNone(second_batch)
+        assert second_batch is not None
+        self.assertEqual(len(second_batch.target_source_keys), 1)
+        first_targets = set(first_batch.target_source_keys)
+        second_targets = set(second_batch.target_source_keys)
+        self.assertFalse(first_targets & second_targets)
+        self.assertEqual(first_targets | second_targets, set(expected_keys))
+        overlap_keys = {
+            message.source_key
+            for message in second_batch.messages
+            if message.source_key not in second_targets
+        }
+        self.assertTrue(overlap_keys)
+        self.assertTrue(overlap_keys.issubset(first_targets))
+        self.storage.finish_distillation_batch(work_item=second_batch)
+
+        stream_upper_bound = int(
+            self.storage._connection.execute(
+                "SELECT MAX(id) FROM messages WHERE umo=?", (self.UMO,)
+            ).fetchone()[0]
+        )
+        recent = self.storage.query_recent_context(
+            umo=self.UMO,
+            before_sent_at=2000,
+            message_upper_bound=stream_upper_bound,
+            limit=64,
+        )
+        recent_keys = [str(item["source_key"]) for item in recent]
+        self.assertEqual(recent_keys, expected_keys[-64:])
+        self.assertEqual(len(recent_keys), len(set(recent_keys)))
+
+        request = self.message(
+            "stream-request",
+            "synthetic current request",
+            sent_at=2000,
+            sender_id="synthetic-requester",
+        )
+        self.storage.upsert_message(request)
+        snapshot = self.capture(request=request, cutoff_at=2001)
+        future = self.message(
+            "stream-future",
+            "future payload",
+            sent_at=3000,
+            sender_id="synthetic-future",
+        )
+        late_old = self.message(
+            "stream-late-old",
+            "late inserted old payload",
+            sent_at=900,
+            sender_id="synthetic-late",
+        )
+        self.storage.upsert_message(future)
+        self.storage.upsert_message(late_old)
+        upper_bound = int(snapshot["message_upper_bound"])
+        self.assertEqual(
+            self.storage.count_snapshot_messages(
+                umo=self.UMO,
+                before_sent_at=int(snapshot["cutoff_at"]),
+                message_upper_bound=upper_bound,
+                exclude_source_key=request.resolved_source_key(),
+            ),
+            501,
+        )
+        visible = self.storage.messages_for_sources(
+            umo=self.UMO,
+            source_keys=(
+                expected_keys[0],
+                request.resolved_source_key(),
+                expected_keys[250],
+                future.resolved_source_key(),
+                expected_keys[-1],
+                late_old.resolved_source_key(),
+            ),
+            before_sent_at=int(snapshot["cutoff_at"]),
+            message_upper_bound=upper_bound,
+        )
+        self.assertEqual(
+            [item["source_key"] for item in visible],
+            [expected_keys[0], expected_keys[250], expected_keys[-1]],
+        )
+
+    def test_chunked_embedding_search_preserves_exact_rank_and_snapshot(self) -> None:
+        old_a = self.message("vector-old-a", "old a", sent_at=100, sender_id="a")
+        old_b = self.message("vector-old-b", "old b", sent_at=110, sender_id="b")
+        request = self.message(
+            "vector-request",
+            "current request",
+            sent_at=200,
+            sender_id="requester",
+        )
+        for message in (old_a, old_b, request):
+            self.storage.upsert_message(message)
+        snapshot = self.capture(request=request, cutoff_at=201)
+        future = self.message(
+            "vector-future",
+            "future",
+            sent_at=300,
+            sender_id="future",
+        )
+        self.storage.upsert_message(future)
+
+        old_episode_a = self.storage.store_episode(
+            umo=self.UMO,
+            started_at=100,
+            ended_at=100,
+            title="old episode a",
+            summary="visible",
+            source_keys=[old_a.resolved_source_key()],
+            keywords=[("old-a", "synthetic")],
+        )
+        old_episode_b = self.storage.store_episode(
+            umo=self.UMO,
+            started_at=110,
+            ended_at=110,
+            title="old episode b",
+            summary="visible",
+            source_keys=[old_b.resolved_source_key()],
+            keywords=[("old-b", "synthetic")],
+        )
+        future_episode = self.storage.store_episode(
+            umo=self.UMO,
+            started_at=300,
+            ended_at=300,
+            title="future episode",
+            summary="hidden",
+            source_keys=[future.resolved_source_key()],
+            keywords=[("future", "synthetic")],
+        )
+        participant_ids = {
+            str(row["account_id"]): int(row["id"])
+            for row in self.storage._connection.execute(
+                "SELECT id, account_id FROM participants WHERE umo=?",
+                (self.UMO,),
+            ).fetchall()
+        }
+        model = "synthetic/exact-vector"
+        embeddings = (
+            ("participant", str(participant_ids["a"]), [1.0, 0.0]),
+            ("participant", str(participant_ids["b"]), [0.8, 0.6]),
+            ("participant", str(participant_ids["future"]), [1.0, 0.0]),
+            ("episode", str(old_episode_a), [1.0, 0.0]),
+            ("episode", str(old_episode_b), [0.6, 0.8]),
+            ("episode", str(future_episode), [1.0, 0.0]),
+        )
+        for owner_type, owner_key, vector in embeddings:
+            self.storage.upsert_memory_embedding(
+                umo=self.UMO,
+                owner_type=owner_type,
+                owner_key=owner_key,
+                model=model,
+                vector=vector,
+            )
+        search = {
+            "model": model,
+            "query_vector": [1.0, 0.0],
+            "owner_types": ("participant", "episode"),
+            "limit": 3,
+            "before_sent_at": int(snapshot["cutoff_at"]),
+            "message_upper_bound": int(snapshot["message_upper_bound"]),
+        }
+        expected = self.legacy_embedding_search(**search)
+        actual = self.storage.search_memory_embeddings(umo=self.UMO, **search)
+        self.assertEqual(actual, expected)
+        self.assertNotIn(
+            ("participant", str(participant_ids["future"])),
+            {(item["owner_type"], item["owner_key"]) for item in actual},
+        )
+        self.assertNotIn(
+            ("episode", str(future_episode)),
+            {(item["owner_type"], item["owner_key"]) for item in actual},
+        )
+
+    def test_chunked_embedding_search_retains_only_bounded_top_candidates(
+        self,
+    ) -> None:
+        row_count = 1537
+        model = "synthetic/chunked-vector"
+        with self.storage._connection:
+            self.storage._connection.executemany(
+                """
+                INSERT INTO participants(
+                    umo, platform_id, account_id, canonical_key,
+                    current_display_name, first_seen_at, last_seen_at
+                ) VALUES (?, 'shadow', ?, ?, ?, 100, 100)
+                """,
+                [
+                    (
+                        self.UMO,
+                        f"bulk-{index:04d}",
+                        f"shadow:bulk-{index:04d}",
+                        f"bulk-{index:04d}",
+                    )
+                    for index in range(row_count)
+                ],
+            )
+            participants = self.storage._connection.execute(
+                "SELECT id FROM participants WHERE umo=? ORDER BY id",
+                (self.UMO,),
+            ).fetchall()
+            self.storage._connection.executemany(
+                """
+                INSERT INTO memory_embeddings(
+                    umo, owner_type, owner_key, model, dimensions, vector
+                ) VALUES (?, 'participant', ?, ?, 2, ?)
+                """,
+                [
+                    (
+                        self.UMO,
+                        str(row["id"]),
+                        model,
+                        encode_vector(
+                            [float(row_count - index), float(index + 1)]
+                        ),
+                    )
+                    for index, row in enumerate(participants)
+                ],
+            )
+
+        result = self.storage.search_memory_embeddings(
+            umo=self.UMO,
+            model=model,
+            query_vector=[1.0, 0.0],
+            owner_types=("participant",),
+            limit=17,
+        )
+        self.assertEqual(len(result), 17)
+        self.assertEqual(
+            [float(item["score"]) for item in result],
+            sorted((float(item["score"]) for item in result), reverse=True),
+        )
+        stats = self.storage._last_embedding_search_stats
+        self.assertEqual(stats["scanned_rows"], row_count)
+        self.assertEqual(stats["scored_rows"], row_count)
+        self.assertEqual(stats["max_chunk_rows"], 512)
+        self.assertLess(stats["max_chunk_rows"], row_count)
+        self.assertLessEqual(
+            stats["max_retained_candidates"],
+            stats["retained_candidate_bound"],
+        )
+        self.assertLess(stats["max_retained_candidates"], row_count)
+
+        with self.storage._connection:
+            self.storage._connection.execute(
+                """
+                UPDATE memory_embeddings SET vector=?
+                WHERE umo=? AND model=? AND owner_type='participant'
+                  AND owner_key=?
+                """,
+                (b"broken", self.UMO, model, str(participants[0]["id"])),
+            )
+        with self.assertRaisesRegex(ValueError, "invalid embedding blob"):
+            self.storage.search_memory_embeddings(
+                umo=self.UMO,
+                model=model,
+                query_vector=[1.0, 0.0],
+                owner_types=("participant",),
+                limit=17,
+            )
+
+    def test_current_schema_contains_layered_and_search_index_tables(self) -> None:
         version = self.storage._connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        self.assertEqual(version["value"], "17")
+        self.assertEqual(version["value"], "18")
         expected = {
             "revision_heads",
             "request_snapshots",
@@ -1433,6 +1858,33 @@ class LayeredStorageTests(unittest.TestCase):
             {message.source_key for message in rows},
         )
 
+    def test_recall_keeps_rare_mixed_script_term_amid_common_cjk_suffix(self) -> None:
+        rare = [
+            self.message(f"mixed-rare-{index}", "Q馆长留下记录", sent_at=100 + index)
+            for index in range(3)
+        ]
+        common = [
+            self.message(f"common-suffix-{index}", "馆长正在值班", sent_at=200 + index)
+            for index in range(120)
+        ]
+        for message in (*rare, *common):
+            self.storage.upsert_message(message)
+        query = "Q馆长是谁"
+        rows = self.storage.search_messages(
+            umo=self.UMO, query=query, match_mode="recall", limit=12,
+            before_sent_at=500,
+        )
+        self.assertEqual(len(rows), 12)
+        self.assertTrue(
+            {message.resolved_source_key() for message in rare}.issubset(
+                message.source_key for message in rows
+            )
+        )
+        self.assertIn("q馆长", fts_recall_terms(query))
+        self.assertIn("q馆长", recall_coverage_terms(query))
+        self.assertLessEqual(len(fts_recall_terms(query)), 32)
+        self.assertLessEqual(len(short_recall_terms(query)), 16)
+
     def test_recall_does_not_lose_an_old_two_character_entity_to_common_bigrams(
         self,
     ) -> None:
@@ -1737,7 +2189,7 @@ class LayeredStorageTests(unittest.TestCase):
             )
         )
 
-    def test_synthetic_schema_15_migrates_to_17_without_data_loss(self) -> None:
+    def test_synthetic_schema_15_migrates_to_current_without_data_loss(self) -> None:
         database_path = self.database_path.with_name(f"{uuid.uuid4().hex}.db")
         storage = MemoryStorage(database_path)
         try:
@@ -1779,7 +2231,7 @@ class LayeredStorageTests(unittest.TestCase):
             version = migrated._connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()["value"]
-            self.assertEqual(version, "17")
+            self.assertEqual(version, "18")
             self.assertEqual(
                 migrated._connection.execute(
                     "SELECT COUNT(*) AS count FROM messages"
@@ -1855,7 +2307,7 @@ class LayeredStorageTests(unittest.TestCase):
                 """
             ).fetchone()
 
-            self.assertEqual(version, "17")
+            self.assertEqual(version, "18")
             self.assertEqual(marker, "completed")
             self.assertEqual(observations["count"], 501)
             self.assertEqual(observations["message_count"], 501)

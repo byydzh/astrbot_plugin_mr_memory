@@ -46,18 +46,18 @@ class SurfaceBriefAbExperimentTests(unittest.TestCase):
         self.output_dir = self.root / "output"
         self.case = {
             "schema_version": "surface.brief.case.v1",
-            "case_id": "case-726",
-            "query": "他这算口嫌体正直吗？",
+            "case_id": "case-a",
+            "query": "纸鹤活动报名是否已经确认？",
             "recent_context": [
-                {"sender": "甲", "content": "这个游戏我还是买了"},
-                {"sender": "乙", "content": "你之前不是说玩吐了吗"},
+                {"sender": "甲", "content": "纸鹤活动已经登记报名"},
+                {"sender": "乙", "content": "场地还没有最终确认"},
             ],
             "cutoff_at": 200,
         }
         self.brief = {
             "claims": [
                 {
-                    "statement": "同一账号先说玩吐，后来又买了相关游戏。",
+                    "statement": "纸鹤活动已经登记报名，场地仍待确认。",
                     "source_keys": ["source-a", "source-b"],
                     "confidence": 0.8,
                 }
@@ -65,7 +65,7 @@ class SurfaceBriefAbExperimentTests(unittest.TestCase):
             "conflicts": [],
             "unresolved": [
                 {
-                    "statement": "不能把购买动机说成当事人的原话。",
+                    "statement": "登记报名不代表最终活动安排已经确认。",
                     "source_keys": ["source-b"],
                 }
             ],
@@ -74,13 +74,13 @@ class SurfaceBriefAbExperimentTests(unittest.TestCase):
             self.case_path: self.case,
             self.control_path: {
                 "schema_version": "surface.brief.arm.v1",
-                "case_id": "case-726",
+                "case_id": "case-a",
                 "arm_id": "control",
                 "memory_brief": None,
             },
             self.memory_path: {
                 "schema_version": "surface.brief.arm.v1",
-                "case_id": "case-726",
+                "case_id": "case-a",
                 "arm_id": "eccr",
                 "memory_brief": self.brief,
             },
@@ -183,11 +183,11 @@ class SurfaceBriefAbExperimentTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema_version": "surface.brief.gold.v1",
-                    "case_id": "case-726",
+                    "case_id": "case-a",
                     "rubric": {
-                        "required_semantics": ["指出前后行为反差"],
-                        "required_uncertainty": ["购买动机不是逐字事实"],
-                        "forbidden_conclusions": ["客观人格诊断"],
+                        "required_semantics": ["指出已经登记与场地待定的区别"],
+                        "required_uncertainty": ["活动安排仍可能改变"],
+                        "forbidden_conclusions": ["全部安排已经确定"],
                         "style_constraints": ["自然简洁"],
                     },
                 },
@@ -356,7 +356,7 @@ class SurfaceBriefAbExperimentTests(unittest.TestCase):
             json.dumps(
                 {
                     "schema_version": "surface.brief.gold.v1",
-                    "case_id": "case-726",
+                    "case_id": "case-a",
                     "rubric": {"required_semantics": ["指出反差"]},
                 },
                 ensure_ascii=False,

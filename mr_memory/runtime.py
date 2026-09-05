@@ -61,6 +61,11 @@ controls automatic activation, not evidence retention. Repeated consistent evide
 can later promote a provisional hypothesis. Use group scope only for genuinely
 group-wide evidence; otherwise scope to the evidence-backed sender.
 
+For every non-ignore decision, feedback_valence must be in [-1, 1] with
+abs(feedback_valence) >= 0.05. Preserve weak attributable evidence through low
+confidence, not a zero valence. For reinforce or contradict, target_hypothesis_id
+must identify an existing supplied hypothesis in the same decision scope.
+
 Return one plan for every supplied proposal_id:
 {"plans":[{"proposal_id":1,"decision":{"target_trace_id":"eligible trace or empty for ignore","mutation":"upsert|reinforce|contradict|ignore","feedback_valence":-1.0,"confidence":0.0,"scope_type":"sender|group","scope_key":"sender id or exact UMO","aspect":"short tag","statement":"bounded evidence hypothesis","prospective_cue":"future-facing guidance","trigger_cues":["required for semantic"],"activation_mode":"always|semantic","target_hypothesis_id":null},"graph_mutations":[]}]}.
 

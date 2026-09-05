@@ -13,7 +13,16 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
 标记为 `HYPOTHESIS`、`SUPPORTED`、`CONTESTED` 或 `CONFIRMED`。embedding 只排序候选，
 稳定账号、作用域、cutoff 和来源仍由宿主约束。
 
+连续对话最多保留六个已验证来源的指针；下一轮按新的时间截止重新读取原文，不把上一轮
+模型生成的回答保存为事实。选中的持久记忆先核验其完整来源关系，再截取有界原文用于
+Reader；缺失、删除、跨群或越过截止时间的来源会使该条派生记忆不可用。Reader 返回后
+重新核验实际使用的记忆与来源，无关后台写入不会使它们失效。机器人、人类及未知作者的
+来源角色贯穿简报，避免把历史机器人发言提升为人类证词。
+
 研究基础：[Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents](https://arxiv.org/abs/2606.06036)。
+
+可发布的测试语料仅限合成数据。真实聊天、个人查询、人物称呼、群账号和人工验收答案仅放在
+Git 忽略的私有目录；运行日志和含原文的报告也不提交。工作树清理不会自动抹除旧提交或外部副本。
 
 > [!WARNING]
 > 本插件把群聊隔离视为独立安全边界，不信任主 Agent 替它完成隔离。
@@ -40,6 +49,10 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
   引用来源使用一次批量 fail-closed 审计。
 - `subconscious_provider_id=deepseek/deepseek-v4-flash`：默认供一次在线 resident Reader 以及
   后台消息整理、反馈维护使用；不继承或替换 AstrBot 当前会话的主模型。
+- `local_serving_reader_provider_id=""`：可单独选择 AstrBot 已配置的 Reader provider。
+  默认留空沿用 `subconscious_provider_id`；显式选择只影响回答前 Reader，后台整理与
+  反馈仍使用原 provider。调用账本与证书模型版本记录实际 Reader；所选 provider 不可用
+  时记录失败，不会自动切换。
 - `distillation_thinking_mode=enabled`：图构建保留模型完整思考能力；长调用采用流式接收，
   该设置只作用于后台消息整理。
 - `feedback_thinking_mode=enabled`：反馈判读独立配置思考模式；切换模式后仍需通过原有
@@ -58,6 +71,9 @@ AngelEye 的历史检索和 Local Reminiscence 的语义记忆。当前实现提
   外部运维工具一次性写入的旧历史只保留独立审计账本，
   不设伪装成日常策略的每日额度，也不会挤占这两类在线预算。
 - 数据库固定写入本插件的 `plugin_data` 目录。
+- 每个整理批次在同一数据库事务中提交记忆图、来源覆盖与进度，再刷新 embedding 索引。
+  索引失败明确记录，不回滚已提交事实，也不重复提取该批原文；目前没有独立的自动索引
+  修复任务，出现此类失败时仍需定向修复索引。
 - 每个账户主体以 `platform_id + account_id` 为不可变主键；昵称只作为带时间的别名，
   重名不会自动合并。
 - 每群的后台整理与反馈学习各有 24 小时 `500000` token 预算；预算不足的维护任务延期，
@@ -241,6 +257,12 @@ Token、时延和 cutoff 审计。实验可恢复，但恢复时会拒绝候选�
 成本边界见[运行时研究报告](docs/research/MR_MEMORY_RUNTIME_STUDY.md)。
 
 ## 反馈学习闭环
+
+反馈维护按 proposal ID、来源修订号和内容指纹冻结每批任务。失败只将本次实际处理且仍为
+同一修订的待分析条目标为 `FAILED`，不会覆盖已提交、已忽略或已修订的结果，也不会自动
+重试失败批次。若准备阶段尚未触及任何条目便失败，该完整批次暂停，条目保留 `PENDING`；
+待分析数量包含这些暂停项，不表示它们正在运行。后续不同批次仍可继续；旧失败作业及错误
+保留。修复原因后可由管理员核对冻结来源并定向人工恢复，插件不自动重开历史失败任务。
 
 启用后，插件为主 Agent 的每次请求保留不含隐藏思维链的可观察工作图。短时间连续反馈先
 等待 15 秒合并，每次最多六条。独立模型在一次完整推理中同时判断后续消息是否确实评价了

@@ -226,7 +226,7 @@ class MaskedPilotTests(unittest.TestCase):
                 "source_key": "source-1",
                 "sent_at": 100,
                 "sender_name": "甲",
-                "plain_text": "类魂玩吐了",
+                "plain_text": "拼图已经放下了",
             }
         ]
         tool_call = SimpleNamespace(
@@ -239,7 +239,7 @@ class MaskedPilotTests(unittest.TestCase):
         final = {
             "claims": [
                 {
-                    "statement": "甲说类魂玩吐了。",
+                    "statement": "甲说拼图已经放下了。",
                     "source_keys": ["source-1"],
                     "confidence": 0.9,
                 }
@@ -256,7 +256,7 @@ class MaskedPilotTests(unittest.TestCase):
         ) as mocked:
             result = _run_pilot_full_mr(
                 storage=storage,
-                call={"query": "谁说类魂玩吐了", "umo": self.umo, "cutoff_at": 200},
+                call={"query": "谁说拼图已经放下了", "umo": self.umo, "cutoff_at": 200},
                 candidates={"episodes": [{"id": 7}]},
                 client=object(),
                 provider_id="deepseek/test",
@@ -290,7 +290,7 @@ class MaskedPilotTests(unittest.TestCase):
                     "source_key": "source-1",
                     "sender_participant_key": "participant-1",
                     "sent_at": 100,
-                    "plain_text": "类魂玩吐了",
+                    "plain_text": "拼图已经放下了",
                 }
             ],
         }
@@ -310,7 +310,7 @@ class MaskedPilotTests(unittest.TestCase):
                     {
                         "id": "prior_preference",
                         "kind": "semantic",
-                        "question": "是否明确表达过厌倦类魂",
+                        "question": "是否明确表达过停止练习拼图",
                         "critical": True,
                         "status": "SUPPORTED",
                         "support_keys": ["source-1"],
@@ -331,7 +331,7 @@ class MaskedPilotTests(unittest.TestCase):
             "memory_brief": {
                 "claims": [
                     {
-                        "statement": "该参与者此前说类魂玩吐了。",
+                        "statement": "该参与者此前说拼图已经放下了。",
                         "source_keys": ["source-1"],
                         "confidence": 0.9,
                     }
@@ -348,7 +348,7 @@ class MaskedPilotTests(unittest.TestCase):
             result = _run_pilot_eccr(
                 storage=Mock(),
                 call={
-                    "query": "谁说过类魂玩吐了",
+                    "query": "谁说过拼图已经放下了",
                     "umo": self.umo,
                     "cutoff_at": 200,
                 },
@@ -617,11 +617,11 @@ class MaskedPilotTests(unittest.TestCase):
         self,
     ) -> None:
         brief = EvidenceBrief(
-            claims=(EvidenceClaim("守夜草说类魂玩吐了。", ("prior",), 0.9),),
+            claims=(EvidenceClaim("合成成员庚说拼图已经放下了。", ("prior",), 0.9),),
             conflicts=(),
             unresolved=(
                 EvidenceQualification(
-                    "是否属于抢首发仍需保留措辞不确定性。", ("launch",)
+                    "是否属于提前报名仍需保留措辞不确定性。", ("launch",)
                 ),
             ),
         )
@@ -629,7 +629,7 @@ class MaskedPilotTests(unittest.TestCase):
             brief=brief,
             visited_source_keys={"prior", "buy", "launch"},
             gold={
-                "identity": {"expected_names": ["守夜草"]},
+                "identity": {"expected_names": ["合成成员庚"]},
                 "evidence_groups": {
                     "prior_dislike": {
                         "required_any": ["prior"],
@@ -642,7 +642,7 @@ class MaskedPilotTests(unittest.TestCase):
                 },
                 "forbidden_terms": ["雾影猎人"],
                 "required_semantics": ["同一账号跨情节发生语义反转"],
-                "required_uncertainty": ["抢首发不是逐字证据"],
+                "required_uncertainty": ["提前报名不是逐字证据"],
                 "forbidden_conclusions": ["完全没有证据"],
             },
         )
@@ -660,7 +660,7 @@ class MaskedPilotTests(unittest.TestCase):
         self.assertIsNone(score["semantic_score"])
         self.assertEqual(
             score["semantic_rubric"]["required_uncertainty"],
-            ["抢首发不是逐字证据"],
+            ["提前报名不是逐字证据"],
         )
 
     def test_provenance_binds_all_frozen_inputs_and_construction(self) -> None:

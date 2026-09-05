@@ -94,7 +94,7 @@ class RuntimePlanTests(unittest.TestCase):
                     "memory_brief": {
                         "claims": [
                             {
-                                "statement": "群内把这个称为好女孩。",
+                                "statement": "群内把这个称为蓝色纸签。",
                                 "source_keys": ["source-1"],
                                 "confidence": 0.7,
                             }

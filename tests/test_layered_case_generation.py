@@ -16,6 +16,7 @@ from mr_memory.snapshot import RequestSnapshot
 from mr_memory.snapshot import stable_sha256
 from mr_memory.surface import compile_surface_packet, validate_surface_packet
 from mr_memory.usage import TokenUsageRecord
+from mr_memory.reader import L2_READER_PROTOCOL
 from mr_memory.orchestrator import ECCR_TOOL_ACTION_CATALOG, EccrProtocolError
 from scripts.layered_case_generation import (
     _READ_TOOLS,
@@ -71,7 +72,7 @@ def _case() -> dict[str, object]:
         "case_id": "layered-runner-test",
         "umo": "scope:test",
         "cutoff_at": 2_000,
-        "query": "好女孩是什么意思",
+        "query": "纸鹤计划进展如何",
         "authorized_participant_keys": ["p1", "p2"],
     }
 
@@ -128,7 +129,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
             / "provider_results"
             / "three-case-layered-v7-partial"
         )
-        source_result = source_suite / "cases" / "call-726" / "result.private.json"
+        source_result = source_suite / "cases" / "case-a" / "result.private.json"
         dev_root = Path.cwd().parent / ".dev"
         if not source_result.is_file() or not dev_root.is_dir():
             self.skipTest("private v7 completed-case fixture is not present")
@@ -137,7 +138,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
         )
         providers = manifest["provider"]
         database_hash = manifest["inputs"]["database_sha256"]
-        source_database = source_suite / "prepared-input" / "call-726" / "scope.db"
+        source_database = source_suite / "prepared-input" / "case-a" / "scope.db"
         self.assertEqual(
             hashlib.sha256(source_database.read_bytes()).hexdigest(), database_hash
         )
@@ -150,14 +151,14 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
             source_attempt_manifest=str(source_suite / "run-plan.json"),
             source_attempt_manifest_sha256=source_attempt_sha256,
             target_dir=str(source_suite.parent / "must-not-write"),
-            case=str(dev_root / "experiments" / "masked-call-726" / "call_r4.json"),
+            case=str(dev_root / "experiments" / "masked-case-a" / "call_r4.json"),
             evidence_packet=str(
-                source_suite / "prepared-input" / "call-726" / "evidence_packet.json"
+                source_suite / "prepared-input" / "case-a" / "evidence_packet.json"
             ),
             surface_case_template=str(
                 dev_root
                 / "experiments"
-                / "masked-call-726"
+                / "masked-case-a"
                 / "surface-ab-v1-input"
                 / "case.json"
             ),
@@ -398,7 +399,7 @@ class LayeredGenerationBoundaryTests(unittest.TestCase):
             prompt_audit = manifest["l2_initial_prompt_audit"]
             self.assertEqual(
                 prompt_audit["protocol"],
-                "evidence-reader.compact-host-speaker",
+                L2_READER_PROTOCOL,
             )
             self.assertEqual(
                 prompt_audit["execution_contract"],
@@ -724,7 +725,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
             / "provider_results"
             / "three-case-layered-v7-partial"
             / "cases"
-            / "q0030"
+            / "case-c"
         )
         if not (source / "memory.private.json").is_file():
             self.skipTest("private v7 q failure fixture is not present")
@@ -757,7 +758,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
             / "provider_results"
             / "three-case-layered-v6-failed"
             / "cases"
-            / "good-girl"
+            / "case-b"
         )
         if not (source / "memory.private.json").is_file():
             self.skipTest("private v6 replay fixture is not present")
@@ -829,7 +830,7 @@ class ProductionLayerChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["route"], "L2")
         self.assertEqual(
             detail["reader_protocol"],
-            "evidence-reader.compact-host-speaker",
+            L2_READER_PROTOCOL,
         )
         self.assertEqual(detail["provider_calls"], 1)
         self.assertTrue(detail["strict_parse"])

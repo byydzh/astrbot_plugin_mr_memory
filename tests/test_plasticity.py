@@ -58,10 +58,10 @@ class PlasticGraphTests(unittest.TestCase):
             "evidence_source_keys": [source_key],
             "confidence": 0.87,
             "utility_delta": 0.6,
-            "statement": "‘好女孩’在本群常用作戏谑性的认可标签。",
+            "statement": "‘蓝色纸签’在合成项目中常用作复核通过标签。",
             "source": {
                 "kind": "symbol",
-                "label": "好女孩",
+                "label": "蓝色纸签",
                 "description": "群内反复出现的表达",
             },
             "relation": {
@@ -73,8 +73,8 @@ class PlasticGraphTests(unittest.TestCase):
             },
             "target": {
                 "kind": "concept",
-                "label": "戏谑性的认可",
-                "description": "不是性别或品德事实判断",
+                "label": "复核通过",
+                "description": "仅表示合成项目的流程状态",
             },
         }
 
@@ -84,8 +84,60 @@ class PlasticGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported plastic node kind"):
             parse_graph_mutation(payload)
 
+    def test_narrative_bindings_separate_batch_keys_and_preserve_retained_fields(self) -> None:
+        first = self.message("narrative-a", "合成材料甲", sent_at=100, sender_id="synthetic-a")
+        second = self.message("narrative-b", "合成材料乙", sent_at=101, sender_id="synthetic-b")
+        self.storage.upsert_message(first)
+        self.storage.upsert_message(second)
+        participants = {row.sender_id: row.sender_participant_key for row in
+                        self.storage.search_messages(umo=self.umo, limit=2)}
+        first_key, second_key = participants["synthetic-a"], participants["synthetic-b"]
+        for message, participant in ((first, first_key), (second, second_key)):
+            payload = self.edge_payload(message.resolved_source_key())
+            payload["source"]["label"] = "p0的纸签"
+            payload["source"]["description"] = "p0整理的标签"
+            payload["statement"] = "p0暂时采用此标记"
+            payload["uncertainty"] = "p0的说法尚待复核"
+            payload["relation"]["description"] = "p0提出的用法定义"
+            self.storage.apply_graph_mutation(umo=self.umo, mutation=parse_graph_mutation(payload),
+                                              narrative_aliases={"p0": participant})
+        rows = self.storage.query_plastic_associations(umo=self.umo, query="p0")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row["source_node_key"] for row in rows}), 2)
+        self.assertEqual({row["narrative_bindings"]["fields"]["source_label"]["references"][0]["participant_key"]
+                          for row in rows}, {first_key, second_key})
+
+        # Stable labels select the same edge; an ordinary upsert retains its old
+        # uncertainty and relation definition while replacing the statement.
+        for message, participant in ((first, first_key), (second, second_key)):
+            payload = self.edge_payload(message.resolved_source_key())
+            payload["statement"] = "p0补充了说明"
+            payload["uncertainty"] = "p0尚未核实"
+            payload["relation"]["description"] = "p0提出的用法定义"
+            result = self.storage.apply_graph_mutation(
+                umo=self.umo, mutation=parse_graph_mutation(payload), narrative_aliases={"p0": participant},
+            )
+        row = self.storage.query_plastic_associations(umo=self.umo, edge_ids=[result["target_id"]])[0]
+        self.assertTrue(result["relation_definition_reused"])
+        bound = row["narrative_bindings"]["fields"]
+        self.assertEqual(bound["statement"]["references"][0]["participant_key"], second_key)
+        self.assertEqual(bound["uncertainty"]["references"][0]["participant_key"], first_key)
+        self.assertEqual(bound["relation_description"]["references"][0]["participant_key"], first_key)
+        self.assertEqual(row["statement"], "p0补充了说明")
+        self.assertFalse(any(key.startswith("_") for key in row))
+
+        self.storage.close()
+        self.storage = MemoryStorage(self.database_path)
+        reopened = self.storage.query_plastic_associations(umo=self.umo, edge_ids=[result["target_id"]])[0]
+        self.assertEqual(reopened["narrative_bindings"], row["narrative_bindings"])
+        invalid = self.edge_payload(first.resolved_source_key())
+        invalid["relation"]["key"] = "p0"
+        with self.assertRaisesRegex(ValueError, "batch-local"):
+            self.storage.apply_graph_mutation(umo=self.umo, mutation=parse_graph_mutation(invalid),
+                                              narrative_aliases={"p0": first_key})
+
     def test_evidence_bound_edge_and_relation_revision(self) -> None:
-        evidence = self.message("e-1", "鉴定为好女孩", sent_at=100)
+        evidence = self.message("e-1", "任务标记为蓝色纸签", sent_at=100)
         self.storage.upsert_message(evidence)
         mutation = parse_graph_mutation(
             self.edge_payload(evidence.resolved_source_key())
@@ -100,7 +152,7 @@ class PlasticGraphTests(unittest.TestCase):
         self.assertEqual(committed["relation_version"], 1)
         rows = self.storage.query_plastic_associations(
             umo=self.umo,
-            query="好女孩",
+            query="蓝色纸签",
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["relation_key"], "group_usage")
@@ -128,7 +180,7 @@ class PlasticGraphTests(unittest.TestCase):
         )
         self.assertEqual(result["version"], 2)
         self.assertEqual(
-            self.storage.query_plastic_associations(umo=self.umo, query="好女孩")[0][
+            self.storage.query_plastic_associations(umo=self.umo, query="蓝色纸签")[0][
                 "relation_version"
             ],
             2,
@@ -198,7 +250,7 @@ class PlasticGraphTests(unittest.TestCase):
         self.assertEqual(len(graph_selects), 2)
 
     def test_upsert_reuses_active_relation_definition_until_explicit_revision(self) -> None:
-        first = self.message("e-1", "鉴定为好女孩", sent_at=100)
+        first = self.message("e-1", "任务标记为蓝色纸签", sent_at=100)
         second = self.message("e-2", "这里也是群内反话", sent_at=110)
         self.storage.upsert_message(first)
         self.storage.upsert_message(second)
@@ -257,7 +309,7 @@ class PlasticGraphTests(unittest.TestCase):
             len(
                 self.storage.query_plastic_associations(
                     umo=self.umo,
-                    query="好女孩",
+                    query="蓝色纸签",
                     before_sent_at=cutoff,
                 )
             ),
@@ -272,17 +324,17 @@ class PlasticGraphTests(unittest.TestCase):
         self.assertEqual(
             self.storage.query_plastic_associations(
                 umo=self.umo,
-                query="好女孩",
+                query="蓝色纸签",
                 before_sent_at=cutoff,
             ),
             [],
         )
 
     def test_competing_meanings_keep_doubt_until_evidence_revision(self) -> None:
-        first = self.message("e-1", "鉴定为好女孩", sent_at=100)
-        second = self.message("e-2", "这里的好女孩是不是反话？", sent_at=110)
+        first = self.message("e-1", "任务标记为蓝色纸签", sent_at=100)
+        second = self.message("e-2", "蓝色纸签表示等待复核还是复核通过？", sent_at=110)
         correction = self.message(
-            "e-3", "对，好女孩在这里就是拿臭婊子开玩笑", sent_at=120
+            "e-3", "本项目中蓝色纸签表示等待复核，还没有通过。", sent_at=120
         )
         for message in (first, second, correction):
             self.storage.upsert_message(message)
@@ -291,7 +343,7 @@ class PlasticGraphTests(unittest.TestCase):
         base.update(
             {
                 "epistemic_state": "HYPOTHESIS",
-                "uncertainty": "可能是反话，也可能只是戏谑性的夸奖。",
+                "uncertainty": "可能表示等待复核，也可能表示复核通过。",
             }
         )
         praise = self.storage.apply_graph_mutation(
@@ -302,7 +354,7 @@ class PlasticGraphTests(unittest.TestCase):
         euphemism.update(
             {
                 "evidence_source_keys": [second.resolved_source_key()],
-                "statement": "‘好女孩’可能是对‘臭婊子’的群内委婉反称。",
+                "statement": "‘蓝色纸签’可能表示合成项目正在等待复核。",
                 "relation": {
                     "key": "possible_euphemism_for",
                     "name": "可能委婉指代",
@@ -312,8 +364,8 @@ class PlasticGraphTests(unittest.TestCase):
                 },
                 "target": {
                     "kind": "concept",
-                    "label": "臭婊子",
-                    "description": "可能被重新引义的冒犯性原词",
+                    "label": "等待复核",
+                    "description": "需要由项目流程确认的状态",
                 },
             }
         )
@@ -321,7 +373,7 @@ class PlasticGraphTests(unittest.TestCase):
             umo=self.umo,
             mutation=parse_graph_mutation(euphemism),
         )
-        rows = self.storage.query_plastic_associations(umo=self.umo, query="好女孩")
+        rows = self.storage.query_plastic_associations(umo=self.umo, query="蓝色纸签")
         self.assertEqual(len(rows), 2)
         self.assertEqual({row["epistemic_state"] for row in rows}, {"HYPOTHESIS"})
         self.assertTrue(all(row["uncertainty"] for row in rows))
@@ -333,7 +385,7 @@ class PlasticGraphTests(unittest.TestCase):
                 "evidence_source_keys": [correction.resolved_source_key()],
                 "confidence": 0.94,
                 "utility_delta": 0.2,
-                "statement": "‘好女孩’在该段群聊中是对‘臭婊子’的玩笑式反称。",
+                "statement": "‘蓝色纸签’在本合成项目中明确表示等待复核。",
                 "epistemic_state": "CONFIRMED",
                 "uncertainty": "",
             }
@@ -346,7 +398,7 @@ class PlasticGraphTests(unittest.TestCase):
         refreshed = {
             row["id"]: row
             for row in self.storage.query_plastic_associations(
-                umo=self.umo, query="好女孩"
+                umo=self.umo, query="蓝色纸签"
             )
         }
         self.assertEqual(
@@ -368,7 +420,7 @@ class PlasticGraphTests(unittest.TestCase):
         still_confirmed = {
             row["id"]: row
             for row in self.storage.query_plastic_associations(
-                umo=self.umo, query="好女孩"
+                umo=self.umo, query="蓝色纸签"
             )
         }
         self.assertEqual(
@@ -380,7 +432,7 @@ class PlasticGraphTests(unittest.TestCase):
         )
 
     def test_cross_group_or_uninspected_evidence_is_rejected(self) -> None:
-        evidence = self.message("e-1", "好女孩", sent_at=100)
+        evidence = self.message("e-1", "蓝色纸签", sent_at=100)
         self.storage.upsert_message(evidence)
         mutation = parse_graph_mutation(
             self.edge_payload(evidence.resolved_source_key())
@@ -393,8 +445,8 @@ class PlasticGraphTests(unittest.TestCase):
             )
 
     def test_uncommitted_feedback_cannot_mutate_plastic_graph(self) -> None:
-        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
-        request = self.message("q-1", "这是好女孩吗", sent_at=100)
+        evidence = self.message("e-1", "任务标记为蓝色纸签", sent_at=90)
+        request = self.message("q-1", "这是蓝色纸签吗", sent_at=100)
         feedback = self.message("f-1", "不对，不是这个意思", sent_at=110)
         self.storage.upsert_message(evidence)
         self.storage.upsert_message(request)
@@ -430,7 +482,7 @@ class PlasticGraphTests(unittest.TestCase):
         self.assertEqual(
             self.storage.query_plastic_associations(
                 umo=self.umo,
-                query="好女孩",
+                query="蓝色纸签",
             ),
             [],
         )
@@ -439,7 +491,7 @@ class PlasticGraphTests(unittest.TestCase):
         digest = "a" * 64
         first = self.storage.update_subconscious_state(
             umo=self.umo,
-            state={"focus": ["好女孩"], "active_edge_ids": [1]},
+            state={"focus": ["蓝色纸签"], "active_edge_ids": [1]},
             last_query_sha256=digest,
             at=100,
         )
@@ -587,8 +639,8 @@ class PlasticGraphTests(unittest.TestCase):
         )
 
     def test_human_feedback_assigns_credit_to_activated_plastic_path(self) -> None:
-        request = self.message("q-1", "这是好女孩吗", sent_at=100)
-        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
+        request = self.message("q-1", "这是蓝色纸签吗", sent_at=100)
+        evidence = self.message("e-1", "任务标记为蓝色纸签", sent_at=90)
         self.storage.upsert_message(evidence)
         self.storage.upsert_message(request)
         edge = self.storage.apply_graph_mutation(
@@ -637,24 +689,24 @@ class PlasticGraphTests(unittest.TestCase):
                 scope_type="sender",
                 scope_key="user-a",
                 aspect="group_slang",
-                statement="正确理解了好女孩的群内含义",
-                prospective_cue="遇到好女孩时优先按群内认可梗理解",
-                trigger_cues=("好女孩",),
+                statement="正确理解了蓝色纸签的群内含义",
+                prospective_cue="遇到蓝色纸签时优先按合成项目流程状态理解",
+                trigger_cues=("蓝色纸签",),
                 activation_mode="semantic",
             ),
         )
         self.assertEqual(result["plastic_edges_credited"], 1)
         self.assertGreater(result["plastic_backward_credit"], 0)
         refreshed = self.storage.query_plastic_associations(
-            umo=self.umo, query="好女孩"
+            umo=self.umo, query="蓝色纸签"
         )[0]
         self.assertGreater(float(refreshed["utility"]), 0.6)
         roles = {item["evidence_role"] for item in refreshed["evidence"]}
         self.assertIn("FEEDBACK_POSITIVE", roles)
 
     def test_negative_feedback_cannot_blame_an_unactivated_path(self) -> None:
-        evidence = self.message("e-1", "鉴定为好女孩", sent_at=90)
-        request = self.message("q-1", "这是好女孩吗", sent_at=100)
+        evidence = self.message("e-1", "任务标记为蓝色纸签", sent_at=90)
+        request = self.message("q-1", "这是蓝色纸签吗", sent_at=100)
         self.storage.upsert_message(evidence)
         self.storage.upsert_message(request)
         first = self.storage.apply_graph_mutation(

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from mr_memory.provider_compat import (
     ProviderCompatibilityError,
+    ProviderStreamError,
     generate_with_enforced_options,
 )
 
@@ -36,6 +37,20 @@ class _StreamingPreparedPayloadProvider(_PreparedPayloadProvider):
 class _IncompleteStreamingProvider(_PreparedPayloadProvider):
     async def _query_stream(self, payload, tools, *, request_max_retries=None):
         yield SimpleNamespace(is_chunk=True)
+
+
+class _UsageThenIncompleteStreamingProvider(_PreparedPayloadProvider):
+    def __init__(self, error=None) -> None:
+        super().__init__()
+        self.error = error
+        self.usage = {"prompt_tokens": 50, "completion_tokens": 20}
+
+    async def _query_stream(self, payload, tools, *, request_max_retries=None):
+        response = SimpleNamespace(is_chunk=True, usage=None)
+        yield response
+        response.usage = self.usage
+        if self.error is not None:
+            raise self.error
 
 
 class _StreamingOnlyPreparedPayloadProvider:
@@ -96,7 +111,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
         self.assertEqual(result, "prepared-result")
         self.assertEqual(provider.payload["thinking"], {"type": "disabled"})
         self.assertEqual(provider.payload["max_tokens"], 4096)
-        self.assertEqual(provider.request_max_retries, 0)
+        self.assertEqual(provider.request_max_retries, 1)
 
     def test_public_fallback_arguments_are_not_part_of_the_contract(self) -> None:
         parameters = inspect.signature(generate_with_enforced_options).parameters
@@ -156,7 +171,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result, "final-result")
         self.assertEqual(provider.payload["thinking"], {"type": "enabled"})
-        self.assertEqual(provider.request_max_retries, 0)
+        self.assertEqual(provider.request_max_retries, 1)
         self.assertEqual(
             progress,
             [(1, "partial-result"), (2, "final-result")],
@@ -177,7 +192,7 @@ class ProviderCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result, "stream-only-final")
         self.assertEqual(provider.payload["thinking"], {"type": "enabled"})
-        self.assertEqual(provider.request_max_retries, 0)
+        self.assertEqual(provider.request_max_retries, 1)
 
     def test_incomplete_stream_is_not_accepted_as_a_full_response(self) -> None:
         provider = _IncompleteStreamingProvider()
@@ -192,6 +207,55 @@ class ProviderCompatibilityTests(unittest.TestCase):
                     stream=True,
                 )
             )
+
+    def test_incomplete_stream_retains_usage_from_unyielded_usage_event(self) -> None:
+        provider = _UsageThenIncompleteStreamingProvider()
+        with self.assertRaises(ProviderStreamError) as caught:
+            asyncio.run(
+                generate_with_enforced_options(
+                    provider=provider,
+                    prompt="data",
+                    system_prompt="return json",
+                    options={},
+                    stream=True,
+                )
+            )
+        self.assertEqual(caught.exception.partial_usage, provider.usage)
+        self.assertEqual(caught.exception.chunk_count, 1)
+        self.assertEqual(caught.exception.failure_kind, "incomplete_stream")
+
+    def test_stream_failure_retains_original_error_and_usage(self) -> None:
+        original = ValueError("synthetic upstream failure")
+        provider = _UsageThenIncompleteStreamingProvider(error=original)
+        with self.assertRaises(ProviderStreamError) as caught:
+            asyncio.run(
+                generate_with_enforced_options(
+                    provider=provider,
+                    prompt="data",
+                    system_prompt="return json",
+                    options={},
+                    stream=True,
+                )
+            )
+        self.assertIs(caught.exception.__cause__, original)
+        self.assertEqual(caught.exception.partial_usage, provider.usage)
+        self.assertEqual(caught.exception.failure_kind, "stream_error")
+
+    def test_stream_cancellation_keeps_cancellation_semantics_and_usage(self) -> None:
+        cancellation = asyncio.CancelledError()
+        provider = _UsageThenIncompleteStreamingProvider(error=cancellation)
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            asyncio.run(
+                generate_with_enforced_options(
+                    provider=provider,
+                    prompt="data",
+                    system_prompt="return json",
+                    options={},
+                    stream=True,
+                )
+            )
+        self.assertIs(caught.exception, cancellation)
+        self.assertEqual(caught.exception.partial_usage, provider.usage)
 
 
 if __name__ == "__main__":

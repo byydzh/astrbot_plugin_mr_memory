@@ -61,8 +61,8 @@ class LocalServingAcceptanceTests(unittest.TestCase):
         )
         return case_dir, case
 
-    def _build_call_726(self) -> None:
-        case_dir, _ = self._case_shell("call-726", query="回忆前后态度")
+    def _build_case_a(self) -> None:
+        case_dir, _ = self._case_shell("case-a", query="回忆前后态度")
         messages = [
             {
                 "source_key": "call-source-old",
@@ -142,7 +142,7 @@ class LocalServingAcceptanceTests(unittest.TestCase):
             "query_scope_token": case["umo"],
             "cutoff_at": case["cutoff_at"],
             "diagnostic_type": "fixed-packet-test",
-            "end_to_end_retrieval_claim": case_key == "q0030",
+            "end_to_end_retrieval_claim": case_key == "case-c",
             "evidence_policy": evidence_policy,
             "episodes": [
                 {
@@ -156,9 +156,9 @@ class LocalServingAcceptanceTests(unittest.TestCase):
         self._write(case_dir / "evidence.input.json", packet)
 
     def _build_suite(self) -> None:
-        self._build_call_726()
+        self._build_case_a()
         self._fixed_packet(
-            "good-girl",
+            "case-b",
             count=52,
             episode_count=4,
             actor_role="human",
@@ -168,7 +168,7 @@ class LocalServingAcceptanceTests(unittest.TestCase):
             },
         )
         self._fixed_packet(
-            "q0030",
+            "case-c",
             count=6,
             episode_count=2,
             actor_role="anonymized_group_member",
@@ -181,7 +181,7 @@ class LocalServingAcceptanceTests(unittest.TestCase):
         )
 
     def test_fixed_packet_adapter_is_verbatim_and_preserves_policy(self) -> None:
-        for case_key in ("good-girl", "q0030"):
+        for case_key in ("case-b", "case-c"):
             frozen = load_private_case(self.suite, case_key)
             self.assertEqual(
                 frozen.serving_packet["evidence_policy"], frozen.evidence_policy
@@ -199,8 +199,8 @@ class LocalServingAcceptanceTests(unittest.TestCase):
                 )
             self.assertEqual(adapted_texts, raw_texts)
 
-        q0030 = load_private_case(self.suite, "q0030")
-        for episode in q0030.serving_packet["expanded_episodes"]:
+        case_c = load_private_case(self.suite, "case-c")
+        for episode in case_c.serving_packet["expanded_episodes"]:
             for message in episode["messages"]:
                 self.assertEqual(message["sender_id"], "")
                 self.assertTrue(message["sender_name"])
@@ -233,7 +233,7 @@ class LocalServingAcceptanceTests(unittest.TestCase):
             )
             expected_semantics = (
                 "native_reconstruction_packet_may_contain_precompiled_semantics"
-                if result.frozen.case_key == "call-726"
+                if result.frozen.case_key == "case-a"
                 else "verbatim_transcript_only_no_semantic_summary"
             )
             self.assertEqual(private["adapter_semantics"], expected_semantics)
@@ -266,8 +266,8 @@ class LocalServingAcceptanceTests(unittest.TestCase):
         self.assertEqual(rows[-1]["warm_samples"], 300)
         self.assertEqual(rows[-1]["memory_provider_calls"], 0)
         self.assertEqual(rows[-1]["total_tokens"], "UNKNOWN_NOT_RUN")
-        self.assertNotIn("private-good-girl-message", stdout.getvalue())
-        self.assertNotIn("private-q0030-message", stdout.getvalue())
+        self.assertNotIn("private-case-b-message", stdout.getvalue())
+        self.assertNotIn("private-case-c-message", stdout.getvalue())
 
 
 if __name__ == "__main__":

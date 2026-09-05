@@ -848,6 +848,68 @@ class TruthLayerV2Tests(unittest.TestCase):
             [],
         )
 
+    def test_self_erasure_removes_third_party_alias_evidence_from_deleted_source(
+        self,
+    ) -> None:
+        source = self.message(
+            "third-party-alias-source",
+            "10001",
+            "ErasedSyntheticSpeaker",
+            "mention another participant",
+            100,
+            content=[
+                {
+                    "type": "mention",
+                    "account_id": "20002",
+                    "display_name": "ThirdPartySyntheticAlias",
+                },
+                {"type": "text", "text": "mention another participant"},
+            ],
+        )
+        self.storage.upsert_message(source)
+
+        third_party = self.storage._connection.execute(
+            "SELECT id FROM participants WHERE umo=? AND account_id=?",
+            (self.umo, "20002"),
+        ).fetchone()
+        self.assertIsNotNone(third_party)
+        third_party_id = int(third_party["id"])
+        before = self.storage._connection.execute(
+            """
+            SELECT observation_count, is_active
+            FROM participant_aliases
+            WHERE participant_id=? AND normalized_alias=?
+            """,
+            (third_party_id, "thirdpartysyntheticalias"),
+        ).fetchone()
+        self.assertEqual(tuple(before), (1, 1))
+
+        self.storage.forget_account(
+            umo=self.umo,
+            platform_id=self.platform_id,
+            account_id="10001",
+        )
+
+        leaked = self.storage._connection.execute(
+            """
+            SELECT 1
+            FROM participant_alias_observations AS observation
+            JOIN messages AS message ON message.id=observation.message_id
+            WHERE message.is_deleted=1
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNone(leaked)
+        after = self.storage._connection.execute(
+            """
+            SELECT observation_count, is_active
+            FROM participant_aliases
+            WHERE participant_id=? AND normalized_alias=?
+            """,
+            (third_party_id, "thirdpartysyntheticalias"),
+        ).fetchone()
+        self.assertEqual(tuple(after), (0, 0))
+
     def test_self_erasure_invalidates_claim_that_depended_on_erased_revision(self) -> None:
         subject = self.message("s", "30003", "丙", "我在", 80)
         old_source = self.message("old", "20002", "乙", "丙喜欢红色", 90)

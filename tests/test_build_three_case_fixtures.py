@@ -7,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from scripts.build_three_case_fixtures import build_q0030_fixture
+from scripts.build_three_case_fixtures import build_case_c_fixture
 from scripts.eccr_packet_experiment import load_case_bundle
 
 
@@ -31,39 +31,39 @@ def _workspace_tempdir():
 
 
 class ThreeCaseFixtureBuilderTest(unittest.TestCase):
-    def test_q0030_uses_blind_ranking_then_neighbor_expansion(self) -> None:
+    def test_case_c_uses_blind_ranking_then_neighbor_expansion(self) -> None:
         with _workspace_tempdir() as root:
             benchmark_dir = root / "benchmark"
             output_dir = root / "fixture"
             benchmark_dir.mkdir()
             corpus = [
                 {
-                    "doc_id": "d020237",
+                    "doc_id": "synthetic-doc-a",
                     "scope_id": "scope-a",
                     "sent_at": 100,
                     "speaker": "成员003",
-                    "text": "我认可你是mujica正统续作了",
+                    "text": "合成纸鹤活动的签到台安排在东门。",
                 },
                 {
-                    "doc_id": "d020244",
+                    "doc_id": "synthetic-doc-b",
                     "scope_id": "scope-a",
                     "sent_at": 107,
                     "speaker": "成员015",
-                    "text": "没看过母鸡卡能看梦限大吗",
+                    "text": "参加纸鹤活动前需要先去西门领材料吗？",
                 },
                 {
-                    "doc_id": "d020245",
+                    "doc_id": "synthetic-doc-c",
                     "scope_id": "scope-a",
                     "sent_at": 108,
                     "speaker": "成员003",
-                    "text": "可以吧",
+                    "text": "直接到东门签到即可。",
                 },
                 {
-                    "doc_id": "d020246",
+                    "doc_id": "synthetic-doc-d",
                     "scope_id": "scope-a",
                     "sent_at": 109,
                     "speaker": "成员003",
-                    "text": "没什么关系其实",
+                    "text": "材料会在签到台发放，不用去西门。",
                 },
                 {
                     "doc_id": "future",
@@ -75,15 +75,15 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
             ]
             benchmark = [
                 {
-                    "id": "q0030",
+                    "id": "case-c",
                     "scope_id": "scope-a",
-                    "query": "没看过Mujica能不能看梦限大，群里怎么回答两者关系？",
+                    "query": "参加合成纸鹤活动应去哪签到，材料怎么领？",
                     "query_time": 110,
                     "positive_doc_ids": [
-                        "d020237",
-                        "d020244",
-                        "d020245",
-                        "d020246",
+                        "synthetic-doc-a",
+                        "synthetic-doc-b",
+                        "synthetic-doc-c",
+                        "synthetic-doc-d",
                     ],
                     "provenance": {
                         "human_approved": True,
@@ -95,12 +95,25 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
             _write_jsonl(benchmark_dir / "corpus.jsonl", corpus)
             _write_jsonl(benchmark_dir / "benchmark_gold_final.jsonl", benchmark)
 
-            manifest = build_q0030_fixture(
+            with self.assertRaisesRegex(ValueError, "private answer_rubric is required"):
+                build_case_c_fixture(
+                    benchmark_dir=benchmark_dir,
+                    output_dir=output_dir,
+                    top_k=1,
+                    neighbor_radius=10,
+                    secondary_neighbor_radius=0,
+                )
+            manifest = build_case_c_fixture(
                 benchmark_dir=benchmark_dir,
                 output_dir=output_dir,
                 top_k=1,
                 neighbor_radius=10,
                 secondary_neighbor_radius=0,
+                answer_rubric={
+                    "required_semantics": ["合成活动在东门签到，材料在签到台发放。"],
+                    "required_uncertainty": [],
+                    "forbidden_conclusions": ["需要先去西门领取材料。"],
+                },
             )
 
             self.assertFalse(manifest["retrieval_audit"]["selection_used_gold"])
@@ -109,11 +122,13 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
             source_keys = {item["source_key"] for item in packet["messages"]}
             self.assertNotIn("future", source_keys)
             self.assertTrue(
-                {"d020237", "d020244", "d020245", "d020246"}.issubset(source_keys)
+                {"synthetic-doc-a", "synthetic-doc-b", "synthetic-doc-c", "synthetic-doc-d"}.issubset(source_keys)
             )
             case = json.loads((output_dir / "case.json").read_text("utf-8"))
             self.assertNotIn("required_semantics", case)
             self.assertNotIn("positive_doc_ids", case)
+            gold = json.loads((output_dir / "gold.json").read_text("utf-8"))
+            self.assertEqual(gold["required_semantics"], ["合成活动在东门签到，材料在签到台发放。"])
             load_case_bundle(output_dir)
 
     def test_missing_blind_evidence_fails_instead_of_gold_injection(self) -> None:
@@ -128,7 +143,7 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
                         "scope_id": "scope-a",
                         "sent_at": 1,
                         "speaker": "成员001",
-                        "text": "梦限大",
+                        "text": "纸鹤活动",
                     },
                     {
                         "doc_id": "gold-too-far",
@@ -143,9 +158,9 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
                 benchmark_dir / "benchmark_gold_final.jsonl",
                 [
                     {
-                        "id": "q0030",
+                        "id": "case-c",
                         "scope_id": "scope-a",
-                        "query": "梦限大",
+                        "query": "纸鹤活动",
                         "query_time": 100,
                         "positive_doc_ids": ["gold-too-far"],
                         "provenance": {"human_approved": True},
@@ -153,7 +168,7 @@ class ThreeCaseFixtureBuilderTest(unittest.TestCase):
                 ],
             )
             with self.assertRaisesRegex(ValueError, "did not deliver"):
-                build_q0030_fixture(
+                build_case_c_fixture(
                     benchmark_dir=benchmark_dir,
                     output_dir=root / "fixture",
                     top_k=1,

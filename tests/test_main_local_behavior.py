@@ -17,9 +17,13 @@ from mr_memory.evidence_pack import (
     hydrate_evidence_atom_pack,
     participant_source_bindings as compile_participant_source_bindings,
 )
+from mr_memory.derivations import MAX_STORED_DERIVATIONS
 from mr_memory.identity import build_request_identity_context
 from mr_memory.reader import build_l2_reader_prompt
 from mr_memory.snapshot import stable_sha256
+from mr_memory.provider_compat import ProviderStreamError
+from mr_memory.usage import TokenUsageRecord
+from mr_memory.distillation import distillation_generation_options
 from tests.test_certificate_v2 import _snapshot as l2_snapshot
 
 MAIN_SOURCE = (
@@ -75,6 +79,366 @@ def _main_method(name: str, **namespace: object):
 
 
 class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_provider_override_is_isolated_and_tracks_actual_model(self):
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["local_serving_reader_provider_id"]["default"], "")
+        self.assertEqual(schema["local_serving_reader_provider_id"]["_special"], "select_provider")
+        select = _main_method("_local_reader_provider_id")
+        host = SimpleNamespace(subconscious_provider_id="synthetic-maintenance",
+                               local_serving_reader_provider_id="", distillation_max_output_tokens=1234,
+                               embedding_enabled=False, _last_reader_model_revision="synthetic-maintenance|model=old")
+        self.assertEqual(select(host), "synthetic-maintenance")
+        host.local_serving_reader_provider_id = " synthetic-reader "
+        selected = select(host)
+        self.assertEqual(selected, "synthetic-reader")
+        response = SimpleNamespace(usage={"input_other": 7, "output": 3})
+        generate = AsyncMock(return_value=response)
+        generate_method = _main_method(
+            "_run_fast_reconstruction_with_ledger", time=time,
+            FAST_RECONSTRUCTION_SYSTEM_PROMPT="synthetic system",
+            distillation_generation_options=distillation_generation_options,
+            _provider_model_name=lambda provider: "gemini-3.5-flash",
+            _generate_with_failure_ledger=generate, TokenUsageRecord=TokenUsageRecord,
+        )
+        service = SimpleNamespace(record_llm_usage=AsyncMock())
+        await generate_method(host, provider=object(), service=service, run_id="synthetic-reader-run",
+                              prompt="synthetic evidence", provider_id=selected, thinking_mode="disabled",
+                              phase="resident_evidence_reader", max_output_tokens=8192)
+        self.assertEqual(generate.await_args.kwargs["provider_id"], selected)
+        self.assertEqual(generate.await_args.kwargs["model"], "gemini-3.5-flash")
+        self.assertEqual(generate.await_args.kwargs["options"]["max_tokens"], 8192)
+        self.assertEqual(service.record_llm_usage.await_args.kwargs["provider_id"], selected)
+        self.assertEqual(host.subconscious_provider_id, "synthetic-maintenance")
+        revision = _main_method(
+            "_runtime_inference_revision", _provider_model_name=lambda provider: "synthetic-reader-model",
+            L2_READER_PROTOCOL="synthetic-protocol", CERTIFICATE_SCHEMA_VERSION="synthetic-certificate",
+            ANSWER_CONTEXT_SCHEMA_VERSION="synthetic-answer-context",
+        )
+        actual_revision = revision(host, provider=object(), policy=SimpleNamespace(revision="same-policy"),
+                                   provider_id=selected)
+        self.assertEqual(actual_revision["reader_model"], selected + "|model=synthetic-reader-model")
+        self.assertEqual(actual_revision["surface_compiler"], "synthetic-answer-context")
+
+        # A missing explicit Reader must not cause another provider lookup.
+        lookup = Mock(return_value=None)
+        host.context = SimpleNamespace(get_provider_by_id=lookup)
+        host._local_reader_provider_id = lambda: select(host)
+        host._inflight_runtime_tasks = set()
+        host.local_serving_enabled = True
+        host._local_serving_guard = lambda event: ""
+        host.max_query_chars = 100
+        serving = _main_method(
+            "_execute_local_memory_serving", asyncio=asyncio, time=time,
+            _runtime_run_id=lambda kind: "synthetic-unavailable-reader", _LocalMemoryOutcome=SimpleNamespace,
+            logger=Mock(),
+        )
+        outcome = await serving(host, object(), "synthetic query")
+        self.assertEqual(outcome.operational_status, "PROVIDER_UNAVAILABLE")
+        lookup.assert_called_once_with(selected)
+
+    def test_feedback_compact_packet_preserves_host_relative_times(self):
+        method = _main_method(
+            "_compact_feedback_inspection",
+            _feedback_text=_main_method("_feedback_text", re=re),
+        )
+        inspected = {
+            "proposal_id": 1,
+            "feedback": {"source_key": "synthetic:feedback", "sent_at": 100},
+            "candidate_traces": [
+                {"trace_id": "synthetic:old", "request_sent_at": 10,
+                 "request_age_seconds": 90, "response_at": 20,
+                 "response_age_seconds": 80},
+                {"trace_id": "synthetic:pending", "request_sent_at": 90,
+                 "request_age_seconds": 10, "response_at": None,
+                 "response_age_seconds": None},
+            ],
+            "context": [
+                {"source_key": "synthetic:near", "sent_at": 99, "age_seconds": 1},
+                {"source_key": "synthetic:same-second", "sent_at": 100, "age_seconds": 0},
+            ],
+        }
+        packet = method(inspected)
+        self.assertEqual(
+            [(row["request_age_seconds"], row["response_age_seconds"])
+             for row in packet["candidate_traces"]],
+            [(90, 80), (10, None)],
+        )
+        self.assertEqual([row["age_seconds"] for row in packet["context"]], [1, 0])
+        self.assertEqual(packet["candidate_traces"][0]["response_at"], 20)
+        self.assertEqual(packet["feedback"]["sent_at"], 100)
+
+    async def test_failed_provider_call_records_partial_usage_and_stays_failed(self):
+        error = ProviderStreamError(
+            "incomplete stream",
+            partial_usage={"input_other": 19, "input_cached": 4, "output": 7},
+            chunk_count=2,
+            failure_kind="incomplete_stream",
+        )
+        provider_call = AsyncMock(side_effect=error)
+        method = _main_method(
+            "_generate_with_failure_ledger",
+            generate_with_enforced_options=provider_call,
+            asyncio=asyncio,
+            TokenUsageRecord=TokenUsageRecord,
+            time=time,
+        )
+        service = SimpleNamespace(record_llm_usage=AsyncMock())
+        with self.assertRaises(ProviderStreamError) as caught:
+            await method(
+                service=service, run_id="synthetic-run", phase="reader",
+                provider_id="synthetic-provider", model="synthetic-model",
+                started=time.perf_counter(), prompt="synthetic input",
+            )
+        self.assertIs(caught.exception, error)
+        provider_call.assert_awaited_once()
+        recorded = service.record_llm_usage.await_args.kwargs
+        self.assertEqual(
+            (recorded["input_other"], recorded["input_cached"], recorded["output"]),
+            (19, 4, 7),
+        )
+        self.assertEqual(recorded["usage_source"], "provider_failure_partial_usage")
+
+    async def test_default_distillation_schedule_uses_next_batch_identity(self):
+        method = _main_method("_schedule_maintenance", time=time)
+        service = SimpleNamespace(
+            enqueue_pending_distillation_job=AsyncMock(return_value=17),
+            enqueue_maintenance_job=AsyncMock(),
+        )
+        host = SimpleNamespace(
+            _scope_event_carriers={},
+            _service_for_scope=lambda scope: service,
+            distillation_max_messages=40,
+            _queue_existing_maintenance=AsyncMock(return_value=True),
+            _schedule_maintenance_wakeup=Mock(),
+        )
+        scope = SimpleNamespace(key="synthetic-scope")
+        self.assertTrue(await method(host, kind="distill", scope=scope))
+        service.enqueue_pending_distillation_job.assert_awaited_once_with(
+            umo="synthetic-scope", limit=40, available_at=None,
+        )
+        service.enqueue_maintenance_job.assert_not_awaited()
+        service.enqueue_pending_distillation_job.return_value = None
+        self.assertFalse(await method(host, kind="distill", scope=scope))
+        self.assertEqual(host._queue_existing_maintenance.await_count, 1)
+
+    async def test_budget_wait_defers_without_failing_or_calling_provider(self):
+        method = _main_method(
+            "_maintenance_worker", asyncio=asyncio, time=time, logger=Mock(),
+            scoped_job_key=lambda **values: (values["umo"], values["job_id"]),
+        )
+        service = SimpleNamespace(
+            claim_maintenance_job=AsyncMock(return_value={"payload": {}}),
+            defer_maintenance_job=AsyncMock(return_value=True),
+            fail_maintenance_job=AsyncMock(),
+        )
+        host = SimpleNamespace(
+            _maintenance_enqueued=set(), _scope_event_carriers={},
+            _service_for_scope=lambda scope: service,
+            maintenance_llm_timeout_seconds=30,
+            _private_budget_available=AsyncMock(return_value=False),
+            _schedule_maintenance_wakeup=Mock(), _distill_scope=AsyncMock(),
+        )
+        queue = asyncio.Queue()
+        queue.put_nowait((17, "distill", SimpleNamespace(key="synthetic-scope")))
+        task = asyncio.create_task(method(host, queue=queue, worker_name="test"))
+        try:
+            await asyncio.wait_for(queue.join(), timeout=1)
+            service.defer_maintenance_job.assert_awaited_once()
+            service.fail_maintenance_job.assert_not_awaited()
+            host._distill_scope.assert_not_awaited()
+            host._schedule_maintenance_wakeup.assert_called_once()
+            self.assertEqual(
+                service.defer_maintenance_job.await_args.kwargs["reason"],
+                "budget_exhausted:online",
+            )
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_feedback_schedule_freezes_next_pending_batch(self):
+        method = _main_method("_schedule_maintenance", time=time)
+        service = SimpleNamespace(
+            enqueue_pending_feedback_job=AsyncMock(return_value=23),
+            enqueue_maintenance_job=AsyncMock(),
+        )
+        host = SimpleNamespace(
+            _scope_event_carriers={}, _service_for_scope=lambda scope: service,
+            feedback_max_pending_per_wake=6,
+            _queue_existing_maintenance=AsyncMock(return_value=True),
+            _schedule_maintenance_wakeup=Mock(),
+        )
+        scope = SimpleNamespace(key="synthetic-scope")
+        self.assertTrue(await method(host, kind="feedback", scope=scope))
+        service.enqueue_pending_feedback_job.assert_awaited_once_with(
+            umo=scope.key, limit=6, available_at=None,
+        )
+        service.enqueue_maintenance_job.assert_not_awaited()
+
+    async def test_feedback_thinking_config_keeps_stream_and_normal_usage(self):
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["feedback_thinking_mode"]["default"], "enabled")
+        self.assertEqual(schema["feedback_thinking_mode"]["options"], ["enabled", "disabled"])
+        response = SimpleNamespace(usage={"input_other": 13, "output": 5})
+        generate = AsyncMock(return_value=response)
+        method = _main_method(
+            "_run_feedback_batch_with_ledger", time=time,
+            distillation_generation_options=distillation_generation_options,
+            _provider_model_name=lambda provider: "deepseek-v4-flash",
+            _generate_with_failure_ledger=generate,
+            FEEDBACK_BATCH_SYSTEM_PROMPT="synthetic feedback contract",
+            PLASTIC_GRAPH_MAINTENANCE_PROMPT="synthetic graph contract",
+            TokenUsageRecord=TokenUsageRecord,
+        )
+        host = SimpleNamespace(
+            feedback_thinking_mode="disabled", distillation_thinking_mode="enabled",
+            distillation_max_output_tokens=384000,
+            subconscious_provider_id="synthetic-provider",
+        )
+        service = SimpleNamespace(record_llm_usage=AsyncMock())
+        actual, _ = await method(
+            host, provider=object(), service=service,
+            run_id="synthetic-feedback", prompt="synthetic evidence", call_index=0,
+        )
+        self.assertIs(actual, response)
+        generate.assert_awaited_once()
+        sent = generate.await_args.kwargs
+        self.assertEqual(sent["options"]["thinking"], {"type": "disabled"})
+        self.assertEqual(sent["options"]["response_format"], {"type": "json_object"})
+        self.assertEqual(sent["options"]["max_tokens"], 384000)
+        self.assertTrue(sent["stream"])
+        self.assertEqual(host.distillation_thinking_mode, "enabled")
+        service.record_llm_usage.assert_awaited_once()
+        self.assertEqual(
+            service.record_llm_usage.await_args.kwargs["usage_source"],
+            "astrbot_response_one_pass_batch",
+        )
+        batch = next(node for node in ast.walk(MAIN_TREE) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_feedback_maintenance_batch")
+        call = next(node for node in ast.walk(batch) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_run_feedback_batch_with_ledger")
+        self.assertEqual(
+            next(ast.unparse(item.value) for item in call.keywords if item.arg == "thinking_mode"),
+            "self.feedback_thinking_mode",
+        )
+
+    async def test_feedback_failure_preserves_error_and_only_fails_attempted_versions(self):
+        method = _main_method("_run_feedback_maintenance", asyncio=asyncio, logger=Mock())
+        scope = SimpleNamespace(key="synthetic-scope")
+        first = {"id": 3, "feedback_revision_no": 1, "feedback_content_sha256": "a" * 64}
+        second = {"id": 4, "feedback_revision_no": 1, "feedback_content_sha256": "b" * 64}
+        service = SimpleNamespace(fail_feedback_proposals=AsyncMock())
+        error = ValueError("invalid decision")
+        async def fail_batch(**kwargs):
+            self.assertEqual(kwargs["proposal_snapshots"], [first, second])
+            kwargs["attempted"].append(first)
+            raise error
+        host = SimpleNamespace(_run_feedback_maintenance_batch=fail_batch)
+        with self.assertRaises(ValueError) as caught:
+            await method(host, scope=scope, service=service, proposal_snapshots=[first, second])
+        self.assertIs(caught.exception, error)
+        service.fail_feedback_proposals.assert_awaited_once_with(
+            umo=scope.key, snapshots=[first], error="ValueError: invalid decision",
+        )
+
+    async def test_unchanged_capture_redelivery_has_no_maintenance_side_effects(self) -> None:
+        logger = SimpleNamespace(info=Mock(), debug=Mock(), exception=Mock())
+        method = _main_method(
+            "capture_group_message",
+            GroupScopeError=_GroupScopeError,
+            logger=logger,
+            time=time,
+        )
+        scope = SimpleNamespace(key="scope-1", platform_id="shadow")
+        normalized = SimpleNamespace(
+            message_id="platform-message-1",
+            sender_id="synthetic-account",
+            plain_text="synthetic text",
+            content=[{"type": "plain", "text": "synthetic text"}],
+            resolved_source_key=lambda: "shadow|scope-1|platform-message-1",
+        )
+        writes = [
+            SimpleNamespace(status="INSERTED", needs_processing=True),
+            SimpleNamespace(status="UNCHANGED", needs_processing=False),
+        ]
+        service = SimpleNamespace(
+            is_account_forgotten=AsyncMock(return_value=False),
+            ingest_with_outcome=AsyncMock(side_effect=writes),
+            enqueue_feedback_candidate=AsyncMock(return_value=None),
+        )
+        host = SimpleNamespace(
+            capture_enabled=True,
+            feedback_learning_enabled=True,
+            feedback_window_seconds=3600,
+            auto_distillation_enabled=True,
+            log_message_content=False,
+            _scope_event_carriers={},
+            _group_scope=lambda event: scope,
+            _session_allowed=lambda umo: True,
+            _service_for_scope=lambda value: service,
+            _normalize_event=lambda event: normalized,
+            _debounce_feedback=Mock(),
+            _ensure_distillation_deadline=AsyncMock(return_value=True),
+        )
+        event = SimpleNamespace(
+            message_obj=SimpleNamespace(raw_message={}),
+            get_sender_id=lambda: normalized.sender_id,
+        )
+
+        await method(host, event)
+        await method(host, event)
+
+        self.assertEqual(service.ingest_with_outcome.await_count, 2)
+        service.enqueue_feedback_candidate.assert_awaited_once()
+        host._ensure_distillation_deadline.assert_awaited_once()
+        logger.exception.assert_not_called()
+
+    async def test_live_capture_rejects_missing_platform_message_id(self) -> None:
+        logger = SimpleNamespace(info=Mock(), debug=Mock(), exception=Mock())
+        method = _main_method(
+            "capture_group_message",
+            GroupScopeError=_GroupScopeError,
+            logger=logger,
+            time=time,
+        )
+        scope = SimpleNamespace(key="scope-1", platform_id="shadow")
+        normalized = SimpleNamespace(
+            message_id="",
+            sender_id="synthetic-account",
+            plain_text="synthetic text",
+            content=[{"type": "plain", "text": "synthetic text"}],
+        )
+        service = SimpleNamespace(
+            is_account_forgotten=AsyncMock(return_value=False),
+            ingest_with_outcome=AsyncMock(),
+            enqueue_feedback_candidate=AsyncMock(),
+        )
+        host = SimpleNamespace(
+            capture_enabled=True,
+            feedback_learning_enabled=True,
+            feedback_window_seconds=3600,
+            auto_distillation_enabled=True,
+            log_message_content=False,
+            _scope_event_carriers={},
+            _group_scope=lambda event: scope,
+            _session_allowed=lambda umo: True,
+            _service_for_scope=lambda value: service,
+            _normalize_event=lambda event: normalized,
+            _debounce_feedback=Mock(),
+            _ensure_distillation_deadline=AsyncMock(),
+        )
+        event = SimpleNamespace(
+            message_obj=SimpleNamespace(raw_message={}),
+            get_sender_id=lambda: normalized.sender_id,
+        )
+
+        await method(host, event)
+
+        service.ingest_with_outcome.assert_not_called()
+        service.enqueue_feedback_candidate.assert_not_called()
+        host._ensure_distillation_deadline.assert_not_called()
+        logger.exception.assert_called_once_with(
+            "MR Memory failed to capture a group message."
+        )
+
     async def test_opening_feedback_trace_does_not_activate_a_hypothesis(self) -> None:
         method = _main_method(
             "_begin_interaction_trace",
@@ -161,6 +525,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             _collect_participant_keys_in_order=collect_participant_keys_in_order,
             _participant_source_bindings=participant_source_bindings,
             EVIDENCE_ATOM_PACK_FORMAT=EVIDENCE_ATOM_PACK_FORMAT,
+            MAX_STORED_DERIVATIONS=MAX_STORED_DERIVATIONS,
             compile_evidence_atom_pack=compile_evidence_atom_pack,
             hydrate_evidence_atom_pack=hydrate_evidence_atom_pack,
             stable_sha256=stable_sha256,
@@ -175,6 +540,15 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.history_keys: list[str] = []
                 self.activity_keys: list[str] = []
                 self.search_calls: list[dict[str, object]] = []
+                self.audit_candidate_memory_closures = AsyncMock(return_value={
+                    "stored_derivations": [], "dependency_source_keys": [],
+                    "rejected": [],
+                })
+                self.query_lexical_context = AsyncMock(return_value=[{
+                    "anchor_source_key": "synthetic-recent-source",
+                    "context_relation": "chronological_neighbor_not_reply",
+                    "messages": [{"source_key": "synthetic-recent-source", "relative_seconds": 0}],
+                }])
                 self.resolve_query_participants = AsyncMock(
                     side_effect=AssertionError(
                         "text alias parser must not decide resident identity"
@@ -189,7 +563,13 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
             async def search_messages(self, **kwargs: object) -> list:
                 self.search_calls.append(dict(kwargs))
-                return []
+                return [SimpleNamespace(
+                    source_key="synthetic-recent-source", sent_at=90,
+                    sender_id="recent-account", sender_name="近期成员",
+                    sender_participant_key=recent_participant, role="USER",
+                    plain_text="一条合成近期消息", reply_to_source_key="",
+                    mentions=(), revision_no=1,
+                )]
 
             async def reconstruction_evidence_packet(
                 self, **_kwargs: object
@@ -389,6 +769,22 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         service.resolve_query_participants.assert_not_awaited()
+        service.audit_candidate_memory_closures.assert_awaited_once_with(
+            umo=snapshot.umo,
+            candidates={"semantic_memories": [], "episodes": [{"id": 7}],
+                        "associations": []},
+            before_sent_at=snapshot.cutoff_at,
+            message_upper_bound=snapshot.message_upper_bound,
+        )
+        service.query_lexical_context.assert_awaited_once_with(
+            umo=snapshot.umo, source_keys=["synthetic-recent-source"],
+            before_sent_at=snapshot.cutoff_at, message_upper_bound=snapshot.message_upper_bound,
+            exclude_source_key=snapshot.request_source_key,
+        )
+        self.assertEqual(len(packet["lexical_context"]), 1)
+        self.assertEqual(packet["lexical_context"][0]["anchor_source_key"], "synthetic-recent-source")
+        self.assertEqual(packet["lexical_context"][0]["context_relation"], "chronological_neighbor_not_reply")
+        self.assertEqual(packet["lexical_context"][0]["messages"][0]["source_key"], "synthetic-recent-source")
         self.assertEqual(service.history_keys, [recent_participant])
         self.assertEqual(service.activity_keys, [recent_participant])
         self.assertNotIn(incidental_episode_speaker, service.history_keys)
@@ -461,7 +857,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         participant_keys = collect_participant_keys(packet)
         self.assertEqual(participant_keys, {participant_key})
         request = build_l2_reader_prompt(
-            query="好女孩是什么意思",
+            query="纸鹤计划进展如何",
             evidence_packet=packet,
             snapshot=l2_snapshot(),
             allowed_source_keys=(),
@@ -533,9 +929,27 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             feedback_learning_enabled=False,
             local_serving_enabled=True,
             local_serving_timeout_seconds=timeout,
+            local_serving_max_chars=12_000,
             _local_memory_for_request=local_result,
             _feedback_candidate_ids={},
             _local_serving_injected=set(),
+            _active_surface_certificates={},
+        )
+        answer_context_value = {
+            "schema_version": "memory-answer-context.v2",
+            "memory_state": "supported",
+            "referents": [],
+            "facts": [{"statement": "synthetic-public-summary"}],
+            "qualifications": {
+                "do_not_upgrade": [],
+                "conflicts": [],
+                "unresolved": [],
+            },
+        }
+        answer_context = SimpleNamespace(
+            text=json.dumps(answer_context_value, ensure_ascii=False),
+            required_fact_count=1,
+            as_dict=Mock(return_value=answer_context_value),
         )
         method = _main_method(
             "inject_subconscious_memory",
@@ -543,7 +957,11 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             GroupScopeError=_GroupScopeError,
             logger=logger,
             json=json,
+            ANSWER_CONTEXT_SCHEMA_VERSION="memory-answer-context.v2",
             SURFACE_SCHEMA_VERSION="memory-surface.v1",
+            SurfaceCompilationError=ValueError,
+            compile_answer_context_packet=Mock(return_value=answer_context),
+            validate_answer_context_packet=Mock(),
             TextPart=_FakeTextPart,
         )
         return method, host, provider_spy, logger
@@ -551,22 +969,15 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _synthetic_surface(status: str) -> dict[str, object]:
         return {
-            "schema_version": "memory-surface.v1",
-            "certificate_sha256": "synthetic-certificate-digest",
-            "snapshot_sha256": "synthetic-snapshot-digest",
-            "status": status,
-            "scope": {"umo": "synthetic:GroupMessage:scope", "cutoff_at": 123},
-            "subjects": [],
-            "evidence": {"required": [], "optional": []},
-            "contract": {
-                "must_include": [],
-                "must_not_upgrade": [],
+            "schema_version": "memory-answer-context.v2",
+            "memory_state": "supported",
+            "referents": [],
+            "facts": [{"statement": "synthetic-public-summary"}],
+            "qualifications": {
+                "do_not_upgrade": [],
                 "conflicts": [],
                 "unresolved": [],
-                "open_obligations": [],
             },
-            "stop_reason": "SYNTHETIC_TEST",
-            "omitted_optional": 0,
         }
 
     async def test_synthetic_memory_surface_is_injected_by_request_hook(self) -> None:
@@ -580,6 +991,9 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     detail="",
                     usable=True,
                     envelope_text=json.dumps(surface, ensure_ascii=False),
+                    certificate=SimpleNamespace(
+                        digest="synthetic-certificate-digest"
+                    ),
                     ledger_result={
                         "surface_injection_status": "COMPILED_NOT_YET_INJECTED"
                     },
@@ -600,13 +1014,30 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.prompt, "合成宿主提示")
                 self.assertEqual(len(request.extra_user_content_parts), 1)
                 injected = request.extra_user_content_parts[0].text
-                opening = "<mr_memory_surface>"
-                closing = "</mr_memory_surface>"
+                opening = "<mr_memory_answer_context>"
+                closing = "</mr_memory_answer_context>"
                 self.assertEqual(injected.count(opening), 1)
                 self.assertEqual(injected.count(closing), 1)
-                encoded_surface = injected.split(opening, 1)[1].split(closing, 1)[0]
-                self.assertEqual(json.loads(encoded_surface), surface)
+                encoded_context = injected.split(opening, 1)[1].split(closing, 1)[0]
+                decoded_context = json.loads(encoded_context)
+                self.assertEqual(
+                    decoded_context["schema_version"],
+                    "memory-answer-context.v2",
+                )
+                self.assertEqual(
+                    decoded_context["facts"][0]["statement"],
+                    "synthetic-public-summary",
+                )
+                self.assertNotIn("synthetic-certificate-digest", injected)
                 self.assertIn(id(event), host._local_serving_injected)
+                self.assertEqual(
+                    host._active_surface_certificates[id(event)],
+                    (
+                        "scope-1",
+                        f"synthetic-{semantic_status.casefold()}",
+                        outcome.certificate,
+                    ),
+                )
                 host._test_service.finish_experiment.assert_awaited_once()
                 final = host._test_service.finish_experiment.await_args.kwargs
                 self.assertEqual(final["status"], "completed")
@@ -614,6 +1045,40 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     final["result"]["surface_injection_status"],
                     "INJECTED_IN_REQUEST_HOOK",
                 )
+                self.assertFalse(final["result"]["raw_surface_injected"])
+                self.assertEqual(final["result"]["answer_context_required_facts"], 1)
+                provider_spy.assert_not_called()
+
+    async def test_hook_rejects_wrong_protocol_and_unvalidated_envelope_content(self) -> None:
+        wrong_protocol = self._synthetic_surface("CERTIFIED")
+        wrong_protocol["schema_version"] = "unrelated-envelope"
+        altered_content = self._synthetic_surface("CERTIFIED")
+        altered_content["facts"] = [{"statement": "synthetic-unvalidated-content"}]
+        for envelope, expected_status in (
+            (wrong_protocol, "NOT_INJECTED_WRONG_PROTOCOL"),
+            (altered_content, "NOT_INJECTED_INVALID_ANSWER_CONTEXT"),
+        ):
+            with self.subTest(expected_status=expected_status):
+                outcome = SimpleNamespace(
+                    operational_status="COMPLETED", semantic_status="CERTIFIED",
+                    run_id="synthetic-envelope-boundary", detail="", usable=True,
+                    envelope_text=json.dumps(envelope), certificate=object(),
+                    ledger_result={},
+                )
+                method, host, provider_spy, logger = self._hook_host(AsyncMock(return_value=outcome))
+                event = SimpleNamespace(message_obj=SimpleNamespace(message_str="/chat 合成回忆请求"))
+                existing = _FakeTextPart(text="合成宿主既有上下文")
+                request = SimpleNamespace(prompt="合成宿主提示", extra_user_content_parts=[existing])
+                await method(host, event, request)
+                self.assertEqual(request.prompt, "合成宿主提示")
+                self.assertEqual(request.extra_user_content_parts, [existing])
+                self.assertNotIn(id(event), host._local_serving_injected)
+                self.assertNotIn(id(event), host._active_surface_certificates)
+                host._test_service.finish_experiment.assert_awaited_once()
+                final = host._test_service.finish_experiment.await_args.kwargs
+                self.assertEqual(final["status"], "failed")
+                self.assertEqual(final["result"]["surface_injection_status"], expected_status)
+                logger.error.assert_called_once()
                 provider_spy.assert_not_called()
 
     async def test_reader_provider_failure_does_not_inject_or_block_host(self) -> None:
@@ -666,6 +1131,12 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
             source_keys=("source-1",),
             selected_edge_ids=(9,),
             selected_hypothesis_ids=(77,),
+            ledger_result={"presented_aggregate_metadata": [{
+                "aggregate_id": "activity-window:" + "a" * 64,
+                "source_revision_sha256": "b" * 64,
+                "source_count": 40,
+                "scope": {"umo": "scope-1"},
+            }]},
         )
         service = SimpleNamespace(
             experiment_report=AsyncMock(
@@ -678,6 +1149,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         host = SimpleNamespace(
             _capture_visible_bot_output=AsyncMock(),
+            _active_surface_certificates={event_key: object()},
             _local_serving_outcomes={
                 event_key: (("scope-1", "source-request", "query-hash"), local_outcome)
             },
@@ -695,10 +1167,13 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await method(host, event)
 
         service.record_memory_brief_trace.assert_awaited_once()
+        self.assertNotIn(event_key, host._active_surface_certificates)
         trace_call = service.record_memory_brief_trace.await_args.kwargs
         self.assertEqual(trace_call["presented_edge_ids"], (9,))
         self.assertEqual(trace_call["presented_hypothesis_ids"], (77,))
         self.assertEqual(trace_call["source_keys"], ("source-1",))
+        self.assertEqual(trace_call["presented_aggregate_metadata"],
+                         local_outcome.ledger_result["presented_aggregate_metadata"])
 
     async def test_sent_trace_never_overwrites_a_failed_local_run(self) -> None:
         method = _main_method(
@@ -718,6 +1193,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         host = SimpleNamespace(
             _capture_visible_bot_output=AsyncMock(),
+            _active_surface_certificates={event_key: object()},
             _local_serving_outcomes={
                 event_key: (("scope-1", "source-request", "query-hash"), local_outcome)
             },
@@ -730,6 +1206,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await method(host, event)
 
         service.experiment_report.assert_not_awaited()
+        self.assertNotIn(event_key, host._active_surface_certificates)
         service.finish_experiment.assert_not_awaited()
 
     async def test_sent_trace_never_reopens_failed_post_compile_run(self) -> None:
@@ -759,6 +1236,7 @@ class MainLocalBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         host = SimpleNamespace(
             _capture_visible_bot_output=AsyncMock(),
+            _active_surface_certificates={event_key: object()},
             _local_serving_outcomes={
                 event_key: (("scope-1", "source-request", "query-hash"), local_outcome)
             },

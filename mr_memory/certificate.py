@@ -5,11 +5,14 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from .activity_statistics import validate_activity_window_statistics
+from .derivations import MAX_STORED_DERIVATIONS, StoredDerivationEvidence
 from .snapshot import RequestSnapshot, stable_sha256
 
 
 CERTIFICATE_SCHEMA_VERSION = "evidence-certificate.v2"
 MAX_CERTIFICATE_SOURCE_KEYS = 64
+MAX_CERTIFICATE_AGGREGATES = 8
 # Contract-to-certificate conversion may combine independent bounded channels.
 # Conflicts can contain the 16-item brief plus 16 contested interpretations;
 # unresolved conditions can contain the 16-item brief, 16 interpretations,
@@ -32,9 +35,11 @@ ATTRIBUTION_KINDS = {
     "HOST_IDENTITY",
     "DERIVED_INTERPRETATION",
     "BEHAVIORAL_FEEDBACK",
+    "HOST_ACTIVITY_STATISTIC",
 }
 ATOM_STANCES = {"SUPPORTED", "REFUTED", "CONTESTED", "UNRESOLVED"}
 ATOM_IMPORTANCE = {"REQUIRED", "OPTIONAL"}
+EVIDENCE_ROLES = {"USER", "BOT", "SYSTEM", "UNKNOWN"}
 SUBJECT_BINDING_MODES = {
     "HOST",
     "STRUCTURED_REF",
@@ -42,6 +47,7 @@ SUBJECT_BINDING_MODES = {
     "AMBIGUOUS",
     "UNBOUND",
 }
+REFERENT_TYPES = {"PARTICIPANT", "WORK", "ENTITY", "TOPIC"}
 STOP_REASONS = {
     "CERTIFIED_CLOSE",
     "SEMANTIC_NONE",
@@ -258,6 +264,123 @@ class CertificateSubject:
 
 
 @dataclass(frozen=True, slots=True)
+class CertificateReferent:
+    """A semantic subject; source authorship does not determine its type."""
+
+    referent_id: str
+    reference: str
+    referent_type: str
+    participant_key: str
+    reference_mode: str
+    candidate_participant_keys: tuple[str, ...]
+    source_keys: tuple[str, ...]
+    valid_at: int | None
+    derivation_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def from_value(
+        cls,
+        value: object,
+        *,
+        allowed_sources: set[str],
+        allowed_participants: set[str],
+        cutoff_at: int,
+        field: str,
+        allowed_derivation_ids: set[str] | None = None,
+    ) -> CertificateReferent:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field} must be an object")
+        _exact_fields({key: item for key, item in value.items() if key != "derivation_ids"}, {
+            "id", "reference", "referent_type", "participant_key",
+            "reference_mode", "candidate_participant_keys", "source_keys", "valid_at",
+        }, field)
+        kind = str(value.get("referent_type") or "").strip().upper()
+        if kind not in REFERENT_TYPES:
+            raise ValueError(f"{field}.referent_type is unsupported")
+        derivation_ids = _string_tuple(value.get("derivation_ids", []), f"{field}.derivation_ids",
+                                      limit=MAX_STORED_DERIVATIONS, item_limit=80)
+        if not set(derivation_ids).issubset(allowed_derivation_ids or set()):
+            raise ValueError(f"{field}.derivation_ids are outside the host allowlist")
+        if derivation_ids and kind == "PARTICIPANT":
+            raise ValueError(f"{field} stored derivations cannot establish participant identity")
+        subject_value = {
+            key: item for key, item in value.items()
+            if key not in {"id", "referent_type", "derivation_ids"}
+        }
+        if kind != "PARTICIPANT":
+            if value.get("participant_key") != "" or value.get("candidate_participant_keys") != []:
+                raise ValueError(f"{field} non-participant referent cannot carry participant keys")
+            if value.get("reference_mode") != "EVIDENCE_REF":
+                raise ValueError(f"{field} non-participant referent requires EVIDENCE_REF")
+            _source_keys(value.get("source_keys"), f"{field}.source_keys", allowed=allowed_sources,
+                         required=not derivation_ids)
+            # Reuse the bounded text/time validation without claiming a person.
+            subject_value["reference_mode"] = "UNBOUND"
+        subject = CertificateSubject.from_value(
+            subject_value, allowed_sources=allowed_sources,
+            allowed_participants=allowed_participants, cutoff_at=cutoff_at, field=field,
+        )
+        return cls(
+            referent_id=_identifier(value.get("id"), f"{field}.id"),
+            reference=subject.reference, referent_type=kind,
+            participant_key=subject.participant_key,
+            reference_mode=subject.reference_mode if kind == "PARTICIPANT" else "EVIDENCE_REF",
+            candidate_participant_keys=subject.candidate_participant_keys,
+            source_keys=subject.source_keys, valid_at=subject.valid_at,
+            derivation_ids=derivation_ids,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.referent_id, "reference": self.reference,
+            "referent_type": self.referent_type, "participant_key": self.participant_key,
+            "reference_mode": self.reference_mode,
+            "candidate_participant_keys": list(self.candidate_participant_keys),
+            "source_keys": list(self.source_keys), "valid_at": self.valid_at,
+            **({"derivation_ids": list(self.derivation_ids)} if self.derivation_ids else {}),
+        }
+
+    def as_subject(self) -> CertificateSubject:
+        if self.referent_type != "PARTICIPANT":
+            raise ValueError("only participant referents have a legacy subject projection")
+        return CertificateSubject(
+            self.reference, self.participant_key, self.reference_mode,
+            self.candidate_participant_keys, self.source_keys, self.valid_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityEvidenceAggregate:
+    """Immutable host statistics, separate from individually delivered messages."""
+
+    aggregate_id: str
+    descriptor_json: str
+
+    @classmethod
+    def from_value(cls, value: object, *, snapshot: RequestSnapshot,
+                   allowed_participants: set[str]) -> ActivityEvidenceAggregate:
+        descriptor = validate_activity_window_statistics(value)
+        scope = descriptor["scope"]
+        if scope["umo"] != snapshot.umo:
+            raise ValueError("activity aggregate scope differs from the host snapshot")
+        if scope["end_sent_at_exclusive"] > snapshot.cutoff_at:
+            raise ValueError("activity aggregate exceeds the host cutoff")
+        if scope["message_upper_bound"] != snapshot.message_upper_bound:
+            raise ValueError("activity aggregate message bound differs from the host snapshot")
+        if scope["participant_key"] not in allowed_participants:
+            raise ValueError("activity aggregate participant is not host-authorized")
+        return cls(descriptor["aggregate_id"], json.dumps(descriptor, ensure_ascii=False,
+                                                        sort_keys=True, separators=(",", ":")))
+
+    def as_dict(self) -> dict[str, Any]:
+        return json.loads(self.descriptor_json)
+
+    @property
+    def participant_key(self) -> str:
+        return self.as_dict()["scope"]["participant_key"]
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceAtom:
     atom_id: str
     statement: str
@@ -269,6 +392,10 @@ class EvidenceAtom:
     source_spans: tuple[str, ...]
     importance: str
     confidence: float
+    subject_referent_id: str = ""
+    aggregate_ids: tuple[str, ...] = ()
+    evidence_roles: tuple[str, ...] = ("UNKNOWN",)
+    derivation_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_value(
@@ -278,11 +405,15 @@ class EvidenceAtom:
         allowed_sources: set[str],
         allowed_participants: set[str],
         field: str,
+        allowed_aggregate_ids: set[str] | None = None,
+        source_roles: Mapping[str, str] | None = None,
+        allowed_derivations: Mapping[str, StoredDerivationEvidence] | None = None,
     ) -> EvidenceAtom:
         if not isinstance(value, Mapping):
             raise ValueError(f"{field} must be an object")
         _exact_fields(
-            value,
+            {key: item for key, item in value.items()
+             if key not in {"subject_referent_id", "aggregate_ids", "evidence_roles", "derivation_ids"}},
             {
                 "id",
                 "statement",
@@ -309,10 +440,27 @@ class EvidenceAtom:
         confidence = float(value.get("confidence"))
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"{field}.confidence must be 0..1")
+        aggregate_ids = _string_tuple(value.get("aggregate_ids", []), f"{field}.aggregate_ids",
+                                      limit=MAX_CERTIFICATE_AGGREGATES, item_limit=80)
+        if not set(aggregate_ids).issubset(allowed_aggregate_ids or set()):
+            raise ValueError(f"{field}.aggregate_ids are outside the host allowlist")
+        if aggregate_ids and attribution not in {"HOST_ACTIVITY_STATISTIC", "DERIVED_INTERPRETATION"}:
+            raise ValueError(
+                f"{field} aggregate evidence requires HOST_ACTIVITY_STATISTIC or DERIVED_INTERPRETATION"
+            )
+        if attribution == "HOST_ACTIVITY_STATISTIC" and not aggregate_ids:
+            raise ValueError(f"{field} HOST_ACTIVITY_STATISTIC requires aggregate_ids")
+        derivation_ids = _string_tuple(value.get("derivation_ids", []), f"{field}.derivation_ids",
+                                      limit=MAX_STORED_DERIVATIONS, item_limit=80)
+        if not set(derivation_ids).issubset(allowed_derivations or {}):
+            raise ValueError(f"{field}.derivation_ids are outside the host allowlist")
+        if derivation_ids and attribution not in {"OBSERVER_SUMMARY", "DERIVED_INTERPRETATION"}:
+            raise ValueError(f"{field} stored derivations require summary or inference attribution")
         source_keys = _source_keys(
             value.get("source_keys"),
             f"{field}.source_keys",
             allowed=allowed_sources,
+            required=not (aggregate_ids or derivation_ids),
         )
         source_spans = _string_tuple(
             value.get("source_spans"),
@@ -322,6 +470,27 @@ class EvidenceAtom:
         )
         if len(source_spans) > len(source_keys):
             raise ValueError(f"{field}.source_spans exceeds cited sources")
+        if aggregate_ids and (source_spans or value.get("speaker_participant_key")):
+            raise ValueError(f"{field} activity statistics cannot assert a speaker or quotation")
+        if derivation_ids and (source_spans or value.get("speaker_participant_key")):
+            raise ValueError(f"{field} stored derivations cannot assert a speaker or quotation")
+        evidence_roles = _string_tuple(
+            value.get("evidence_roles", ["UNKNOWN"]), f"{field}.evidence_roles",
+            limit=len(EVIDENCE_ROLES), item_limit=7, required=True,
+        )
+        if (not set(evidence_roles).issubset(EVIDENCE_ROLES)
+                or len(evidence_roles) != len(value.get("evidence_roles", ["UNKNOWN"]))):
+            raise ValueError(f"{field}.evidence_roles must be unique host source roles")
+        if source_roles is not None:
+            expected_roles = {source_roles.get(key, "UNKNOWN") for key in source_keys}
+            expected_roles.update(role for key in derivation_ids
+                                  for role in allowed_derivations[key].source_roles)
+            expected_roles = expected_roles or {"UNKNOWN"}
+            if set(evidence_roles) != expected_roles:
+                raise ValueError(f"{field}.evidence_roles differ from host source metadata")
+        elif derivation_ids and not {role for key in derivation_ids
+                                    for role in allowed_derivations[key].source_roles}.issubset(evidence_roles):
+            raise ValueError(f"{field}.evidence_roles omit stored derivation source roles")
         return cls(
             atom_id=_identifier(value.get("id"), f"{field}.id"),
             statement=_text(value.get("statement"), f"{field}.statement", limit=2000),
@@ -341,10 +510,17 @@ class EvidenceAtom:
             source_spans=source_spans,
             importance=importance,
             confidence=confidence,
+            subject_referent_id=(
+                _identifier(value["subject_referent_id"], f"{field}.subject_referent_id")
+                if value.get("subject_referent_id") else ""
+            ),
+            aggregate_ids=aggregate_ids,
+            evidence_roles=tuple(sorted(evidence_roles)),
+            derivation_ids=derivation_ids,
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "id": self.atom_id,
             "statement": self.statement,
             "speaker_participant_key": self.speaker_participant_key,
@@ -356,6 +532,15 @@ class EvidenceAtom:
             "importance": self.importance,
             "confidence": self.confidence,
         }
+        if self.subject_referent_id:
+            result["subject_referent_id"] = self.subject_referent_id
+        if self.aggregate_ids:
+            result["aggregate_ids"] = list(self.aggregate_ids)
+        if self.evidence_roles != ("UNKNOWN",):
+            result["evidence_roles"] = list(self.evidence_roles)
+        if self.derivation_ids:
+            result["derivation_ids"] = list(self.derivation_ids)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +592,7 @@ class CertificateQualification:
     statement: str
     source_keys: tuple[str, ...]
     atom_ids: tuple[str, ...]
+    basis: str = "EVIDENCE"
 
     @classmethod
     def from_value(
@@ -415,10 +601,14 @@ class CertificateQualification:
         *,
         allowed_sources: set[str],
         field: str,
+        allow_packet_coverage_gap: bool = False,
     ) -> CertificateQualification:
         if not isinstance(value, Mapping):
             raise ValueError(f"{field} must be an object")
-        _exact_fields(value, {"statement", "source_keys", "atom_ids"}, field)
+        _exact_fields(
+            {key: item for key, item in value.items() if key != "basis"},
+            {"statement", "source_keys", "atom_ids"}, field,
+        )
         sources = _source_keys(
             value.get("source_keys"),
             f"{field}.source_keys",
@@ -433,20 +623,35 @@ class CertificateQualification:
         )
         if any(not _ID_RE.fullmatch(item) for item in atom_ids):
             raise ValueError(f"{field}.atom_ids contains an invalid identifier")
-        if not sources and not atom_ids:
+        # No citation can prove an absence in the retrieved packet. Preserve
+        # that open question as a non-factual, packet-bound coverage gap. The
+        # enclosing certificate binds it to the host snapshot and packet hash.
+        basis = value.get("basis", "EVIDENCE" if sources or atom_ids else "PACKET_COVERAGE_GAP")
+        if not isinstance(basis, str) or basis not in {"EVIDENCE", "PACKET_COVERAGE_GAP"}:
+            raise ValueError(f"{field}.basis is unsupported")
+        if basis == "PACKET_COVERAGE_GAP":
+            if not allow_packet_coverage_gap:
+                raise ValueError(f"{field} requires source_keys or atom_ids")
+            if sources or atom_ids:
+                raise ValueError(f"{field} packet coverage gap cannot carry evidence references")
+        elif not sources and not atom_ids:
             raise ValueError(f"{field} requires source_keys or atom_ids")
         return cls(
             statement=_text(value.get("statement"), f"{field}.statement", limit=1200),
             source_keys=sources,
             atom_ids=atom_ids,
+            basis=basis,
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "statement": self.statement,
             "source_keys": list(self.source_keys),
             "atom_ids": list(self.atom_ids),
         }
+        if self.basis == "PACKET_COVERAGE_GAP":
+            result["basis"] = self.basis
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,9 +736,13 @@ class EvidenceCertificateV2:
     stop_reason: str
     pack_read_complete: bool
     host_validated: bool
+    # Optional v2 extension. Legacy certificates retain their canonical digest.
+    referents: tuple[CertificateReferent, ...] = ()
+    aggregates: tuple[ActivityEvidenceAggregate, ...] = ()
+    derivations: tuple[StoredDerivationEvidence, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": CERTIFICATE_SCHEMA_VERSION,
             "status": self.status,
             "scope_snapshot": self.scope_snapshot.as_dict(),
@@ -553,6 +762,13 @@ class EvidenceCertificateV2:
                 "host_validated": self.host_validated,
             },
         }
+        if self.referents:
+            result["referents"] = [item.as_dict() for item in self.referents]
+        if self.aggregates:
+            result["aggregates"] = [item.as_dict() for item in self.aggregates]
+        if self.derivations:
+            result["derivations"] = [item.as_dict() for item in self.derivations]
+        return result
 
     @property
     def digest(self) -> str:
@@ -585,12 +801,15 @@ def parse_evidence_certificate(
     allowed_participant_keys: Iterable[str] = (),
     pack_read_complete: bool,
     host_validated: bool = True,
+    allowed_aggregates: Mapping[str, Mapping[str, object]] | None = None,
+    source_roles: Mapping[str, str] | None = None,
+    allowed_derivations: Mapping[str, Mapping[str, object]] | None = None,
 ) -> EvidenceCertificateV2:
     """Parse one host-bound certificate; model-owned scope/revisions are rejected."""
 
     raw = _extract_object(value)
     _exact_fields(
-        raw,
+        {key: item for key, item in raw.items() if key not in {"referents", "aggregates", "derivations"}},
         {
             "schema_version",
             "status",
@@ -648,6 +867,27 @@ def parse_evidence_certificate(
     allowed_participants = {
         str(item) for item in allowed_participant_keys if str(item)
     }
+    aggregates = _parse_items(
+        raw.get("aggregates", []), "aggregates", limit=MAX_CERTIFICATE_AGGREGATES,
+        parser=lambda item, index: ActivityEvidenceAggregate.from_value(
+            item, snapshot=expected_snapshot, allowed_participants=allowed_participants),
+    )
+    aggregates_by_id = {item.aggregate_id: item for item in aggregates}
+    if len(aggregates_by_id) != len(aggregates):
+        raise ValueError("certificate aggregates contain duplicate IDs")
+    for aggregate in aggregates:
+        authorized = (allowed_aggregates or {}).get(aggregate.aggregate_id)
+        if authorized is None or aggregate.as_dict() != authorized:
+            raise ValueError("certificate aggregate differs from the host allowlist")
+    derivations = _parse_items(raw.get("derivations", []), "derivations", limit=MAX_STORED_DERIVATIONS,
+                              parser=lambda item, index: StoredDerivationEvidence.from_value(
+                                  item, snapshot=expected_snapshot))
+    derivations_by_id = {item.derivation_id: item for item in derivations}
+    if len(derivations_by_id) != len(derivations):
+        raise ValueError("certificate derivations contain duplicate IDs")
+    for derivation in derivations:
+        if derivation.as_dict() != (allowed_derivations or {}).get(derivation.derivation_id):
+            raise ValueError("certificate derivation differs from the host allowlist")
     subjects = _parse_items(
         raw.get("subjects"),
         "subjects",
@@ -660,6 +900,22 @@ def parse_evidence_certificate(
             field=f"subjects[{index}]",
         ),
     )
+    referents = _parse_items(
+        raw.get("referents", []), "referents", limit=16,
+        parser=lambda item, index: CertificateReferent.from_value(
+            item, allowed_sources=allowed_sources,
+            allowed_participants=allowed_participants,
+            cutoff_at=expected_snapshot.cutoff_at, field=f"referents[{index}]",
+            allowed_derivation_ids=set(derivations_by_id),
+        ),
+    )
+    referents_by_id = {item.referent_id: item for item in referents}
+    if len(referents_by_id) != len(referents):
+        raise ValueError("certificate referents contain duplicate IDs")
+    if referents and subjects != tuple(
+        item.as_subject() for item in referents if item.referent_type == "PARTICIPANT"
+    ):
+        raise ValueError("certificate subjects differ from the typed participant projection")
     atoms = _parse_items(
         raw.get("atoms"),
         "atoms",
@@ -669,8 +925,30 @@ def parse_evidence_certificate(
             allowed_sources=allowed_sources,
             allowed_participants=allowed_participants,
             field=f"atoms[{index}]",
+            allowed_aggregate_ids=set(aggregates_by_id),
+            source_roles=source_roles,
+            allowed_derivations=derivations_by_id,
         ),
     )
+    if {key for atom in atoms for key in atom.aggregate_ids} != set(aggregates_by_id):
+        raise ValueError("certificate aggregates must match the referenced aggregate IDs")
+    if {key for item in (*atoms, *referents) for key in item.derivation_ids} != set(derivations_by_id):
+        raise ValueError("certificate derivations must match the referenced derivation IDs")
+    for atom in atoms:
+        if atom.aggregate_ids and any(
+            aggregates_by_id[key].participant_key != atom.subject_participant_key
+            for key in atom.aggregate_ids
+        ):
+            raise ValueError("activity statistic subject differs from its aggregate participant")
+        if not atom.subject_referent_id:
+            if referents and atom.subject_participant_key:
+                raise ValueError("typed atom participant requires subject_referent_id")
+            continue
+        referent = referents_by_id.get(atom.subject_referent_id)
+        if referent is None:
+            raise ValueError("atom subject_referent_id references an unknown referent")
+        if atom.subject_participant_key != referent.participant_key:
+            raise ValueError("atom subject participant differs from its typed referent")
     atom_ids = [item.atom_id for item in atoms]
     if len(atom_ids) != len(set(atom_ids)):
         raise ValueError("certificate atoms contain duplicate IDs")
@@ -715,6 +993,7 @@ def parse_evidence_certificate(
             item,
             allowed_sources=allowed_sources,
             field=f"unresolved[{index}]",
+            allow_packet_coverage_gap=True,
         ),
     )
     obligations = _parse_items(
@@ -745,10 +1024,14 @@ def parse_evidence_certificate(
     )
     has_critical_open = any(item.critical for item in obligations)
     if status == "CERTIFIED":
+        if any(item.basis == "PACKET_COVERAGE_GAP" for item in unresolved):
+            raise ValueError("CERTIFIED cannot retain packet coverage gaps")
         if not host_validated or not pack_read_complete:
             raise ValueError("CERTIFIED requires a complete host-validated packet")
         if not atoms:
             raise ValueError("CERTIFIED requires at least one evidence atom")
+        if not must_include:
+            raise ValueError("CERTIFIED requires at least one REQUIRED atom")
         if has_critical_open or has_ambiguous_subject:
             raise ValueError("CERTIFIED cannot retain critical or identity ambiguity")
         if stop_reason != "CERTIFIED_CLOSE":
@@ -756,7 +1039,7 @@ def parse_evidence_certificate(
     elif status == "SEMANTIC_NONE":
         if not host_validated or not pack_read_complete:
             raise ValueError("SEMANTIC_NONE requires a complete host-validated packet")
-        if any((atoms, must_include, guards, conflicts, unresolved, obligations)):
+        if any((subjects, referents, aggregates, derivations, atoms, must_include, guards, conflicts, unresolved, obligations)):
             raise ValueError("SEMANTIC_NONE cannot carry evidence or open obligations")
         if stop_reason != "SEMANTIC_NONE":
             raise ValueError("SEMANTIC_NONE requires stop_reason=SEMANTIC_NONE")
@@ -798,4 +1081,7 @@ def parse_evidence_certificate(
         stop_reason=stop_reason,
         pack_read_complete=bool(pack_read_complete),
         host_validated=bool(host_validated),
+        referents=referents,
+        aggregates=aggregates,
+        derivations=derivations,
     )

@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from mr_memory.models import NormalizedMessage
+from mr_memory.retrieval_terms import literal_recall_query, recall_coverage_terms, short_recall_terms
 from mr_memory.storage import MemoryStorage
 
 
@@ -122,6 +123,28 @@ class LexicalPrefetchTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_request_framing_cannot_evict_literal_targets(self) -> None:
+        targets = [self.message(f"target-{index}", f"今天见到{name}。", 100 + index)
+                   for index, name in enumerate(("春岚", "秋岚", "夏岚"))]
+        noise = [self.message("noise-one", "分辨一下显示器的颜色", 200),
+                 self.message("noise-two", "是几个人去搬桌子", 201),
+                 self.message("noise-three", "请把他找出来", 202)]
+        for message in (*targets, *noise):
+            self.storage.upsert_message(message)
+        query = "分辨一下春岚，秋岚和夏岚是几个人"
+        selected = self.storage.search_messages(umo=self.umo, query=query,
+                                               match_mode="recall", limit=3,
+                                               before_sent_at=300, message_upper_bound=6)
+        self.assertEqual({message.source_key for message in selected},
+                         {message.resolved_source_key() for message in targets})
+        self.assertFalse({"分辨", "一下", "几个"}.intersection(recall_coverage_terms(query)))
+        self.assertEqual(literal_recall_query("群里有Q老师吗，请把他找出来"), "Q老师")
+        self.assertEqual(literal_recall_query("查一下分辨率"), "分辨率")
+        self.assertEqual(literal_recall_query("《分辨一下》是几个人"), "《分辨一下》是几个人")
+        self.assertNotIn("老师", recall_coverage_terms("群里有Q老师吗，请把他找出来"))
+        self.assertIn("q老师", recall_coverage_terms("群里有Q老师吗，请把他找出来"))
+        self.assertIn("老师", short_recall_terms("Q老师和老师"))
 
 
 if __name__ == "__main__":

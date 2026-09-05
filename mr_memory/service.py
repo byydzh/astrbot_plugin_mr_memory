@@ -14,7 +14,7 @@ from .embedding import EmbeddingBackend
 from .feedback import FeedbackDecision
 from .models import DistillationWorkItem, NormalizedMessage, StoredMessage
 from .plasticity import GraphMutation
-from .storage import MemoryStorage
+from .storage import MemoryStorage, MessageWriteOutcome
 
 
 class MemoryService:
@@ -46,6 +46,13 @@ class MemoryService:
     ) -> dict[str, object]:
         return await asyncio.to_thread(
             self.storage.audit_snapshot_sources, **kwargs
+        )
+
+    async def audit_candidate_memory_closures(
+        self, **kwargs: object
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(
+            self.storage.audit_candidate_memory_closures, **kwargs
         )
 
     async def put_evidence_pack_cache(
@@ -86,6 +93,11 @@ class MemoryService:
     async def recover_layered_runtime(self, **kwargs: object) -> dict[str, int]:
         return await asyncio.to_thread(
             self.storage.recover_layered_runtime, **kwargs
+        )
+
+    async def recover_distillation_runtime(self, **kwargs: object) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self.storage.recover_distillation_runtime, **kwargs
         )
 
     async def cleanup_layered_runtime(self, **kwargs: object) -> dict[str, int]:
@@ -135,6 +147,20 @@ class MemoryService:
     ) -> bool:
         return await asyncio.to_thread(
             self.storage.upsert_message,
+            message,
+            processing_class=processing_class,
+            ingestion_source=ingestion_source,
+        )
+
+    async def ingest_with_outcome(
+        self,
+        message: NormalizedMessage,
+        *,
+        processing_class: str = "LIVE",
+        ingestion_source: str = "",
+    ) -> MessageWriteOutcome:
+        return await asyncio.to_thread(
+            self.storage.upsert_message_with_outcome,
             message,
             processing_class=processing_class,
             ingestion_source=ingestion_source,
@@ -219,6 +245,11 @@ class MemoryService:
         """Run snapshot-bounded raw-message lexical retrieval off the event loop."""
 
         return await asyncio.to_thread(self.storage.search_messages, **kwargs)
+
+    async def query_lexical_context(
+        self, **kwargs: object
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.storage.query_lexical_context, **kwargs)
 
     async def query_identity_semantic_evidence(
         self, **kwargs: object
@@ -452,13 +483,29 @@ class MemoryService:
         extractor_version: str,
         embedding_backend: EmbeddingBackend | None = None,
     ) -> tuple[PersistedDistillation, int, str]:
-        persisted = await asyncio.to_thread(
-            commit_distillation_batch,
-            self.storage,
-            batch,
-            work_item=work_item,
-            extractor_version=extractor_version,
+        commit_task = asyncio.create_task(
+            asyncio.to_thread(
+                commit_distillation_batch,
+                self.storage,
+                batch,
+                work_item=work_item,
+                extractor_version=extractor_version,
+            )
         )
+        try:
+            persisted = await asyncio.shield(commit_task)
+        except asyncio.CancelledError as cancellation:
+            # SQLite's worker thread cannot be cancelled with its awaiter.
+            # Settle its transaction before the host handles cancellation or
+            # startup recovery could race a graph commit still in progress.
+            try:
+                await asyncio.shield(commit_task)
+            except Exception as commit_error:
+                cancellation.add_note(
+                    "distillation commit failed while cancellation was pending: "
+                    f"{type(commit_error).__name__}: {commit_error}"
+                )
+            raise
         indexed = 0
         index_error = ""
         if embedding_backend is not None:
@@ -774,6 +821,17 @@ class MemoryService:
     async def enqueue_maintenance_job(self, **kwargs: object) -> int:
         return await asyncio.to_thread(self.storage.enqueue_maintenance_job, **kwargs)
 
+    async def enqueue_pending_distillation_job(self, **kwargs: object) -> int | None:
+        return await asyncio.to_thread(
+            self.storage.enqueue_pending_distillation_job, **kwargs
+        )
+
+    async def enqueue_pending_feedback_job(self, **kwargs: object) -> int | None:
+        return await asyncio.to_thread(self.storage.enqueue_pending_feedback_job, **kwargs)
+
+    async def fail_feedback_proposals(self, **kwargs: object) -> int:
+        return await asyncio.to_thread(self.storage.fail_feedback_proposals, **kwargs)
+
     async def pending_maintenance_jobs(
         self, **kwargs: object
     ) -> list[dict[str, object]]:
@@ -790,6 +848,9 @@ class MemoryService:
 
     async def fail_maintenance_job(self, **kwargs: object) -> str:
         return await asyncio.to_thread(self.storage.fail_maintenance_job, **kwargs)
+
+    async def defer_maintenance_job(self, **kwargs: object) -> bool:
+        return await asyncio.to_thread(self.storage.defer_maintenance_job, **kwargs)
 
     async def start_interaction_trace(self, **kwargs: object) -> str:
         return await asyncio.to_thread(self.storage.start_interaction_trace, **kwargs)

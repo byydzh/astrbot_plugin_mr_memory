@@ -22,16 +22,16 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         return MaterializedReconstruction(
             brief=EvidenceBrief(
                 claims=(
-                    EvidenceClaim("甲后来明确说已经买了。", ("source-buy",), 0.83),
+                    EvidenceClaim("合成成员甲后来确认已经报名。", ("source-buy",), 0.83),
                 ),
                 conflicts=(
                     EvidenceQualification(
-                        "甲此前说自己不喜欢这个作品。", ("source-dislike",)
+                        "合成成员甲此前表示时间尚未确定。", ("source-dislike",)
                     ),
                 ),
                 unresolved=(
                     EvidenceQualification(
-                        "“口嫌体正直”只是群友调侃，不能升级为人格事实。",
+                        "合成活动的场地仍待确认，报名不代表场地已安排。",
                         ("source-joke",),
                     ),
                 ),
@@ -83,8 +83,8 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                 {
                     "memory": {
                         "person_cue": "甲",
-                        "aspect_tag": "购买状态",
-                        "content": "甲后来明确说已经买了。",
+                        "aspect_tag": "报名状态",
+                        "content": "合成成员甲后来确认已经报名。",
                         "epistemic_status": "ASSERTED",
                         "status": "ACTIVE",
                         "semantic_subject": {
@@ -99,7 +99,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                             "sender_id": "account-a",
                             "sender_name": "甲",
                             "role": "USER",
-                            "plain_text": "我买了",
+                            "plain_text": "已经登记报名",
                             "evidence_role": "SUPPORT",
                         }
                     ],
@@ -115,7 +115,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                             "sender_id": "account-a",
                             "sender_name": "甲",
                             "role": "USER",
-                            "plain_text": "我不喜欢",
+                            "plain_text": "时间暂时未定",
                         },
                         {
                             "source_key": "source-joke",
@@ -123,7 +123,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                             "sender_id": "account-b",
                             "sender_name": "乙",
                             "role": "USER",
-                            "plain_text": "口嫌体正直是吧（笑）",
+                            "plain_text": "活动场地还没有确定",
                         },
                     ],
                 }
@@ -175,7 +175,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         )
         self.assertEqual(
             reasoning["semantic"][0]["predicate"],
-            "购买状态",
+            "报名状态",
         )
         self.assertEqual(
             reasoning["semantic"][0]["epistemic_state"],
@@ -184,7 +184,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         hypothesis_source_ids = reasoning["semantic"][0]["source_ids"]
         self.assertEqual(len(hypothesis_source_ids), 1)
         source_records = {item["id"]: item for item in value["source_records"]}
-        self.assertEqual(source_records[hypothesis_source_ids[0]]["text"], "我买了")
+        self.assertEqual(source_records[hypothesis_source_ids[0]]["text"], "已经登记报名")
         self.assertNotIn("participant_key", reasoning["semantic"][0])
         self.assertNotIn("synthetic-semantic-subject", reasoning["semantic"][0].values())
         self.assertIn("identity anchors", value["identity"]["rules"][0])
@@ -208,7 +208,7 @@ class LocalServingEnvelopeTests(unittest.TestCase):
                         "sender_id": "account-a",
                         "sender_name": "甲",
                         "role": "USER",
-                        "plain_text": "我不喜欢",
+                        "plain_text": "时间暂时未定",
                     }
                 ],
             }
@@ -397,8 +397,8 @@ class LocalServingEnvelopeTests(unittest.TestCase):
         source_text = " ".join(
             str(item.get("text") or "") for item in value["source_records"]
         )
-        self.assertIn("我买了", source_text)
-        self.assertIn("我不喜欢", source_text)
+        self.assertIn("已经登记报名", source_text)
+        self.assertIn("时间暂时未定", source_text)
         self.assertNotIn("source-buy", result.json_text)
         self.assertEqual(value["graph_connections"][0]["edge_id"], 9)
 
@@ -713,6 +713,66 @@ class LocalServingEnvelopeTests(unittest.TestCase):
             [],
         )
 
+    def test_activity_preserves_sample_basis_timezone_and_sources(self) -> None:
+        packet = self.packet()
+        packet["participant_activity"] = [
+            {
+                "found": True,
+                "participant": {
+                    "canonical_key": 'participant:["synthetic-platform","synthetic-lab-reporter"]',
+                    "account_id": "synthetic-lab-reporter",
+                    "current_display_name": "合成实验室播报器",
+                },
+                "timezone": "UTC",
+                "window": {
+                    "days": 1,
+                    "start_sent_at": 1933372800,
+                    "end_sent_at_exclusive": 1933459200,
+                },
+                "message_count": 2,
+                "statistics_basis": "returned_source_messages_only",
+                "sampling_method": "daily_boundaries_plus_message_order_quantiles",
+                "hour_histogram": {"06": 1, "14": 1},
+                "messages": [
+                    {
+                        "source_key": "synthetic-lab-morning",
+                        "sent_at": 1933394400,
+                        "local_datetime": "2031-04-08T06:00:00+00:00",
+                        "local_hour": 6,
+                    },
+                    {
+                        "source_key": "synthetic-lab-afternoon",
+                        "sent_at": 1933423200,
+                        "local_datetime": "2031-04-08T14:00:00+00:00",
+                        "local_hour": 14,
+                    },
+                ],
+                "messages_truncated": True,
+            }
+        ]
+        empty = MaterializedReconstruction(None, (), (), ())
+
+        result = compile_local_serving_envelope(
+            packet,
+            empty,
+            request_kind="MEMORY_QUERY",
+            max_chars=3000,
+        )
+
+        value = json.loads(result.json_text)
+        activity = value["participant_activity"][0]
+        self.assertEqual(activity["timezone"], "UTC")
+        self.assertEqual(activity["statistics_basis"], "envelope_source_messages_only")
+        self.assertEqual(
+            activity["upstream_statistics_basis"],
+            "returned_source_messages_only",
+        )
+        self.assertEqual(activity["hour_histogram"]["06"], 1)
+        self.assertEqual(activity["hour_histogram"]["14"], 1)
+        self.assertTrue(activity["messages_truncated"])
+        self.assertTrue(
+            {"synthetic-lab-morning", "synthetic-lab-afternoon"}.issubset(result.source_keys)
+        )
 
     def test_empty_local_packet_is_not_reported_as_semantic_absence(self) -> None:
         packet = {

@@ -348,8 +348,10 @@ function renderRuntimeHealth(scope) {
   const recallCalls = Number(reconstruction.calls || 0);
   const feedbackCalls = Number(feedback.calls || 0);
   const pending = Number(proposalStatus.pending || 0);
+  const failedProposals = Number(proposalStatus.failed || 0);
   const provisional = Number(hypothesisStatus.provisional || 0);
   const budgetWait = Number(jobStatus.budget_wait || 0);
+  const failedJobs = Number(jobStatus.failed || 0);
   const recallFailures = Number(reconstruction.failed || 0);
   const feedbackFailures = Number(feedback.failed || 0);
   const effectiveFeedback = Number(feedback.committed || 0) + Number(feedback.provisional || 0);
@@ -373,6 +375,12 @@ function renderRuntimeHealth(scope) {
   elements.metricFeedbackQueueCaption.textContent = pending
     ? `最久已等待 ${formatAge(queue.oldest_pending_age_seconds)}`
     : "当前没有等待分析的反馈";
+  if (failedProposals) {
+    elements.metricFeedbackQueueCaption.textContent += `；${formatNumber(failedProposals)} 条处理失败，记录已保留`;
+  }
+  if (pending && failedJobs) {
+    elements.metricFeedbackQueueCaption.textContent += "；待分析数可能包含失败作业中暂停的未处理条目";
+  }
 
   elements.queuePending.textContent = formatNumber(pending);
   elements.queueProvisional.textContent = formatNumber(provisional);

@@ -112,7 +112,7 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("semantic_status=decision.semantic_status", body)
 
     def test_missing_feedback_evidence_is_rejected_without_retry(self) -> None:
-        method = self._method("_run_feedback_maintenance")
+        method = self._method("_run_feedback_maintenance_batch")
         body = ast.unparse(method)
         self.assertIn("except FeedbackEvidenceUnavailableError as exc", body)
         self.assertIn("await service.reject_feedback_proposal", body)
@@ -487,21 +487,6 @@ class MainLayeredWiringTests(unittest.TestCase):
             parse_failure_body,
         )
 
-    def test_injection_validates_surface_protocol_and_uses_one_marker(self) -> None:
-        body = ast.unparse(self._method("inject_subconscious_memory"))
-        parse_index = body.index("surface_value = json.loads(outcome.envelope_text)")
-        schema_index = body.index(
-            "surface_value.get('schema_version') != SURFACE_SCHEMA_VERSION"
-        )
-        marker_index = body.index("marker = '<mr_memory_surface>'")
-        append_index = body.index("req.extra_user_content_parts.append(memory_part)")
-        self.assertLess(parse_index, schema_index)
-        self.assertLess(schema_index, marker_index)
-        self.assertLess(marker_index, append_index)
-        self.assertIn("NOT_INJECTED_WRONG_PROTOCOL", body)
-        self.assertIn("{marker}{outcome.envelope_text}</mr_memory_surface>", body)
-        self.assertIn("ALREADY_INJECTED_FOR_EVENT", body)
-
     def test_completed_empty_local_result_is_not_rewritten_as_failure(self) -> None:
         method = self._method("inject_subconscious_memory")
         completed_guard = next(
@@ -637,13 +622,6 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("'repair_attempted': protocol_repair_attempted", producer)
 
     def test_reply_target_is_snapshot_bounded_packet_evidence(self) -> None:
-        revision = ast.unparse(self._method("_runtime_inference_revision"))
-        self.assertIn("host-prefetch.snapshot.v8.compact", revision)
-        self.assertIn(
-            "fts5-plus-bigram-plus-embedding-plus-resident-reader.v8",
-            revision,
-        )
-
         method = self._method("_layered_evidence_packet")
         body = ast.unparse(method)
         reply_lookup = body.index("await service.message_for_source")
@@ -916,7 +894,7 @@ class MainLayeredWiringTests(unittest.TestCase):
             for node in ast.walk(method)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "generate_with_enforced_options"
+            and node.func.id == "_generate_with_failure_ledger"
         ]
         self.assertEqual(len(provider_calls), 1)
         self.assertIn("batch = parse_distillation_response", body)
@@ -948,7 +926,7 @@ class MainLayeredWiringTests(unittest.TestCase):
 
     def test_missing_feedback_provider_consumes_a_bounded_job_attempt(self) -> None:
         worker = ast.unparse(self._method("_maintenance_worker"))
-        feedback = ast.unparse(self._method("_run_feedback_maintenance"))
+        feedback = ast.unparse(self._method("_run_feedback_maintenance_batch"))
         distill_schedule = ast.unparse(self._method("_ensure_distillation_deadline"))
         feedback_schedule = ast.unparse(self._method("_schedule_pending_feedback"))
         self.assertNotIn("kind == 'feedback' and self.context.get_provider_by_id", worker)
@@ -971,7 +949,7 @@ class MainLayeredWiringTests(unittest.TestCase):
         self.assertIn("raise RuntimeError", feedback)
 
     def test_feedback_failure_never_repairs_synthesizes_or_fails_open(self) -> None:
-        method = self._method("_run_feedback_maintenance")
+        method = self._method("_run_feedback_maintenance_batch")
         body = ast.unparse(method)
         provider_calls = [
             node

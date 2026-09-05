@@ -24,11 +24,11 @@ from mr_memory.runtime import (  # noqa: E402
 )
 
 
-CASE_KEYS = ("call-726", "good-girl", "q0030")
+CASE_KEYS = ("case-a", "case-b", "case-c")
 EXPECTED_CASE_IDS = {
-    "call-726": "masked-call-726-r4",
-    "good-girl": "good-girl-competing-meaning-v1",
-    "q0030": "q0030-mujica-yumemita",
+    "case-a": "masked-case-a-r4",
+    "case-b": "case-b-competing-meaning-v1",
+    "case-c": "case-c-entity-links",
 }
 REPORT_SCHEMA_VERSION = "mr-memory.local-serving-acceptance.v1"
 CASE_REPORT_SCHEMA_VERSION = "mr-memory.local-serving-acceptance.case.v1"
@@ -219,7 +219,7 @@ def _adapt_fixed_packet(
                 raw.get("sender_participant_key") or ""
             ).strip()
             speaker_label = str(raw.get("speaker_label") or "").strip()
-            # q0030 explicitly says anonymized speaker labels are not stable
+            # case-c explicitly says anonymized speaker labels are not stable
             # accounts. Preserve the visible label without manufacturing identity.
             sender_id = (
                 participant_token
@@ -317,10 +317,10 @@ def load_private_case(suite_root: str | Path, case_key: str) -> FrozenServingCas
         raise ValueError(f"{case_key} packet query differs from case query")
 
     adapt_started = time.perf_counter_ns()
-    if case_key == "call-726":
+    if case_key == "case-a":
         required = {"candidates", "expanded_episodes", "semantic_evidence"}
         if not required.issubset(packet):
-            raise ValueError("call-726 is not a reconstruction evidence packet")
+            raise ValueError("case-a is not a reconstruction evidence packet")
         serving_packet = packet
         fixture_sources = _record_source_keys(packet)
         groups = _episode_groups_from_reconstruction_packet(packet)
@@ -329,7 +329,7 @@ def load_private_case(suite_root: str | Path, case_key: str) -> FrozenServingCas
         declared = int(packet.get("source_count") or 0)
         if declared and declared != len(fixture_sources):
             raise ValueError(
-                f"call-726 source_count mismatch: {declared}!={len(fixture_sources)}"
+                f"case-a source_count mismatch: {declared}!={len(fixture_sources)}"
             )
     else:
         serving_packet, fixture_sources, groups = _adapt_fixed_packet(
@@ -753,7 +753,7 @@ def run_suite(
     case_keys: Sequence[str] = CASE_KEYS,
 ) -> tuple[CaseAcceptanceResult, ...]:
     if tuple(case_keys) != CASE_KEYS:
-        raise ValueError("acceptance suite must run call-726, good-girl, q0030 in order")
+        raise ValueError("acceptance suite must run case-a, case-b, case-c in order")
     results = tuple(
         run_private_case(
             load_private_case(suite_root, case_key),
@@ -807,7 +807,7 @@ def run_suite(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay the frozen #726 / good-girl / q0030 packets through the "
+            "Replay the frozen 案例 A / case-b / case-c packets through the "
             "provider-free local serving compiler. Private text is written only "
             "to --output-dir; stdout contains metrics."
         )
