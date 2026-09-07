@@ -314,13 +314,13 @@ class MrMemoryPlugin(Star):
         recorded = await asyncio.to_thread(store.append_message, current) if self.config["capture_enabled"] else {}
         if "id" in recorded:
             current.update(id=recorded["id"], source_key=recorded["source_key"])
+        current["content"] = await asyncio.to_thread(store.resolve_quotes, current["content"], current["platform_id"])
         current["question"] = req.prompt or current["plain_text"]
         current["bot_id"] = str(event.get_self_id() or "")
         roster_task = self.spawn(self.refresh_roster(store, event))
-        recent, working, feedback = await asyncio.gather(
+        recent, working = await asyncio.gather(
             asyncio.to_thread(store.recent, limit=int(self.config.get("recent_messages", 24)), before=current["sent_at"] + 1),
             asyncio.to_thread(store.load_working_state),
-            asyncio.to_thread(store.feedback),
         )
         cached_roster = await asyncio.to_thread(store.roster)
         if not cached_roster:
@@ -333,8 +333,9 @@ class MrMemoryPlugin(Star):
         current["bot_name"] = next((person["name"] for person in current["participants"]
                                     if person["account_id"] == current["bot_id"]), "")
         current["roster_fetched_at"] = cached_roster.get("fetched_at") if cached_roster else None
-        current["previously_learned_feedback"] = feedback
-        working = {key: working[key] for key in ("background", "question", "request_at", "status") if key in working}
+        # The last model interpretation is a recorded output, not a premise for
+        # every new question. Learned corrections remain searchable in the DB.
+        working = {key: working[key] for key in ("question", "request_at") if key in working}
         try:
             agent = self.agent(store)
             agent.timeout_seconds = max(0.01, float(self.config["local_serving_timeout_seconds"]) - (time.perf_counter() - started))
@@ -459,7 +460,7 @@ class MrMemoryPlugin(Star):
                 messages = await asyncio.to_thread(store.pending_messages, maximum, newest=True)
             if not messages:
                 return {"status": "idle", "reason": "没有待处理互动"}
-            working = {key: state[key] for key in ("background", "question", "request_at", "learned_feedback") if key in state}
+            working = {key: state[key] for key in ("question", "request_at") if key in state}
             reserved = len(json.dumps({"messages": messages, "working": working}, ensure_ascii=False).encode())
             reserved += int(self.config["distillation_max_output_tokens"]) + 1000
             started_at = time.time()
@@ -467,19 +468,32 @@ class MrMemoryPlugin(Star):
             payload = {"status": "interrupted", "messages": messages, "working": working,
                        "usage": {}, "usage_estimated": True, "reserved_tokens": reserved}
             try:
-                result = await self.agent(store, background=True, feedback=feedback).consolidate(messages, working, feedback=feedback)
+                result = await self.agent(store, background=True, feedback=feedback).consolidate(
+                    messages, working, feedback=feedback, token_budget=budget - used if budget > 0 else None)
                 payload.update(asdict(result), usage_estimated=not bool(result.usage))
                 if result.usage:
                     await asyncio.to_thread(store.settle_usage, usage_id, sum(result.usage.values()))
                 if result.status != "completed":
-                    return {"status": result.status, "reason": result.detail}
-                written = await asyncio.to_thread(store.save_memories, result.items,
-                    [m["source_key"] for m in messages], mark_processed=not feedback)
+                    if result.written:
+                        await self.index_pending(store)
+                    return {"status": result.status, "reason": result.detail, "written_count": len(result.written)}
+                source_keys = [m["source_key"] for m in messages]
+                learned_sources = list(dict.fromkeys(source_keys +
+                    [key for item in result.items for key in item.get("source_keys", [])]))
+                written = result.written + await asyncio.to_thread(store.save_memories, result.items,
+                    learned_sources, mark_processed=False)
+                written = list({(row["kind"], row["id"]): row for row in written}.values())
+                # Reading older sources to revise a memory does not process unrelated backlog.
+                if not feedback:
+                    await asyncio.to_thread(store.save_memories, [], source_keys, mark_processed=True)
                 if feedback:
                     # LLM interpretations remain available to the next foreground turn,
                     # including corrections, while original dialogue remains in the store.
+                    learned = [{key: value for key, value in row.items() if key in {
+                        "kind", "id", "title", "summary", "content", "subject", "aspect",
+                        "source", "target", "relation", "statement", "source_ids"}} for row in written]
                     await self.update_state(store, {"feedback_after": max(m["id"] for m in messages),
-                        "feedback_at": int(time.time()), "learned_feedback": result.items})
+                        "feedback_at": int(time.time()), "learned_feedback": learned})
                 else:
                     await self.update_state(store, {"consolidated_at": int(time.time())})
                 payload["written_count"] = len(written)

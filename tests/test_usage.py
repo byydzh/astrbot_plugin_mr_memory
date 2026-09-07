@@ -101,8 +101,8 @@ class UsageTests(unittest.TestCase):
         self.store.save_memories([], [reaction["source_key"]])
         self.assertEqual(self.store.pending_status()["count"], 4)
         self.assertNotIn(reaction["id"], [m["id"] for m in self.store.pending_messages(20)])
-        self.store.save_working_state({"learned_feedback": [{"content": "地点以最新约定为准"}]})
-        self.assertEqual(self.store.feedback()[0]["content"], "地点以最新约定为准")
+        learned = self.store.search_memories(terms=["西门"])
+        self.assertEqual(learned[0]["summary"], "约定已改到西门")
 
 
 if __name__ == "__main__":

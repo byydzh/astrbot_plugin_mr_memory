@@ -81,6 +81,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         current.send = AsyncMock(return_value={"message_id": "synthetic-receipt"})
         current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
         store = await self.plugin.store_for(current)
+        store.save_working_state({"question": "上次问题", "request_at": 1699999900,
+                                  "background": "先前未经确认的推断", "learned_feedback": [{"content": "过度概括的反馈"}]})
         tools = ToolSet(tools=[FunctionTool(name="synthetic_lookup", description="Synthetic lookup", parameters={"type": "object", "properties": {}})])
         text_part = TextPart(text="其他插件提供的上下文")
         image_part = ImageURLPart(image_url=ImageURLPart.ImageURL(url="https://example.invalid/context.png"))
@@ -101,6 +103,9 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(plugin_module.logger, "exception") as error_log:
             await self.plugin.inject_subconscious_memory(current, request)
         self.assertEqual({name: getattr(request, name) for name in preserved}, preserved)
+        model_current, _, model_working = memory_agent.reconstruct.call_args.args
+        self.assertNotIn("background", model_working)
+        self.assertNotIn("previously_learned_feedback", model_current)
         self.assertIs(request.func_tool, tools)
         self.assertEqual(len(request.func_tool.tools), 1)
         self.assertIs(request.extra_user_content_parts[0], text_part)
@@ -280,6 +285,27 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await self.plugin.consolidate(store, force=True)
         self.assertEqual(result["status"], "budget_exhausted")
         call.assert_not_called()
+
+    async def test_learning_finishes_only_the_batch_and_keeps_tool_written_memories(self):
+        store = await self.plugin.store_for(event())
+        base = self.plugin.message(event())
+        older = store.append_message({**base, "message_id": "older", "plain_text": "旧的上下文"})
+        current = store.append_message(base)
+        saved = store.save_memories([{"kind": "semantic", "content": "读旧原文后的新理解"}],
+                                   [older["source_key"]], mark_processed=False)
+        result = ConsolidationResult(status="completed", written=saved, usage={"input_other": 25, "output": 5},
+            items=[{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
+                    "source_keys": [older["source_key"], current["source_key"]]}])
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=result))
+        with patch.object(store, "pending_messages", return_value=[current]), \
+                patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            outcome = await self.plugin.learn(store, force=True)
+        self.assertEqual(outcome["status"], "completed")
+        self.assertEqual(outcome["written_count"], 2)
+        self.assertEqual([m["id"] for m in store.pending_messages(10)], [older["id"]])
+        self.assertEqual(store.usage_total("background"), 30)
+        self.assertIn("token_budget", learning.consolidate.call_args.kwargs)
 
 
 if __name__ == "__main__":
