@@ -1,2 +1,2 @@
-fastembed==0.8.0
+sentence-transformers>=5.2,<6
 numpy>=1.26,<3

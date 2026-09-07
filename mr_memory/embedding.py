@@ -1,458 +1,143 @@
+"""The existing local Harrier model and its stored float32 vector index."""
 from __future__ import annotations
 
 import asyncio
-import functools
-import hashlib
-import importlib.util
-import math
-import struct
-import threading
-from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Protocol
+
+import numpy as np
 
 
-class EmbeddingBackend(Protocol):
-    """Minimal async embedding interface used by the memory core."""
-
-    @property
-    def model_id(self) -> str: ...
-
-    @property
-    def dimensions(self) -> int: ...
-
-    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
-
-    async def embed_query(self, text: str) -> list[float]: ...
-
-
-class _SingleInferenceGate:
-    """Serialize uncancellable local inference per backend instance.
-
-    Cancelling an asyncio waiter does not stop the native model thread.  Keep
-    the real executor future registered until that thread exits.  Later
-    requests wait for that exact resource instead of failing an otherwise
-    healthy memory request merely because another inference is in flight.
-    """
-
-    def __init__(self) -> None:
-        self._active: asyncio.Future[Any] | None = None
-        self._slot = asyncio.Lock()
-
-    @property
-    def busy(self) -> bool:
-        return self._active is not None and not self._active.done()
-
-    async def run(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        # asyncio.Lock queues waiters fairly.  Do not submit multiple native
-        # calls that would only occupy executor threads while blocking on the
-        # backend's threading lock.
-        await self._slot.acquire()
-        release_when_native_finishes = False
-        try:
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                None,
-                functools.partial(function, *args, **kwargs),
-            )
-            self._active = future
-
-            def clear(completed: asyncio.Future[Any]) -> None:
-                if self._active is completed:
-                    self._active = None
-
-            future.add_done_callback(clear)
-            try:
-                return await asyncio.shield(future)
-            except asyncio.CancelledError:
-                if not future.done():
-                    release_when_native_finishes = True
-
-                    def release_slot(_completed: asyncio.Future[Any]) -> None:
-                        self._slot.release()
-
-                    future.add_done_callback(release_slot)
-                raise
-        finally:
-            if not release_when_native_finishes:
-                self._slot.release()
-
-
-def normalize_vector(vector: Sequence[float]) -> list[float]:
-    values = [float(value) for value in vector]
-    magnitude = math.sqrt(sum(value * value for value in values))
-    if not values or not math.isfinite(magnitude) or magnitude <= 0:
-        raise ValueError("embedding vector must have a finite non-zero norm")
-    return [value / magnitude for value in values]
-
-
-def encode_vector(vector: Sequence[float]) -> bytes:
-    values = normalize_vector(vector)
-    return struct.pack(f"<{len(values)}f", *values)
-
-
-def decode_vector(value: bytes, dimensions: int) -> tuple[float, ...]:
-    expected = int(dimensions) * 4
-    if dimensions <= 0 or len(value) != expected:
-        raise ValueError(
-            f"invalid embedding blob: dimensions={dimensions}, bytes={len(value)}"
-        )
-    return struct.unpack(f"<{dimensions}f", value)
-
-
-def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right) or not left:
-        return 0.0
-    return float(sum(a * b for a, b in zip(left, right, strict=True)))
-
-
-class LocalFastEmbedBackend:
-    """Plugin-owned CPU embedding backend powered by FastEmbed and ONNX.
-
-    The model is loaded lazily on the first embedding request. Network access is
-    used only when FastEmbed needs to download a missing model artifact; no text
-    is ever sent to a remote inference API.
-    """
-
+class Embedder:
     def __init__(
         self,
-        *,
         model_name: str,
         cache_dir: str | Path,
-        cpu_threads: int = 1,
-        batch_size: int = 16,
-        model_factory: Callable[..., object] | None = None,
-    ):
-        normalized_name = str(model_name).strip()
-        if not normalized_name:
-            raise ValueError("local embedding model name is required")
-        self._model_name = normalized_name
-        self._cache_dir = Path(cache_dir)
-        self._cpu_threads = max(1, min(8, int(cpu_threads)))
-        self._batch_size = max(1, min(128, int(batch_size)))
-        self._model_factory = model_factory
-        self._model: object | None = None
-        self._dimensions = 0
-        self._model_lock = threading.Lock()
-        self._inference_lock = threading.Lock()
-        self._inference_gate = _SingleInferenceGate()
-
-    @property
-    def model_id(self) -> str:
-        return f"fastembed/{self._model_name}"
-
-    @property
-    def dimensions(self) -> int:
-        return self._dimensions
-
-    @property
-    def dependency_available(self) -> bool:
-        return self._model_factory is not None or importlib.util.find_spec(
-            "fastembed"
-        ) is not None
-
-    @property
-    def model_loaded(self) -> bool:
-        return self._model is not None
-
-    def _load_model(self) -> object:
-        if self._model is not None:
-            return self._model
-        with self._model_lock:
-            if self._model is not None:
-                return self._model
-            factory = self._model_factory
-            if factory is None:
-                try:
-                    from fastembed import TextEmbedding
-                except ModuleNotFoundError as exc:
-                    raise RuntimeError(
-                        "fastembed is not installed; install plugin requirements"
-                    ) from exc
-                factory = TextEmbedding
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            model = factory(
-                model_name=self._model_name,
-                cache_dir=str(self._cache_dir),
-                threads=self._cpu_threads,
-                providers=["CPUExecutionProvider"],
-                lazy_load=True,
-            )
-            dimensions = int(getattr(model, "embedding_size", 0))
-            if dimensions <= 0:
-                raise ValueError("local embedding model returned an invalid dimension")
-            self._dimensions = dimensions
-            self._model = model
-            return model
-
-    def _validate(self, vectors: Sequence[Any]) -> list[list[float]]:
-        normalized: list[list[float]] = []
-        for index, vector in enumerate(vectors):
-            to_list = getattr(vector, "tolist", None)
-            raw = to_list() if callable(to_list) else list(vector)
-            if len(raw) != self.dimensions:
-                raise ValueError(
-                    "embedding dimension mismatch at index "
-                    f"{index}: expected {self.dimensions}, got {len(raw)}"
-                )
-            normalized.append(normalize_vector(raw))
-        return normalized
-
-    def _embed_texts_sync(self, texts: list[str]) -> list[list[float]]:
-        with self._inference_lock:
-            model = self._load_model()
-            embed = getattr(model, "passage_embed", None)
-            if not callable(embed):
-                raise TypeError("local embedding model does not implement passage_embed()")
-            vectors = list(embed(texts, batch_size=self._batch_size))
-            if len(vectors) != len(texts):
-                raise ValueError(
-                    f"embedding count mismatch: expected {len(texts)}, "
-                    f"got {len(vectors)}"
-                )
-            return self._validate(vectors)
-
-    def _embed_query_sync(self, text: str) -> list[float]:
-        with self._inference_lock:
-            model = self._load_model()
-            embed = getattr(model, "query_embed", None)
-            if not callable(embed):
-                raise TypeError("local embedding model does not implement query_embed()")
-            vectors = list(embed([text], batch_size=1))
-            if len(vectors) != 1:
-                raise ValueError(
-                    f"query embedding count mismatch: expected 1, got {len(vectors)}"
-                )
-            return self._validate(vectors)[0]
-
-    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        values = [str(text).strip() for text in texts]
-        if not values:
-            return []
-        if any(not value for value in values):
-            raise ValueError("embedding passages must not be empty")
-        vectors: list[list[float]] = []
-        for offset in range(0, len(values), self._batch_size):
-            vectors.extend(
-                await self._inference_gate.run(
-                    self._embed_texts_sync,
-                    values[offset : offset + self._batch_size],
-                )
-            )
-        return vectors
-
-    async def embed_query(self, text: str) -> list[float]:
-        value = str(text).strip()
-        if not value:
-            raise ValueError("embedding query must not be empty")
-        return await self._inference_gate.run(self._embed_query_sync, value)
-
-
-class LocalSentenceTransformerBackend:
-    """Plugin-owned CPU embedding backend powered by Sentence Transformers.
-
-    The model is loaded lazily and kept separate from AstrBot's embedding
-    provider abstraction.  Query prompts are applied only to queries; passage
-    vectors remain unprompted as required by asymmetric retrieval models such
-    as Microsoft Harrier.
-    """
-
-    def __init__(
-        self,
-        *,
-        model_name: str,
-        cache_dir: str | Path,
-        batch_size: int = 4,
-        query_prompt_name: str = "",
+        threads: int = 1,
+        batch_size: int = 1,
+        query_prompt: str = "web_search_query",
         max_seq_length: int = 512,
-        device: str = "cpu",
-        model_factory: Callable[..., object] | None = None,
     ):
-        normalized_name = str(model_name).strip()
-        if not normalized_name:
-            raise ValueError("local embedding model name is required")
-        self._model_name = normalized_name
-        self._cache_dir = Path(cache_dir)
-        self._batch_size = max(1, min(32, int(batch_size)))
-        self._query_prompt_name = str(query_prompt_name).strip()
-        self._max_seq_length = max(32, min(4096, int(max_seq_length)))
-        self._device = str(device).strip() or "cpu"
-        self._model_factory = model_factory
-        self._model: object | None = None
-        self._dimensions = 0
-        self._model_lock = threading.Lock()
-        self._inference_lock = threading.Lock()
-        self._inference_gate = _SingleInferenceGate()
+        if not model_name.strip() or min(threads, batch_size, max_seq_length) < 1:
+            raise ValueError("model name and positive embedding limits are required")
+        self.model_name = model_name.strip()
+        self.cache_dir = Path(cache_dir)
+        self.threads = int(threads)
+        self.batch_size = int(batch_size)
+        self.query_prompt = query_prompt.strip()
+        self.max_seq_length = int(max_seq_length)
+        self.model_id = (
+            f"sentence-transformers/{self.model_name}"
+            f"?query_prompt={self.query_prompt or 'none'}"
+        )
+        self.dimensions = 0
+        self._model = None
+        # Cancelling an async waiter cannot stop native inference. One executor
+        # worker keeps it serialized with the next request even after cancellation.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mr-harrier")
+        self._closed = False
 
-    @property
-    def model_id(self) -> str:
-        prompt = self._query_prompt_name or "none"
-        return (
-            f"sentence-transformers/{self._model_name}"
-            f"?query_prompt={prompt}"
+    async def _run(self, function, *args, **kwargs):
+        if self._closed:
+            raise RuntimeError("embedding service is closed")
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor, partial(function, *args, **kwargs),
         )
 
-    @property
-    def dimensions(self) -> int:
-        return self._dimensions
+    def _load(self):
+        if self._model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
 
-    @property
-    def dependency_available(self) -> bool:
-        return self._model_factory is not None or importlib.util.find_spec(
-            "sentence_transformers"
-        ) is not None
-
-    @property
-    def model_loaded(self) -> bool:
-        return self._model is not None
-
-    def _load_model(self) -> object:
-        if self._model is not None:
-            return self._model
-        with self._model_lock:
-            if self._model is not None:
-                return self._model
-            factory = self._model_factory
-            if factory is None:
-                try:
-                    from sentence_transformers import SentenceTransformer
-                except ModuleNotFoundError as exc:
-                    raise RuntimeError(
-                        "sentence-transformers is not installed; install plugin "
-                        "requirements"
-                    ) from exc
-                factory = SentenceTransformer
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            model = factory(
-                self._model_name,
-                device=self._device,
-                cache_folder=str(self._cache_dir),
+            torch.set_num_threads(self.threads)
+            model = SentenceTransformer(
+                self.model_name,
+                device="cpu",
+                cache_folder=str(self.cache_dir),
                 trust_remote_code=False,
                 model_kwargs={"dtype": "auto"},
             )
-            current_max_length = int(
-                getattr(model, "max_seq_length", self._max_seq_length)
-                or self._max_seq_length
-            )
-            setattr(
-                model,
-                "max_seq_length",
-                min(current_max_length, self._max_seq_length),
-            )
-            dimension_getter = getattr(model, "get_embedding_dimension", None)
-            if not callable(dimension_getter):
-                dimension_getter = getattr(
-                    model,
-                    "get_sentence_embedding_dimension",
-                    None,
-                )
-            dimensions = int(dimension_getter() if callable(dimension_getter) else 0)
+            model.max_seq_length = min(int(model.max_seq_length), self.max_seq_length)
+            dimensions = int(model.get_sentence_embedding_dimension())
             if dimensions <= 0:
-                raise ValueError("local embedding model returned an invalid dimension")
-            self._dimensions = dimensions
+                raise ValueError("local embedding model has no valid dimension")
+            self.dimensions = dimensions
             self._model = model
-            return model
+        return self._model
 
-    def _validate(self, vectors: Sequence[Any]) -> list[list[float]]:
-        normalized: list[list[float]] = []
-        for index, vector in enumerate(vectors):
-            to_list = getattr(vector, "tolist", None)
-            raw = to_list() if callable(to_list) else list(vector)
-            if len(raw) != self.dimensions:
-                raise ValueError(
-                    "embedding dimension mismatch at index "
-                    f"{index}: expected {self.dimensions}, got {len(raw)}"
-                )
-            normalized.append(normalize_vector(raw))
-        return normalized
+    async def warmup(self) -> None:
+        await self._run(self._load)
 
-    def _embed_sync(self, texts: list[str], *, query: bool) -> list[list[float]]:
-        with self._inference_lock:
-            model = self._load_model()
-            encode = getattr(model, "encode", None)
-            if not callable(encode):
-                raise TypeError("local embedding model does not implement encode()")
-            kwargs: dict[str, Any] = {
-                "batch_size": 1 if query else self._batch_size,
-                "normalize_embeddings": True,
-                "convert_to_numpy": True,
-                "show_progress_bar": False,
-            }
-            if query and self._query_prompt_name:
-                kwargs["prompt_name"] = self._query_prompt_name
-            vectors = encode(texts, **kwargs)
-            return self._validate(list(vectors))
+    def _encode(self, texts: list[str], *, query: bool) -> list[list[float]]:
+        model = self._load()
+        prompt = {"prompt_name": self.query_prompt} if query and self.query_prompt else {"prompt": ""}
+        vectors = np.asarray(model.encode(
+            texts, batch_size=1 if query else self.batch_size,
+            normalize_embeddings=True, convert_to_numpy=True,
+            show_progress_bar=False, **prompt,
+        ), dtype=np.float32)
+        if vectors.shape != (len(texts), self.dimensions):
+            raise ValueError("local model returned an unexpected embedding shape")
+        norms = np.linalg.norm(vectors, axis=1)
+        if not np.isfinite(vectors).all() or not np.isfinite(norms).all() or np.any(norms <= 0):
+            raise ValueError("local model returned an invalid embedding")
+        return (vectors / norms[:, None]).tolist()
 
-    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        values = [str(text).strip() for text in texts]
-        if not values:
-            return []
-        if any(not value for value in values):
-            raise ValueError("embedding passages must not be empty")
-        vectors: list[list[float]] = []
-        for offset in range(0, len(values), self._batch_size):
-            vectors.extend(
-                await self._inference_gate.run(
-                    self._embed_sync,
-                    values[offset : offset + self._batch_size],
-                    query=False,
-                )
-            )
-        return vectors
-
-    async def embed_query(self, text: str) -> list[float]:
-        value = str(text).strip()
-        if not value:
+    async def query(self, text: str) -> list[float]:
+        text = text.strip()
+        if not text:
             raise ValueError("embedding query must not be empty")
-        vectors = await self._inference_gate.run(
-            self._embed_sync,
-            [value],
-            query=True,
-        )
-        return vectors[0]
+        return (await self._run(self._encode, [text], query=True))[0]
 
+    async def texts(self, texts: list[str]) -> list[list[float]]:
+        values = [text.strip() for text in texts]
+        if any(not text for text in values):
+            raise ValueError("embedding passages must not be empty")
+        result = []
+        # Yield between passage batches so live queries can share this model.
+        for offset in range(0, len(values), self.batch_size):
+            result.extend(await self._run(self._encode, values[offset:offset + self.batch_size], query=False))
+        return result
 
-class HashEmbeddingBackend:
-    """Dependency-free character n-gram embedding for deterministic offline tests.
+    @staticmethod
+    def _search_rows(rows, vector: list[float], limit: int) -> list[dict]:
+        query = np.asarray(vector, dtype=np.float32)
+        matrix = np.empty((len(rows), query.size), dtype=np.float32)
+        for index, row in enumerate(rows):
+            if int(row["dimensions"]) != query.size or len(row["vector"]) != query.size * 4:
+                raise ValueError("stored embedding dimensions or byte length differ from the query")
+            matrix[index] = np.frombuffer(row["vector"], dtype="<f4")
+        norms = np.linalg.norm(matrix, axis=1)
+        if not np.isfinite(matrix).all() or not np.isfinite(norms).all() or np.any(norms <= 0):
+            raise ValueError("stored embedding contains an invalid vector")
+        matrix /= norms[:, None]
+        scores = np.clip(matrix @ query, -1.0, 1.0)
+        selected = np.argsort(-scores, kind="stable")[:limit]
+        return [
+            {"owner_type": str(rows[index]["owner_type"]),
+             "owner_key": str(rows[index]["owner_key"]), "score": float(scores[index])}
+            for index in selected
+        ]
 
-    This backend proves the vector indexing and candidate-initialization path. It
-    is not intended to replace a semantic embedding model in production.
-    """
+    async def search(self, store, query: str, limit: int = 8) -> list[dict]:
+        if limit < 1:
+            return []
+        # Read the actual index each time: additions/deletions are visible without
+        # an invented cache fingerprint or a second index-version protocol.
+        rows = await asyncio.to_thread(store.vector_rows, self.model_id)
+        if not rows:
+            return []
+        vector = await self.query(query)
+        return await asyncio.to_thread(self._search_rows, rows, vector, int(limit))
 
-    def __init__(self, dimensions: int = 256):
-        if dimensions < 32:
-            raise ValueError("hash embedding dimensions must be at least 32")
-        self._dimensions = int(dimensions)
-
-    @property
-    def model_id(self) -> str:
-        return f"hash-char-ngram-v1:{self.dimensions}"
-
-    @property
-    def dimensions(self) -> int:
-        return self._dimensions
-
-    def _embed(self, text: str) -> list[float]:
-        normalized = " ".join(str(text).casefold().split())
-        if not normalized:
-            normalized = "<empty>"
-        vector = [0.0] * self.dimensions
-        features: list[str] = []
-        for size in (1, 2, 3):
-            features.extend(
-                normalized[index : index + size]
-                for index in range(max(0, len(normalized) - size + 1))
-            )
-        features.extend(normalized.split())
-        for feature in features:
-            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(digest[:4], "little") % self.dimensions
-            sign = 1.0 if digest[4] & 1 else -1.0
-            vector[bucket] += sign
-        return normalize_vector(vector)
-
-    async def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        return [self._embed(text) for text in texts]
-
-    async def embed_query(self, text: str) -> list[float]:
-        return self._embed(text)
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # A queued barrier waits for native inference already submitted above.
+        barrier = asyncio.get_running_loop().run_in_executor(self._executor, lambda: None)
+        try:
+            await asyncio.shield(barrier)
+        finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)

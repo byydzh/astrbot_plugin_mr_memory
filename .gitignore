@@ -10,15 +10,9 @@ __pycache__/
 .dev/
 .test-artifacts/
 *.private.*
+/data/
 /pytest-cache-files-*/
 /tmp*/
 dist/
 build/
 *.egg-info/
-
-# Local acceptance evidence: contains production/group identifiers and raw answers.
-/docs/research/LOCAL_SERVING_REWRITE_REPORT_20260826.md
-/docs/research/data/latency_architecture_audit_2026-08-26.json
-/docs/research/data/latency_architecture_report_2026-08-26.json
-/docs/research/data/local_serving_rewrite_acceptance_2026-08-26.json
-/docs/research/data/local_serving_rewrite_acceptance_artifact_2026-08-26.candidate.json

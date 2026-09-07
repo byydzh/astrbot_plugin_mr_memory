@@ -1,196 +1,21 @@
 {
-  "capture_enabled": {
-    "description": "启用群聊记忆",
-    "type": "bool",
-    "default": false,
-    "obvious_hint": true,
-    "hint": "记录群消息并为每个群建立完全独立的记忆库；不会跨群读取。"
-  },
-  "allowed_umos": {
-    "description": "在哪些群启用（留空=全部群）",
-    "type": "list",
-    "items": {"type": "string"},
-    "default": [],
-    "obvious_hint": true,
-    "hint": "UMO 首段是平台实例 ID，不是适配器类型。例如 synthetic_bot:GroupMessage:123456；留空即处理所有群。"
-  },
-  "local_serving_enabled": {
-    "description": "回答前注入本地记忆证据",
-    "type": "bool",
-    "default": true,
-    "obvious_hint": true,
-    "hint": "先读取本群 SQLite、稳定账号、原始消息、关系图和本地向量，再由已配置的记忆分析模型进行且仅进行一次证据阅读；不会修复重试、升级深挖或切换模型。"
-  },
-  "local_serving_timeout_seconds": {
-    "description": "本地记忆异常卡死保护（秒）",
-    "type": "float",
-    "default": 180,
-    "condition": {"local_serving_enabled": true},
-    "hint": "仅用于终止异常卡死的完整本地读取，默认 180 秒、可设 1-600 秒；正常慢路径通过阶段耗时观测，不会因短延迟目标丢弃记忆。超时不会切换模型、数据源或继续后台查询。"
-  },
-  "local_serving_max_chars": {
-    "description": "注入主模型的证据字符上限",
-    "type": "int",
-    "default": 12000,
-    "condition": {"local_serving_enabled": true},
-    "hint": "限制一次 Reader 产出的 memory-surface 注入主模型的字符数。按完整证据项压缩并保留来源约束，不会截断成缺少来源的半条事实。"
-  },
-  "subconscious_enabled": {
-    "description": "启用后台记忆整理",
-    "type": "bool",
-    "default": true,
-    "obvious_hint": true,
-    "hint": "只控制后台消息整理和反馈维护；关闭它不会关闭回答前的一次证据 Reader，后者由“回答前注入本地记忆证据”单独控制。"
-  },
-  "subconscious_provider_id": {
-    "description": "后台记忆分析与默认 Reader 模型",
-    "type": "string",
-    "default": "deepseek/deepseek-v4-flash",
-    "_special": "select_provider",
-    "obvious_hint": true,
-    "hint": "选择 AstrBot 已配置的聊天模型，供后台消息整理和反馈维护使用。回答前 Reader 的独立模型留空时，也使用此模型；不改变 AstrBot 主模型。"
-  },
-  "local_serving_reader_provider_id": {
-    "description": "回答前证据 Reader 的独立模型（可选）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider",
-    "obvious_hint": true,
-    "hint": "留空沿用后台记忆分析模型；选择后只影响回答前的一次 Reader，不改变消息整理、反馈维护或 AstrBot 主模型。所选模型不可用时明确记录失败，不会自动改用其他 provider。"
-  },
-  "distillation_thinking_mode": {
-    "description": "后台记忆整理是否完整推理",
-    "type": "string",
-    "options": ["enabled", "disabled"],
-    "default": "enabled",
-    "obvious_hint": true,
-    "hint": "只用于后台消息整理和反馈维护。后台任务保留 enabled；回答前 Reader 使用下面的独立设置。"
-  },
-  "local_serving_reader_thinking_mode": {
-    "description": "回答前证据 Reader 的思考模式",
-    "type": "string",
-    "options": ["disabled", "enabled"],
-    "default": "disabled",
-    "obvious_hint": true,
-    "hint": "默认 disabled，让一次证据判读直接产出可验证 JSON，避免隐藏推理耗尽输出预算和回复时间。enabled 仅用于显式实验；仍只有一次调用，不会修复重试或切换模型。"
-  },
-  "feedback_learning_enabled": {
-    "description": "学习群友的后续反馈",
-    "type": "bool",
-    "default": false,
-    "obvious_hint": true,
-    "condition": {"capture_enabled": true},
-    "hint": "判断后续消息是否在评价刚才的回答；成立时更新行为偏好和群内语义，弱证据会先保留为待验证。"
-  },
-  "feedback_thinking_mode": {
-    "description": "反馈学习的思考模式",
-    "type": "string",
-    "options": ["enabled", "disabled"],
-    "default": "enabled",
-    "condition": {"feedback_learning_enabled": true},
-    "hint": "仅控制反馈判断，默认保留原思考模式。可显式关闭以兼容模型的正文输出；仍使用原模型、一次调用和相同证据校验，不影响历史整理或回答前 Reader。"
-  },
-  "feedback_window_hours": {
-    "description": "可关联到多久前的回答（小时）",
-    "type": "float",
-    "default": 6,
-    "condition": {"feedback_learning_enabled": true},
-    "hint": "只在这个时间范围内寻找可能被评价的 Bot 回答。"
-  },
-  "feedback_debounce_seconds": {
-    "description": "连续反馈合并等待（秒）",
-    "type": "int",
-    "default": 15,
-    "condition": {"feedback_learning_enabled": true},
-    "hint": "短时间内连续发送的反馈会合并分析，降低调用次数；建议 10–30 秒。"
-  },
-  "embedding_enabled": {
-    "description": "启用本地语义检索",
-    "type": "bool",
-    "default": true,
-    "hint": "只在本机或服务器运行，不借用 AstrBot 的向量服务，也不会把群聊内容发给远程向量接口；用于回答前的本地候选检索。"
-  },
-  "embedding_backend": {
-    "description": "语义检索运行后端",
-    "type": "string",
-    "options": ["sentence_transformers", "fastembed"],
-    "default": "fastembed",
-    "obvious_hint": true,
-    "condition": {"embedding_enabled": true},
-    "hint": "Harrier 使用 sentence_transformers；BGE ONNX 使用 fastembed。切换后端需要对应本地依赖。"
-  },
-  "embedding_model_name": {
-    "description": "语义检索模型",
-    "type": "string",
-    "default": "BAAI/bge-small-zh-v1.5",
-    "obvious_hint": true,
-    "condition": {"embedding_enabled": true},
-    "hint": "当前服务器推荐 microsoft/harrier-oss-v1-270m；轻量方案为 BAAI/bge-small-zh-v1.5。模型只用于候选初始化，不裁决语义。"
-  },
-  "auto_distillation_enabled": {
-    "description": "自动整理新消息",
-    "type": "bool",
-    "default": true,
-    "obvious_hint": true,
-    "condition": {"capture_enabled": true, "subconscious_enabled": true},
-    "hint": "达到消息数量阈值时立即整理；未达到时也会在最长等待时间到达后整理。"
-  },
-  "auto_distillation_min_pending": {
-    "description": "积累多少条后立即整理",
-    "type": "int",
-    "default": 150,
-    "condition": {"auto_distillation_enabled": true},
-    "hint": "同一群累计到此数量后立刻触发一次增量整理。"
-  },
-  "maintenance_interval_minutes": {
-    "description": "最长多久整理一次（分钟）",
-    "type": "float",
-    "default": 1440,
-    "condition": {"auto_distillation_enabled": true},
-    "hint": "只要存在尚未尝试的待处理消息，后台最迟在此时间后触发整理；失败任务保持终态，不会自动重试。"
-  },
-  "private_daily_token_budget": {
-    "description": "每群每日后台整理额度",
-    "type": "int",
-    "default": 500000,
-    "condition": {"subconscious_enabled": true},
-    "hint": "只覆盖后台消息整理。回答前的一次证据 Reader 不受该后台额度阻断，其实际 usage 单独记录在调用账本；另不含反馈学习与一次性历史导入。0 表示后台整理不限。"
-  },
-  "feedback_daily_token_budget": {
-    "description": "每群每日反馈学习额度",
-    "type": "int",
-    "default": 500000,
-    "condition": {"feedback_learning_enabled": true},
-    "hint": "反馈使用独立额度，不会被潜意识深挖或消息整理挤占；0 表示不限。"
-  },
-  "feedback_window_seconds": {"type": "int", "default": 21600, "invisible": true},
-  "feedback_trace_ttl_seconds": {"type": "int", "default": 86400, "invisible": true},
-  "feedback_hypothesis_ttl_days": {"type": "int", "default": 180, "invisible": true},
-  "feedback_max_pending_per_wake": {"type": "int", "default": 6, "invisible": true},
-  "feedback_max_active_hypotheses": {"type": "int", "default": 200, "invisible": true},
-  "feedback_maintenance_steps": {"type": "int", "default": 6, "invisible": true},
-  "feedback_min_commit_score": {"type": "float", "default": 0.65, "invisible": true},
-  "embedding_cpu_threads": {"type": "int", "default": 1, "invisible": true},
-  "embedding_batch_size": {"type": "int", "default": 16, "invisible": true},
-  "embedding_query_prompt_name": {"type": "string", "default": "auto", "invisible": true},
-  "embedding_max_seq_length": {"type": "int", "default": 512, "invisible": true},
-  "embedding_preload_on_startup": {"type": "bool", "default": false, "invisible": true},
-  "embedding_top_k": {"type": "int", "default": 12, "invisible": true},
-  "distillation_max_messages": {"type": "int", "default": 80, "invisible": true},
-  "distillation_overlap_messages": {"type": "int", "default": 12, "invisible": true},
-  "distillation_max_output_tokens": {"type": "int", "default": 384000, "invisible": true},
-  "maintenance_interval_seconds": {"type": "int", "default": 86400, "invisible": true},
-  "candidate_seed_floor": {"type": "float", "default": -1.0, "invisible": true},
-  "host_gate_min_score": {"type": "float", "default": -1.0, "invisible": true},
-  "runtime_host_evidence_gate": {"type": "bool", "default": false, "invisible": true},
-  "max_loop_steps": {"type": "int", "default": 6, "invisible": true},
-  "subconscious_timeout_seconds": {"type": "int", "default": 90, "invisible": true},
-  "online_budget_reserve_tokens": {"type": "int", "default": 65536, "invisible": true},
-  "feedback_budget_reserve_tokens": {"type": "int", "default": 32768, "invisible": true},
-  "maintenance_llm_timeout_seconds": {"type": "int", "default": 3600, "invisible": true},
-  "max_query_chars": {"type": "int", "default": 4000, "invisible": true},
-  "local_serving_max_items": {"type": "int", "default": 12, "invisible": true},
-  "max_brief_chars": {"type": "int", "default": 3000, "invisible": true},
-  "max_search_results": {"type": "int", "default": 20, "invisible": true},
-  "log_message_content": {"type": "bool", "default": false, "invisible": true}
+  "subconscious_enabled": {"description": "向主模型提供群聊语义背景", "type": "bool", "default": true},
+  "subconscious_provider_id": {"description": "潜意识模型 Provider ID", "type": "string", "default": "deepseek/deepseek-v4-flash", "hint": "使用 AstrBot 中已配置的原生 DeepSeek V4 Flash，不改变主回复模型。"},
+  "allowed_umos": {"description": "启用的群会话（空为全部群）", "type": "list", "items": {"type": "string"}, "default": []},
+  "memory_timeout_seconds": {"description": "本次潜意识搜索时间预算（秒）", "type": "float", "default": 20},
+  "memory_max_turns": {"description": "潜意识模型最多调用轮数", "type": "int", "default": 4},
+  "memory_max_tokens": {"description": "单轮潜意识输出 Token 上限", "type": "int", "default": 1200},
+  "recent_messages": {"description": "交给潜意识的近期群消息数", "type": "int", "default": 24},
+  "auto_distillation_enabled": {"description": "后台整理长期群聊记忆", "type": "bool", "default": true},
+  "background_interval_seconds": {"description": "后台整理检查间隔（秒）", "type": "float", "default": 60},
+  "background_min_messages": {"description": "累计多少条新消息开始整理", "type": "int", "default": 30, "hint": "不足此数时，最早消息等待五分钟后也会处理。"},
+  "background_batch_size": {"description": "每次后台整理的消息数", "type": "int", "default": 60},
+  "background_timeout_seconds": {"description": "后台单次模型调用时间预算（秒）", "type": "float", "default": 90},
+  "background_max_tokens": {"description": "后台单次输出 Token 上限", "type": "int", "default": 4096},
+  "background_daily_tokens": {"description": "每群每日后台整理 Token 预算", "type": "int", "default": 500000, "hint": "按北京时间自然日统计，达到后暂停后台模型调用，次日继续；不停止当前对话的记忆搜索。最后一次调用可能略超预算。0表示不限。"},
+  "embedding_model_name": {"description": "本地语义检索模型", "type": "string", "default": "microsoft/harrier-oss-v1-270m"},
+  "embedding_query_prompt_name": {"description": "向量模型查询提示名", "type": "string", "default": "web_search_query"},
+  "embedding_cpu_threads": {"description": "本地向量推理 CPU 线程数", "type": "int", "default": 1},
+  "embedding_batch_size": {"description": "向量批量处理条数", "hint": "默认逐条处理，让前台搜索能在后台索引之间使用模型。", "type": "int", "default": 1},
+  "embedding_max_seq_length": {"description": "向量模型输入长度", "type": "int", "default": 512}
 }
