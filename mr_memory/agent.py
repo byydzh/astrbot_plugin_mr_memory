@@ -216,6 +216,36 @@ class MemoryAgent:
         self.max_turns = max(1, int(max_turns))
         self.max_output_tokens = max(64, int(max_output_tokens))
         self.thinking_mode = thinking_mode
+        self.trace = None
+
+    async def _emit(self, phase, title, status="completed", **data):
+        if self.trace is not None:
+            try:
+                await self.trace.emit(phase, title, status=status, **data)
+            except Exception:
+                pass
+
+    async def _model_turn(self, messages, prompt, tools, turn, *, json_output=False):
+        began = time.monotonic()
+        await self._emit("model", f"第 {turn} 轮模型调用", "running", turn=turn)
+        try:
+            response = await self._generate(messages, prompt, tools, json_output=json_output)
+        except asyncio.CancelledError:
+            await self._emit("model", f"第 {turn} 轮模型调用已取消", "cancelled", turn=turn,
+                             elapsed_ms=(time.monotonic() - began) * 1000)
+            raise
+        except Exception as exc:
+            await self._emit("model", f"第 {turn} 轮模型调用失败", "error", turn=turn,
+                             elapsed_ms=(time.monotonic() - began) * 1000, detail=f"{type(exc).__name__}: {exc}")
+            raise
+        usage = {}
+        _add_usage(usage, response)
+        await self._emit("model", f"第 {turn} 轮模型已返回", turn=turn,
+                         elapsed_ms=(time.monotonic() - began) * 1000,
+                         completion_text=str(getattr(response, "completion_text", "") or ""), usage=usage,
+                         finish_reason=_finish_reason(response),
+                         tool_names=list(getattr(response, "tools_call_name", None) or []))
+        return response
 
     async def _generate(self, messages, system_prompt, tools=None, *, json_output=False):
         # AstrBot's public text_chat drops generation kwargs on this provider.
@@ -285,6 +315,7 @@ class MemoryAgent:
         messages = []
         seen_messages = {}
         tools = _tool_set()
+        cancelled = False
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 messages.append({"role": "user", "content": _json({"current": current, "recent": recent,
@@ -297,7 +328,7 @@ class MemoryAgent:
                     forced_finish = bool(result.tool_calls) and (turn == self.max_turns - 1 or remaining <= 6 + last_round_seconds)
                     if forced_finish:
                         messages.append({"role": "user", "content": "本次检索预算即将用尽。根据已读材料给出背景，并明确仍未解决的缺口。"})
-                    response = await self._generate(messages, RECONSTRUCTION_PROMPT, None if forced_finish else tools)
+                    response = await self._model_turn(messages, RECONSTRUCTION_PROMPT, None if forced_finish else tools, turn + 1)
                     _add_usage(result.usage, response)
                     names = list(getattr(response, "tools_call_name", None) or [])
                     text = str(getattr(response, "completion_text", "") or "").strip()
@@ -336,6 +367,9 @@ class MemoryAgent:
                         began = time.monotonic()
                         record = {"name": name, "arguments": args, "id": call_id, "status": "running"}
                         result.tool_calls.append(record)
+                        value = None
+                        await self._emit("read", f"读取 {name}", "running", turn=turn + 1,
+                                         tool_call_id=call_id, name=name, arguments=args)
                         try:
                             value = await self._execute(name, args, cutoff)
                             record["status"] = "completed"
@@ -347,6 +381,8 @@ class MemoryAgent:
                             record["status"] = "error"
                         finally:
                             record["elapsed_ms"] = (time.monotonic() - began) * 1000
+                            await self._emit("read", f"读取 {name}", record["status"], turn=turn + 1,
+                                             tool_call_id=call_id, name=name, elapsed_ms=record["elapsed_ms"], result=value)
                         record["result"] = value
                         return {"role": "tool", "tool_call_id": call_id, "content": _json(value, seen_messages=seen_messages)}
 
@@ -355,6 +391,9 @@ class MemoryAgent:
                     last_round_seconds = time.monotonic() - round_started
                 else:
                     result.status, result.detail = "partial", "Model turn limit reached before a final background"
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except TimeoutError:
             result.status, result.detail = "partial", "Memory reconstruction time budget exhausted"
         except Exception as exc:
@@ -363,6 +402,8 @@ class MemoryAgent:
             result.elapsed_ms = (time.monotonic() - started) * 1000
             # Debug evidence is private; hidden model reasoning is not persisted.
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"} for message in messages]
+            await self._emit("output", "本次记忆背景产出", "cancelled" if cancelled else result.status,
+                             background=result.background, detail=result.detail, usage=result.usage, elapsed_ms=result.elapsed_ms)
         return result
 
     async def consolidate(self, messages: list, working: dict, *, feedback: bool = False,
@@ -373,6 +414,7 @@ class MemoryAgent:
         seen_messages = {}
         sources: dict[int, str] = {}
         pending_write_error = ""
+        cancelled = False
 
         def read_sources(value):
             if isinstance(value, list):
@@ -419,8 +461,8 @@ class MemoryAgent:
                     last = turn == self.max_turns - 1
                     if last and turn:
                         conversation.append({"role": "user", "content": "本轮结束整理。输出JSON，items仅包含尚未保存的记忆；已保存的不要重复。"})
-                    response = await self._generate(conversation, CONSOLIDATION_PROMPT + purpose,
-                                                    None if last else tools, json_output=True)
+                    response = await self._model_turn(conversation, CONSOLIDATION_PROMPT + purpose,
+                                                     None if last else tools, turn + 1, json_output=True)
                     _add_usage(result.usage, response)
                     text = str(getattr(response, "completion_text", "") or "")
                     result.response_text = text
@@ -451,6 +493,11 @@ class MemoryAgent:
                         began = time.monotonic()
                         record = {"name": name, "arguments": args, "id": call_id, "status": "running"}
                         result.tool_calls.append(record)
+                        value = None
+                        phase = "write" if name == "remember" else "read"
+                        extra = {"target": "long_term_memory"} if name == "remember" else {}
+                        await self._emit(phase, f"{'保存' if name == 'remember' else '读取'} {name}", "running",
+                                         turn=turn + 1, tool_call_id=call_id, name=name, arguments=args, **extra)
                         try:
                             if name == "remember":
                                 items = clean_items(args.get("items") if isinstance(args, dict) else None)
@@ -474,8 +521,14 @@ class MemoryAgent:
                                 pending_write_error = "Memory write has not completed: " + value["detail"]
                         finally:
                             record["elapsed_ms"] = (time.monotonic() - began) * 1000
+                            await self._emit(phase, f"{'保存' if name == 'remember' else '读取'} {name}", record["status"],
+                                             turn=turn + 1, tool_call_id=call_id, name=name,
+                                             elapsed_ms=record["elapsed_ms"], result=value, **extra)
                         record["result"] = value
                         conversation.append({"role": "tool", "tool_call_id": call_id, "content": _json(value, seen_messages=seen_messages)})
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
             if result.written:
                 result.status = "partial"
@@ -484,4 +537,7 @@ class MemoryAgent:
             result.elapsed_ms = (time.monotonic() - started) * 1000
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
                                for message in conversation]
+            await self._emit("output", "本次学习产出", "cancelled" if cancelled else result.status,
+                             pending_item_count=len(result.items), written_count=len(result.written), detail=result.detail,
+                             usage=result.usage, elapsed_ms=result.elapsed_ms)
         return result

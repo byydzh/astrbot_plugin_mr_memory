@@ -1,6 +1,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { scope: "", tab: "runtime", overview: null, next: null, query: "", graphQuery: "" };
+const state = { scope: "", tab: "runtime", overview: null, next: null, query: "", graphQuery: "", runDetail: null, detailVersion: 0, pollTimer: null, pollBusy: false };
 const kinds = { foreground: "回答前回忆", recall: "回答前回忆", reconstruction: "回答前回忆", background: "后台学习", consolidation: "后台学习", feedback: "反馈学习", episode: "共同经历", semantic: "人物与事实", association: "语义连接", topic: "主题" };
 const statuses = { completed: "完成", partial: "部分完成", error: "失败", failed: "失败", timeout: "超时", running: "处理中", skipped: "未执行", empty: "没有相关内容", cancelled: "已取消" };
 const number = (value) => value == null ? "未记录" : Number(value).toLocaleString("zh-CN");
@@ -60,9 +60,51 @@ function proseSection(parent, heading, text, missing = "没有保存这部分内
   const section = el("section"); section.append(el("h3", heading), el("div", text || missing, "prose")); parent.append(section);
 }
 function openDetail(title) {
+  state.detailVersion += 1; state.runDetail = null;
   $("detail-title").textContent = title;
   empty($("detail-content"), "正在读取…");
   if (!$("detail").open) $("detail").showModal();
+  schedulePoll();
+  return { version: state.detailVersion, scope: state.scope };
+}
+function detailCurrent(ticket) { return ticket.version === state.detailVersion && ticket.scope === state.scope && $("detail").open; }
+function runHelpers() { return { date, duration, number, tokens, appendMessages, showContext: (id) => attempt(() => showContext(id)), refresh: () => attempt(async () => { if (state.runDetail) await refreshRunDetail(state.runDetail); }), kind: (kind) => kinds[kind] || kind || "调用" }; }
+function schedulePoll() {
+  clearTimeout(state.pollTimer); state.pollTimer = null;
+  if (document.visibilityState !== "visible" || !state.scope || state.pollBusy) return;
+  if (state.tab === "runtime" || state.runDetail && MRRunTrajectory.running(state.runDetail.run?.status)) state.pollTimer = setTimeout(pollLive, 3000);
+}
+async function pollLive() {
+  state.pollTimer = null;
+  if (state.pollBusy || document.visibilityState !== "visible" || !state.scope) return;
+  state.pollBusy = true;
+  try {
+    const jobs = [];
+    if (state.tab === "runtime") jobs.push(loadRuns());
+    const detail = state.runDetail;
+    if (detail && MRRunTrajectory.running(detail.run?.status)) jobs.push(refreshRunDetail(detail));
+    const results = await Promise.allSettled(jobs);
+    const failure = results.find((result) => result.status === "rejected");
+    $("runs-live-note").textContent = failure ? "刷新暂未完成，稍后重试" : "最近 30 次 · 每 3 秒刷新 · 北京时间";
+  } finally { state.pollBusy = false; schedulePoll(); }
+}
+async function loadRuns() {
+  const scope = state.scope;
+  const data = await api(path("runs"));
+  if (scope !== state.scope || state.tab !== "runtime") return;
+  renderRuns(data.runs || []);
+}
+function renderRuns(rows) {
+  const body = $("runs"); body.replaceChildren();
+  if (!rows.length) { const tr = el("tr"), td = el("td", "尚无保存的调用详情。旧版本没有留下的过程不会补造。", "empty"); td.colSpan = 6; tr.append(td); body.append(tr); }
+  for (const run of rows) {
+    const tr = el("tr"), question = el("td", null, "question");
+    question.append(el("span", kinds[run.kind] || run.kind || "调用", "run-kind"), el("span", run.question || (typeof run.detail === "string" ? run.detail : "") || "后台整理群聊"));
+    const status = el("td", null, "run-progress"); status.append(el("span", statuses[run.status] || run.status || "未记录", `status ${run.status}`));
+    status.append(el("small", MRRunTrajectory.labelTitle(run.latest_title) || (run.step_count ? `${run.step_count} 条步骤记录` : "旧记录 · 可查看已保存过程")));
+    const action = el("td"); action.append(button(MRRunTrajectory.running(run.status) ? "跟随运行" : "查看轨迹", () => showRun(run.id)));
+    tr.append(el("td", date(run.started_at), "time"), question, status, el("td", duration(run.elapsed_ms)), el("td", number(tokens(run.usage))), action); body.append(tr);
+  }
 }
 
 async function refresh() {
@@ -96,7 +138,7 @@ async function refresh() {
     ...(r.background_provider && r.background_provider !== r.provider ? [`后台模型：${r.background_provider}`] : []),
     `回忆异常超时：${r.memory_timeout_seconds} 秒`,
   ].map((text) => el("span", text, "policy")));
-  await loadTab();
+  await loadTab(); schedulePoll();
 }
 
 async function loadTab() {
@@ -122,36 +164,24 @@ async function loadTab() {
       ["语义连接", number(c.associations), "仍可用于搜索的关联"],
       ["检索向量", number(c.embeddings), "数据库中已保存的索引项"],
     ].map(([label, value, caption]) => { const card = el("article", null, "metric"); card.append(el("span", label), el("strong", value), el("small", caption)); return card; }));
-    const body = $("runs"); body.replaceChildren();
-    if (!rows.length) { const tr = el("tr"); const td = el("td", "尚无保存的调用详情。旧版本没有留下的过程不会补造。", "empty"); td.colSpan = 6; tr.append(td); body.append(tr); }
-    for (const run of rows) {
-      const tr = el("tr"); const question = el("td", null, "question");
-      question.append(el("span", kinds[run.kind] || run.kind || "调用", "run-kind"), el("span", run.question || run.detail || "后台整理群聊"));
-      const status = el("td"); status.append(el("span", statuses[run.status] || run.status || "未记录", `status ${run.status}`));
-      const action = el("td"); action.append(button("查看", () => showRun(run.id)));
-      tr.append(el("td", date(run.started_at), "time"), question, status, el("td", duration(run.elapsed_ms)), el("td", number(tokens(run.usage))), action); body.append(tr);
-    }
+    renderRuns(rows);
   } else if (state.tab === "memory") { await searchMemory(); }
   else if (state.tab === "people") { await searchPeople(); }
   else { await searchMessages(); }
 }
 
 async function showRun(id) {
-  openDetail("调用详情");
-  const run = await api(path(`runs/${encodeURIComponent(id)}`));
-  const parent = $("detail-content"); parent.replaceChildren();
-  parent.append(el("p", `${date(run.started_at)} · ${kinds[run.kind] || run.kind} · ${statuses[run.status] || run.status} · ${duration(run.elapsed_ms)} · ${number(tokens(run.usage))} Token`, "meta"));
-  proseSection(parent, "当时的问题", run.question, "后台学习，没有用户提问");
-  proseSection(parent, "提供给主意识的语义背景", run.background, "没有保存背景，不能据此推测当时注入了什么");
-  if (run.detail) proseSection(parent, "处理情况", typeof run.detail === "string" ? run.detail : JSON.stringify(run.detail, null, 2));
-  if (run.items?.length) details(parent, "本次形成的记忆", run.items);
-  const tools = run.tool_calls || [];
-  const toolSection = el("section"); toolSection.append(el("h3", `搜索与阅读过程 · ${tools.length} 项记录`));
-  if (!tools.length) toolSection.append(el("p", "本次没有保存工具调用过程。", "footnote"));
-  for (const [i, tool] of tools.entries()) details(toolSection, `${i + 1}. ${tool.name || tool.tool || tool.function?.name || "工具调用"}`, tool);
-  parent.append(toolSection);
-  if (run.messages?.length) details(parent, "本次模型上下文（完整保存内容）", run.messages);
-  details(parent, "原始用量记录", run.usage || "未记录");
+  const ticket = openDetail("运行轨迹");
+  const detail = { ...ticket, id, run: null, view: null }; state.runDetail = detail;
+  await refreshRunDetail(detail); schedulePoll();
+}
+async function refreshRunDetail(detail) {
+  const run = await api(`scopes/${encodeURIComponent(detail.scope)}/runs/${encodeURIComponent(detail.id)}`);
+  if (state.runDetail !== detail || !detailCurrent(detail)) return;
+  detail.run = run;
+  $("detail-title").textContent = `${kinds[run.kind] || run.kind || "调用"} · 运行轨迹`;
+  if (!detail.view) detail.view = new MRRunTrajectory.View($("detail-content"), runHelpers());
+  detail.view.update(run);
 }
 
 async function searchMemory() {
@@ -167,8 +197,9 @@ async function searchMemory() {
   renderGraph(graph);
 }
 async function showMemory(kind, id) {
-  openDetail(kinds[kind] || "记忆详情");
+  const ticket = openDetail(kinds[kind] || "记忆详情");
   const item = await api(path(`memory/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`));
+  if (!detailCurrent(ticket)) return;
   const parent = $("detail-content"); parent.replaceChildren();
   proseSection(parent, item.title || item.relation || "记忆内容", item.summary || item.statement);
   if (item.source && item.target) parent.append(el("p", `${item.source} → ${item.relation} → ${item.target}`, "meta"));
@@ -224,11 +255,18 @@ function readableContent(content) {
 function appendMessages(parent, messages, contextButtons = true) {
   for (const message of messages) {
     const article = el("article", null, "message"); const header = el("header");
-    header.append(el("strong", message.sender_name || message.sender_id || "未知发送者"), el("span", { USER: "群友", BOT: "实际发送", SYSTEM: "生成 / 工具活动" }[message.role] || message.role), el("span", date(message.sent_at)));
+    const botEvent = Array.isArray(message.content) ? message.content.find((part) => part.type === "bot_event")?.event : null;
+    const eventName = { generated: "主意识生成稿", tool_call: "主意识工具请求", tool_result: "主意识工具返回", sent: "实际发送" }[botEvent];
+    header.append(el("strong", message.sender_name || message.sender_id || "未知发送者"), el("span", eventName || { USER: "群友", BOT: "实际发送", SYSTEM: "生成 / 工具活动" }[message.role] || message.role), el("span", date(message.sent_at)));
     if (contextButtons) header.append(button("查看前后文", () => showContext(message.id)));
     const rawText = message.plain_text || "";
     const text = !rawText || /^\[(node|nodes|forward)\]$/.test(rawText.trim()) ? readableContent(message.content) || rawText : rawText;
-    article.append(header, el("div", text || "这条消息没有纯文本，请展开消息结构。", "message-text"));
+    article.append(header);
+    const toolActivity = ["tool_call", "tool_result"].includes(botEvent) ? message.content.find((part) => part.type === botEvent) : null;
+    if (toolActivity) {
+      const content = el("div", null, "trajectory-section");
+      MRRunTrajectory.renderValue(content, { name: toolActivity.name, arguments: toolActivity.arguments, ...(botEvent === "tool_result" ? { result: toolActivity.result } : {}) }, runHelpers()); article.append(content);
+    } else article.append(el("div", text || "这条消息没有纯文本，请展开消息结构。", "message-text"));
     details(article, `消息 ${message.id} · 结构、引用与附件`, { content: message.content, relations: message.relations, attachments: message.attachments }); parent.append(article);
   }
 }
@@ -242,21 +280,27 @@ async function searchMessages(older = false) {
   state.next = data.next_before_id; $("older").hidden = !state.next;
 }
 async function showContext(id) {
-  openDetail(`消息 ${id} 的前后文`);
+  const returnRun = state.runDetail?.id;
+  const ticket = openDetail(`消息 ${id} 的前后文`);
   const data = await api(path(`context/${id}`));
+  if (!detailCurrent(ticket)) return;
   const parent = $("detail-content"); parent.replaceChildren();
+  if (returnRun != null) parent.append(button("← 返回本次运行轨迹", () => showRun(returnRun), "return-run"));
   parent.append(el("p", "按时间先后显示，目标消息前后各最多 8 条。", "meta"));
   appendMessages(parent, data.messages, false);
   if (!data.messages.length) empty(parent, "找不到原文，可能已撤回或移除。");
 }
 
 $("close-detail").addEventListener("click", () => $("detail").close());
-$("scope-select").addEventListener("change", () => { state.scope = $("scope-select").value; attempt(refresh); });
+$("detail").addEventListener("close", () => { state.detailVersion += 1; state.runDetail = null; schedulePoll(); });
+$("scope-select").addEventListener("change", () => { state.detailVersion += 1; state.runDetail = null; if ($("detail").open) $("detail").close(); state.scope = $("scope-select").value; clearTimeout(state.pollTimer); attempt(refresh); });
+document.addEventListener("visibilitychange", schedulePoll);
+window.addEventListener("pagehide", () => { clearTimeout(state.pollTimer); state.detailVersion += 1; state.runDetail = null; });
 $("refresh").addEventListener("click", () => attempt(refresh));
 document.querySelectorAll("[data-tab]").forEach((tab) => tab.addEventListener("click", () => {
   state.tab = tab.dataset.tab;
   document.querySelectorAll("[data-tab]").forEach((n) => n.removeAttribute("aria-current")); tab.setAttribute("aria-current", "page");
-  document.querySelectorAll("[data-view]").forEach((view) => { view.hidden = view.dataset.view !== state.tab; }); attempt(loadTab);
+  document.querySelectorAll("[data-view]").forEach((view) => { view.hidden = view.dataset.view !== state.tab; }); attempt(loadTab); schedulePoll();
 }));
 for (const [form, action] of [["memory-search", searchMemory], ["people-search", searchPeople], ["message-search", () => searchMessages()]]) $(form).addEventListener("submit", (event) => { event.preventDefault(); attempt(action); });
 $("graph-reset").addEventListener("click", () => attempt(async () => renderGraph(await api(path("graph"), { query: state.graphQuery }))));

@@ -137,6 +137,8 @@ class Console:
         result = await asyncio.to_thread(store.run_detail, run_id)
         if result is None:
             raise FileNotFoundError("这次调用没有保存详情")
+        if result.get("request_id"):
+            result["response_events"] = await asyncio.to_thread(store.response_events, result["request_id"])
         return result
 
     async def memories(self, scope_id):

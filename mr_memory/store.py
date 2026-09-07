@@ -147,6 +147,9 @@ CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT N
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
 CREATE TABLE IF NOT EXISTS mr_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
  kind TEXT NOT NULL,started_at REAL NOT NULL,payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_run_steps (run_id INTEGER NOT NULL REFERENCES mr_runs(id),seq INTEGER NOT NULL,
+ at REAL NOT NULL,phase TEXT NOT NULL,status TEXT NOT NULL,title TEXT NOT NULL,data_json TEXT NOT NULL,
+ PRIMARY KEY(run_id,seq));
 CREATE TABLE IF NOT EXISTS mr_usage (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
  kind TEXT NOT NULL CHECK(kind IN ('background','feedback')),tokens INTEGER NOT NULL,
  occurred_at INTEGER NOT NULL,status TEXT NOT NULL,detail_json TEXT NOT NULL DEFAULT '{}',
@@ -894,16 +897,60 @@ class Store:
                                       (self.umo, kind, started_at, _encode(payload))).lastrowid)
 
     @_serialized
+    def append_run_step(self, run_id: int, seq: int, at: float, phase: str, status: str, title: str, data: dict) -> None:
+        with self.db:
+            changed = self.db.execute("""INSERT INTO mr_run_steps(run_id,seq,at,phase,status,title,data_json)
+                SELECT id,?,?,?,?,?,? FROM mr_runs WHERE umo=? AND id=?""",
+                (int(seq), float(at), phase, status, title, _encode(data), self.umo, int(run_id))).rowcount
+            if not changed:
+                raise ValueError("Run does not exist in this group")
+
+    @_serialized
+    def update_run(self, run_id: int, payload: dict) -> None:
+        with self.db:
+            row = self.db.execute("SELECT payload_json FROM mr_runs WHERE umo=? AND id=?", (self.umo, int(run_id))).fetchone()
+            if row is None:
+                raise ValueError("Run does not exist in this group")
+            combined = {**json.loads(row["payload_json"]), **payload}
+            self.db.execute("UPDATE mr_runs SET payload_json=? WHERE umo=? AND id=?", (_encode(combined), self.umo, int(run_id)))
+
+    @_serialized
     def recent_runs(self, limit: int = 30) -> list[dict]:
-        rows = self._rows("SELECT * FROM mr_runs WHERE umo=? ORDER BY id DESC LIMIT ?", (self.umo, _limit(limit)))
-        return [{**{k: v for k, v in json.loads(row["payload_json"]).items() if k not in ("messages", "tool_calls", "items", "written")},
-                 "id": row["id"], "kind": row["kind"], "started_at": row["started_at"]} for row in rows]
+        rows = self._rows("""SELECT r.*,s.at AS step_at,s.phase AS latest_phase,s.title AS latest_title,
+            (SELECT count(*) FROM mr_run_steps n WHERE n.run_id=r.id) AS step_count FROM mr_runs r
+            LEFT JOIN mr_run_steps s ON s.run_id=r.id AND s.seq=(SELECT max(n.seq) FROM mr_run_steps n WHERE n.run_id=r.id)
+            WHERE r.umo=? ORDER BY r.id DESC LIMIT ?""", (self.umo, _limit(limit)))
+        result = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            updated = payload.get("finished_at") or row["step_at"] or row["started_at"] if payload.get("trace_version") else None
+            result.append({**{k: v for k, v in payload.items() if k not in ("messages", "tool_calls", "items", "written")},
+                           "id": row["id"], "kind": row["kind"], "started_at": row["started_at"], "updated_at": updated,
+                           "step_count": row["step_count"], "latest_phase": row["latest_phase"], "latest_title": row["latest_title"]})
+        return result
 
     @_serialized
     def run_detail(self, run_id: int) -> dict | None:
         row = self.db.execute("SELECT * FROM mr_runs WHERE umo=? AND id=?", (self.umo, int(run_id))).fetchone()
+        steps = self._rows("SELECT seq,at,phase,status,title,data_json FROM mr_run_steps WHERE run_id=? ORDER BY seq", (int(run_id),)) if row else []
+        for step in steps:
+            step["data"] = json.loads(step.pop("data_json"))
         return {**json.loads(row["payload_json"]), "id": row["id"], "kind": row["kind"],
-                "started_at": row["started_at"]} if row else None
+                "started_at": row["started_at"], "steps": steps} if row else None
+
+    @_serialized
+    def response_events(self, request_id: str) -> list[dict]:
+        """Read recorded main-agent activity linked to this one platform request."""
+        rows = self._rows("""SELECT DISTINCT m.* FROM message_relations r JOIN messages m ON m.id=r.source_message_id
+            WHERE r.umo=? AND m.umo=r.umo AND r.target_platform_message_id=? AND m.is_deleted=0
+            ORDER BY m.sent_at,m.id""", (self.umo, str(request_id)))
+        result = []
+        for row in rows:
+            content = json.loads(row["content_json"])
+            if any(isinstance(part, dict) and part.get("type") == "bot_event"
+                   and part.get("event") in {"generated", "tool_call", "tool_result", "sent"} for part in content):
+                result.append(self._message(row))
+        return result
 
     @_serialized
     def cache_roster(self, payload: Any, fetched_at: int) -> None:

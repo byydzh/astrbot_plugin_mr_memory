@@ -149,6 +149,10 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             events = {next(item["event"] for item in row["content"] if item["type"] == "bot_event"): row
                       for row in rows if row["role"] != "USER"}
             self.assertEqual(set(events), {"generated", "sent", "tool_call", "tool_result"})
+            linked = restored.response_events("synthetic-request-1")
+            self.assertEqual([next(p["event"] for p in row["content"] if p["type"] == "bot_event") for row in linked],
+                             ["tool_call", "tool_result", "generated", "sent"])
+            self.assertEqual(restored.response_events("different-request"), [])
             self.assertEqual(events["generated"]["role"], "SYSTEM")
             self.assertEqual(events["generated"]["plain_text"], "模型生成但尚未发送的合成回答")
             self.assertEqual(events["sent"]["role"], "BOT")
