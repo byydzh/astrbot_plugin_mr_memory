@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ class ConsolidationResult:
     elapsed_ms: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
     detail: str = ""
+    response_text: str = ""
 
 
 RECONSTRUCTION_PROMPT = """你是群聊机器人的潜意识，给主回答模型提供有用的语义背景，不直接回复用户。
@@ -149,24 +151,28 @@ def _finish_reason(response: Any) -> str:
 
 class MemoryAgent:
     def __init__(self, provider, store, embedder=None, timeout_seconds=20,
-                 max_turns=4, max_output_tokens=1200):
+                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled"):
         self.provider, self.store, self.embedder = provider, store, embedder
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.max_turns = max(1, int(max_turns))
         self.max_output_tokens = max(64, int(max_output_tokens))
+        self.thinking_mode = thinking_mode
 
     async def _generate(self, messages, system_prompt, tools=None, *, json_output=False):
         # AstrBot's public text_chat drops generation kwargs on this provider.
         # Keep its client/parser while placing native options in the prepared payload.
-        extra = getattr(self.provider, "provider_config", {}).get("custom_extra_body", {})
-        if isinstance(extra, dict) and extra.get("thinking", {"type": "disabled"}) != {"type": "disabled"}:
-            raise ValueError("Configured provider custom_extra_body overrides MR thinking=disabled")
-        payload, _ = await self.provider._prepare_chat_payload(
+        # Keep the configured client/model; isolate per-call thinking options from
+        # other users of the same AstrBot provider instance.
+        provider = copy.copy(self.provider)
+        config = getattr(provider, "provider_config", {})
+        provider.provider_config = {**config, "custom_extra_body": {
+            **config.get("custom_extra_body", {}), "thinking": {"type": self.thinking_mode}}}
+        payload, _ = await provider._prepare_chat_payload(
             prompt=None, contexts=messages, system_prompt=system_prompt)
-        payload.update(thinking={"type": "disabled"}, max_tokens=self.max_output_tokens)
+        payload.update(thinking={"type": self.thinking_mode}, max_tokens=self.max_output_tokens)
         if json_output:
             payload["response_format"] = {"type": "json_object"}
-        return await self.provider._query(payload, tools, request_max_retries=1)
+        return await provider._query(payload, tools, request_max_retries=1)
 
     @staticmethod
     def _arguments(name, arguments):
@@ -313,7 +319,7 @@ class MemoryAgent:
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"} for message in messages]
         return result
 
-    async def consolidate(self, messages: list, working: dict):
+    async def consolidate(self, messages: list, working: dict, *, feedback: bool = False):
         started = time.monotonic()
         result = ConsolidationResult()
         try:
@@ -321,12 +327,17 @@ class MemoryAgent:
             if not sources:
                 raise ValueError("Consolidation requires recorded source messages")
             async with asyncio.timeout(self.timeout_seconds):
+                purpose = ("\n本次专门回看机器人参与的互动及随后群友的反应。重点理解哪些经历被错安在人身上、"
+                           "哪些说法受到当事人纠正、怎样理解下一次互动；区分玩笑、反驳和真实修正。"
+                           "不要把机器人的猜测当成群友自述。把有用的修正和新的理解形成记忆；"
+                           "普通回应不必硬找教训，不输出满意度分数。" if feedback else "")
                 response = await self._generate([{"role": "user", "content": _json({"messages": messages, "working": working})}],
-                                                CONSOLIDATION_PROMPT, json_output=True)
+                                                CONSOLIDATION_PROMPT + purpose, json_output=True)
             _add_usage(result.usage, response)
+            result.response_text = str(getattr(response, "completion_text", "") or "")
             if _finish_reason(response) == "length":
                 raise ValueError("Consolidation output reached its token limit")
-            text = str(getattr(response, "completion_text", "") or "").strip()
+            text = result.response_text.strip()
             if text.startswith("```json") and text.endswith("```"):
                 text = text[7:-3].strip()
             payload = json.loads(text)

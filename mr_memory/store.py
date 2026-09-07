@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS mr_working_state (umo TEXT PRIMARY KEY,state_json TEX
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
+CREATE TABLE IF NOT EXISTS mr_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
+ kind TEXT NOT NULL,started_at REAL NOT NULL,payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_usage (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('background','feedback')),tokens INTEGER NOT NULL,
+ occurred_at INTEGER NOT NULL,status TEXT NOT NULL,detail_json TEXT NOT NULL DEFAULT '{}',
+ migration_key TEXT,UNIQUE(umo,migration_key));
+CREATE INDEX IF NOT EXISTS idx_mr_usage_scope_time ON mr_usage(umo,kind,occurred_at);
 """
 
 
@@ -607,13 +614,132 @@ class Store:
 
     @_serialized
     def feedback(self, limit: int = 8) -> list[dict]:
+        learned = self.load_working_state().get("learned_feedback", [])
+        if isinstance(learned, (str, dict)):
+            learned = [learned]
+        combined = [item if isinstance(item, dict) else {"content": item}
+                    for item in learned if isinstance(item, (str, dict))] if isinstance(learned, list) else []
         if "feedback_hypotheses" not in self.tables:
-            return []
+            return combined[:_limit(limit)]
         rows = self._rows("SELECT * FROM feedback_hypotheses WHERE umo=? AND status IN('ACTIVE','PROVISIONAL') AND invalidation_reason='' AND (expires_at IS NULL OR expires_at>?) ORDER BY learned_at DESC,id DESC LIMIT ?", (self.umo, int(time.time()), _limit(limit)))
         for row in rows:
             row["source_keys"] = [r[0] for r in self.db.execute("SELECT feedback_source_key FROM hypothesis_evidence WHERE hypothesis_id=?", (row["id"],))]
             row["trigger_cues"] = json.loads(row.pop("trigger_cues_json"))
-        return rows
+        return (combined + rows)[:_limit(limit)]
+
+    @_serialized
+    def feedback_messages(self, window_seconds: int, after: int, limit: int = 500) -> list[dict]:
+        """Return the next new reaction and its conversation, with an id watermark.
+
+        The first unprocessed user message must follow a retained bot response.
+        The model, not this query, determines whether it is meaningful feedback.
+        """
+        now = int(time.time())
+        cutoff = now - int(window_seconds)
+        first = self.db.execute("""SELECT u.* FROM messages u WHERE u.umo=? AND u.is_deleted=0
+            AND u.role='USER' AND u.id>? AND u.sent_at BETWEEN ? AND ?
+            AND EXISTS(SELECT 1 FROM messages b WHERE b.umo=u.umo AND b.is_deleted=0
+                AND b.role='BOT' AND b.sent_at>=? AND (b.sent_at,b.id)<(u.sent_at,u.id))
+            ORDER BY u.sent_at,u.id LIMIT 1""", (self.umo, int(after), cutoff, now, cutoff)).fetchone()
+        if first is None:
+            return []
+        bot = self.db.execute("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND role='BOT'
+            AND sent_at>=? AND (sent_at,id)<(?,?) ORDER BY sent_at DESC,id DESC LIMIT 1""",
+            (self.umo, cutoff, first["sent_at"], first["id"])).fetchone()
+        bot_message = self._message(dict(bot))
+        # Include the bot's original question when the send observation retained
+        # a reply relation. This is structural association, not text matching.
+        if bot_message["reply_to"]:
+            rows = self._rows("""SELECT m.* FROM messages m WHERE m.umo=? AND m.is_deleted=0
+                AND m.sent_at>=? AND (m.sent_at,m.id)<=(?,?) AND
+                (m.source_key=? OR EXISTS(SELECT 1 FROM message_relations r WHERE r.source_message_id=m.id
+                    AND r.umo=m.umo AND r.target_source_key=? AND r.relation IN('REPLY_TO','RESPONDS_TO')))
+                ORDER BY m.sent_at,m.id""", (self.umo, cutoff, bot["sent_at"], bot["id"],
+                                            bot_message["reply_to"], bot_message["reply_to"]))
+            prefix = [self._message(row) for row in rows]
+        else:
+            prefix = [bot_message]
+        prefix = prefix[-max(1, _limit(limit) - 1):]
+        room = max(1, _limit(limit) - len(prefix))
+        rows = self._rows("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND sent_at<=?
+            AND (sent_at,id)>=(?,?) ORDER BY sent_at,id LIMIT ?""",
+            (self.umo, now, first["sent_at"], first["id"], room))
+        return prefix + [self._message(row) for row in rows]
+
+    @staticmethod
+    def _usage_kind(kind: str) -> str:
+        if kind not in {"background", "feedback"}:
+            raise ValueError("Usage kind must be background or feedback")
+        return kind
+
+    def _carryover_usage(self) -> None:
+        row = self.db.execute("SELECT state_json,updated_at FROM mr_working_state WHERE umo=?", (self.umo,)).fetchone()
+        if row is None:
+            return
+        state = json.loads(row["state_json"])
+        if "background_tokens" not in state:
+            return
+        # The removed implementation kept only a daily aggregate. Its event
+        # times cannot be recovered; keep one explicitly estimated aggregate.
+        at = int(state.get("consolidated_at") or row["updated_at"])
+        detail = {"time_basis": "consolidated_at" if state.get("consolidated_at") else "working_state_updated_at",
+                  "original_background_day": state.get("background_day"), "aggregate_only": True}
+        with self.db:
+            self.db.execute("""INSERT OR IGNORE INTO mr_usage
+                (umo,kind,tokens,occurred_at,status,detail_json,migration_key)
+                VALUES(?,'background',?,?,'carryover_estimate',?,'working_state_background_tokens')""",
+                (self.umo, max(0, int(state["background_tokens"])), at, _encode(detail)))
+
+    @_serialized
+    def reserve_usage(self, kind: str, tokens: int, at: int | None = None) -> int:
+        kind = self._usage_kind(kind)
+        if int(tokens) < 0:
+            raise ValueError("Usage tokens cannot be negative")
+        self._carryover_usage()
+        with self.db:
+            return int(self.db.execute("""INSERT INTO mr_usage(umo,kind,tokens,occurred_at,status)
+                VALUES(?,?,?,?,'reserved')""", (self.umo, kind, int(tokens), int(time.time()) if at is None else int(at))).lastrowid)
+
+    @_serialized
+    def settle_usage(self, id: int, tokens: int) -> None:
+        if int(tokens) < 0:
+            raise ValueError("Usage tokens cannot be negative")
+        with self.db:
+            changed = self.db.execute("""UPDATE mr_usage SET tokens=?,status='settled'
+                WHERE umo=? AND id=? AND migration_key IS NULL""", (int(tokens), self.umo, int(id))).rowcount
+            if not changed:
+                raise ValueError("Usage reservation does not exist in this group")
+
+    @_serialized
+    def usage_total(self, kind: str, now: int | None = None) -> int:
+        """Combine retained legacy usage and new reservations over rolling 24h."""
+        kind = self._usage_kind(kind)
+        self._carryover_usage()
+        end = int(time.time()) if now is None else int(now)
+        since, watermark = end - 86400, 0
+        old_class = "online" if kind == "background" else "feedback"
+        if "token_budget_resets" in self.tables:
+            reset = self.db.execute("""SELECT reset_at,usage_event_id FROM token_budget_resets
+                WHERE umo=? AND budget_class=? AND reset_at<=? ORDER BY reset_at DESC,id DESC LIMIT 1""",
+                (self.umo, old_class, end)).fetchone()
+            if reset:
+                since, watermark = max(since, int(reset["reset_at"])), int(reset["usage_event_id"] or 0)
+        total = int(self.db.execute("""SELECT COALESCE(SUM(tokens),0) FROM mr_usage
+            WHERE umo=? AND kind=? AND occurred_at BETWEEN ? AND ?""", (self.umo, kind, since, end)).fetchone()[0])
+        if {"llm_usage_events", "experiment_runs"}.issubset(self.tables):
+            # Preserve the existing operator budget/reset contract. Historical
+            # imports and resident_reader_one_pass do not belong to this class.
+            phases = ("construction", "construction_repair", "reconstruction", "reconstruction_deep",
+                      "certificate_reader") if kind == "background" else ("feedback_maintenance",)
+            predicate = "u.phase IN (" + ",".join("?" for _ in phases) + ")"
+            if kind == "background":
+                predicate += " OR u.phase GLOB 'eccr_*'"
+            legacy = self.db.execute(f"""SELECT COALESCE(SUM(u.input_other+u.input_cached+u.output),0)
+                FROM llm_usage_events u JOIN experiment_runs r ON r.run_id=u.run_id
+                WHERE r.umo=? AND unixepoch(u.created_at) BETWEEN ? AND ? AND u.id>? AND ({predicate})""",
+                (self.umo, since, end, watermark, *phases)).fetchone()[0]
+            total += int(legacy)
+        return total
 
     @_serialized
     def load_working_state(self) -> Any:
@@ -624,6 +750,24 @@ class Store:
     def save_working_state(self, state: Any) -> None:
         with self.db:
             self.db.execute("INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at", (self.umo, _encode(state), int(time.time())))
+
+    @_serialized
+    def record_run(self, kind: str, started_at: float, payload: dict) -> int:
+        with self.db:
+            return int(self.db.execute("INSERT INTO mr_runs(umo,kind,started_at,payload_json) VALUES(?,?,?,?)",
+                                      (self.umo, kind, started_at, _encode(payload))).lastrowid)
+
+    @_serialized
+    def recent_runs(self, limit: int = 30) -> list[dict]:
+        rows = self._rows("SELECT * FROM mr_runs WHERE umo=? ORDER BY id DESC LIMIT ?", (self.umo, _limit(limit)))
+        return [{**{k: v for k, v in json.loads(row["payload_json"]).items() if k not in ("messages", "tool_calls", "items")},
+                 "id": row["id"], "kind": row["kind"], "started_at": row["started_at"]} for row in rows]
+
+    @_serialized
+    def run_detail(self, run_id: int) -> dict | None:
+        row = self.db.execute("SELECT * FROM mr_runs WHERE umo=? AND id=?", (self.umo, int(run_id))).fetchone()
+        return {**json.loads(row["payload_json"]), "id": row["id"], "kind": row["kind"],
+                "started_at": row["started_at"]} if row else None
 
     @_serialized
     def cache_roster(self, payload: Any, fetched_at: int) -> None:
@@ -644,6 +788,14 @@ class Store:
         payload = json.loads(row[0])
         members = payload if isinstance(payload, list) else payload.get("members", payload.get("data", [])) if isinstance(payload, dict) else []
         return {"payload": payload, "members": members, "fetched_at": row[1]}
+
+    @_serialized
+    def pending_status(self) -> dict:
+        row = self.db.execute("""SELECT count(*) AS count,min(m.sent_at) AS oldest_at
+            FROM messages m LEFT JOIN message_processing p ON p.message_id=m.id
+            WHERE m.umo=? AND m.is_deleted=0 AND COALESCE(p.status,'PENDING')<>'DISTILLED'""",
+            (self.umo,)).fetchone()
+        return dict(row)
 
     @_serialized
     def pending_messages(self, limit: int, newest: bool = True) -> list[dict]:
@@ -727,7 +879,7 @@ class Store:
                 dimensions=excluded.dimensions,vector=excluded.vector,updated_at=CURRENT_TIMESTAMP""", (self.umo, owner_type, str(owner_key), model_id, int(dimensions), vector))
 
     @_serialized
-    def save_memories(self, items: Iterable[dict], sources: Iterable[str]) -> list[dict]:
+    def save_memories(self, items: Iterable[dict], sources: Iterable[str], mark_processed: bool = True) -> list[dict]:
         keys = list(dict.fromkeys(str(s) for s in sources))
         source_rows = {r["source_key"]: r for r in self._messages_for_sources(keys)}
         if set(keys) != set(source_rows):
@@ -789,7 +941,7 @@ class Store:
                     raise ValueError("Unsupported memory write kind")
                 self._queue_embedding(kind, owner)
                 outputs.append((kind, owner))
-            for key in keys:
+            for key in keys if mark_processed else ():
                 message = source_rows[key]
                 raw = self.db.execute("SELECT content_sha256 FROM messages WHERE id=?", (message["id"],)).fetchone()
                 self.db.execute("""INSERT INTO message_processing(message_id,content_sha256,status,distilled_at)

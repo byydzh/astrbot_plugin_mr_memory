@@ -28,6 +28,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import Aioc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot_plugin_mr_memory import main as plugin_module
+from astrbot_plugin_mr_memory.mr_memory.agent import ReconstructionResult, ConsolidationResult
 
 
 def event() -> AstrMessageEvent:
@@ -56,13 +57,15 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.directory.mkdir(parents=True)
         self.embedder = SimpleNamespace(warmup=AsyncMock(), close=AsyncMock())
         self.context = Mock(spec=Context)
+        self.context.registered_web_apis = []
         self.patches = [
             patch.object(plugin_module, "get_astrbot_data_path", return_value=str(self.directory)),
             patch.object(plugin_module, "Embedder", return_value=self.embedder),
         ]
         for item in self.patches:
             item.start()
-        self.plugin = plugin_module.MrMemoryPlugin(self.context, {"maintenance_interval_seconds": 600})
+        self.plugin = plugin_module.MrMemoryPlugin(self.context, {"maintenance_interval_seconds": 600,
+            "capture_enabled": True, "embedding_enabled": True})
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
@@ -90,7 +93,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         preserved = {name: copy.deepcopy(getattr(request, name)) for name in
                      ("prompt", "system_prompt", "session_id", "contexts", "image_urls", "audio_urls", "model")}
-        result = SimpleNamespace(background="合成成员是本群参与者，之前讨论了图书馆。", status="complete",
+        result = ReconstructionResult(background="合成成员是本群参与者，之前讨论了图书馆。", status="completed",
                                  elapsed_ms=12, usage={}, tool_calls=[])
         memory_agent = SimpleNamespace(reconstruct=AsyncMock(return_value=result))
         with patch.object(self.plugin, "agent", return_value=memory_agent), \
@@ -245,7 +248,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await release.wait()
             self.assertTrue(store.recent(limit=1))
-            return SimpleNamespace(background="仍在途的群聊背景", status="complete",
+            return ReconstructionResult(background="仍在途的群聊背景", status="completed",
                                    elapsed_ms=12, usage={}, tool_calls=[])
 
         request = ProviderRequest(prompt="合成问题")
@@ -261,6 +264,22 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.stores, {})
         await self.plugin.capture_group_message(event())
         self.assertEqual(self.plugin.stores, {})
+
+    async def test_original_controls_drive_provider_and_manual_learning_honors_budget(self):
+        self.plugin.config.update(local_serving_timeout_seconds=180, max_loop_steps=6,
+            distillation_max_messages=500, maintenance_llm_timeout_seconds=3600,
+            distillation_max_output_tokens=384000, distillation_thinking_mode="enabled",
+            local_serving_reader_thinking_mode="disabled", private_daily_token_budget=50)
+        store = await self.plugin.store_for(event())
+        front = self.plugin.agent(store)
+        back = self.plugin.agent(store, background=True)
+        self.assertEqual((front.timeout_seconds, front.max_turns, front.thinking_mode), (180, 6, "disabled"))
+        self.assertEqual((back.timeout_seconds, back.max_output_tokens, back.thinking_mode), (3600, 384000, "enabled"))
+        store.reserve_usage("background", 50)
+        with patch.object(self.plugin, "agent") as call:
+            result = await self.plugin.consolidate(store, force=True)
+        self.assertEqual(result["status"], "budget_exhausted")
+        call.assert_not_called()
 
 
 if __name__ == "__main__":

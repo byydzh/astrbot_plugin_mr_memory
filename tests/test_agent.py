@@ -56,6 +56,23 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_thinking_overrides_call_without_mutating_shared_provider(self):
+        class ConfiguredProvider(Provider):
+            provider_config = {"custom_extra_body": {"thinking": {"type": "disabled"}, "other": "kept"}}
+
+            async def _query(self, payload, tools, request_max_retries):
+                self.requests.append((payload, self.provider_config))
+                return response('{"items":[]}')
+        provider = ConfiguredProvider([])
+        result = await MemoryAgent(provider, Store(), thinking_mode="enabled",
+            max_output_tokens=384000).consolidate([{"id": 1, "source_key": "synthetic", "plain_text": "合成对话"}], {})
+        self.assertEqual(result.status, "completed")
+        payload, actual = provider.requests[0]
+        self.assertEqual(payload["max_tokens"], 384000)
+        self.assertEqual(actual["custom_extra_body"]["thinking"], {"type": "enabled"})
+        self.assertEqual(provider.provider_config["custom_extra_body"]["thinking"], {"type": "disabled"})
+        self.assertEqual(actual["custom_extra_body"]["other"], "kept")
+
     async def test_native_search_then_context_preserves_tool_history(self):
         provider = Provider([
             response(calls=[("search_messages", {"terms": ["星舟"]}, "call-1")]),

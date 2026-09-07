@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MR · 群聊记忆</title>
+  <link rel="stylesheet" href="./style.css" />
+  <script src="./script.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero"><div class="brand">MR</div><div><p class="eyebrow">MR MEMORY</p><h1>群聊记忆</h1><p>看它如何回忆，学到了什么，以及这些理解来自哪里。</p></div><span id="connection" role="status">正在连接…</span></header>
+  <section class="scope-bar"><label>查看哪个群<select id="scope-select" disabled><option>正在读取…</option></select></label><div class="scope-copy"><strong id="scope-summary">尚未选择群聊</strong><small id="scope-meta"></small></div><button id="refresh" type="button">刷新</button><button id="distill" class="primary" type="button" disabled>整理新消息</button></section>
+  <p id="notice" class="notice" role="status" hidden></p>
+  <nav class="tabs" aria-label="控制台区域"><button data-tab="runtime" aria-current="page">运行与调用</button><button data-tab="memory">记忆与连接</button><button data-tab="people">账户与别名</button><button data-tab="messages">原始消息</button></nav>
+
+  <section data-view="runtime">
+    <div id="policies" class="policies"></div>
+    <div id="metrics" class="metrics"></div>
+    <section class="panel"><div class="panel-heading"><div><h2>最近调用</h2><p>直接查看送给主意识的背景、读过的消息和工具结果。未记录的内容会明确留空。</p></div><small>最近 30 次 · 时间为北京时间</small></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>任务 / 问题</th><th>状态</th><th>耗时</th><th>Token</th><th></th></tr></thead><tbody id="runs"></tbody></table></div></section>
+    <p class="footnote">参数调整请使用 AstrBot 插件的配置面板。这里展示实际记录，调用完成或注入背景不代表回答质量合格。</p>
+  </section>
+
+  <section data-view="memory" hidden>
+    <form id="memory-search" class="search-bar"><label class="grow">查找群内经历、人物与概念<input id="memory-query" type="search" placeholder="输入关键词或昵称" /></label><label>记忆类型<select id="memory-kind"><option value="all">经历、事实与主题</option value="episode">共同经历</option><option value="semantic">人物与事实</option><option value="association">语义连接</option><option value="topic">主题</option></select></label><button class="primary">搜索</button></form>
+    <div class="memory-layout"><section class="panel"><div class="panel-heading"><div><h2>记忆条目</h2><p>最多显示最近 60 条匹配记录，点开可回到原始消息。</p></div></div><div id="memory-list" class="card-list"></div></section>
+    <section class="panel"><div class="panel-heading"><div><h2>记忆图</h2><p id="graph-caption">数据库中保存的语义连接；点击节点展开相邻连接。</p></div><button id="graph-reset" type="button">返回概览</button></div><div class="graph-stage"><svg id="graph" viewBox="0 0 680 440" aria-label="语义记忆连接图"></svg></div><div id="edge-list" class="edge-list"></div></section></div>
+  </section>
+
+  <section data-view="people" hidden>
+    <section class="panel"><div class="panel-heading"><div><h2>账户与别名</h2><p>历史称呼和当前群名片放在同一账户下。点击账户可填入下方的别名表单。</p></div><form id="people-search"><input id="people-query" type="search" placeholder="昵称、别名或账户 ID" aria-label="搜索账户" /><button>搜索</button></form></div><form id="alias-form" class="search-bar inset"><label>账户 ID<input id="alias-account" required /></label><label class="grow">确认属于该账户的别名<input id="alias-value" required /></label><button class="primary">保存别名</button></form><div class="table-wrap"><table><thead><tr><th>账户</th><th>当前名称</th><th>出现过的别名</th><th>资料来源</th></tr></thead><tbody id="people"></tbody></table></div></section>
+  </section>
+
+  <section data-view="messages" hidden>
+    <form id="message-search" class="search-bar"><label class="grow">搜索原始消息<input id="message-query" type="search" placeholder="输入文字；留空查看最近消息" /></label><button class="primary">搜索</button></form>
+    <section class="panel"><div class="panel-heading"><div><h2>群聊原文</h2><p>包含群友、机器人实际发送，以及单独标注的生成与工具活动。新消息在前。</p></div></div><div id="message-list" class="message-list"></div><button id="older" class="more" type="button" hidden>读取更早的消息</button></section>
+  </section>
+</main>
+<dialog id="detail"><header><h2 id="detail-title">详情</h2><button id="close-detail" type="button" aria-label="关闭详情">关闭 ×</button></header><div id="detail-content"></div></dialog>
+</body>
+</html>
