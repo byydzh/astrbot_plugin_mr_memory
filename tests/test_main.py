@@ -246,6 +246,22 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(next(iter(self.plugin.tasks)).done())
         self.context.get_provider_by_id.assert_not_called()
 
+    async def test_initialize_restores_unresolved_allowed_scopes_without_a_new_event(self):
+        scopes = ["synthetic:GroupMessage:42", "synthetic:GroupMessage:43", "synthetic:GroupMessage:44"]
+        for scope, status in zip(scopes, ["pending", "waiting", "resolved"]):
+            path = self.plugin.scope_dir / (hashlib.sha256(scope.encode()).hexdigest() + ".db")
+            store = plugin_module.Store(path, scope)
+            try:
+                store.reflections.save({"content": "待回看的合成经历", "status": status})
+            finally:
+                store.close()
+        self.plugin.config["allowed_umos"] = [scopes[0], scopes[2]]
+        await self.plugin.initialize()
+        self.assertEqual(set(self.plugin.stores), {scopes[0]})
+        self.assertEqual(self.plugin.active_scopes, {scopes[0]})
+        self.assertEqual(len(self.plugin.stores[scopes[0]].reflections.due()), 1)
+        self.context.get_provider_by_id.assert_not_called()
+
     async def test_hot_reload_waits_for_memory_search_before_closing_its_store(self):
         current = event()
         current.send = AsyncMock()
@@ -283,6 +299,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         front = self.plugin.agent(store)
         back = self.plugin.agent(store, background=True)
         self.assertEqual((front.timeout_seconds, front.max_turns, front.thinking_mode), (180, 6, "disabled"))
+        self.assertIsNone(back.max_turns)
         self.assertEqual((back.timeout_seconds, back.max_output_tokens, back.thinking_mode), (3600, 384000, "enabled"))
         store.reserve_usage("background", 50)
         with patch.object(self.plugin, "agent") as call:
@@ -295,7 +312,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         base = self.plugin.message(event())
         older = store.append_message({**base, "message_id": "older", "plain_text": "旧的上下文"})
         current = store.append_message(base)
-        saved = store.save_memories([{"kind": "semantic", "content": "读旧原文后的新理解"}],
+        saved = store.save_memories([{"kind": "semantic", "content": "读旧原文后的新理解",
+                                    "source_keys": [older["source_key"]]}],
                                    [older["source_key"]], mark_processed=False)
         result = ConsolidationResult(status="completed", written=saved, usage={"input_other": 25, "output": 5},
             items=[{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
@@ -310,6 +328,59 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["id"] for m in store.pending_messages(10)], [older["id"]])
         self.assertEqual(store.usage_total("background"), 30)
         self.assertIn("token_budget", learning.consolidate.call_args.kwargs)
+
+    async def test_feedback_can_revisit_without_new_messages_or_a_different_current_question(self):
+        store = await self.plugin.store_for(event())
+        source = store.append_message(self.plugin.message(event()))
+        store.save_working_state({"question": "属于另一轮的无关提问", "feedback_after": source["id"]})
+        task = store.reflections.save({"content": "查清这次转述的经历属于谁", "priority": 8,
+            "source_ids": [source["id"]], "status": "pending"})
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="completed", usage={"input_other": 5, "output": 2})))
+        with patch.object(store, "feedback_messages", return_value=[]), \
+                patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            outcome = await self.plugin.learn(store, feedback=True)
+        self.assertEqual(outcome["status"], "completed")
+        messages, working = learning.consolidate.call_args.args
+        self.assertEqual(messages, [])
+        self.assertNotIn("question", working)
+        self.assertEqual(working["reflections"][0]["id"], task["id"])
+        self.assertEqual(store.load_working_state()["feedback_after"], source["id"])
+        self.assertEqual(store.reflections.due(), [])
+        self.assertEqual(store.usage_total("feedback"), 7)
+
+    async def test_regular_new_chat_revisits_waiting_without_forcing_earlier_learning(self):
+        store = await self.plugin.store_for(event())
+        store.save_working_state({"question": "与这批对话无关的上一轮请求", "request_at": 1})
+        now = int(plugin_module.time.time())
+        base = self.plugin.message(event())
+        source = store.append_message({**base, "message_id": "older-context", "sent_at": now - 1000})
+        store.save_memories([], [source["source_key"]], mark_processed=True)
+        task = store.reflections.save({"content": "等待后续交流澄清转述的经历", "status": "waiting",
+            "next_review_at": now - 5, "source_ids": [source["id"]]})
+        store.append_message({**base, "message_id": "ordinary-new-1", "sent_at": now, "plain_text": "补充上次谈话的情况"})
+        self.plugin.config["auto_distillation_min_pending"] = 2
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="completed", usage={"input_other": 5, "output": 2})))
+        with patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            outcome = await self.plugin.learn(store)
+            self.assertEqual(outcome["status"], "waiting")
+            learning.consolidate.assert_not_awaited()
+            store.append_message({**base, "message_id": "ordinary-new-2", "sent_at": now, "plain_text": "继续说明当时的人物"})
+            self.assertEqual(store.feedback_messages(3600, 0), [])
+            outcome = await self.plugin.learn(store)
+        self.assertEqual(outcome["status"], "completed")
+        messages, working = learning.consolidate.call_args.args
+        self.assertEqual(len(messages), 2)
+        self.assertNotIn("question", working)
+        self.assertEqual(working["reflections"][0]["id"], task["id"])
+        self.assertEqual(working["reflections"][0]["sources"][0]["id"], source["id"])
+        reviewed = store.reflections.get(task["id"])
+        self.assertIsNotNone(reviewed["last_reviewed_at"])
+        self.assertIsNone(reviewed["next_review_at"])
+        self.assertEqual(store.reflections.due(), [])
 
 
 if __name__ == "__main__":

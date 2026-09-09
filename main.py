@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 import weakref
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -154,6 +156,31 @@ class MrMemoryPlugin(Star):
     async def initialize(self) -> None:
         if self.config["embedding_enabled"]:
             await self.embedder.warmup()
+        # A persisted concern must survive a plugin reload even while its group
+        # is quiet. Discovery reads only this plugin's scope metadata and tasks.
+        def reflection_scopes():
+            scopes = []
+            allowed = self.config["allowed_umos"]
+            for path in self.scope_dir.glob("*.db"):
+                try:
+                    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                        row = db.execute("SELECT umo FROM scope_meta WHERE singleton=1").fetchone()
+                        if not row or (allowed and row[0] not in allowed):
+                            continue
+                        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mr_reflections'").fetchone():
+                            continue
+                        if db.execute("SELECT 1 FROM mr_reflections WHERE umo=? AND status IN('pending','waiting') LIMIT 1", row).fetchone():
+                            scopes.append((path, row[0]))
+                except sqlite3.Error:
+                    logger.exception("MR: could not reopen reflection scope %s", path.name)
+            return scopes
+
+        for path, umo in await asyncio.to_thread(reflection_scopes):
+            async with self.open_lock:
+                if umo not in self.stores:
+                    self.stores[umo] = await asyncio.to_thread(Store, path, umo)
+                    self.state_locks[umo] = asyncio.Lock()
+                self.active_scopes.add(umo)
         self.spawn(self.maintain())
         logger.info("MR: active memory reconstruction ready")
 
@@ -183,7 +210,7 @@ class MrMemoryPlugin(Star):
         return MemoryAgent(provider, store, self.embedder if self.config["embedding_enabled"] else None,
                            timeout_seconds=float(self.config["maintenance_llm_timeout_seconds"] if background
                                                  else self.config["local_serving_timeout_seconds"]),
-                           max_turns=int(self.config["max_loop_steps"]),
+                           max_turns=None if background else int(self.config["max_loop_steps"]),
                            max_output_tokens=int(self.config["distillation_max_output_tokens"] if background
                                                  else self.config["memory_max_tokens"]),
                            thinking_mode=self.config["feedback_thinking_mode"] if feedback else
@@ -464,11 +491,15 @@ class MrMemoryPlugin(Star):
             if budget > 0 and used >= budget:
                 return {"status": "budget_exhausted", "reason": "滚动24小时额度已用完", "used_tokens": used}
             maximum = int(self.config["distillation_max_messages"])
+            reflection_tasks = []
             if feedback:
+                reflection_tasks = await asyncio.to_thread(store.reflections.due)
                 messages = await asyncio.to_thread(store.feedback_messages,
                     int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum)
                 if messages and time.time() - messages[-1]["sent_at"] < self.config["feedback_debounce_seconds"]:
-                    return {"status": "waiting", "reason": "等待当前互动结束"}
+                    if not reflection_tasks:
+                        return {"status": "waiting", "reason": "等待当前互动结束"}
+                    messages = []
             else:
                 pending = await asyncio.to_thread(store.pending_status)
                 if not force and pending["count"] < self.config["auto_distillation_min_pending"]:
@@ -476,9 +507,18 @@ class MrMemoryPlugin(Star):
                         return {"status": "waiting", "reason": "等待积累消息或到达最长等待时间"}
                 # Live group experience gets the next batch; idle capacity catches up older history.
                 messages = await asyncio.to_thread(store.pending_messages, maximum, newest=True)
-            if not messages:
+            if not messages and not reflection_tasks:
                 return {"status": "idle", "reason": "没有待处理互动"}
-            working = {key: state[key] for key in ("question", "request_at") if key in state}
+            if feedback:
+                interactions = await asyncio.to_thread(store.reflections.feedback_context, messages)
+                waiting = await asyncio.to_thread(store.reflections.waiting) if messages else []
+                reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
+                working = {"interactions": interactions, "reflections": reflection_tasks}
+            else:
+                working = {}
+                reflection_tasks = await asyncio.to_thread(store.reflections.waiting)
+                if reflection_tasks:
+                    working["reflections"] = reflection_tasks
             reserved = len(json.dumps({"messages": messages, "working": working}, ensure_ascii=False).encode())
             reserved += int(self.config["distillation_max_output_tokens"]) + 1000
             started_at = time.time()
@@ -509,7 +549,8 @@ class MrMemoryPlugin(Star):
                     await trace.emit("write", "保存模型结束时形成的长期记忆", status="running",
                                      target="long_term_memory", items=result.items, operation_id="final_memories")
                 try:
-                    saved = await asyncio.to_thread(store.save_memories, result.items, learned_sources, mark_processed=False)
+                    saved = await asyncio.to_thread(store.save_memories, result.items, learned_sources, mark_processed=False,
+                                                    run_id=trace.id)
                 except BaseException as exc:
                     if result.items:
                         await trace.emit("write", "末次长期记忆保存未完成", target="long_term_memory", operation_id="final_memories",
@@ -532,12 +573,16 @@ class MrMemoryPlugin(Star):
                     learned = [{key: value for key, value in row.items() if key in {
                         "kind", "id", "title", "summary", "content", "subject", "aspect",
                         "source", "target", "relation", "statement", "source_ids"}} for row in written]
-                    await self.update_state(store, {"feedback_after": max(m["id"] for m in messages),
+                    last_message = max((m["id"] for m in messages), default=int(state.get("feedback_after", 0)))
+                    await self.update_state(store, {"feedback_after": last_message,
                         "feedback_at": int(time.time()), "learned_feedback": learned})
                     await trace.emit("write", "已推进反馈学习进度", target="feedback_progress",
-                                     last_message_id=max(m["id"] for m in messages))
+                                     last_message_id=last_message, reflection_ids=[item["id"] for item in reflection_tasks])
                 else:
                     await self.update_state(store, {"consolidated_at": int(time.time())})
+                if reflection_tasks:
+                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in reflection_tasks],
+                        time.time() + float(self.config["maintenance_interval_seconds"]), started_at)
                 payload["written_count"] = len(written)
                 await self.index_pending(store, trace=trace)
                 logger.info("MR: scope=%s %s learned from %s messages, %s updates", store.umo, kind, len(messages), len(written))

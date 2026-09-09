@@ -4,6 +4,7 @@ import asyncio
 import sys
 import threading
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -102,6 +103,42 @@ class EmbedderTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await embedder.close()
+
+    async def test_close_releases_model_only_after_submitted_inference_finishes(self):
+        started, release = threading.Event(), threading.Event()
+
+        class Encoder:
+            def encode(self, texts, **kwargs):
+                started.set()
+                if not release.wait(2):
+                    raise TimeoutError("synthetic inference was not released")
+                return [[1.0, 0.0, 0.0]]
+
+        embedder = Embedder(MODEL, "unused")
+        embedder._model = Encoder()
+        embedder.dimensions = 3
+        model = weakref.ref(embedder._model)
+        closing = None
+        running = asyncio.create_task(embedder.query("still running"))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            closing = asyncio.create_task(embedder.close())
+            await asyncio.sleep(0)
+            self.assertFalse(closing.done())
+            self.assertIs(embedder._model, model())
+            self.assertIsNotNone(model())
+            release.set()
+            self.assertEqual(await running, [1.0, 0.0, 0.0])
+            await closing
+            self.assertIsNone(embedder._model)
+            self.assertIsNone(model())
+        finally:
+            release.set()
+            await running
+            if closing is not None:
+                await closing
+            else:
+                await embedder.close()
 
 
 if __name__ == "__main__":

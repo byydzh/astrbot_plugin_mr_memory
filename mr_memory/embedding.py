@@ -135,9 +135,14 @@ class Embedder:
         if self._closed:
             return
         self._closed = True
-        # A queued barrier waits for native inference already submitted above.
-        barrier = asyncio.get_running_loop().run_in_executor(self._executor, lambda: None)
+        # Release only after submitted native inference has finished. Reload may
+        # retain this Embedder object while constructing the replacement model.
+        def release_model():
+            self._model = None
+
+        barrier = asyncio.get_running_loop().run_in_executor(self._executor, release_model)
         try:
             await asyncio.shield(barrier)
         finally:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            # Even a cancelled close waiter must leave the queued release intact.
+            self._executor.shutdown(wait=False)

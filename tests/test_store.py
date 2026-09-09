@@ -28,6 +28,10 @@ class StoreContractTests(unittest.TestCase):
             file.unlink()
         self.scratch.rmdir()
 
+    def remember(self, items, sources, **kwargs):
+        # These fixtures intentionally assign their listed messages to each item.
+        return self.store.save_memories([{**item, "source_keys": list(sources)} for item in items], sources, **kwargs)
+
     def message(self, number, text, sender="10", role="USER", **extra):
         row = dict(platform="test", platform_id="test", umo=self.scope,
             group_id="42", message_id=str(number), sender_id=sender, sender_name="Tester " + sender,
@@ -66,6 +70,16 @@ class StoreContractTests(unittest.TestCase):
         member = self.store.members(account_ids=["88"])[0]
         self.assertEqual(member["account_type"], "BOT")
         self.assertIn("群助手", member["aliases"])
+
+    def test_message_search_roles_are_chosen_by_caller_and_default_includes_all(self):
+        user = self.message(1, "青桥是我的故乡")
+        bot = self.message(2, "你刚提到青桥", sender="99", role="BOT")
+        tool = self.message(3, "", sender="99", role="SYSTEM",
+                            content=[{"type": "tool_result", "name": "search", "result": "青桥的查询结果"}])
+        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"])], [tool["id"], bot["id"], user["id"]])
+        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"], roles=["USER"])], [user["id"]])
+        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"], roles=["BOT", "SYSTEM"])], [tool["id"], bot["id"]])
+        self.assertEqual(self.store.search_messages(["青桥"], roles=[]), [])
 
     def test_connection_serializes_reader_and_separate_transaction(self):
         entered, release, second_started, second_done = Event(), Event(), Event(), Event()
@@ -124,7 +138,7 @@ class StoreContractTests(unittest.TestCase):
             {"kind": "semantic", "content": "展览在周六开幕", "aspect": "日程", "participant_id": first["participant_id"]},
             {"kind": "association", "source": "展览", "target": "东门", "relation": "集合地点", "statement": "去展览时在东门集合"},
         ]
-        saved = self.store.save_memories(items, [first["source_key"], second["source_key"]])
+        saved = self.remember(items, [first["source_key"], second["source_key"]])
         self.assertEqual([m["kind"] for m in saved], ["episode", "semantic", "association"])
         self.assertEqual([m["source_ids"] for m in saved], [[first["id"], second["id"]]] * 3)
         self.assertEqual(saved[0]["source_speakers"], [{"participant_id": first["participant_id"],
@@ -164,7 +178,7 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in self.store.search_messages(related_account_id="10")],
                          [bot["id"], second["id"], first["id"]])
         self.assertEqual(self.store.activity(account_id="10", start_at=first["sent_at"], end_at=bot["sent_at"] + 1)["message_count"], 1)
-        saved = self.store.save_memories([
+        saved = self.remember([
             {"kind": "episode", "summary": "p7说以前五人寝，p14说现在两人寝"},
             {"kind": "semantic", "content": "以前住五人寝", "participant_id": first["participant_id"]},
         ], [first["source_key"], second["source_key"], bot["source_key"]])
@@ -182,17 +196,17 @@ class StoreContractTests(unittest.TestCase):
         reply = self.message(3, "你问的是展览安排", sender="30", reply_to="1")
         mention = self.message(4, "问问小桥", sender="40",
             content=[{"type": "mention", "account_id": "10", "display_name": "小桥"}])
-        old, unrelated = self.store.save_memories([
+        old, unrelated = self.remember([
             {"kind": "semantic", "content": "p9是去过展览的那位小桥", "participant_id": first["participant_id"]},
             {"kind": "semantic", "content": "另一位小桥还没去", "participant_id": other["participant_id"]},
         ], [other["source_key"]], mark_processed=False)
-        natural = self.store.save_memories([
+        natural = self.remember([
             {"kind": "semantic", "person": "小桥", "content": "小桥回忆曾去展览"}
         ], [first["source_key"]], mark_processed=False)[0]
-        episode = self.store.save_memories([
+        episode = self.remember([
             {"kind": "episode", "summary": "群友接着小桥的问题讨论展览"}
         ], [reply["source_key"]], mark_processed=False)[0]
-        association = self.store.save_memories([
+        association = self.remember([
             {"kind": "association", "source": "展览", "target": "讨论", "relation": "话题", "statement": "有人提及小桥讨论展览"}
         ], [mention["source_key"]], mark_processed=False)[0]
         with self.store.db:
@@ -237,7 +251,7 @@ class StoreContractTests(unittest.TestCase):
     def test_graph_reuses_only_explicit_nodes_and_revises_connections(self):
         first = self.message(1, "两个角色碰巧都叫小桥")
         second = self.message(2, "刚才说的是另一位小桥")
-        saved = self.store.save_memories([
+        saved = self.remember([
             {"kind": "association", "source": {"label": "小桥", "description": "作品甲角色", "aliases": ["桥桥"]},
              "target": {"label": "排练室"}, "relation": "去过", "statement": "作品甲的小桥去过排练室"},
             {"kind": "association", "source": {"label": "小桥", "description": "作品乙角色"},
@@ -246,60 +260,61 @@ class StoreContractTests(unittest.TestCase):
         self.assertNotEqual(saved[0]["source_node_id"], saved[1]["source_node_id"])
         self.assertNotEqual(saved[0]["target_node_id"], saved[1]["target_node_id"])
         self.assertEqual([m["id"] for m in self.store.graph(terms=["桥桥"])], [saved[0]["id"]])
-        reused = self.store.save_memories([
+        reused = self.remember([
             {"kind": "association", "source": {"node_id": saved[0]["source_node_id"], "label": "小桥甲", "aliases": ["桥某"]},
              "target": {"node_id": saved[0]["target_node_id"]}, "relation": "下次要去", "statement": "桥桥下次还想去排练室"}
         ], [second["source_key"]], mark_processed=False)[0]
         self.assertEqual(reused["source_node_id"], saved[0]["source_node_id"])
         self.assertEqual(self.store.memory("association", saved[0]["id"])["source"], "小桥甲")
         self.assertIn("桥某", reused["source_node"]["aliases"])
-        revised = self.store.save_memories([
+        revised = self.remember([
             {"kind": "association", "id": saved[0]["id"], "source": {"node_id": saved[1]["source_node_id"]},
              "statement": "更正：那次去排练室的是作品乙的小桥"}
         ], [second["source_key"]], mark_processed=False)[0]
         self.assertEqual(revised["id"], saved[0]["id"])
         self.assertEqual(revised["source_node_id"], saved[1]["source_node_id"])
         self.assertEqual(revised["target_node_id"], saved[0]["target_node_id"])
-        self.assertEqual(revised["source_ids"], [first["id"], second["id"]])
+        self.assertEqual(revised["source_ids"], [second["id"]])
         doc = next(d for d in self.store.pending_embeddings("fixture", 10) if d["owner_key"] == str(revised["id"]))
         self.assertIn("更正", doc["text"])
         self.assertEqual(self.store.memory("association", reused["id"])["source_node"]["description"], "作品甲角色")
 
-    def test_model_revises_existing_memory_and_preserves_all_sources(self):
+    def test_model_revision_replaces_sources_and_keeps_history(self):
         first = self.message(1, "机器人说这里周六开门", sender="99", role="BOT")
         correction = self.message(2, "我是说周日才开门")
-        saved = self.store.save_memories([
+        saved = self.remember([
             {"kind": "episode", "title": "开门讨论", "summary": "机器人说周六开门"},
             {"kind": "semantic", "person": "小桥", "subject": "小桥", "content": "小桥周六去"},
         ], [first["source_key"]], mark_processed=False)
-        revised = self.store.save_memories([
+        revised = self.remember([
             {"kind": "episode", "id": saved[0]["id"], "summary": "机器人曾说周六，群友更正周日才开门"},
             {"kind": "semantic", "id": saved[1]["id"], "person": "桥桥", "content": "桥桥解释周日才开门，先前周六是机器人的误解"},
         ], [correction["source_key"]], mark_processed=False)
         self.assertEqual([m["id"] for m in revised], [m["id"] for m in saved])
         self.assertEqual(revised[0]["title"], "开门讨论")
         self.assertEqual(revised[1]["subject"], {"name": "桥桥", "account_id": None})
-        self.assertEqual([m["source_ids"] for m in revised], [[first["id"], correction["id"]]] * 2)
+        self.assertEqual([m["source_ids"] for m in revised], [[correction["id"]]] * 2)
+        self.assertEqual(self.store.memory("semantic", revised[1]["id"], include_history=True)["history"][0]["snapshot"]["memory"]["source_ids"], [first["id"]])
         self.assertEqual(len(self.store.pending_messages(10)), 2)
-        self.assertEqual(self.store.save_memories([], [first["source_key"], correction["source_key"]]), [])
+        self.assertEqual(self.remember([], [first["source_key"], correction["source_key"]]), [])
         self.assertEqual(self.store.pending_messages(10), [])
 
-    def test_existing_topic_revision_preserves_sources_and_vector_owner(self):
+    def test_existing_topic_revision_replaces_sources_and_preserves_vector_owner(self):
         first = self.message(1, "小桥说展览周六开放")
         correction = self.message(2, "我说的是周日开放")
-        episode = self.store.save_memories([{"kind": "episode", "summary": "小桥解释展览日程"}], [first["source_key"]])[0]
+        episode = self.remember([{"kind": "episode", "summary": "小桥解释展览日程"}], [first["source_key"]])[0]
         with self.store.db:
             topic_id = self.store.db.execute("INSERT INTO topics(umo,name,summary) VALUES(?,?,?)",
                 (self.scope, "旧日程", "p3说展览周六开放")).lastrowid
             self.store.db.execute("INSERT INTO topic_episodes(topic_id,episode_id) VALUES(?,?)", (topic_id, episode["id"]))
         self.store.put_vector("topic", str(topic_id), "fixture", struct.pack("<2f", 1.0, 0.0), 2)
-        revised = self.store.save_memories([
+        revised = self.remember([
             {"kind": "topic", "id": topic_id, "title": "展览日程", "summary": "小桥说展览周日开放"}
         ], [correction["source_key"]], mark_processed=False)[0]
         self.assertEqual((revised["id"], revised["title"]), (topic_id, "展览日程"))
-        self.assertEqual(revised["source_ids"], [first["id"], correction["id"]])
-        self.assertEqual(revised["sources"][0]["plain_text"], first["plain_text"])
-        self.assertEqual(self.store.memory("topic", topic_id)["sources"][1]["plain_text"], correction["plain_text"])
+        self.assertEqual(revised["source_ids"], [correction["id"]])
+        self.assertEqual(revised["sources"][0]["plain_text"], correction["plain_text"])
+        self.assertEqual(self.store.memory("topic", topic_id)["sources"][0]["plain_text"], correction["plain_text"])
         doc = next(d for d in self.store.pending_embeddings("fixture", 10) if d["owner_type"] == "topic")
         self.assertEqual(doc["owner_key"], str(topic_id))
         self.assertIn("小桥说", doc["text"])
@@ -308,7 +323,7 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(vector["owner_key"], str(topic_id))
         self.assertEqual(struct.unpack("<2f", vector["vector"]), (0.0, 1.0))
         with self.assertRaisesRegex(ValueError, "existing id"):
-            self.store.save_memories([{"kind": "topic", "summary": "不新建topic"}], [first["source_key"]])
+            self.remember([{"kind": "topic", "summary": "不新建topic"}], [first["source_key"]])
         self.store.delete_message(correction["source_key"])
         self.assertIsNone(self.store.memory("topic", topic_id))
         self.assertEqual(self.store.search_memories(kind="topic"), [])
@@ -320,7 +335,7 @@ class StoreContractTests(unittest.TestCase):
         second = self.message(2, "第二条")
         third = self.message(3, "其他人", sender="20")
         with self.assertRaises(ValueError):
-            self.store.save_memories([
+            self.remember([
                 {"kind": "semantic", "content": "这次会回滚"},
                 {"kind": "association", "content": "缺少图端点"},
             ], [first["source_key"]])

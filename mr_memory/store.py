@@ -18,6 +18,8 @@ from threading import RLock
 from typing import Any, Iterable
 from uuid import uuid4
 
+from .reflection import Reflection, SCHEMA as REFLECTION_SCHEMA
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scope_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1),umo TEXT NOT NULL UNIQUE,
@@ -100,7 +102,7 @@ CREATE TABLE IF NOT EXISTS semantic_memory_sources (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(semantic_memory_id,message_id,evidence_role));
 CREATE TABLE IF NOT EXISTS topics (
  id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,name TEXT NOT NULL COLLATE NOCASE,
- summary TEXT NOT NULL DEFAULT '',extractor_version TEXT NOT NULL DEFAULT '',UNIQUE(umo,name));
+ summary TEXT NOT NULL DEFAULT '',extractor_version TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ACTIVE',UNIQUE(umo,name));
 CREATE TABLE IF NOT EXISTS topic_episodes (
  topic_id INTEGER NOT NULL REFERENCES topics(id),episode_id INTEGER NOT NULL REFERENCES episodes(id),
  PRIMARY KEY(topic_id,episode_id));
@@ -145,6 +147,11 @@ CREATE TABLE IF NOT EXISTS mr_working_state (umo TEXT PRIMARY KEY,state_json TEX
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
+CREATE TABLE IF NOT EXISTS mr_memory_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
+ kind TEXT NOT NULL,owner_id INTEGER NOT NULL,operation TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',
+ run_id INTEGER,snapshot_json TEXT NOT NULL,source_ids_json TEXT NOT NULL DEFAULT '[]',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_mr_memory_revisions_owner ON mr_memory_revisions(umo,kind,owner_id,id);
 CREATE TABLE IF NOT EXISTS mr_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
  kind TEXT NOT NULL,started_at REAL NOT NULL,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_run_steps (run_id INTEGER NOT NULL REFERENCES mr_runs(id),seq INTEGER NOT NULL,
@@ -204,11 +211,15 @@ class Store:
                 raise ValueError("Database belongs to another group")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        self.db.executescript(REFLECTION_SCHEMA)
+        if 'status' not in {row[1] for row in self.db.execute('PRAGMA table_info(topics)')}:
+            self.db.execute("ALTER TABLE topics ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'")
         parts = self.umo.split(":")
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO scope_meta(singleton,umo,platform_id,group_id) VALUES(1,?,?,?)",
                             (self.umo, parts[0], parts[-1]))
         self.tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.reflections = Reflection(self)
 
     @_serialized
     def close(self) -> None:
@@ -332,9 +343,9 @@ class Store:
         return self.db.execute("SELECT 1 FROM forgotten_accounts WHERE umo=? AND platform_id=? AND account_hash=?",
                                (self.umo, platform_id, digest)).fetchone() is not None
 
-    def _invalidate_sources(self, ids: list[int]) -> None:
+    def _invalidate_sources(self, ids: list[int]) -> dict:
         if not ids:
-            return
+            return {}
         placeholders = ",".join("?" for _ in ids)
         owners = {
             "episode": self._rows(f"SELECT DISTINCT episode_id id FROM episode_messages WHERE message_id IN({placeholders})", ids),
@@ -352,6 +363,45 @@ class Store:
         if "hypothesis_evidence" in self.tables:
             self.db.execute(f"""UPDATE feedback_hypotheses SET invalidation_reason='source_removed',status='DORMANT'
                 WHERE umo=? AND id IN(SELECT h.hypothesis_id FROM hypothesis_evidence h JOIN messages m ON m.source_key=h.feedback_source_key AND m.umo=? WHERE m.id IN({placeholders}))""", [self.umo, self.umo, *ids])
+        return owners
+
+    def _forget_memory_context(self, messages: list[dict], invalidated: dict) -> None:
+        """Remove new reflection/history copies linked to explicitly forgotten sources."""
+        if not messages:
+            return
+        ids = [message["id"] for message in messages]
+        placeholders = ",".join("?" for _ in ids)
+        refs = {("association" if kind == "plastic_edge" else kind, row["id"])
+                for kind, rows in invalidated.items() for row in rows}
+        history = self._rows(f"""SELECT kind,owner_id,snapshot_json FROM mr_memory_revisions WHERE umo=? AND
+            (EXISTS(SELECT 1 FROM json_each(source_ids_json) s WHERE s.value IN({placeholders})) OR
+             EXISTS(SELECT 1 FROM json_each(json_extract(snapshot_json,'$.memory.source_ids')) s
+                    WHERE s.value IN({placeholders})))""", [self.umo, *ids, *ids])
+        refs.update((row["kind"], row["owner_id"]) for row in history)
+        # Node snapshots can retain an old identity after an edge changed its sources.
+        nodes = set()
+        for kind, owner in tuple(refs):
+            if kind == "association":
+                row = self.db.execute("SELECT source_node_id,target_node_id FROM plastic_edges WHERE umo=? AND id=?",
+                                      (self.umo, owner)).fetchone()
+                if row:
+                    nodes.update(row)
+            elif kind == "episode":
+                refs.update(("topic", row[0]) for row in self.db.execute("SELECT topic_id FROM topic_episodes WHERE episode_id=?", (owner,)))
+        for row in history:
+            if row["kind"] == "association":
+                record = json.loads(row["snapshot_json"])["record"]
+                nodes.update(record[key] for key in ("source_node_id", "target_node_id"))
+        refs.update(("node", node) for node in nodes)
+        self.db.executemany("DELETE FROM mr_memory_revisions WHERE umo=? AND kind=? AND owner_id=?",
+                            [(self.umo, kind, owner) for kind, owner in refs])
+        self.db.execute(f"""DELETE FROM mr_reflections WHERE umo=? AND
+            (EXISTS(SELECT 1 FROM json_each(source_ids_json) s WHERE s.value IN({placeholders})) OR
+             request_id IN({placeholders}))""", [self.umo, *ids, *(message["message_id"] for message in messages)])
+        self.db.executemany("""DELETE FROM mr_reflections WHERE umo=? AND EXISTS(
+            SELECT 1 FROM json_each(memory_refs_json) ref WHERE json_extract(ref.value,'$.kind')=?
+            AND CAST(json_extract(ref.value,'$.id') AS INTEGER)=?)""",
+            [(self.umo, kind, owner) for kind, owner in refs])
 
     @_serialized
     def delete_message(self, message_id: str) -> int:
@@ -366,13 +416,14 @@ class Store:
     def forget(self, account_id: str) -> dict:
         people = self._rows("SELECT * FROM participants WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
         platform_ids = {p["platform_id"] for p in people} or {self.umo.split(":")[0]}
-        rows = self._rows("SELECT id FROM messages WHERE umo=? AND sender_id=?", (self.umo, str(account_id)))
+        rows = self._rows("SELECT id,message_id FROM messages WHERE umo=? AND sender_id=?", (self.umo, str(account_id)))
         ids = [r["id"] for r in rows]
         with self.db:
             for platform in platform_ids:
                 digest = hashlib.sha256("\x1f".join((self.umo, platform, str(account_id))).encode()).hexdigest()
                 self.db.execute("INSERT OR REPLACE INTO forgotten_accounts(umo,platform_id,account_hash,requested_at) VALUES(?,?,?,?)", (self.umo, platform, digest, int(time.time())))
-            self._invalidate_sources(ids)
+            invalidated = self._invalidate_sources(ids)
+            self._forget_memory_context(rows, invalidated)
             for row_id in ids:
                 self.db.execute("UPDATE messages SET is_deleted=1,plain_text='',content_json='[]',sender_name='',deleted_at=? WHERE id=?", (int(time.time()), row_id))
                 self.db.execute("UPDATE message_revisions SET plain_text='',content_json='[]' WHERE message_id=?", (row_id,))
@@ -489,8 +540,14 @@ class Store:
     @_serialized
     def search_messages(self, terms: Iterable[str] = (), participant_id: int | None = None,
                         start_at: int | None = None, end_at: int | None = None, limit: int = 20,
-                        *, sender_id: str | None = None, related_account_id: str | None = None) -> list[dict]:
+                        *, sender_id: str | None = None, related_account_id: str | None = None,
+                        roles: list[str] | None = None) -> list[dict]:
         clauses, args = ["m.umo=?", "m.is_deleted=0"], [self.umo]
+        if roles is not None:
+            if not roles:
+                return []
+            clauses.append(f"m.role IN ({','.join('?' for _ in roles)})")
+            args.extend(roles)
         words = _terms(terms)
         if words:
             clauses.append("(" + " OR ".join("(instr(lower(m.plain_text),lower(?))>0 OR instr(lower(m.content_json),lower(?))>0)" for _ in words) + ")")
@@ -580,6 +637,11 @@ class Store:
         for field in ("started_at", "ended_at", "created_at", "updated_at", "confidence", "person_cue", "subject_text", "epistemic_status", "uncertainty"):
             if field in row:
                 result[field] = row[field]
+        result["revision_no"] = 1 + self.db.execute("SELECT count(*) FROM mr_memory_revisions WHERE umo=? AND kind=? AND owner_id=?",
+            (self.umo, kind, row["id"])).fetchone()[0]
+        attention = self.reflections.associated(kind, row["id"])
+        if attention:
+            result["reflections"] = attention
         if "narrative_identity_bindings" in self.tables:
             binding = self.db.execute("SELECT metadata_json FROM narrative_identity_bindings WHERE umo=? AND owner_type=? AND owner_id=?",
                                       (self.umo, "plastic_edge" if kind == "association" else kind, row["id"])).fetchone()
@@ -609,8 +671,9 @@ class Store:
             if selected == "semantic":
                 clauses.append("status='ACTIVE'")
             elif selected == "episode":
-                clauses.append("status<>'INVALIDATED'")
+                clauses.append("status NOT IN('INVALIDATED','SUPERSEDED','RETRACTED')")
             elif selected == "topic":
+                clauses.append("status='ACTIVE'")
                 clauses.append("NOT EXISTS(SELECT 1 FROM topic_episodes t JOIN episodes e ON e.id=t.episode_id WHERE t.topic_id=topics.id AND e.status='INVALIDATED')")
                 clauses.append("NOT EXISTS(SELECT 1 FROM mr_topic_sources t JOIN messages m ON m.id=t.message_id WHERE t.umo=topics.umo AND t.topic_id=topics.id AND m.is_deleted=1)")
             if words:
@@ -645,7 +708,29 @@ class Store:
         return outputs[:_limit(limit)]
 
     @_serialized
-    def memory(self, kind: str, id: int | str, *, include_sources: bool = True) -> dict | None:
+    def memory(self, kind: str, id: int | str, *, include_sources: bool = True, include_history: bool = False) -> dict | None:
+        kind = {"plastic_edge": "association", "episodic": "episode"}.get(kind, kind)
+        if include_history:
+            tables = {"episode": "episodes", "semantic": "semantic_memories", "association": "plastic_edges", "topic": "topics", "node": "plastic_nodes"}
+            if kind not in tables:
+                raise ValueError("History is available for stored memories and graph nodes")
+            rows = self._rows(f"SELECT * FROM {tables[kind]} WHERE umo=? AND id=?", (self.umo, int(id)))
+            if not rows:
+                return None
+            if rows[0].get("status") == "INVALIDATED":
+                return None
+            source_ids = [source["id"] for source in self._sources(kind, rows[0])]
+            if source_ids and self.db.execute(
+                f"SELECT 1 FROM messages WHERE umo=? AND is_deleted=1 AND id IN({','.join('?' for _ in source_ids)}) LIMIT 1",
+                [self.umo, *source_ids]).fetchone():
+                return None
+            current = self._memory_snapshot(kind, rows[0])["memory"]
+            if include_sources and kind != "node":
+                current["sources"] = self._messages_for_sources(current["source_keys"])
+            current["history"] = self._memory_history(kind, int(id))
+            return current
+        if kind == "node":
+            return self._node(int(id))
         if kind in {"association", "plastic_edge"}:
             rows = self._graph_rows(" AND e.id=?", [int(id)])
             return self._graph_record(rows[0], include_sources=include_sources) if rows else None
@@ -676,6 +761,54 @@ class Store:
             WHERE t.umo=? AND t.topic_id=? AND m.is_deleted=1 LIMIT 1""", (self.umo, int(id))).fetchone():
             return None
         return self._memory(kind, rows[0], include_sources=include_sources)
+
+    def _memory_history(self, kind: str, owner: int) -> list[dict]:
+        rows = self._rows("SELECT id,operation,reason,run_id,snapshot_json,source_ids_json,created_at FROM mr_memory_revisions WHERE umo=? AND kind=? AND owner_id=? ORDER BY id",
+                          (self.umo, kind, owner))
+        for revision in rows:
+            revision["snapshot"] = json.loads(revision.pop("snapshot_json"))
+            revision["source_ids"] = json.loads(revision.pop("source_ids_json"))
+        return rows
+
+    def _memory_snapshot(self, kind: str, row: dict) -> dict:
+        if kind == "node":
+            memory = {"kind": "node", "id": row["id"], **self._node(row["id"])}
+        elif kind == "association":
+            enriched = {**row, "source": self._node(row["source_node_id"])["label"],
+                        "target": self._node(row["target_node_id"])["label"],
+                        "relation": self.db.execute("SELECT canonical_name FROM relation_types WHERE umo=? AND id=?",
+                                                    (self.umo, row["relation_type_id"])).fetchone()[0]}
+            memory = self._graph_record(enriched, include_sources=False)
+        else:
+            memory = self._memory(kind, row, include_sources=False)
+        snapshot = {"record": row, "memory": memory}
+        if kind == "episode":
+            snapshot["keywords"] = self._rows("SELECT cue,tag FROM episode_keywords WHERE episode_id=?", (row["id"],))
+        if kind == "topic":
+            snapshot["episode_ids"] = [r[0] for r in self.db.execute("SELECT episode_id FROM topic_episodes WHERE topic_id=?", (row["id"],))]
+        return snapshot
+
+    def _remember_revision(self, kind: str, row: dict, *, reason: str, source_ids: list[int],
+                           operation: str = "revise", run_id: int | None = None) -> None:
+        snapshot = self._memory_snapshot(kind, row)
+        # Attention is current working context, not part of a memory's old assertion.
+        snapshot["memory"].pop("reflections", None)
+        for endpoint in ("source_node", "target_node"):
+            if endpoint in snapshot["memory"]:
+                snapshot["memory"][endpoint].pop("reflections", None)
+        self.db.execute("""INSERT INTO mr_memory_revisions(umo,kind,owner_id,operation,reason,run_id,snapshot_json,source_ids_json)
+            VALUES(?,?,?,?,?,?,?,?)""", (self.umo, kind, row["id"], operation, reason, run_id,
+                                         _encode(snapshot), _encode(source_ids)))
+
+    def _clear_memory_derivatives(self, kind: str, owner: int) -> None:
+        aliases = ("association", "plastic_edge") if kind in {"association", "plastic_edge"} else (kind,)
+        for owner_type in aliases:
+            self.db.execute("DELETE FROM memory_embeddings WHERE umo=? AND owner_type=? AND owner_key=?", (self.umo, owner_type, str(owner)))
+            self.db.execute("DELETE FROM mr_index_pending WHERE umo=? AND owner_type=? AND owner_key=?", (self.umo, owner_type, str(owner)))
+            if "embeddings" in self.tables:
+                self.db.execute("DELETE FROM embeddings WHERE owner_type=? AND owner_id=?", (owner_type, owner))
+            if "narrative_identity_bindings" in self.tables:
+                self.db.execute("DELETE FROM narrative_identity_bindings WHERE umo=? AND owner_type=? AND owner_id=?", (self.umo, owner_type, owner))
 
     def _messages_for_sources(self, sources: Iterable[str]) -> list[dict]:
         keys = list(dict.fromkeys(sources))
@@ -709,16 +842,26 @@ class Store:
                               (self.umo, int(node_id))).fetchone()
         if row is None:
             return None
-        return {"node_id": row["id"], "label": row["label"], "description": row["description"],
-                "aliases": [r[0] for r in self.db.execute("SELECT alias FROM mr_node_aliases WHERE umo=? AND node_id=? ORDER BY alias",
-                                                         (self.umo, row["id"]))]}
+        result = {"node_id": row["id"], "label": row["label"], "description": row["description"],
+                  "aliases": [r[0] for r in self.db.execute("SELECT alias FROM mr_node_aliases WHERE umo=? AND node_id=? ORDER BY alias",
+                                                           (self.umo, row["id"]))]}
+        attention = self.reflections.associated("node", row["id"])
+        if attention:
+            result["reflections"] = attention
+        return result
 
-    def _save_node(self, endpoint: str | dict) -> int:
+    def _save_node(self, endpoint: str | dict, *, reason: str = "", source_ids: list[int] | None = None,
+                   run_id: int | None = None) -> int:
         # A label describes a node; only an explicit record address reuses it.
         value = {"label": endpoint} if isinstance(endpoint, str) else endpoint
         if not isinstance(value, dict):
             raise ValueError("An association endpoint requires node_id or a new label")
         node_id = value.get("node_id")
+        changed = False
+        aliases = value.get("aliases", [])
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        aliases = list(dict.fromkeys(str(a).strip() for a in aliases if str(a).strip()))
         if node_id is not None:
             current = self._node(int(node_id))
             if current is None:
@@ -727,9 +870,15 @@ class Store:
             description = str(value.get("description", current["description"])).strip()
             if not label:
                 raise ValueError("Graph node label must not be empty")
-            if (label, description) != (current["label"], current["description"]):
+            changed = (label, description) != (current["label"], current["description"]) or (
+                "aliases" in value and set(aliases) != set(current["aliases"]))
+            if changed:
+                old = dict(self.db.execute("SELECT * FROM plastic_nodes WHERE umo=? AND id=?", (self.umo, int(node_id))).fetchone())
+                self._remember_revision("node", old, reason=reason, source_ids=source_ids or [], run_id=run_id)
                 self.db.execute("UPDATE plastic_nodes SET label=?,description=?,updated_at=CURRENT_TIMESTAMP WHERE umo=? AND id=?",
                                 (label, description, self.umo, int(node_id)))
+            if "aliases" in value:
+                self.db.execute("DELETE FROM mr_node_aliases WHERE umo=? AND node_id=?", (self.umo, int(node_id)))
         else:
             label = str(value.get("label") or "").strip()
             if not label:
@@ -737,15 +886,13 @@ class Store:
             node_id = int(self.db.execute("""INSERT INTO plastic_nodes(umo,node_key,node_kind,label,description,created_by)
                 VALUES(?,'mr-node:'||lower(hex(randomblob(16))),'entity',?,?,'mr-simple')""",
                 (self.umo, label, str(value.get("description") or "").strip())).lastrowid)
-        aliases = value.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [aliases]
-        for alias in dict.fromkeys(str(a).strip() for a in aliases if str(a).strip()):
+        for alias in aliases:
             self.db.execute("INSERT OR IGNORE INTO mr_node_aliases(umo,node_id,alias) VALUES(?,?,?)",
                             (self.umo, int(node_id), alias))
-        if value.get("node_id") is not None and any(field in value for field in ("label", "description", "aliases")):
+        if changed:
             for edge in self._rows("SELECT id FROM plastic_edges WHERE umo=? AND (source_node_id=? OR target_node_id=?)",
                                    (self.umo, int(node_id), int(node_id))):
+                self._clear_memory_derivatives("association", edge["id"])
                 self._queue_embedding("association", edge["id"])
         return int(node_id)
 
@@ -991,6 +1138,7 @@ class Store:
         return [self._message(r) for r in sorted(rows, key=lambda row: (row["sent_at"], row["id"]))]
 
     def _queue_embedding(self, kind: str, owner: int | str) -> None:
+        kind = "association" if kind == "plastic_edge" else kind
         entry = self.memory(kind, owner, include_sources=False)
         if not entry:
             return
@@ -1011,7 +1159,7 @@ class Store:
         with self.db:
             # Existing memories missing this model are also durable pending work.
             for kind, table in (("episode", "episodes"), ("semantic", "semantic_memories"), ("topic", "topics"), ("plastic_edge", "plastic_edges")):
-                eligible = " AND x.status IN('ACTIVE','WEAKENED')" if kind == "plastic_edge" else " AND x.status='ACTIVE'" if kind == "semantic" else " AND x.status<>'INVALIDATED'" if kind == "episode" else ""
+                eligible = " AND x.status IN('ACTIVE','WEAKENED') AND x.invalidation_reason=''" if kind == "plastic_edge" else " AND x.status='ACTIVE'" if kind in {"semantic", "topic"} else " AND x.status NOT IN('INVALIDATED','SUPERSEDED','RETRACTED')" if kind == "episode" else ""
                 if kind == "topic":
                     eligible += " AND NOT EXISTS(SELECT 1 FROM mr_topic_sources t JOIN messages m ON m.id=t.message_id WHERE t.umo=x.umo AND t.topic_id=x.id AND m.is_deleted=1)"
                 rows = self._rows(f"""SELECT x.id FROM {table} x WHERE x.umo=? {eligible}
@@ -1040,7 +1188,7 @@ class Store:
         owners = {"episode": "episodes", "semantic": "semantic_memories", "topic": "topics", "plastic_edge": "plastic_edges", "participant": "participants"}
         allowed = {}
         for kind, table in owners.items():
-            status = " AND status IN('ACTIVE','WEAKENED') AND invalidation_reason=''" if kind == "plastic_edge" else " AND status='ACTIVE'" if kind == "semantic" else " AND status<>'INVALIDATED'" if kind == "episode" else ""
+            status = " AND status IN('ACTIVE','WEAKENED') AND invalidation_reason=''" if kind == "plastic_edge" else " AND status='ACTIVE'" if kind in {"semantic", "topic"} else " AND status NOT IN('INVALIDATED','SUPERSEDED','RETRACTED')" if kind == "episode" else ""
             if kind == "topic":
                 status += " AND NOT EXISTS(SELECT 1 FROM mr_topic_sources t JOIN messages m ON m.id=t.message_id WHERE t.umo=topics.umo AND t.topic_id=topics.id AND m.is_deleted=1)"
             allowed[kind] = {str(r[0]) for r in self.db.execute(f"SELECT id FROM {table} WHERE umo=?{status}", (self.umo,))}
@@ -1069,8 +1217,30 @@ class Store:
                 VALUES(?,?,?,?,?,?) ON CONFLICT(umo,owner_type,owner_key,model) DO UPDATE SET
                 dimensions=excluded.dimensions,vector=excluded.vector,updated_at=CURRENT_TIMESTAMP""", (self.umo, owner_type, str(owner_key), model_id, int(dimensions), vector))
 
+    def _replace_memory_sources(self, kind: str, owner: int, evidence: list[dict]) -> None:
+        if kind == "episode":
+            self.db.execute("DELETE FROM episode_messages WHERE episode_id=?", (owner,))
+            self.db.executemany("INSERT INTO episode_messages VALUES(?,?,?)",
+                                [(owner, message["id"], position) for position, message in enumerate(evidence)])
+        elif kind == "semantic":
+            self.db.execute("DELETE FROM semantic_memory_sources WHERE semantic_memory_id=?", (owner,))
+            self.db.execute("UPDATE semantic_memories SET source_message_id=? WHERE umo=? AND id=?",
+                            (evidence[0]["id"] if evidence else None, self.umo, owner))
+            self.db.executemany("INSERT INTO semantic_memory_sources(semantic_memory_id,message_id,evidence_role) VALUES(?,?,'SUPPORT')",
+                                [(owner, message["id"]) for message in evidence])
+        elif kind == "association":
+            self.db.execute("DELETE FROM plastic_edge_evidence WHERE edge_id=?", (owner,))
+            self.db.executemany("INSERT INTO plastic_edge_evidence(edge_id,message_id,evidence_role) VALUES(?,?,'SUPPORT')",
+                                [(owner, message["id"]) for message in evidence])
+        elif kind == "topic":
+            self.db.execute("DELETE FROM topic_episodes WHERE topic_id=?", (owner,))
+            self.db.execute("DELETE FROM mr_topic_sources WHERE umo=? AND topic_id=?", (self.umo, owner))
+            self.db.executemany("INSERT INTO mr_topic_sources(umo,topic_id,message_id) VALUES(?,?,?)",
+                                [(self.umo, owner, message["id"]) for message in evidence])
+
     @_serialized
-    def save_memories(self, items: Iterable[dict], sources: Iterable[str], mark_processed: bool = True) -> list[dict]:
+    def save_memories(self, items: Iterable[dict], sources: Iterable[str], mark_processed: bool = True,
+                      *, run_id: int | None = None) -> list[dict]:
         keys = list(dict.fromkeys(str(s) for s in sources))
         source_rows = {r["source_key"]: r for r in self._messages_for_sources(keys)}
         if set(keys) != set(source_rows):
@@ -1078,8 +1248,13 @@ class Store:
         outputs: list[tuple[str, int]] = []
         with self.db:
             for item in items:
-                selected = list(dict.fromkeys(str(k) for k in item.get("source_keys", keys)))
-                if not selected or not set(selected).issubset(source_rows):
+                if "source_keys" not in item or not isinstance(item["source_keys"], (list, tuple)):
+                    raise ValueError("Each memory requires explicit source_keys")
+                selected = list(dict.fromkeys(str(k) for k in item["source_keys"]))
+                action = str(item.get("action") or "revise")
+                if action not in {"revise", "withdraw"}:
+                    raise ValueError("Unsupported memory action")
+                if (not selected and action != "withdraw") or not set(selected).issubset(source_rows):
                     raise ValueError("Each memory requires existing input source keys")
                 evidence = [source_rows[k] for k in selected]
                 kind = str(item.get("kind") or "semantic")
@@ -1095,8 +1270,22 @@ class Store:
                     if stored is None:
                         raise ValueError("Memory to update does not exist in this group")
                     stored = dict(stored)
+                reason = str(item.get("reason") or "")
+                if action == "withdraw" and (stored is None or not reason.strip()):
+                    raise ValueError("Withdrawal requires an existing memory and reason")
+                if stored:
+                    self._remember_revision(kind, stored, reason=reason, source_ids=[r["id"] for r in evidence],
+                                            operation=action, run_id=run_id)
+                if action == "withdraw":
+                    owner = int(stored["id"])
+                    self.db.execute(f"UPDATE {table} SET status='RETRACTED' WHERE umo=? AND id=?", (self.umo, owner))
+                    self._replace_memory_sources(kind, owner, evidence)
+                    self._clear_memory_derivatives(kind, owner)
+                    outputs.append((kind, owner))
+                    continue
                 text_field = {"episode": "summary", "semantic": "content", "association": "statement", "topic": "summary"}[kind]
-                summary = str(item.get("content") or item.get("summary") or item.get("statement") or (stored[text_field] if stored else "")).strip()
+                summary = str(next((item[field] or "" for field in ("content", "summary", "statement") if field in item),
+                                   stored[text_field] if stored else "")).strip()
                 if not summary:
                     raise ValueError("Memory content must not be empty")
                 fingerprint = hashlib.sha256(_encode([kind, item, sorted(selected)]).encode()).hexdigest()
@@ -1107,21 +1296,21 @@ class Store:
                         self.db.execute("""UPDATE episodes SET title=?,summary=?,started_at=?,ended_at=?,revision_no=revision_no+1,
                             updated_at=CURRENT_TIMESTAMP WHERE umo=? AND id=?""",
                             (str(item.get("title", stored["title"])), summary,
-                             min(stored["started_at"], *(r["sent_at"] for r in evidence)),
-                             max(stored["ended_at"], *(r["sent_at"] for r in evidence)), self.umo, owner))
+                             int(item.get("started_at", min(r["sent_at"] for r in evidence))),
+                             int(item.get("ended_at", max(r["sent_at"] for r in evidence))), self.umo, owner))
                     else:
                         existing = self.db.execute("SELECT id FROM episodes WHERE umo=? AND stable_key=?", (self.umo, stable)).fetchone()
                         owner = int(existing[0]) if existing else int(self.db.execute("""INSERT INTO episodes
                             (umo,started_at,ended_at,title,summary,status,extractor_version,stable_key,updated_at)
-                            VALUES(?,?,?,?,?,'CLOSED','mr-simple',?,CURRENT_TIMESTAMP)""", (self.umo, min(r["sent_at"] for r in evidence), max(r["sent_at"] for r in evidence), str(item.get("title") or ""), summary, stable)).lastrowid)
-                    for position, message in enumerate(evidence):
-                        self.db.execute("INSERT OR IGNORE INTO episode_messages VALUES(?,?,?)", (owner, message["id"], position))
+                            VALUES(?,?,?,?,?,'CLOSED','mr-simple',?,CURRENT_TIMESTAMP)""", (self.umo, int(item.get("started_at", min(r["sent_at"] for r in evidence))), int(item.get("ended_at", max(r["sent_at"] for r in evidence))), str(item.get("title") or ""), summary, stable)).lastrowid)
                     cues = item.get("cues", item.get("keywords", []))
+                    if "cues" in item or "keywords" in item:
+                        self.db.execute("DELETE FROM episode_keywords WHERE episode_id=?", (owner,))
                     for cue in _terms(cues if isinstance(cues, (str, list, tuple)) else []):
                         self.db.execute("INSERT OR IGNORE INTO episode_keywords VALUES(?,?,?)", (owner, cue, "model"))
                 elif kind == "semantic":
                     participant = item.get("participant_id", stored.get("subject_participant_id") if stored else None)
-                    person = str(item.get("person", stored.get("person_cue", "") if stored else ""))
+                    person = str(item.get("person", stored.get("person_cue", "") if stored else "") or "")
                     subject = item.get("subject", stored.get("subject_text", "") if stored else "")
                     if "person" in item and "subject" not in item:
                         subject = person
@@ -1135,6 +1324,7 @@ class Store:
                                 raise ValueError("Memory subject account does not exist in this group")
                             participant = author[0]
                         subject = subject.get("name") or ""
+                    subject = subject or ""
                     if "subject" in item and "person" not in item:
                         person = str(subject)
                     if participant is not None and not self.db.execute("SELECT 1 FROM participants WHERE umo=? AND id=?", (self.umo, int(participant))).fetchone():
@@ -1151,15 +1341,10 @@ class Store:
                             (umo,person_cue,aspect_tag,content,source_message_id,extractor_version,stable_key,
                              subject_participant_id,subject_text,updated_at) VALUES(?,?,?,?,?,'mr-simple',?,?,?,CURRENT_TIMESTAMP)""",
                             (self.umo, person, aspect, summary, evidence[0]["id"], stable, participant, str(subject))).lastrowid)
-                    for message in evidence:
-                        self.db.execute("INSERT OR IGNORE INTO semantic_memory_sources(semantic_memory_id,message_id,evidence_role) VALUES(?,?,'SUPPORT')", (owner, message["id"]))
                 elif kind == "topic":
                     owner = int(stored["id"])
                     name = str(item.get("name", item.get("title", stored["name"])))
                     self.db.execute("UPDATE topics SET name=?,summary=? WHERE umo=? AND id=?", (name, summary, self.umo, owner))
-                    for message in evidence:
-                        self.db.execute("INSERT OR IGNORE INTO mr_topic_sources(umo,topic_id,message_id) VALUES(?,?,?)",
-                                        (self.umo, owner, message["id"]))
                 elif kind == "association":
                     source = item.get("source", {"node_id": stored["source_node_id"]} if stored else None)
                     target = item.get("target", {"node_id": stored["target_node_id"]} if stored else None)
@@ -1169,7 +1354,8 @@ class Store:
                     relation = str(relation or "").strip()
                     if not source or not target or not relation:
                         raise ValueError("Association needs source, target and relation")
-                    node_ids = [self._save_node(endpoint) for endpoint in (source, target)]
+                    node_ids = [self._save_node(endpoint, reason=reason, source_ids=[r["id"] for r in evidence], run_id=run_id)
+                                for endpoint in (source, target)]
                     relation_key = "mr-simple:" + hashlib.sha256(relation.encode()).hexdigest()
                     self.db.execute("INSERT OR IGNORE INTO relation_types(umo,relation_key,canonical_name,description,created_by) VALUES(?,?,?,?,'mr-simple')", (self.umo, relation_key, relation, relation))
                     relation_id = self.db.execute("SELECT id FROM relation_types WHERE umo=? AND relation_key=? ORDER BY version DESC LIMIT 1", (self.umo, relation_key)).fetchone()[0]
@@ -1183,8 +1369,8 @@ class Store:
                         owner = int(self.db.execute("""INSERT INTO plastic_edges(umo,stable_key,source_node_id,relation_type_id,target_node_id,
                             statement,uncertainty,created_by) VALUES(?,?,?,?,?,?,?,'mr-simple')""",
                             (self.umo, "mr-simple:" + uuid4().hex, node_ids[0], relation_id, node_ids[1], summary, uncertainty)).lastrowid)
-                    for message in evidence:
-                        self.db.execute("INSERT OR IGNORE INTO plastic_edge_evidence(edge_id,message_id,evidence_role) VALUES(?,?,'SUPPORT')", (owner, message["id"]))
+                self._replace_memory_sources(kind, owner, evidence)
+                self._clear_memory_derivatives(kind, owner)
                 self._queue_embedding(kind, owner)
                 outputs.append((kind, owner))
             for key in keys if mark_processed else ():
@@ -1193,4 +1379,12 @@ class Store:
                 self.db.execute("""INSERT INTO message_processing(message_id,content_sha256,status,distilled_at)
                     VALUES(?,?,'DISTILLED',?) ON CONFLICT(message_id) DO UPDATE SET status='DISTILLED',
                     distilled_at=excluded.distilled_at,content_sha256=excluded.content_sha256,last_error=''""", (message["id"], raw[0], int(time.time())))
-        return [self.memory(kind, owner) for kind, owner in outputs]
+        result = []
+        for kind, owner in outputs:
+            entry = self.memory(kind, owner)
+            if entry is None:
+                table = {"episode": "episodes", "semantic": "semantic_memories", "association": "plastic_edges", "topic": "topics"}[kind]
+                status = self.db.execute(f"SELECT status FROM {table} WHERE umo=? AND id=?", (self.umo, owner)).fetchone()[0]
+                entry = {"kind": kind, "id": owner, "status": status}
+            result.append(entry)
+        return result
