@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from contextlib import closing
@@ -12,6 +13,7 @@ from astrbot.api.web import request
 
 from .store import Store
 from .settings import DEFAULTS
+from .schedule import work_window
 
 
 class Console:
@@ -99,7 +101,43 @@ class Console:
             "memory_timeout_seconds": config["local_serving_timeout_seconds"],
             "background_rolling24h_budget": config["private_daily_token_budget"],
             "feedback_rolling24h_budget": config["feedback_daily_token_budget"],
+            "learning_window": self.learning_window(),
         }}
+
+    def learning_window(self):
+        config = {**DEFAULTS, **self.plugin.config}
+        window = work_window(config)
+        window["enabled"] = config["learning_window_enabled"]
+        window["next_start_local"] = self.local_date(window["next_start"])
+        return window
+
+    @staticmethod
+    def local_date(value):
+        return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(float(value))) if value is not None else None
+
+    @staticmethod
+    def learning_tasks(store):
+        # The persisted conversation can be large. Select only the small
+        # reader-facing state rather than loading or sending that transcript.
+        with store._lock:
+            rows = store._rows("""SELECT kind,json_array_length(task_json,'$.material_ids') material_count,
+                json_array_length(task_json,'$.completed_ids') completed_count,
+                json_extract(task_json,'$.checkpoint') checkpoint,
+                json_extract(task_json,'$.memory_refs') memory_refs,
+                json_extract(task_json,'$.run_id') run_id
+                FROM mr_learning_tasks WHERE umo=? ORDER BY kind""", (store.umo,))
+        for row in rows:
+            row["memory_refs"] = json.loads(row["memory_refs"] or "[]")
+        return rows
+
+    async def learning_overview(self, store):
+        statuses = {}
+        for kind, value in getattr(self.plugin, "learning_status", {}).get(store.umo, {}).items():
+            statuses[kind] = {key: value[key] for key in ("status", "reason", "next_start", "local_now", "timezone",
+                             "remaining_message_count", "used_tokens") if key in value}
+            statuses[kind]["next_start_local"] = self.local_date(value.get("next_start"))
+        return {"learning": await asyncio.to_thread(self.learning_tasks, store),
+                "learning_status": statuses, "learning_window": self.learning_window()}
 
     @staticmethod
     def inventory(store):
@@ -124,13 +162,14 @@ class Console:
         store = await self.get_store(scope_id)
         counts = await asyncio.to_thread(self.inventory, store)
         state = await asyncio.to_thread(store.load_working_state)
-        return {"counts": counts, "state": state,
+        return {"counts": counts, "state": state, **await self.learning_overview(store),
                 "background_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "background"),
                 "feedback_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "feedback")}
 
     async def runs(self, scope_id):
         store = await self.get_store(scope_id)
-        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30)}
+        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30),
+                **await self.learning_overview(store)}
 
     async def run(self, scope_id, run_id):
         store = await self.get_store(scope_id)

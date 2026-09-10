@@ -8,7 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mr_memory.agent import MemoryAgent, _model_view, _json
+from mr_memory.agent import MemoryAgent, _model_view, _json, estimate_learning_input
 from mr_memory.store import Store as MemoryStore
 
 
@@ -257,7 +257,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                         "memory_refs": [{"kind": record["kind"], "id": record["id"]}]}, "reflect")]))
                 return await super()._query(payload, tools, request_max_retries)
         first = response(calls=[("search_messages", {"terms": ["星舟"]}, "read")])
-        first.usage = {"input_other": 100, "output": 0}
+        first.usage = {"input_other": 10000, "output": 0}
         provider = FollowingProvider([
             first,
             response(calls=[("remember", {"items": [
@@ -265,13 +265,119 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             response('{"items":[]}')])
         store = WriteStore()
         result = await MemoryAgent(provider, store, max_turns=None).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "星舟是我们做的桌游"}], {}, token_budget=400)
+            [{"id": 1, "source_key": "u1", "plain_text": "星舟是我们做的桌游"}], {}, token_budget=40000)
         self.assertEqual(result.status, "completed", result.detail)
         self.assertEqual(len(result.written), 1)
         self.assertEqual(store.reflections.saved["memory_refs"], [{"kind": "semantic", "id": 37}])
         self.assertEqual(len(provider.requests), 4)
         for request in provider.requests[1:]:
-            self.assertEqual({t.name for t in request[1].tools}, {"remember", "reflect"})
+            self.assertIs(request[1], provider.requests[0][1])
+            self.assertIn("search_messages", {t.name for t in request[1].tools})
+
+    async def test_learning_resumes_saved_progress_with_exact_history_and_reasoning(self):
+        class WriteStore(Store):
+            def __init__(self):
+                self.task = {"material_ids": [1, 2], "completed_ids": []}
+
+            def save_memories(self, items, sources, *, learning_kind, progress, **kwargs):
+                self.task.update(progress)
+                self.saved_progress = copy.deepcopy(progress)
+                return [{"kind": "episode", "id": 37, "summary": "星舟是桌游", "source_ids": [1, 2],
+                         "sources": [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"}],
+                         "reflections": [{"sources": [{"id": 88, "source_key": "u88", "plain_text": "新的关注原文"}]}]}]
+
+            def update_learning_task(self, kind, patch):
+                self.task.update(patch)
+
+        first = response(calls=[("remember", {"items": [{"kind": "episode", "summary": "星舟是桌游",
+            "source_ids": [1, 2]}], "progress": {"completed_ids": [1], "checkpoint": "已厘清名称，下一步理解规则"}}, "save")])
+        first.reasoning_content = "为下一轮原生工具调用保留的思考"
+        provider = Provider([first, response('{"items":[],"progress":{"completed_ids":[2],"checkpoint":"规则已理解"}}')])
+        messages = [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"},
+                    {"id": 2, "source_key": "u2", "plain_text": "下次玩四人规则"}]
+        store = WriteStore()
+        initial = await MemoryAgent(provider, store, max_turns=1).consolidate(messages, {}, task=dict(store.task))
+        self.assertEqual(initial.status, "partial")
+        self.assertEqual(initial.model_attempts, 1)
+        self.assertEqual(store.saved_progress["completed_ids"], [1])
+        self.assertEqual(initial.written[0]["source_ids"], [1, 2])
+        prefix = copy.deepcopy(initial.continuation["conversation"])
+        saved_receipt = json.loads(next(row["content"] for row in prefix if row.get("tool_call_id") == "save"))[0]
+        self.assertNotIn("sources", saved_receipt)
+        self.assertIn("sources", saved_receipt["reflections"][0])
+        self.assertEqual(next(row for row in prefix if row.get("tool_calls"))["reasoning_content"], first.reasoning_content)
+        resumed = await MemoryAgent(provider, store, max_turns=1).consolidate(messages, {}, task=dict(store.task))
+        self.assertEqual(resumed.status, "completed", resumed.detail)
+        self.assertEqual(resumed.progress["completed_ids"], [2])
+        self.assertEqual(provider.requests[1][0]["messages"][:len(prefix)], prefix)
+        self.assertEqual(len(resumed.tool_calls), 0)
+        new_message = {"id": 3, "source_key": "u3", "plain_text": "新提供的规则说明"}
+        task = {**store.task, "continuation": initial.continuation}
+        self.assertGreater(estimate_learning_input([new_message], {"new_understanding": "新的线索"}, task=task),
+                           initial.continuation["previous_input_tokens"])
+
+    async def test_learning_defers_when_budget_cannot_pay_for_its_input(self):
+        messages = [{"id": 1, "source_key": "u1", "plain_text": "待处理的原始经历"}]
+        provider = Provider([])
+        self.assertGreater(estimate_learning_input(messages, {}), 1000)
+        result = await MemoryAgent(provider, Store(), max_output_tokens=384000).consolidate(
+            messages, {}, token_budget=1000)
+        self.assertEqual(result.status, "partial")
+        self.assertIn("cannot cover", result.detail)
+        self.assertEqual(provider.requests, [])
+        self.assertEqual(result.model_attempts, 0)
+        self.assertTrue(result.continuation["conversation"])
+        self.assertEqual(result.usage, {})
+
+    def test_revision_transport_retains_unique_record_meaning(self):
+        snapshot = {"record": {"id": 4, "content": "修正后的认识", "status": "ACTIVE", "claim_type": "reported",
+                               "superseded_by": 9, "source_message_id": 7, "uncertainty": "原版本的不确定性"},
+                    "memory": {"id": 4, "summary": "修正后的认识", "status": "ACTIVE", "uncertainty": "后来形成的不确定性"}}
+        result = _model_view({"snapshot": snapshot})["snapshot"]
+        self.assertEqual(result["record"], {"claim_type": "reported", "superseded_by": 9,
+            "source_message_id": 7, "uncertainty": "原版本的不确定性"})
+        self.assertEqual(result["memory"], snapshot["memory"])
+
+    async def test_output_limit_keeps_unfinished_understanding_for_continuation(self):
+        truncated = response('{"items":[', finish="length")
+        truncated.reasoning_content = "已经理解了两个话题，第二个还没有完成写入"
+        result = await MemoryAgent(Provider([truncated]), Store()).consolidate(
+            [{"id": 1, "source_key": "u1", "plain_text": "一起讨论两个话题"}], {})
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.continuation["conversation"][-1]["reasoning_content"], truncated.reasoning_content)
+        self.assertEqual(result.continuation["conversation"][-1]["content"], truncated.completion_text)
+        self.assertEqual(result.items, [])
+
+    async def test_known_first_call_usage_does_not_hide_unknown_later_call(self):
+        provider = Provider([response(calls=[("search_messages", {"terms": ["星舟"]}, "read")]),
+                             TimeoutError("provider response did not arrive")])
+        result = await MemoryAgent(provider, Store()).consolidate(
+            [{"id": 1, "source_key": "u1", "plain_text": "继续回忆星舟"}], {})
+        self.assertEqual(result.usage, {"input_other": 10, "output": 4})
+        self.assertEqual(result.model_attempts, 2)
+        self.assertEqual(result.unknown_usage_calls, 1)
+        self.assertTrue(any(row.get("tool_call_id") == "read" for row in result.continuation["conversation"]))
+
+    async def test_resumption_metadata_does_not_resend_material_and_budget_excludes_this_input(self):
+        class TaskStore(Store):
+            def update_learning_task(self, kind, patch): pass
+        original = {"id": 1, "source_key": "u1", "plain_text": "这是此前已经读过的原文"}
+        seen = {}
+        initial = {"role": "user", "content": _json({"messages": [original]}, seen_messages=seen)}
+        task = {"material_ids": [1], "continuation": {"conversation": [initial], "seen_messages": seen,
+                "sources": {1: "u1"}, "previous_input_tokens": 10000, "previous_input_bytes": 30000,
+                "previous_call_usage": {"input_other": 10000, "output": 1000}}}
+        provider = Provider([response('{"items":[],"progress":{"completed_ids":[1]}}')])
+        await MemoryAgent(provider, TaskStore()).consolidate([{**original, "context_only": False}], {}, task=task, token_budget=30000)
+        sent = provider.requests[0][0]["messages"]
+        self.assertEqual(sent[0], initial)
+        self.assertNotIn("messages", json.loads(sent[1]["content"]))
+        resource = next(json.loads(row["content"])["resource_state"] for row in sent[1:]
+                        if row["role"] == "user" and row["content"].startswith('{"resource_state":'))
+        self.assertEqual(resource["remaining_after_current_input_tokens"], 30000 - resource["estimated_input_tokens"])
+        self.assertGreaterEqual(resource["estimated_input_tokens"], 10000)
+        self.assertIn("本次剩余资源", sent[-1]["content"])
+        self.assertTrue(_model_view({**original, "context_only": True})["context_only"])
 
     async def test_learning_reads_old_sources_then_revises_and_reuses_real_graph_nodes(self):
         test_root = Path(__file__).resolve().parents[1] / ".dev"

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS messages (
  sender_participant_id INTEGER REFERENCES participants(id), content_sha256 TEXT NOT NULL DEFAULT '',
  revision_no INTEGER NOT NULL DEFAULT 1, deleted_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_messages_umo_time ON messages(umo,sent_at,id);
+CREATE INDEX IF NOT EXISTS idx_messages_umo_id ON messages(umo,id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages(umo,sender_id,sent_at,id);
 CREATE TABLE IF NOT EXISTS participant_aliases (
  participant_id INTEGER NOT NULL REFERENCES participants(id), alias TEXT NOT NULL,
@@ -144,6 +145,9 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
  umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,model TEXT NOT NULL,dimensions INTEGER NOT NULL,
  vector BLOB NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(umo,owner_type,owner_key,model));
 CREATE TABLE IF NOT EXISTS mr_working_state (umo TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_learning_tasks (umo TEXT NOT NULL,kind TEXT NOT NULL
+ CHECK(kind IN ('background','feedback')),task_json TEXT NOT NULL,updated_at INTEGER NOT NULL,
+ PRIMARY KEY(umo,kind));
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
@@ -433,6 +437,7 @@ class Store:
                 self.db.execute("UPDATE participants SET current_display_name='' WHERE id=?", (person["id"],))
                 self.db.execute("DELETE FROM memory_embeddings WHERE umo=? AND owner_type='participant' AND owner_key=?", (self.umo, str(person["id"])))
             self.db.execute("DELETE FROM mr_working_state WHERE umo=?", (self.umo,))
+            self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_roster_cache WHERE umo=?", (self.umo,))
         return {"forgotten": True, "messages_removed": len(ids)}
 
@@ -920,37 +925,39 @@ class Store:
         The first unprocessed user message must follow a retained bot response.
         The model, not this query, determines whether it is meaningful feedback.
         """
-        now = int(time.time())
-        cutoff = now - int(window_seconds)
         first = self.db.execute("""SELECT u.* FROM messages u WHERE u.umo=? AND u.is_deleted=0
-            AND u.role='USER' AND u.id>? AND u.sent_at BETWEEN ? AND ?
+            AND u.role='USER' AND u.id>?
             AND EXISTS(SELECT 1 FROM messages b WHERE b.umo=u.umo AND b.is_deleted=0
-                AND b.role='BOT' AND b.sent_at>=? AND (b.sent_at,b.id)<(u.sent_at,u.id))
-            ORDER BY u.sent_at,u.id LIMIT 1""", (self.umo, int(after), cutoff, now, cutoff)).fetchone()
+                AND b.role='BOT' AND b.sent_at>=u.sent_at-? AND (b.sent_at,b.id)<(u.sent_at,u.id))
+            ORDER BY u.id LIMIT 1""", (self.umo, int(after), int(window_seconds))).fetchone()
         if first is None:
             return []
         bot = self.db.execute("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND role='BOT'
             AND sent_at>=? AND (sent_at,id)<(?,?) ORDER BY sent_at DESC,id DESC LIMIT 1""",
-            (self.umo, cutoff, first["sent_at"], first["id"])).fetchone()
+            (self.umo, first["sent_at"] - int(window_seconds), first["sent_at"], first["id"])).fetchone()
         bot_message = self._message(dict(bot))
         # Include the bot's original question when the send observation retained
         # a reply relation. This is structural association, not text matching.
         if bot_message["reply_to"]:
             rows = self._rows("""SELECT m.* FROM messages m WHERE m.umo=? AND m.is_deleted=0
-                AND m.sent_at>=? AND (m.sent_at,m.id)<=(?,?) AND
+                AND (m.sent_at,m.id)<=(?,?) AND
                 (m.source_key=? OR EXISTS(SELECT 1 FROM message_relations r WHERE r.source_message_id=m.id
                     AND r.umo=m.umo AND r.target_source_key=? AND r.relation IN('REPLY_TO','RESPONDS_TO')))
-                ORDER BY m.sent_at,m.id""", (self.umo, cutoff, bot["sent_at"], bot["id"],
+                ORDER BY m.sent_at,m.id""", (self.umo, bot["sent_at"], bot["id"],
                                             bot_message["reply_to"], bot_message["reply_to"]))
             prefix = [self._message(row) for row in rows]
         else:
             prefix = [bot_message]
         prefix = prefix[-max(1, _limit(limit) - 1):]
         room = max(1, _limit(limit) - len(prefix))
-        rows = self._rows("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND sent_at<=?
-            AND (sent_at,id)>=(?,?) ORDER BY sent_at,id LIMIT ?""",
-            (self.umo, now, first["sent_at"], first["id"], room))
-        return prefix + [self._message(row) for row in rows]
+        rows = self._rows("""SELECT * FROM messages WHERE umo=? AND is_deleted=0
+            AND id>=? ORDER BY id LIMIT ?""", (self.umo, first["id"], room))
+        material = [self._message(row) for row in rows]
+        material_ids = {row["id"] for row in material}
+        # The window describes a reaction's relation to a bot response. Waiting
+        # until tonight must not expire already observed daytime feedback.
+        return [{**row, "context_only": True} for row in prefix if row["id"] not in material_ids] + [
+            {**row, "context_only": False} for row in material]
 
     @staticmethod
     def _usage_kind(kind: str) -> str:
@@ -1036,6 +1043,150 @@ class Store:
     def save_working_state(self, state: Any) -> None:
         with self.db:
             self.db.execute("INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at", (self.umo, _encode(state), int(time.time())))
+
+    @_serialized
+    def update_working_state(self, patch: dict) -> dict:
+        """Merge a foreground or worker update without overwriting another writer's fields."""
+        state = self.load_working_state()
+        state.update(patch)
+        with self.db:
+            self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                (self.umo, _encode(state), int(time.time())))
+        return state
+
+    @_serialized
+    def learning_task(self, kind: str) -> dict | None:
+        row = self.db.execute("SELECT task_json FROM mr_learning_tasks WHERE umo=? AND kind=?",
+                              (self.umo, self._usage_kind(kind))).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @_serialized
+    def unfinished_learning(self, kind: str) -> dict | None:
+        """Locate real writes from older unfinished runs without inventing their progress."""
+        kind = self._usage_kind(kind)
+        latest = self.db.execute("""SELECT id,json_extract(payload_json,'$.status') AS status,
+            substr(json_extract(payload_json,'$.detail'),1,512) AS detail FROM mr_runs
+            WHERE umo=? AND kind=? ORDER BY id DESC LIMIT 1""", (self.umo, kind)).fetchone()
+        if latest is None or latest["status"] == "completed":
+            return None
+        completed = self.db.execute("""SELECT COALESCE(max(id),0) FROM mr_runs WHERE umo=? AND kind=?
+            AND json_extract(payload_json,'$.status')='completed'""", (self.umo, kind)).fetchone()[0]
+        run_ids = [row[0] for row in self.db.execute("""SELECT id FROM mr_runs
+            WHERE umo=? AND kind=? AND id>? ORDER BY id""", (self.umo, kind, completed))]
+        refs = self._rows("""SELECT DISTINCT json_extract(w.value,'$.kind') AS kind,
+            json_extract(w.value,'$.id') AS id FROM mr_runs r,json_each(r.payload_json,'$.written') w
+            WHERE r.umo=? AND r.kind=? AND r.id>? AND json_type(w.value,'$.id')='integer'
+            AND json_type(w.value,'$.kind')='text' ORDER BY kind,id""", (self.umo, kind, completed))
+        return {"run_ids": run_ids, "memory_refs": refs, "last_status": latest["status"],
+                "detail": latest["detail"] or "", "interpretation": "这些运行未完成，实际写入不等于整批材料已处理；按需回看运行和记忆继续。"}
+
+    def _write_learning_task(self, kind: str, task: dict) -> None:
+        task["updated_at"] = int(time.time())
+        self.db.execute("""INSERT INTO mr_learning_tasks(umo,kind,task_json,updated_at) VALUES(?,?,?,?)
+            ON CONFLICT(umo,kind) DO UPDATE SET task_json=excluded.task_json,updated_at=excluded.updated_at""",
+            (self.umo, kind, _encode(task), task["updated_at"]))
+
+    @_serialized
+    def start_learning_task(self, kind: str, material_ids: list[int], context_ids: list[int] | None = None,
+                            working: dict | None = None) -> dict:
+        kind = self._usage_kind(kind)
+        existing = self.learning_task(kind)
+        if existing is not None:
+            return existing
+        material = list(dict.fromkeys(int(value) for value in material_ids))
+        context = [value for value in dict.fromkeys(int(value) for value in (context_ids or []))
+                   if value not in material]
+        ids = context + material
+        if ids:
+            count = self.db.execute(f"""SELECT count(*) FROM messages WHERE umo=? AND is_deleted=0
+                AND id IN ({','.join('?' for _ in ids)})""", (self.umo, *ids)).fetchone()[0]
+            if count != len(ids):
+                raise ValueError("Learning material must be retained messages in this group")
+        task = {"kind": kind, "material_ids": material, "context_ids": context, "completed_ids": [],
+                "checkpoint": "", "memory_refs": [], "working": working or {}, "created_at": int(time.time()),
+                "updated_at": int(time.time()), "run_id": None, "continuation": {}}
+        with self.db:
+            self._write_learning_task(kind, task)
+        return task
+
+    @_serialized
+    def update_learning_task(self, kind: str, patch: dict) -> dict:
+        kind = self._usage_kind(kind)
+        task = self.learning_task(kind)
+        if task is None:
+            raise ValueError("Learning task does not exist")
+        task.update(patch)
+        with self.db:
+            self._write_learning_task(kind, task)
+        return task
+
+    @_serialized
+    def finish_learning_task(self, kind: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=? AND kind=?",
+                            (self.umo, self._usage_kind(kind)))
+
+    @_serialized
+    def learning_messages(self, task: dict) -> list[dict]:
+        context = set(task.get("context_ids", []))
+        ids = list(dict.fromkeys([*task.get("context_ids", []), *task.get("material_ids", [])]))
+        if not ids:
+            return []
+        rows = self._rows(f"""SELECT * FROM messages WHERE umo=? AND is_deleted=0
+            AND id IN ({','.join('?' for _ in ids)})""", (self.umo, *ids))
+        by_id = {row["id"]: row for row in rows}
+        return [{**self._message(by_id[value]), "context_only": value in context}
+                for value in ids if value in by_id]
+
+    def _save_learning_progress(self, kind: str, progress: dict | None, memory_refs: list[tuple[str, int]],
+                                run_id: int | None) -> dict:
+        """Apply the model's explicit progress inside the caller's write transaction."""
+        task = self.learning_task(kind)
+        if task is None:
+            raise ValueError("Learning task does not exist")
+        progress = progress or {}
+        completed = set(int(value) for value in progress.get("completed_ids", []))
+        material = task["material_ids"]
+        if not completed.issubset(material):
+            raise ValueError("Completed message ids must belong to this task's material, not its context or evidence")
+        newly_completed = completed - set(task["completed_ids"])
+        completed.update(task["completed_ids"])
+        task["completed_ids"] = [value for value in material if value in completed]
+        if "checkpoint" in progress:
+            task["checkpoint"] = progress["checkpoint"]
+        refs = {(ref["kind"], int(ref["id"])) for ref in task["memory_refs"]}
+        for ref in memory_refs:
+            if ref not in refs:
+                task["memory_refs"].append({"kind": ref[0], "id": ref[1]})
+                refs.add(ref)
+        if run_id is not None:
+            task["run_id"] = int(run_id)
+        if kind == "background":
+            for value in newly_completed:
+                self.db.execute("""INSERT INTO message_processing(message_id,content_sha256,status,distilled_at)
+                    SELECT id,content_sha256,'DISTILLED',? FROM messages WHERE umo=? AND id=? AND is_deleted=0
+                    ON CONFLICT(message_id) DO UPDATE SET status='DISTILLED',distilled_at=excluded.distilled_at,
+                    content_sha256=excluded.content_sha256,last_error=''""", (int(time.time()), self.umo, value))
+        elif material:
+            state = self.load_working_state()
+            cursor = int(state.get("feedback_after") or 0)
+            for value in material:
+                if value not in completed:
+                    break
+                cursor = max(cursor, value)
+            if cursor > int(state.get("feedback_after") or 0):
+                state["feedback_after"] = cursor
+                self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                    DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                    (self.umo, _encode(state), int(time.time())))
+        self._write_learning_task(kind, task)
+        return task
+
+    @_serialized
+    def save_learning_progress(self, kind: str, progress: dict, run_id: int | None = None) -> dict:
+        with self.db:
+            return self._save_learning_progress(self._usage_kind(kind), progress, [], run_id)
 
     @_serialized
     def record_run(self, kind: str, started_at: float, payload: dict) -> int:
@@ -1240,7 +1391,10 @@ class Store:
 
     @_serialized
     def save_memories(self, items: Iterable[dict], sources: Iterable[str], mark_processed: bool = True,
-                      *, run_id: int | None = None) -> list[dict]:
+                      *, run_id: int | None = None, learning_kind: str | None = None,
+                      progress: dict | None = None) -> list[dict]:
+        if learning_kind is not None:
+            learning_kind = self._usage_kind(learning_kind)
         keys = list(dict.fromkeys(str(s) for s in sources))
         source_rows = {r["source_key"]: r for r in self._messages_for_sources(keys)}
         if set(keys) != set(source_rows):
@@ -1373,7 +1527,9 @@ class Store:
                 self._clear_memory_derivatives(kind, owner)
                 self._queue_embedding(kind, owner)
                 outputs.append((kind, owner))
-            for key in keys if mark_processed else ():
+            if learning_kind is not None:
+                self._save_learning_progress(learning_kind, progress, outputs, run_id)
+            for key in keys if mark_processed and learning_kind is None else ():
                 message = source_rows[key]
                 raw = self.db.execute("SELECT content_sha256 FROM messages WHERE id=?", (message["id"],)).fetchone()
                 self.db.execute("""INSERT INTO message_processing(message_id,content_sha256,status,distilled_at)

@@ -93,6 +93,41 @@ async function loadRuns() {
   const data = await api(path("runs"));
   if (scope !== state.scope || state.tab !== "runtime") return;
   renderRuns(data.runs || []);
+  renderLearning(data);
+}
+
+function renderLearning(data) {
+  const plan = $("learning-plan"), window = data.learning_window || state.overview?.runtime?.learning_window;
+  if (!window) { plan.replaceChildren(); return; }
+  const allDay = !window.enabled || window.start === window.end;
+  const heading = el("div", null, "learning-window");
+  heading.append(el("strong", allDay ? "后台工作：全天可运行" : `后台工作时段：${window.start}–${window.end}`));
+  heading.append(el("span", `服务当地时间 ${window.local_now} · ${window.timezone}`));
+  heading.append(el("small", window.open ? "当前处于工作时段；群消息记录和回答前回忆始终即时。" :
+    `普通新任务排到 ${window.next_start_local || "下一工作时段"}；已开始的任务继续保存，群消息记录、回答前回忆和明确预约照常进行。`));
+  plan.replaceChildren(heading);
+  const labels = { deferred: "等待工作时段", budget_exhausted: "等待额度恢复", budget_wait: "等待可用额度", running: "正在学习", partial: "保存进度，待续接", completed: "本批完成", disabled: "已关闭", busy: "群内正在学习", skipped: "等待新材料", waiting: "等待更多交流", idle: "暂无待处理材料" };
+  for (const kind of ["background", "feedback"]) {
+    const task = (data.learning || []).find((item) => item.kind === kind);
+    const runtime = data.learning_status?.[kind] || {};
+    const enabled = state.overview?.runtime?.[kind === "background" ? "learning" : "feedback"];
+    const row = el("div", null, "learning-row"), title = el("div", null, "learning-title");
+    const status = !enabled ? "已关闭" : labels[runtime.status] || statuses[runtime.status] || (task ? "等待续接" : "等待新材料");
+    title.append(el("strong", kinds[kind]), el("span", status, `status ${runtime.status || ""}`));
+    if (task?.run_id) title.append(button("查看最近过程", () => showRun(task.run_id)));
+    row.append(title);
+    if (task) {
+      row.append(el("p", `本批已理解 ${number(task.completed_count)} / ${number(task.material_count)} 条消息，已保存 ${number(task.memory_refs?.length || 0)} 项记忆；后续从已保存的进度继续。`));
+      const checkpoint = typeof task.checkpoint === "string" ? task.checkpoint : JSON.stringify(task.checkpoint);
+      if (checkpoint) {
+        const understanding = el("details", null, "learning-checkpoint");
+        understanding.append(el("summary", "已形成的理解与接下来要做的事"), el("p", checkpoint)); row.append(understanding);
+      }
+    }
+    if (runtime.reason) row.append(el("small", runtime.reason));
+    if (runtime.next_start_local && runtime.next_start !== window.next_start) row.append(el("small", `下次可继续：${runtime.next_start_local}`));
+    plan.append(row);
+  }
 }
 function renderRuns(rows) {
   const body = $("runs"); body.replaceChildren();
@@ -165,6 +200,7 @@ async function loadTab() {
       ["检索向量", number(c.embeddings), "数据库中已保存的索引项"],
     ].map(([label, value, caption]) => { const card = el("article", null, "metric"); card.append(el("span", label), el("strong", value), el("small", caption)); return card; }));
     renderRuns(rows);
+    renderLearning(overview);
   } else if (state.tab === "memory") { await searchMemory(); }
   else if (state.tab === "people") { await searchPeople(); }
   else { await searchMessages(); }

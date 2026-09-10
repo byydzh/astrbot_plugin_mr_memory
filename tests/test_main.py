@@ -65,7 +65,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for item in self.patches:
             item.start()
         self.plugin = plugin_module.MrMemoryPlugin(self.context, {"maintenance_interval_seconds": 600,
-            "capture_enabled": True, "embedding_enabled": True})
+            "capture_enabled": True, "embedding_enabled": True, "learning_window_enabled": False})
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
@@ -99,7 +99,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                  elapsed_ms=12, usage={}, tool_calls=[])
         memory_agent = SimpleNamespace(reconstruct=AsyncMock(return_value=result))
         with patch.object(self.plugin, "agent", return_value=memory_agent), \
-                patch.object(store, "save_working_state", side_effect=OSError("synthetic disk failure")), \
+                patch.object(store, "update_working_state", side_effect=OSError("synthetic disk failure")), \
                 patch.object(plugin_module.logger, "exception") as error_log:
             await self.plugin.inject_subconscious_memory(current, request)
         self.assertEqual({name: getattr(request, name) for name in preserved}, preserved)
@@ -246,19 +246,21 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(next(iter(self.plugin.tasks)).done())
         self.context.get_provider_by_id.assert_not_called()
 
-    async def test_initialize_restores_unresolved_allowed_scopes_without_a_new_event(self):
+    async def test_initialize_restores_deferred_allowed_scopes_without_a_new_event(self):
         scopes = ["synthetic:GroupMessage:42", "synthetic:GroupMessage:43", "synthetic:GroupMessage:44"]
         for scope, status in zip(scopes, ["pending", "waiting", "resolved"]):
             path = self.plugin.scope_dir / (hashlib.sha256(scope.encode()).hexdigest() + ".db")
             store = plugin_module.Store(path, scope)
             try:
                 store.reflections.save({"content": "待回看的合成经历", "status": status})
+                if status == "resolved":
+                    store.start_learning_task("background", [], working={"checkpoint": "继续尚未结束的理解"})
             finally:
                 store.close()
         self.plugin.config["allowed_umos"] = [scopes[0], scopes[2]]
         await self.plugin.initialize()
-        self.assertEqual(set(self.plugin.stores), {scopes[0]})
-        self.assertEqual(self.plugin.active_scopes, {scopes[0]})
+        self.assertEqual(set(self.plugin.stores), {scopes[0], scopes[2]})
+        self.assertEqual(self.plugin.active_scopes, {scopes[0], scopes[2]})
         self.assertEqual(len(self.plugin.stores[scopes[0]].reflections.due()), 1)
         self.context.get_provider_by_id.assert_not_called()
 
@@ -306,6 +308,12 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await self.plugin.consolidate(store, force=True)
         self.assertEqual(result["status"], "budget_exhausted")
         call.assert_not_called()
+        self.plugin.config["private_daily_token_budget"] = 500000
+        store.append_message(self.plugin.message(event()))
+        self.context.get_provider_by_id.return_value = None
+        with self.assertRaisesRegex(RuntimeError, "provider is unavailable"):
+            await self.plugin.learn(store, force=True)
+        self.assertEqual(store.usage_total("background"), 50)
 
     async def test_learning_finishes_only_the_batch_and_keeps_tool_written_memories(self):
         store = await self.plugin.store_for(event())
@@ -316,6 +324,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                     "source_keys": [older["source_key"]]}],
                                    [older["source_key"]], mark_processed=False)
         result = ConsolidationResult(status="completed", written=saved, usage={"input_other": 25, "output": 5},
+            progress={"completed_ids": [current["id"]]},
             items=[{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
                     "source_keys": [older["source_key"], current["source_key"]]}])
         learning = SimpleNamespace(consolidate=AsyncMock(return_value=result))
@@ -370,6 +379,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             learning.consolidate.assert_not_awaited()
             store.append_message({**base, "message_id": "ordinary-new-2", "sent_at": now, "plain_text": "继续说明当时的人物"})
             self.assertEqual(store.feedback_messages(3600, 0), [])
+            learning.consolidate.return_value.progress = {
+                "completed_ids": [row["id"] for row in store.pending_messages(10)]}
             outcome = await self.plugin.learn(store)
         self.assertEqual(outcome["status"], "completed")
         messages, working = learning.consolidate.call_args.args
@@ -381,6 +392,87 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(reviewed["last_reviewed_at"])
         self.assertIsNone(reviewed["next_review_at"])
         self.assertEqual(store.reflections.due(), [])
+
+    async def test_partial_learning_resumes_saved_material_before_new_messages(self):
+        store = await self.plugin.store_for(event())
+        base = self.plugin.message(event())
+        first = store.append_message({**base, "message_id": "task-1"})
+        second = store.append_message({**base, "message_id": "task-2"})
+        selections = []
+
+        async def learn(messages, working, **options):
+            selections.append([row["id"] for row in messages if not row.get("context_only")])
+            if len(selections) == 1:
+                saved = store.save_memories([{"kind": "episode", "title": "已理解的交流", "summary": "合成经历",
+                    "source_keys": [first["source_key"]]}], [first["source_key"]], learning_kind="background",
+                    progress={"completed_ids": [first["id"]], "checkpoint": "第一段已保存，继续第二段。"})
+                return ConsolidationResult(status="partial", written=saved, usage={"input_other": 20},
+                                           detail="本轮额度用完", model_attempts=1)
+            self.assertEqual(options["task"]["completed_ids"], [first["id"]])
+            self.assertEqual(len(options["task"]["memory_refs"]), 1)
+            self.assertIn("第一段已保存", options["task"]["checkpoint"])
+            return ConsolidationResult(status="completed", usage={"input_other": 20}, model_attempts=1,
+                                       progress={"completed_ids": [second["id"]]})
+
+        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            one = await self.plugin.learn(store, force=True)
+            new = store.append_message({**base, "message_id": "arrived-after-task"})
+            two = await self.plugin.learn(store, force=True)
+        self.assertEqual((one["status"], two["status"]), ("partial", "completed"))
+        self.assertEqual(selections, [[first["id"], second["id"]], [second["id"]]])
+        self.assertIsNone(store.learning_task("background"))
+        self.assertEqual([row["id"] for row in store.pending_messages(10)], [new["id"]])
+
+    async def test_closed_window_defers_routine_but_visits_explicit_appointment_once(self):
+        store = await self.plugin.store_for(event())
+        source = store.append_message(self.plugin.message(event()))
+        store.start_learning_task("feedback", [source["id"]])
+        closed = {"open": False, "next_start": plugin_module.time.time() + 1000,
+                  "local_now": "local service time", "timezone": "service"}
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="completed", usage={"input_other": 20}, model_attempts=1)))
+        with patch.object(plugin_module, "work_window", return_value=closed), \
+                patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            self.assertEqual((await self.plugin.learn(store, feedback=True))["status"], "deferred")
+            learning.consolidate.assert_not_awaited()
+            concern = store.reflections.save({"content": "已约定此刻回看", "status": "waiting",
+                                             "next_review_at": plugin_module.time.time() - 5})
+            result = await self.plugin.learn(store, feedback=True)
+            self.assertEqual(result["status"], "partial")  # original material is still pending
+            self.assertEqual(learning.consolidate.call_args.args[1]["scheduled_reflections"][0]["id"], concern["id"])
+            self.assertEqual((await self.plugin.learn(store, feedback=True))["status"], "deferred")
+            self.assertEqual(learning.consolidate.await_count, 1)
+
+    async def test_batch_fits_remaining_budget_without_completing_unread_material(self):
+        store = await self.plugin.store_for(event())
+        base = self.plugin.message(event())
+        for index in range(80):
+            store.append_message({**base, "message_id": f"large-{index}", "plain_text": "合成群聊内容" * 100})
+        self.plugin.config.update(private_daily_token_budget=100000, distillation_max_messages=80)
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="partial", detail="尚未结束", usage={"input_other": 20}, model_attempts=1)))
+        with patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            await self.plugin.learn(store, force=True)
+        selected = learning.consolidate.call_args.args[0]
+        self.assertGreater(len(selected), 0)
+        self.assertLess(len(selected), 80)
+        self.assertEqual(len(store.pending_messages(100)), 80)
+
+    async def test_known_usage_does_not_erase_the_last_unmetered_call(self):
+        store = await self.plugin.store_for(event())
+        store.append_message(self.plugin.message(event()))
+        self.plugin.config["private_daily_token_budget"] = 100000
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="partial", detail="Last call timed out", usage={"input_other": 20, "output": 5},
+            model_attempts=2, unknown_usage_calls=1)))
+        with patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            await self.plugin.learn(store, force=True)
+        self.assertEqual(store.usage_total("background"), 100000)
+        self.assertTrue(store.recent_runs(1)[0]["usage_estimated"])
 
 
 if __name__ == "__main__":

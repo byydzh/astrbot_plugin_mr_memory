@@ -35,6 +35,10 @@ class ConsolidationResult:
     usage: dict[str, int] = field(default_factory=dict)
     detail: str = ""
     response_text: str = ""
+    progress: dict[str, Any] = field(default_factory=dict)
+    continuation: dict[str, Any] = field(default_factory=dict, repr=False)
+    model_attempts: int = 0
+    unknown_usage_calls: int = 0
 
 
 RECONSTRUCTION_PROMPT = """你是持续参与群聊的机器人的潜意识。为主回答模型提供语义背景，让它理解这次在说谁、沿用了什么共同经历、话里有什么含义，能自然接上大家的交流。
@@ -71,7 +75,10 @@ CONSOLIDATION_PROMPT = """用episode保存可独立理解的经历，用semantic
 反思时可以用interaction回到当时的请求、实际注入、主回答和群友反应，再按需展开检索过程。被检索到不等于造成了错误，由你理解实际联系。
 你决定哪些疑点值得多花注意力：记录具体影响、已知和待查内容，通过reflect保存或更新，优先程度由你判断。未查清可继续待办或等新信息，不必把猜测立即判真判假；解决后修订有关记忆与图，把有用经验形成可检索的认识。处理同一问题时更新已存在的关注与记忆，别一轮轮重复新增同一教训。
 已查清的一部分可以立即remember保存，其余线索用reflect继续；不必等所有可能相关的人物和图都查完才修正第一条。关注中写下已查到什么、还差什么和下一步的原文地址，使下次能接着思考。每轮会告知本次剩余资源，由你按问题的影响分配注意力。
-结束时输出JSON对象 {"items":[...]}，仅放尚未保存的记忆；都已用remember保存时items为空。
+learning_task给出本批待理解的material_ids、本次实际提供的offered_ids、只供参考的context_ids、已处理的completed_ids、已保存memory_refs和上次checkpoint。material_ids是总清单，尚未提供也尚未自行读过的材料不能标记完成，context_ids不计本批完成。接着已有理解与写入继续；不要为已经完成的部分重复查阅、写入相同记忆。需要重新核实时仍可打开相关原文与记忆。
+通过remember的progress同步保存本批进度：completed_ids只列出你已经理解并处理完的材料消息编号，包括无需形成记忆的闲聊；source_ids只是某条记忆的证据，引用它不表示整条材料已处理完。checkpoint写下目前理解、已做的工作、未完成部分和下一步具体线索。可用items=[]单独保存进度。完成整批交流的理解后，把所有已处理材料标记完成；尚待新信息的独立关注可交给reflect等待，不阻止这批材料完成。
+reflect的next_review_at是需要按时继续的预约，可越过普通后台工作时段；只有确有时效需要时指定。日常继续理解用pending，等新信息用waiting，不必人为预约。
+结束时输出JSON对象 {"items":[...],"progress":{"completed_ids":[...],"checkpoint":"..."}}，items仅放尚未保存的记忆；都已用remember保存时items为空。progress补充本轮尚未保存的进度。
 每项有kind和source_ids，source_ids是已读原始消息的整数id列表：
 episode: title, summary；semantic: content，可选person（自然称呼）, aspect, subject（name与确知的account_id）；
 association: source, target, relation, statement。复用节点写{"node_id":已查到的节点id}；创建节点写{"label":"自然名称","description":"其语境或身份"}。
@@ -90,6 +97,18 @@ def _model_view(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     result = {key: _model_view(item) for key, item in value.items()}
+    if result.get("context_only") is False:
+        result.pop("context_only")
+    # Revision snapshots retain the readable memory plus SQL-only information.
+    # Drop only fields already present with the same meaning and value.
+    if isinstance(result.get("record"), dict) and isinstance(result.get("memory"), dict):
+        memory = result["memory"]
+        aliases = {"content": "summary", "statement": "summary", "name": "title", "aspect_tag": "title"}
+        result["record"] = {key: item for key, item in result["record"].items()
+                            if not ((key in memory and memory[key] == item)
+                                    or (aliases.get(key) in memory and memory[aliases[key]] == item))}
+        if not result["record"]:
+            result.pop("record")
     for key in ("participant_id", "sender_participant_id", "subject_participant_id",
                 "target_participant_id", "canonical_key", "narrative_bindings"):
         result.pop(key, None)
@@ -177,7 +196,11 @@ TOOL_SCHEMAS = {
 }
 
 
-REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆；返回已保存记录和可复用的图节点id。source_ids引用已读原始消息。", {
+PROGRESS_SCHEMA = {"type": "object", "properties": {
+    "completed_ids": {"type": "array", "items": INTEGER}, "checkpoint": TEXT}, "additionalProperties": False}
+
+
+REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，并可同步保存本批处理进度。source_ids是证据；progress.completed_ids是已完整处理的材料，两者不同。items可为空。返回已保存记录和可复用的图节点id。", {
     "items": {"type": "array", "items": {"type": "object", "properties": {
         "kind": {"type": "string", "enum": ["episode", "semantic", "association", "topic"]},
         "id": INTEGER, "source_ids": {"type": "array", "items": INTEGER},
@@ -187,15 +210,14 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆；�
         "target": {"type": "object", "properties": {"node_id": INTEGER, "label": TEXT, "description": TEXT, "aliases": TERMS}},
         "relation": TEXT, "statement": TEXT, "cues": TERMS, "reason": TEXT,
         "action": {"type": "string", "enum": ["revise", "withdraw"]},
-        "started_at": INTEGER, "ended_at": INTEGER}, "required": ["kind", "source_ids"]}}}, ("items",))
+        "started_at": INTEGER, "ended_at": INTEGER}, "required": ["kind", "source_ids"]}},
+    "progress": PROGRESS_SCHEMA}, ("items",))
 
 
-def _tool_set(*, learning=False, writing_only=False):
+def _tool_set(*, learning=False):
     # Imported only when running under AstrBot; the core remains importable offline.
     from astrbot.core.agent.tool import FunctionTool, ToolSet
     definitions = {**TOOL_SCHEMAS, **({"remember": REMEMBER_SCHEMA} if learning else {})}
-    if writing_only:
-        definitions = {name: schema for name, schema in definitions.items() if name in {"remember", "reflect"}}
     return ToolSet(tools=[FunctionTool(name=name, **definition) for name, definition in definitions.items()])
 
 
@@ -218,7 +240,7 @@ def _finish_reason(response: Any) -> str:
     return str(choice.get("finish_reason", "") if isinstance(choice, dict) else getattr(choice, "finish_reason", ""))
 
 
-def _memory_items(text: str) -> list:
+def _memory_output(text: str) -> dict:
     """Read a complete final JSON envelope, allowing a preceding brief summary."""
     text = text.strip()
     if text.startswith("```json"):
@@ -238,8 +260,60 @@ def _memory_items(text: str) -> list:
             continue
         items = payload.get("items") if isinstance(payload, dict) else payload
         if isinstance(items, list):
-            return items
+            return {"items": items, "progress": payload.get("progress", {}) if isinstance(payload, dict) else {}}
     raise ValueError("Memory output must end with a complete JSON items list")
+
+
+def _memory_items(text: str) -> list:
+    return _memory_output(text)["items"]
+
+
+def _learning_material(messages: list, working: dict, task: dict | None) -> dict:
+    value = {"messages": messages, "working": working}
+    if task is not None:
+        value["learning_task"] = {key: task[key] for key in (
+            "material_ids", "offered_ids", "context_ids", "completed_ids", "checkpoint", "memory_refs", "run_id") if key in task}
+    return value
+
+
+def _learning_resume_update(messages: list, working: dict, task: dict, previous: dict) -> dict:
+    update = {"resume": "接着上次未完成的工作继续。"}
+    seen = previous.get("seen_messages", {})
+    fresh = [row for row in messages if _model_view(row) != seen.get(row.get("id"), seen.get(str(row.get("id"))))]
+    if fresh:
+        update["messages"] = fresh
+    changes = {key: value for key, value in working.items() if previous.get("working", {}).get(key) != value}
+    if changes:
+        update["working_updates"] = changes
+    task_state = _learning_material([], {}, task).get("learning_task", {})
+    if previous.get("task_state") != task_state:
+        update["learning_task"] = task_state
+    return update
+
+
+def _learning_bytes(conversation: list, feedback: bool) -> int:
+    prompt = (REFLECTION_TASK if feedback else CONSOLIDATION_TASK) + CONSOLIDATION_PROMPT
+    request = {"messages": [{"role": "system", "content": prompt}, *conversation],
+               "tools": {**TOOL_SCHEMAS, "remember": REMEMBER_SCHEMA}}
+    return len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1024
+
+
+def estimate_learning_input(messages: list, working: dict, *, feedback: bool = False,
+                            task: dict | None = None) -> int:
+    """Budget the next input, preserving the observed cost of a resumable prefix."""
+    previous = (task or {}).get("continuation") or {}
+    conversation = list(previous.get("conversation", []))
+    if conversation:
+        seen = {int(key): value for key, value in previous.get("seen_messages", {}).items()}
+        update = _learning_resume_update(messages, working, task, previous)
+        conversation.append({"role": "user", "content": _json(update, seen_messages=seen)})
+    else:
+        conversation.append({"role": "user", "content": _json(_learning_material(messages, working, task))})
+    # The resource report and possible save hint are appended immediately before
+    # a call. Include their small transport overhead in scheduler admission.
+    input_bytes = _learning_bytes(conversation, feedback) + 2048
+    tokens, size = previous.get("previous_input_tokens", 0), previous.get("previous_input_bytes", 0)
+    return max(tokens, round(input_bytes * tokens / size)) if tokens and size else input_bytes
 
 
 class MemoryAgent:
@@ -259,11 +333,11 @@ class MemoryAgent:
             except Exception:
                 pass
 
-    async def _model_turn(self, messages, prompt, tools, turn):
+    async def _model_turn(self, messages, prompt, tools, turn, *, max_output_tokens=None):
         began = time.monotonic()
         await self._emit("model", f"第 {turn} 轮模型调用", "running", turn=turn)
         try:
-            response = await self._generate(messages, prompt, tools)
+            response = await self._generate(messages, prompt, tools, max_output_tokens=max_output_tokens)
         except asyncio.CancelledError:
             await self._emit("model", f"第 {turn} 轮模型调用已取消", "cancelled", turn=turn,
                              elapsed_ms=(time.monotonic() - began) * 1000)
@@ -281,7 +355,7 @@ class MemoryAgent:
                          tool_names=list(getattr(response, "tools_call_name", None) or []))
         return response
 
-    async def _generate(self, messages, system_prompt, tools=None):
+    async def _generate(self, messages, system_prompt, tools=None, *, max_output_tokens=None):
         # AstrBot's public text_chat drops generation kwargs on this provider.
         # Keep its client/parser while placing native options in the prepared payload.
         # Keep the configured client/model; isolate per-call thinking options from
@@ -292,7 +366,8 @@ class MemoryAgent:
             **config.get("custom_extra_body", {}), "thinking": {"type": self.thinking_mode}}}
         payload, _ = await provider._prepare_chat_payload(
             prompt=None, contexts=messages, system_prompt=system_prompt)
-        payload.update(thinking={"type": self.thinking_mode}, max_tokens=self.max_output_tokens)
+        payload.update(thinking={"type": self.thinking_mode},
+                       max_tokens=self.max_output_tokens if max_output_tokens is None else max_output_tokens)
         return await provider._query(payload, tools, request_max_retries=1)
 
     @staticmethod
@@ -454,13 +529,19 @@ class MemoryAgent:
         return result
 
     async def consolidate(self, messages: list, working: dict, *, feedback: bool = False,
-                          token_budget: int | None = None):
+                          token_budget: int | None = None, task: dict | None = None):
         started = time.monotonic()
         result = ConsolidationResult()
-        conversation = []
-        seen_messages = {}
-        sources: dict[int, str] = {}
-        pending_write_errors = {}
+        previous = (task or {}).get("continuation") or {}
+        conversation = copy.deepcopy(previous.get("conversation", []))
+        seen_messages = {int(key): value for key, value in previous.get("seen_messages", {}).items()}
+        sources: dict[int, str] = {int(key): value for key, value in previous.get("sources", {}).items()}
+        pending_write_errors = dict(previous.get("pending_write_errors", {}))
+        previous_input_tokens = int(previous.get("previous_input_tokens", 0))
+        previous_input_bytes = int(previous.get("previous_input_bytes", 0))
+        usage_this_turn = dict(previous.get("previous_call_usage", {}))
+        previous_call_seconds = float(previous.get("previous_call_seconds", 0))
+        learning_kind = "feedback" if feedback else "background"
         cancelled = False
 
         def read_sources(value):
@@ -492,15 +573,19 @@ class MemoryAgent:
         try:
             read_sources(messages)
             read_sources(working)
-            if not messages and not working:
+            if not messages and not working and not conversation:
                 raise ValueError("Consolidation requires an experience or a reflection to revisit")
             tools = _tool_set(learning=True)
             cutoff = int(time.time())
             async with asyncio.timeout(self.timeout_seconds):
                 purpose = REFLECTION_TASK if feedback else CONSOLIDATION_TASK
-                conversation.append({"role": "user", "content": _json({"messages": messages, "working": working}, seen_messages=seen_messages)})
-                usage_this_turn = {}
-                previous_call_seconds = 0.0
+                material = _learning_material(messages, working, task)
+                if not conversation:
+                    conversation.append({"role": "user", "content": _json(material, seen_messages=seen_messages)})
+                else:
+                    # Previous messages remain byte-for-byte intact for prefix reuse.
+                    update = _learning_resume_update(messages, working, task, previous)
+                    conversation.append({"role": "user", "content": _json(update, seen_messages=seen_messages)})
                 saving = False
                 for turn in itertools.count():
                     if self.max_turns is not None and turn >= self.max_turns:
@@ -516,32 +601,65 @@ class MemoryAgent:
                     # including room for the longer context after tool results.
                     begin_saving = not saving and (
                         (turn > 0 and self.max_turns is not None and turn >= self.max_turns - 3)
-                        or (turn > 0 and remaining is not None and remaining <= 4 * sum(usage_this_turn.values()))
-                        or (turn > 0 and seconds_left <= 4 * previous_call_seconds))
+                        or (usage_this_turn and remaining is not None and remaining <= 4 * sum(usage_this_turn.values()))
+                        or (previous_call_seconds > 0 and seconds_left <= 4 * previous_call_seconds))
                     saving = saving or begin_saving
-                    conversation.append({"role": "user", "content": _json({"resource_state": {
-                        "now_unix": int(time.time()), "timezone": "Asia/Shanghai",
+                    resource_state = {
+                        "now_unix": int(time.time()), "service_local_time": datetime.now().astimezone().isoformat(),
                         "remaining_total_tokens": remaining,
                         "previous_call_total_tokens": sum(usage_this_turn.values()),
                         "remaining_seconds": round(max(0, seconds_left), 1),
-                        "meaning": "Token额度按历次输入（含缓存）和输出累计，每次调用都会再次计算上下文。保存已查清的部分；剩余工作可连同线索写入reflect。"}})})
+                        "estimated_input_tokens": 0, "remaining_after_current_input_tokens": None,
+                        "meaning": "总余额是调用前数值，本次输入（含缓存）也要从中扣除。remaining_after_current_input_tokens才是扣除本次输入估算后可用于本次输出和后续调用的余额；下一次调用还要再次支付整个上下文。若不够再携带一次上下文，可在本次最后JSON的items和progress中直接保存认识与进度，无需再等待remember回执。未完思路写checkpoint，独立待查关注可用reflect。"}
+                    resource_message = {"role": "user", "content": _json({"resource_state": resource_state})}
+                    conversation.append(resource_message)
                     if begin_saving:
-                        conversation.append({"role": "user", "content": "本次进入保存阶段，剩余调用用于保存已经形成的理解。用remember保存修正，收到实际记忆编号后可继续reflect更新关注：写清已经查到的内容、有关记忆和原文地址、还差什么与下一步线索。已解决的更新为resolved，未查清的留待继续；由你完成这些写入后结束。本阶段保留这两种工具，下一次可从保存的关注继续检索。"})
+                        conversation.append({"role": "user", "content": "本次剩余资源适合收拢已经形成的理解。用remember保存修正和progress：已处理材料、目前理解、有关记忆与原文地址、还差什么及下一步线索。独立关注可用reflect更新，已解决的设为resolved。所有工具仍可用，由你判断完成保存所需的读取和写入，然后结束本轮，下次从进度继续。"})
+                    input_bytes = _learning_bytes(conversation, feedback)
+                    estimated_input = (max(previous_input_tokens, round(input_bytes * previous_input_tokens / previous_input_bytes))
+                                       if previous_input_tokens and previous_input_bytes else input_bytes)
+                    resource_state["estimated_input_tokens"] = estimated_input
+                    resource_state["remaining_after_current_input_tokens"] = max(0, remaining - estimated_input) if remaining is not None else None
+                    resource_message["content"] = _json({"resource_state": resource_state})
+                    input_bytes = _learning_bytes(conversation, feedback)
+                    if remaining is not None and remaining <= estimated_input:
+                        result.status, result.detail = "partial", "Remaining rolling budget cannot cover the next learning input"
+                        break
+                    output_limit = (min(self.max_output_tokens, remaining - estimated_input)
+                                    if remaining is not None else self.max_output_tokens)
                     call_started = time.monotonic()
-                    response = await self._model_turn(conversation, purpose + CONSOLIDATION_PROMPT,
-                                                     _tool_set(learning=True, writing_only=True) if saving else tools, turn + 1)
+                    result.model_attempts += 1
+                    try:
+                        response = await self._model_turn(conversation, purpose + CONSOLIDATION_PROMPT,
+                                                         tools, turn + 1, max_output_tokens=output_limit)
+                    except (Exception, asyncio.CancelledError):
+                        result.unknown_usage_calls += 1
+                        raise
                     previous_call_seconds = time.monotonic() - call_started
                     usage_this_turn = {}
                     _add_usage(usage_this_turn, response)
                     _add_usage(result.usage, response)
+                    if "output" not in usage_this_turn or not ({"input_other", "input_cached"} & usage_this_turn.keys()):
+                        result.unknown_usage_calls += 1
+                    observed_input = usage_this_turn.get("input_other", 0) + usage_this_turn.get("input_cached", 0)
+                    if observed_input:
+                        previous_input_tokens, previous_input_bytes = observed_input, input_bytes
                     text = str(getattr(response, "completion_text", "") or "")
                     result.response_text = text
                     if _finish_reason(response) == "length":
-                        raise ValueError("Consolidation output reached its token limit")
+                        conversation.append({"role": "assistant", "content": text,
+                                             "reasoning_content": getattr(response, "reasoning_content", None) or ""})
+                        result.status, result.detail = "partial", "Consolidation output reached its token limit"
+                        break
                     names = list(getattr(response, "tools_call_name", None) or [])
                     if not names:
-                        conversation.append({"role": "assistant", "content": text})
-                        result.items = clean_items(_memory_items(text))
+                        conversation.append({"role": "assistant", "content": text,
+                                             "reasoning_content": getattr(response, "reasoning_content", None) or ""})
+                        envelope = _memory_output(text)
+                        result.items = clean_items(envelope["items"])
+                        if not isinstance(envelope["progress"], dict):
+                            raise ValueError("Learning progress must be an object")
+                        result.progress = envelope["progress"]
                         if pending_write_errors and ("reflect" in pending_write_errors or not result.items):
                             result.status, result.detail = "partial", "; ".join(pending_write_errors.values())
                         else:
@@ -554,6 +672,10 @@ class MemoryAgent:
                     calls = [{"id": call_id, "type": "function", "function": {
                         "name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
                         for name, args, call_id in zip(names, arguments, ids)]
+                    extras = getattr(response, "tools_call_extra_content", None) or {}
+                    for call in calls:
+                        if call["id"] in extras:
+                            call["extra_content"] = extras[call["id"]]
                     conversation.append({"role": "assistant", "content": text or None, "tool_calls": calls,
                         "reasoning_content": getattr(response, "reasoning_content", None) or ""})
                     # Learning may read its own writes; execute in the model's order.
@@ -569,12 +691,17 @@ class MemoryAgent:
                         try:
                             if name == "remember":
                                 items = clean_items(args.get("items") if isinstance(args, dict) else None)
+                                progress = args.get("progress", {})
+                                if not isinstance(progress, dict):
+                                    raise ValueError("Learning progress must be an object")
                                 value = await asyncio.to_thread(self.store.save_memories, items,
                                                                list(sources.values()), mark_processed=False,
-                                                               run_id=getattr(self.trace, "id", None))
+                                                               run_id=getattr(self.trace, "id", None),
+                                                               **({"learning_kind": learning_kind, "progress": progress}
+                                                                  if task is not None else {}))
                                 latest = {(row["kind"], row["id"]): row for row in result.written + value}
                                 result.written = list(latest.values())
-                                if value:
+                                if value or progress:
                                     pending_write_errors.pop("remember", None)
                             else:
                                 value = await self._execute(name, args, cutoff)
@@ -598,8 +725,12 @@ class MemoryAgent:
                         record["result"] = value
                         # Reopening a conversation should show it together, even
                         # when individual lines appeared in earlier search hits.
+                        # A save acknowledges normalized content and real addresses;
+                        # its top-level sources were already read to perform the save.
+                        receipt = ([{key: part for key, part in row.items() if key != "sources"} for row in value]
+                                   if name == "remember" and isinstance(value, list) else value)
                         conversation.append({"role": "tool", "tool_call_id": call_id,
-                            "content": _json(value, seen_messages=None if name == "context" else seen_messages)})
+                            "content": _json(receipt, seen_messages=None if name == "context" else seen_messages)})
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -609,6 +740,28 @@ class MemoryAgent:
             result.detail = f"{type(exc).__name__}: {exc}"
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
+            pending_calls = []
+            for message in conversation:
+                if message.get("role") == "assistant":
+                    pending_calls = [call["id"] for call in message.get("tool_calls", [])]
+                elif message.get("role") == "tool" and message.get("tool_call_id") in pending_calls:
+                    pending_calls.remove(message["tool_call_id"])
+            for call_id in pending_calls:
+                conversation.append({"role": "tool", "tool_call_id": call_id, "content": _json({
+                    "status": "interrupted", "detail": "调用中断，结果尚未收到；恢复后结合已保存的进度与实际记忆检查再继续。"})})
+            input_bytes = _learning_bytes(conversation, feedback)
+            result.continuation = {
+                "conversation": conversation, "sources": sources, "seen_messages": seen_messages,
+                "pending_write_errors": pending_write_errors, "previous_input_tokens": previous_input_tokens,
+                "previous_input_bytes": previous_input_bytes, "previous_call_usage": usage_this_turn,
+                "previous_call_seconds": previous_call_seconds, "working": working,
+                "task_state": _learning_material([], {}, task).get("learning_task", {}),
+                "estimated_next_input_tokens": (max(previous_input_tokens, round(input_bytes * previous_input_tokens / previous_input_bytes))
+                    if previous_input_tokens and previous_input_bytes else input_bytes)}
+            if task is not None:
+                await asyncio.to_thread(self.store.update_learning_task, learning_kind, {
+                    "continuation": result.continuation, "run_id": getattr(self.trace, "id", None),
+                    "updated_at": time.time()})
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
                                for message in conversation]
             await self._emit("output", "本次学习产出", "cancelled" if cancelled else result.status,

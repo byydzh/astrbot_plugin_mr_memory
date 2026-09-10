@@ -64,6 +64,16 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("合成别名", (await console.participants("synthetic"))["participants"][0]["aliases"])
                 self.assertEqual((await console.run("synthetic", str(run_id)))["background"], "合成背景")
                 self.assertEqual((await console.scope_overview("synthetic"))["counts"]["pending"], 102)
+                opened.start_learning_task("background", [1, 2])
+                opened.save_learning_progress("background", {"completed_ids": [1], "checkpoint": "下一次继续理解第二条"}, run_id)
+                opened.update_learning_task("background", {"conversation": [{"role": "user", "content": "完整模型输入"}]})
+                plugin.learning_status = {scope: {"background": {"status": "deferred", "reason": "等待工作时段", "next_start": 1800000000}}}
+                learning = await console.runs("synthetic")
+                self.assertEqual(learning["learning"][0], {"kind": "background", "material_count": 2,
+                    "completed_count": 1, "checkpoint": "下一次继续理解第二条", "memory_refs": [], "run_id": run_id})
+                self.assertEqual(learning["learning_status"]["background"]["status"], "deferred")
+                self.assertEqual(learning["learning_status"]["background"]["next_start_local"], console.local_date(1800000000))
+                self.assertTrue(learning["learning_window"]["local_now"])
                 await console.distill("synthetic")
                 plugin.consolidate.assert_awaited_once_with(opened, force=True)
                 with self.assertRaises(FileNotFoundError):

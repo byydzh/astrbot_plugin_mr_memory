@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .schedule import clock_minutes
+
 
 _SCHEMA = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8-sig"))
 DEFAULTS = {name: specification["default"] for name, specification in _SCHEMA.items()}
@@ -42,6 +44,9 @@ def normalize_settings(raw: Mapping[str, Any]) -> dict[str, Any]:
         result["maintenance_interval_seconds"] = int(float(raw["maintenance_interval_minutes"]) * 60)
     if "feedback_window_hours" in raw:
         result["feedback_window_seconds"] = int(float(raw["feedback_window_hours"]) * 3600)
+    for key in ("learning_window_start", "learning_window_end"):
+        minutes = clock_minutes(result[key])
+        result[key] = f"{minutes // 60:02d}:{minutes % 60:02d}"
     if str(result["embedding_query_prompt_name"]).casefold() == "auto":
         result["embedding_query_prompt_name"] = (
             "web_search_query" if "harrier" in str(result["embedding_model_name"]).casefold() else ""

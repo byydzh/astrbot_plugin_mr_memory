@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MR · 群聊记忆</title>
-  <link rel="stylesheet" href="./style.css?v=20260908-trace3" />
+  <link rel="stylesheet" href="./style.css?v=20260911-learning" />
   <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20260908-trace3" defer></script>
+  <script src="./script.js?v=20260911-learning" defer></script>
 </head>
 <body>
 <main>
@@ -17,6 +17,7 @@
 
   <section data-view="runtime">
     <div id="policies" class="policies"></div>
+    <section id="learning-plan" class="learning-plan" aria-label="后台工作安排"></section>
     <div id="metrics" class="metrics"></div>
     <section class="panel"><div class="panel-heading"><div><h2>最近调用</h2><p>点开一次活跃，沿着模型输出、搜索、写入和背景交接逐步阅读。</p></div><small id="runs-live-note">最近 30 次 · 时间为北京时间</small></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>任务 / 问题</th><th>状态 / 当前步骤</th><th>耗时</th><th>Token</th><th></th></tr></thead><tbody id="runs"></tbody></table></div></section>
     <p class="footnote">参数调整请使用 AstrBot 插件的配置面板。这里展示实际记录，调用完成或注入背景不代表回答质量合格。</p>

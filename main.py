@@ -19,10 +19,11 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .mr_memory.agent import MemoryAgent
+from .mr_memory.agent import MemoryAgent, estimate_learning_input
 from .mr_memory.embedding import Embedder
 from .mr_memory.store import Store
 from .mr_memory.settings import normalize_settings
+from .mr_memory.schedule import work_window
 from .mr_memory.console import register_console
 from .mr_memory.trace import RunTrace
 
@@ -136,6 +137,7 @@ class MrMemoryPlugin(Star):
         self.requests: set[asyncio.Task] = set()
         self.observed_events = weakref.WeakSet()
         self.last_result: dict[str, dict] = {}
+        self.learning_status: dict[str, dict] = {}
         self.stopping = False
         self.embedder = Embedder(
             str(config.get("embedding_model_name", "microsoft/harrier-oss-v1-270m")),
@@ -156,8 +158,8 @@ class MrMemoryPlugin(Star):
     async def initialize(self) -> None:
         if self.config["embedding_enabled"]:
             await self.embedder.warmup()
-        # A persisted concern must survive a plugin reload even while its group
-        # is quiet. Discovery reads only this plugin's scope metadata and tasks.
+        # Deferred messages and unfinished work must wake even if a group stays
+        # quiet after reload. Opening a scope does not start a model call.
         def reflection_scopes():
             scopes = []
             allowed = self.config["allowed_umos"]
@@ -167,10 +169,7 @@ class MrMemoryPlugin(Star):
                         row = db.execute("SELECT umo FROM scope_meta WHERE singleton=1").fetchone()
                         if not row or (allowed and row[0] not in allowed):
                             continue
-                        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mr_reflections'").fetchone():
-                            continue
-                        if db.execute("SELECT 1 FROM mr_reflections WHERE umo=? AND status IN('pending','waiting') LIMIT 1", row).fetchone():
-                            scopes.append((path, row[0]))
+                        scopes.append((path, row[0]))
                 except sqlite3.Error:
                     logger.exception("MR: could not reopen reflection scope %s", path.name)
             return scopes
@@ -235,9 +234,7 @@ class MrMemoryPlugin(Star):
 
     async def update_state(self, store: Store, changes: dict) -> None:
         async with self.state_locks[store.umo]:
-            state = await asyncio.to_thread(store.load_working_state)
-            state.update(changes)
-            await asyncio.to_thread(store.save_working_state, state)
+            await asyncio.to_thread(store.update_working_state, changes)
 
     def observe_sends(self, event: AstrMessageEvent) -> None:
         """Record successful sends on this event, including streamed segments."""
@@ -401,9 +398,9 @@ class MrMemoryPlugin(Star):
                     async with self.state_locks[store.umo]:
                         state = await asyncio.to_thread(store.load_working_state)
                         if current["sent_at"] >= state.get("request_at", 0):
-                            state.update(background=result.background, request_at=current["sent_at"],
-                                         question=current["question"], status=result.status)
-                            await asyncio.to_thread(store.save_working_state, state)
+                            await asyncio.to_thread(store.update_working_state, {
+                                "background": result.background, "request_at": current["sent_at"],
+                                "question": current["question"], "status": result.status})
                             await trace.emit("write", "已保存当次背景（未修改长期记忆）", target="working_state")
                 except Exception as exc:
                     await trace.emit("write", "当次背景保存失败，已交付的背景仍有效", status="error",
@@ -485,63 +482,133 @@ class MrMemoryPlugin(Star):
         if lock.locked():
             return {"status": "busy", "reason": "此群正在整理记忆"}
         async with lock:
+            def report(status, reason, **detail):
+                value = {"status": status, "reason": reason, **detail}
+                self.learning_status.setdefault(store.umo, {})[kind] = value
+                return value
+
+            window = work_window(self.config)
+            scheduled = []
+            if not force and not window["open"]:
+                if feedback:
+                    scheduled = await asyncio.to_thread(store.reflections.due, scheduled_only=True)
+                if not scheduled:
+                    return report("deferred", "等待服务当地工作时段", **window)
             state = await asyncio.to_thread(store.load_working_state)
             used = await asyncio.to_thread(store.usage_total, kind)
             budget = int(self.config["feedback_daily_token_budget" if feedback else "private_daily_token_budget"])
             if budget > 0 and used >= budget:
-                return {"status": "budget_exhausted", "reason": "滚动24小时额度已用完", "used_tokens": used}
+                return report("budget_exhausted", "滚动24小时额度已用完", used_tokens=used)
+            remaining = budget - used if budget > 0 else None
             maximum = int(self.config["distillation_max_messages"])
+            task = await asyncio.to_thread(store.learning_task, kind)
+            resuming = task is not None
             reflection_tasks = []
-            if feedback:
-                reflection_tasks = await asyncio.to_thread(store.reflections.due)
+            if task:
+                messages = await asyncio.to_thread(store.learning_messages, task)
+                done = set(task["completed_ids"])
+                messages = [row for row in messages if row.get("context_only") or row["id"] not in done]
+                working = dict(task["working"])
+                # A model appointment can bring an unfinished feedback task
+                # forward. It is not an invitation to process fresh backlog.
+                if scheduled:
+                    working["scheduled_reflections"] = scheduled
+                    working["focus"] = "工作时段外先处理这些模型预约到期的关注；其余材料可继续留待工作时段。"
+                refs = working.get("reflections", [])
+                refreshed = [await asyncio.to_thread(store.reflections.get, row["id"]) for row in refs]
+                reflection_tasks = [row for row in refreshed if row and row["status"] != "resolved"]
+                working["reflections"] = reflection_tasks
+                # Keep the native prefix while it fits. If it cannot continue
+                # within available resources, a model-written checkpoint and
+                # real saved memories let it resume without the whole trace.
+                if (task.get("checkpoint") and task.get("continuation") and remaining is not None
+                        and estimate_learning_input(messages, working, feedback=feedback, task=task) * 2 > remaining):
+                    task = {**task, "continuation": {}}
+                if not task.get("continuation"):
+                    memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
+                                for ref in task["memory_refs"]]
+                    working["saved_memories"] = [row for row in memories if row]
+            elif feedback:
+                reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due)
                 messages = await asyncio.to_thread(store.feedback_messages,
-                    int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum)
+                    int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum) if not scheduled else []
                 if messages and time.time() - messages[-1]["sent_at"] < self.config["feedback_debounce_seconds"]:
                     if not reflection_tasks:
-                        return {"status": "waiting", "reason": "等待当前互动结束"}
+                        return report("waiting", "等待当前互动结束")
                     messages = []
             else:
                 pending = await asyncio.to_thread(store.pending_status)
                 if not force and pending["count"] < self.config["auto_distillation_min_pending"]:
                     if pending["oldest_at"] is None or time.time() - pending["oldest_at"] < self.config["maintenance_interval_seconds"]:
-                        return {"status": "waiting", "reason": "等待积累消息或到达最长等待时间"}
+                        return report("waiting", "等待积累消息或到达最长等待时间")
                 # Live group experience gets the next batch; idle capacity catches up older history.
                 messages = await asyncio.to_thread(store.pending_messages, maximum, newest=True)
-            if not messages and not reflection_tasks:
-                return {"status": "idle", "reason": "没有待处理互动"}
-            if feedback:
-                interactions = await asyncio.to_thread(store.reflections.feedback_context, messages)
-                waiting = await asyncio.to_thread(store.reflections.waiting) if messages else []
-                reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
-                working = {"interactions": interactions, "reflections": reflection_tasks}
-            else:
-                working = {}
-                reflection_tasks = await asyncio.to_thread(store.reflections.waiting)
-                if reflection_tasks:
-                    working["reflections"] = reflection_tasks
-            reserved = len(json.dumps({"messages": messages, "working": working}, ensure_ascii=False).encode())
-            reserved += int(self.config["distillation_max_output_tokens"]) + 1000
+            if not task:
+                if not messages and not reflection_tasks:
+                    return report("idle", "没有待处理互动")
+                if feedback:
+                    waiting = await asyncio.to_thread(store.reflections.waiting) if messages else []
+                    reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
+                    working = {"interactions": await asyncio.to_thread(store.reflections.feedback_context, messages),
+                               "reflections": reflection_tasks}
+                else:
+                    reflection_tasks = await asyncio.to_thread(store.reflections.waiting)
+                    working = {"reflections": reflection_tasks} if reflection_tasks else {}
+                previous_learning = await asyncio.to_thread(store.unfinished_learning, kind)
+                if previous_learning:
+                    working["previous_learning"] = previous_learning
+
+            # The configured message count is a maximum. Fit whole messages to
+            # the available input/continuation budget; omitted messages remain
+            # queued and can also be opened by the model's context tool.
+            estimate = estimate_learning_input(messages, working, feedback=feedback, task=task)
+            while remaining is not None and estimate * 2 > remaining and not (task or {}).get("continuation"):
+                material = [row for row in messages if not row.get("context_only")]
+                if len(material) <= 1:
+                    break
+                context = [row for row in messages if row.get("context_only")]
+                count = max(1, len(material) // 2)
+                messages = context + (material[:count] if feedback or task else material[-count:])
+                if feedback:
+                    working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
+                estimate = estimate_learning_input(messages, working, feedback=feedback, task=task)
+            required = estimate + 1 if (task or {}).get("continuation") else estimate * 2
+            if remaining is not None and required > remaining:
+                return report("budget_wait", "剩余额度不足以读取并保存当前材料，等待滚动额度释放",
+                              used_tokens=used, required_tokens=required)
+
+            if task is None:
+                task = await asyncio.to_thread(store.start_learning_task, kind,
+                    [row["id"] for row in messages if not row.get("context_only")],
+                    [row["id"] for row in messages if row.get("context_only")], working)
+            task = {**task, "offered_ids": [row["id"] for row in messages if not row.get("context_only")]}
+            agent = self.agent(store, background=True, feedback=feedback)
+            reserved = remaining if remaining is not None else estimate + int(self.config["distillation_max_output_tokens"])
             started_at = time.time()
             usage_id = await asyncio.to_thread(store.reserve_usage, kind, reserved, started_at)
             payload = {"status": "interrupted", "messages": messages, "working": working,
-                       "usage": {}, "usage_estimated": True, "reserved_tokens": reserved}
+                       "usage": {}, "usage_estimated": True, "reserved_tokens": reserved,
+                       "material_ids": task["material_ids"], "context_ids": task["context_ids"],
+                       "previous_run_id": task.get("run_id")}
             trace = RunTrace(store, kind, started_at, {"message_count": len(messages), "status": "running"})
             await trace.start()
             try:
-                await trace.emit("input", "已选取原回答与后续交流" if feedback else "已选取待整理群聊",
+                report("running", "接着上次已保存的进度继续" if resuming else "正在学习本批交流")
+                await trace.emit("input", "继续上次未完成的学习" if resuming else "已选取原回答与后续交流" if feedback else "已选取待整理群聊",
                                  messages=messages, message_count=len(messages), working=working,
-                                 budget_kind=kind, rolling_budget=budget, used_tokens=used)
-                agent = self.agent(store, background=True, feedback=feedback)
+                                 budget_kind=kind, rolling_budget=budget, used_tokens=used,
+                                 previous_run_id=task.get("run_id"), completed_ids=task["completed_ids"],
+                                 checkpoint=task["checkpoint"], memory_refs=task["memory_refs"])
                 agent.trace = trace
                 result = await agent.consolidate(
-                    messages, working, feedback=feedback, token_budget=budget - used if budget > 0 else None)
-                payload.update(asdict(result), usage_estimated=not bool(result.usage))
-                if result.usage:
+                    messages, working, feedback=feedback, token_budget=remaining, task=task)
+                payload.update({key: value for key, value in asdict(result).items() if key != "continuation"},
+                               usage_estimated=bool(result.unknown_usage_calls) or not bool(result.usage))
+                if result.usage and not result.unknown_usage_calls:
                     await asyncio.to_thread(store.settle_usage, usage_id, sum(result.usage.values()))
-                if result.status != "completed":
-                    if result.written:
-                        await self.index_pending(store, trace=trace)
-                    return {"status": result.status, "reason": result.detail, "written_count": len(result.written)}
+                elif result.model_attempts == 0:
+                    await asyncio.to_thread(store.settle_usage, usage_id, 0)
+                    payload["usage_estimated"] = False
                 source_keys = [m["source_key"] for m in messages]
                 learned_sources = list(dict.fromkeys(source_keys +
                     [key for item in result.items for key in item.get("source_keys", [])]))
@@ -550,7 +617,7 @@ class MrMemoryPlugin(Star):
                                      target="long_term_memory", items=result.items, operation_id="final_memories")
                 try:
                     saved = await asyncio.to_thread(store.save_memories, result.items, learned_sources, mark_processed=False,
-                                                    run_id=trace.id)
+                                                    run_id=trace.id, learning_kind=kind, progress=result.progress)
                 except BaseException as exc:
                     if result.items:
                         await trace.emit("write", "末次长期记忆保存未完成", target="long_term_memory", operation_id="final_memories",
@@ -562,31 +629,40 @@ class MrMemoryPlugin(Star):
                 written = result.written + saved
                 written = list({(row["kind"], row["id"]): row for row in written}.values())
                 payload["written"] = written
-                # Reading older sources to revise a memory does not process unrelated backlog.
-                if not feedback:
-                    await asyncio.to_thread(store.save_memories, [], source_keys, mark_processed=True)
-                    await trace.emit("write", "本批消息已标记为整理完成", target="processing_progress",
-                                     source_ids=[m["id"] for m in messages], message_count=len(messages))
+                progress = await asyncio.to_thread(store.learning_task, kind)
+                payload.update({key: progress[key] for key in ("completed_ids", "checkpoint", "memory_refs")})
+                unfinished = set(progress["material_ids"]) - set(progress["completed_ids"])
+                completed = result.status == "completed" and not unfinished
+                await trace.emit("write", "已保存本批学习进度", target="processing_progress",
+                                 completed_ids=progress["completed_ids"], remaining_message_count=len(unfinished),
+                                 checkpoint=progress["checkpoint"], memory_refs=progress["memory_refs"])
                 if feedback:
                     # LLM interpretations remain available to the next foreground turn,
                     # including corrections, while original dialogue remains in the store.
                     learned = [{key: value for key, value in row.items() if key in {
                         "kind", "id", "title", "summary", "content", "subject", "aspect",
                         "source", "target", "relation", "statement", "source_ids"}} for row in written]
-                    last_message = max((m["id"] for m in messages), default=int(state.get("feedback_after", 0)))
-                    await self.update_state(store, {"feedback_after": last_message,
-                        "feedback_at": int(time.time()), "learned_feedback": learned})
-                    await trace.emit("write", "已推进反馈学习进度", target="feedback_progress",
-                                     last_message_id=last_message, reflection_ids=[item["id"] for item in reflection_tasks])
-                else:
+                    if learned:
+                        await self.update_state(store, {"feedback_at": int(time.time()), "learned_feedback": learned})
+                elif completed:
                     await self.update_state(store, {"consolidated_at": int(time.time())})
-                if reflection_tasks:
-                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in reflection_tasks],
+                if completed and (reflection_tasks or scheduled):
+                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in reflection_tasks + scheduled],
                         time.time() + float(self.config["maintenance_interval_seconds"]), started_at)
+                elif result.status == "completed" and scheduled:
+                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in scheduled],
+                        time.time() + float(self.config["maintenance_interval_seconds"]), started_at)
+                if completed:
+                    await asyncio.to_thread(store.finish_learning_task, kind)
+                else:
+                    await asyncio.to_thread(store.update_learning_task, kind,
+                        {"continuation": result.continuation, "run_id": trace.id})
+                    payload["status"] = "partial" if result.status == "completed" else result.status
+                    payload["detail"] = result.detail or "本批尚有材料未完成，已保存进度等待续接"
                 payload["written_count"] = len(written)
                 await self.index_pending(store, trace=trace)
-                logger.info("MR: scope=%s %s learned from %s messages, %s updates", store.umo, kind, len(messages), len(written))
-                return {"status": "completed", "written_count": len(written), "message_count": len(messages)}
+                return report("completed" if completed else payload["status"], "本批已完成" if completed else payload["detail"],
+                              written_count=len(written), message_count=len(messages), remaining_message_count=len(unfinished))
             except asyncio.CancelledError:
                 payload.update(status="cancelled", detail="Plugin unloaded during this call; token reservation retained")
                 raise

@@ -5,6 +5,19 @@ from mr_memory.settings import normalize_settings
 
 
 class SettingsTests(unittest.TestCase):
+    def test_learning_window_defaults_and_user_choice(self):
+        defaults = normalize_settings({})
+        self.assertTrue(defaults["learning_window_enabled"])
+        self.assertEqual(defaults["learning_window_start"], "00:00")
+        self.assertEqual(defaults["learning_window_end"], "06:00")
+        chosen = normalize_settings({"learning_window_enabled": False,
+                                     "learning_window_start": "22:30", "learning_window_end": "5:30"})
+        self.assertFalse(chosen["learning_window_enabled"])
+        self.assertEqual(chosen["learning_window_start"], "22:30")
+        self.assertEqual(chosen["learning_window_end"], "05:30")
+        with self.assertRaisesRegex(ValueError, "后台工作时段"):
+            normalize_settings({"learning_window_start": "25:00"})
+
     def test_original_values_win_and_keep_original_time_units(self):
         original = {
             "capture_enabled": True,

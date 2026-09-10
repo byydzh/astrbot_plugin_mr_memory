@@ -87,6 +87,33 @@ class ReflectionTests(unittest.TestCase):
         self.assertIsNone(cleared["next_review_at"])
         self.assertEqual(self.reflections.due(now=400), [])
 
+    def test_only_model_appointments_bypass_preferred_window_and_automatic_retry_does_not(self):
+        with patch("mr_memory.reflection.time.time", return_value=100):
+            ordinary = self.reflections.save({"content": "下次整理时继续理解"})
+            appointed = self.reflections.save({"content": "约定时间回来核实", "next_review_at": 200})
+        self.assertEqual(self.reflections.due(now=199, scheduled_only=True), [])
+        self.assertEqual([entry["id"] for entry in self.reflections.due(now=200, scheduled_only=True)], [appointed["id"]])
+        with patch("mr_memory.reflection.time.time", return_value=210):
+            self.reflections.reviewed([ordinary["id"], appointed["id"]], 300, 200)
+        self.assertEqual(self.reflections.due(now=300, scheduled_only=True), [])
+        self.assertEqual(len(self.reflections.due(now=300)), 2)
+        with patch("mr_memory.reflection.time.time", return_value=310):
+            # Choosing the same date as a system retry is still an explicit
+            # model appointment and must survive this call's completion.
+            self.reflections.save({"id": appointed["id"], "next_review_at": 300})
+        with patch("mr_memory.reflection.time.time", return_value=320):
+            self.reflections.reviewed([appointed["id"]], 500, 305)
+        self.assertTrue(self.reflections.get(appointed["id"])["next_review_explicit"])
+        self.assertEqual(self.reflections.get(appointed["id"])["next_review_at"], 300)
+
+    def test_legacy_automatic_dates_are_not_inferred_to_be_model_appointments(self):
+        self.store.db.execute("ALTER TABLE mr_reflections DROP COLUMN next_review_explicit")
+        self.store.db.execute("""INSERT INTO mr_reflections(umo,content,status,next_review_at,created_at,updated_at,schedule_updated_at)
+                              VALUES(?,?,'pending',100,50,50,50)""", (self.scope, "旧版本默认重排"))
+        migrated = Reflection(self.store)
+        self.assertEqual(len(migrated.due(now=200)), 1)
+        self.assertEqual(migrated.due(now=200, scheduled_only=True), [])
+
     def test_feedback_opens_original_request_and_actual_stages_not_latest_question(self):
         question = self.message(1, "这句话是谁说的？")
         run = self.store.record_run("foreground", 10, {"request_id": "1", "question": question["plain_text"],
@@ -120,6 +147,26 @@ class ReflectionTests(unittest.TestCase):
         self.assertEqual(self.reflections.interaction(run_id=legacy, detailed=True)["runs"][0]["tool_calls"], [{"name": "memory"}])
         with self.assertRaisesRegex(ValueError, "different request"):
             self.reflections.interaction(request_id="5", run_id=run)
+
+    def test_learning_run_can_be_reopened_without_a_foreground_request(self):
+        source = self.message(1, "待分析的交流")
+        run = self.store.record_run("background", 10, {"status": "partial", "detail": "等待额度恢复",
+            "written": [{"kind": "semantic", "id": 7, "summary": "已经形成的理解"}],
+            "response_text": "下一次继续检查后半段", "messages": [{"role": "user", "content": "模型输入"}]})
+        self.store.append_run_step(run, 1, 11, "input", "completed", "本批材料", {"messages": [source]})
+        self.store.append_run_step(run, 2, 12, "tool", "completed", "读取上下文", {"name": "context"})
+        self.store.append_run_step(run, 3, 13, "write", "completed", "保存进度",
+                                  {"checkpoint": "前半段已理解，继续核查后半段", "completed_ids": [source["id"]]})
+        compact = self.reflections.interaction(run_id=run)
+        self.assertEqual(compact["status"], "recorded")
+        saved = compact["runs"][0]
+        self.assertEqual(saved["material_ids"], [source["id"]])
+        self.assertEqual(saved["memory_refs"], [{"kind": "semantic", "id": 7}])
+        self.assertEqual(saved["checkpoint"], "前半段已理解，继续核查后半段")
+        self.assertNotIn("steps", saved)
+        detail = self.reflections.interaction(run_id=run, detailed=True)["runs"][0]
+        self.assertEqual(detail["steps"][1]["data"]["name"], "context")
+        self.assertNotIn("messages", detail)
 
 
 if __name__ == "__main__":

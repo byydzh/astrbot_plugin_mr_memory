@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS mr_reflections (
  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','waiting','resolved')),
  source_ids_json TEXT NOT NULL DEFAULT '[]', memory_refs_json TEXT NOT NULL DEFAULT '[]',
  request_id TEXT, next_review_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
- last_reviewed_at REAL, schedule_updated_at REAL NOT NULL);
+ last_reviewed_at REAL, schedule_updated_at REAL NOT NULL,
+ next_review_explicit INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_mr_reflections_due
  ON mr_reflections(umo,status,next_review_at,priority);
 CREATE INDEX IF NOT EXISTS idx_mr_runs_reflection_request
@@ -49,11 +50,17 @@ def _limit(value):
 class Reflection:
     def __init__(self, store):
         self.store = store
+        with self.store._lock, self.store.db:
+            if "next_review_explicit" not in {row[1] for row in self.store.db.execute("PRAGMA table_info(mr_reflections)")}:
+                # Old dates include automatic retry times. They cannot be
+                # treated as explicit, time-sensitive model appointments.
+                self.store.db.execute("ALTER TABLE mr_reflections ADD COLUMN next_review_explicit INTEGER NOT NULL DEFAULT 0")
 
     def _record(self, row):
         item = dict(row)
         item.pop("umo", None)
         item.pop("schedule_updated_at", None)
+        item["next_review_explicit"] = bool(item["next_review_explicit"])
         item["source_ids"] = json.loads(item.pop("source_ids_json"))
         item["memory_refs"] = json.loads(item.pop("memory_refs_json"))
         ids = item["source_ids"]
@@ -94,6 +101,10 @@ class Reflection:
             raise ValueError("Reflection content is required")
         if value["status"] not in {"pending", "waiting", "resolved"}:
             raise ValueError("Reflection status must be pending, waiting or resolved")
+        explicit = (bool(old and old["next_review_explicit"]) if "next_review_at" not in item
+                    else value["next_review_at"] is not None)
+        if value["next_review_at"] is None or value["status"] == "resolved":
+            explicit = False
         sources = list(dict.fromkeys(int(source) for source in value["source_ids"]))
         refs = []
         for ref in value["memory_refs"]:
@@ -112,28 +123,30 @@ class Reflection:
             raise ValueError("Reflection refers to an explicitly forgotten source or request")
         values = (content, float(value["priority"]), value["status"], _encode(sources), _encode(refs),
                   str(value["request_id"]) if value["request_id"] is not None else None,
-                  float(value["next_review_at"]) if value["next_review_at"] is not None else None, now)
+                  float(value["next_review_at"]) if value["next_review_at"] is not None else None, now, int(explicit))
         with self.store.db:
             if old:
-                schedule_changed = value["status"] != old["status"] or value["next_review_at"] != old["next_review_at"]
+                schedule_changed = (value["status"] != old["status"] or "next_review_at" in item
+                                    or explicit != old["next_review_explicit"])
                 self.store.db.execute("""UPDATE mr_reflections SET content=?,priority=?,status=?,
-                    source_ids_json=?,memory_refs_json=?,request_id=?,next_review_at=?,updated_at=?,
+                    source_ids_json=?,memory_refs_json=?,request_id=?,next_review_at=?,updated_at=?,next_review_explicit=?,
                     schedule_updated_at=CASE WHEN ? THEN ? ELSE schedule_updated_at END
                     WHERE umo=? AND id=?""", (*values, schedule_changed, now, self.store.umo, int(id)))
             else:
                 id = self.store.db.execute("""INSERT INTO mr_reflections(content,priority,status,
-                    source_ids_json,memory_refs_json,request_id,next_review_at,updated_at,umo,created_at,schedule_updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (*values, self.store.umo, now, now)).lastrowid
+                    source_ids_json,memory_refs_json,request_id,next_review_at,updated_at,next_review_explicit,umo,created_at,schedule_updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (*values, self.store.umo, now, now)).lastrowid
         return self.get(id)
 
     @_locked
-    def due(self, limit: int = 8, now: float | None = None) -> list[dict]:
+    def due(self, limit: int = 8, now: float | None = None, *, scheduled_only: bool = False) -> list[dict]:
         now = time.time() if now is None else float(now)
         rows = self.store._rows("""SELECT * FROM mr_reflections WHERE umo=? AND
             ((status='pending' AND (next_review_at IS NULL OR next_review_at<=?)) OR
              (status='waiting' AND next_review_at IS NOT NULL AND next_review_at<=?))
+            AND (?=0 OR (next_review_explicit=1 AND next_review_at IS NOT NULL))
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
-            (self.store.umo, now, now, _limit(limit)))
+            (self.store.umo, now, now, int(scheduled_only), _limit(limit)))
         return [self._record(row) for row in rows]
 
     @_locked
@@ -159,10 +172,14 @@ class Reflection:
         with self.store.db:
             for id in dict.fromkeys(int(id) for id in ids):
                 self.store.db.execute("""UPDATE mr_reflections SET last_reviewed_at=?,
+                    next_review_explicit=CASE WHEN schedule_updated_at>? THEN next_review_explicit
+                        WHEN status='pending' THEN 0
+                        WHEN status='waiting' AND next_review_at<=? THEN 0 ELSE next_review_explicit END,
                     next_review_at=CASE WHEN schedule_updated_at>? THEN next_review_at
                         WHEN status='pending' THEN ?
                         WHEN status='waiting' AND next_review_at<=? THEN NULL ELSE next_review_at END
-                    WHERE umo=? AND id=?""", (now, float(call_started_at), float(default_next_at), now, self.store.umo, id))
+                    WHERE umo=? AND id=?""", (now, float(call_started_at), now, float(call_started_at),
+                                             float(default_next_at), now, self.store.umo, id))
 
     def _events(self, request_id: str) -> tuple[list[dict], bool]:
         rows = self.store._rows("""SELECT DISTINCT m.* FROM message_relations r
@@ -201,6 +218,8 @@ class Reflection:
             raise ValueError("Run belongs to a different request")
         request_id = str(request_id if request_id is not None else linked or "")
         if not request_id:
+            if selected and selected["kind"] in {"background", "feedback"}:
+                return self._learning_interaction(selected, detailed)
             return {"status": "request_link_missing", "run_id": run_id}
         request_row = self.store.db.execute("""SELECT * FROM messages WHERE umo=? AND message_id=?
             ORDER BY id DESC LIMIT 1""", (self.store.umo, request_id)).fetchone()
@@ -257,6 +276,33 @@ class Reflection:
         else:
             result["subsequent_context"] = []
         return result
+
+    @staticmethod
+    def _learning_interaction(run: dict, detailed: bool) -> dict:
+        """Open a previous learning session only when the model asks for its run id."""
+        steps = run.get("steps", [])
+        inputs = next((step["data"] for step in steps if step["phase"] == "input"
+                       and isinstance(step.get("data", {}).get("messages"), list)), {})
+        material = inputs.get("messages", run.get("messages", []))
+        view = {key: run[key] for key in ("id", "kind", "started_at", "status", "detail", "elapsed_ms", "response_text")
+                if key in run}
+        view["material_ids"] = run.get("material_ids", [row["id"] for row in material
+            if isinstance(row, dict) and "id" in row and not row.get("context_only")])
+        view["context_ids"] = run.get("context_ids", [row["id"] for row in material
+            if isinstance(row, dict) and "id" in row and row.get("context_only")])
+        view["memory_refs"] = run.get("memory_refs", [{"kind": row["kind"], "id": row["id"]}
+            for row in run.get("written", []) if isinstance(row, dict) and "id" in row and "kind" in row])
+        progress = next((step["data"] for step in reversed(steps) if "checkpoint" in step.get("data", {})), {})
+        view["checkpoint"] = run.get("checkpoint", run.get("progress", {}).get("checkpoint", progress.get("checkpoint", "")))
+        view["completed_ids"] = run.get("completed_ids", progress.get("completed_ids", []))
+        if detailed:
+            if steps:
+                # The retained steps already include material, calls and results.
+                view["steps"] = steps
+            else:
+                view.update({key: run[key] for key in ("messages", "tool_calls") if key in run})
+        return {"status": "recorded", "run_id": run["id"], "runs": [view],
+                "interpretation": "这是之前一次学习的实际材料、写入和续接线索；按需展开详细记录，不需要从头重做。"}
 
     @_locked
     def feedback_context(self, messages: list[dict], limit: int = 8) -> list[dict]:
