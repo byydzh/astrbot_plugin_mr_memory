@@ -19,6 +19,7 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from .reflection import Reflection, SCHEMA as REFLECTION_SCHEMA
+from .content import searchable_text, text_view
 
 
 SCHEMA = """
@@ -148,6 +149,8 @@ CREATE TABLE IF NOT EXISTS mr_working_state (umo TEXT PRIMARY KEY,state_json TEX
 CREATE TABLE IF NOT EXISTS mr_learning_tasks (umo TEXT NOT NULL,kind TEXT NOT NULL
  CHECK(kind IN ('background','feedback')),task_json TEXT NOT NULL,updated_at INTEGER NOT NULL,
  PRIMARY KEY(umo,kind));
+CREATE TABLE IF NOT EXISTS mr_feedback_processed (umo TEXT NOT NULL,message_id INTEGER NOT NULL REFERENCES messages(id),
+ completed_at INTEGER NOT NULL,PRIMARY KEY(umo,message_id));
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
@@ -208,12 +211,14 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), timeout=10, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self.db.create_function("mr_searchable_text", 1, searchable_text, deterministic=True)
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='scope_meta'").fetchone():
             scope = self.db.execute("SELECT umo FROM scope_meta WHERE singleton=1").fetchone()
             if scope and scope[0] != self.umo:
                 self.db.close()
                 raise ValueError("Database belongs to another group")
         self.db.execute("PRAGMA foreign_keys=ON")
+        feedback_queue_exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='mr_feedback_processed'").fetchone()
         self.db.executescript(SCHEMA)
         self.db.executescript(REFLECTION_SCHEMA)
         if 'status' not in {row[1] for row in self.db.execute('PRAGMA table_info(topics)')}:
@@ -223,6 +228,14 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO scope_meta(singleton,umo,platform_id,group_id) VALUES(1,?,?,?)",
                             (self.umo, parts[0], parts[-1]))
         self.tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not feedback_queue_exists:
+            # The old cursor remains a legacy floor. Preserve sparse progress
+            # on the unfinished old task too, without advancing that floor.
+            with self.db:
+                self.db.execute("""INSERT OR IGNORE INTO mr_feedback_processed
+                    SELECT t.umo,m.id,t.updated_at FROM mr_learning_tasks t,
+                    json_each(t.task_json,'$.completed_ids') done JOIN messages m ON m.id=done.value AND m.umo=t.umo
+                    WHERE t.umo=? AND t.kind='feedback' AND m.is_deleted=0""", (self.umo,))
         self.reflections = Reflection(self)
 
     @_serialized
@@ -301,6 +314,7 @@ class Store:
                     revision += 1
                     self.db.execute("""UPDATE messages SET plain_text=?,content_json=?,role=?,content_sha256=?,
                         revision_no=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""", (text, encoded, role, digest, revision, row_id))
+                    self.db.execute("DELETE FROM mr_feedback_processed WHERE umo=? AND message_id=?", (self.umo, row_id))
             self.db.execute("INSERT OR IGNORE INTO message_participants(message_id,participant_id,relation,evidence) VALUES(?,?,'SENDER','host')",
                             (row_id, participant))
             self._alias(participant, name, at, row_id, "SENDER")
@@ -486,9 +500,27 @@ class Store:
         result.update(participant_id=row.get("sender_participant_id"), content=self.resolve_quotes(json.loads(row["content_json"]), row["platform_id"]),
                       reply_to=next((r["target_source_key"] for r in relations if r["relation"] in {"REPLY_TO", "RESPONDS_TO"}), None),
                       relations=relations, revision_no=row.get("revision_no", 1))
+        if result["reply_to"]:
+            original = self.db.execute("""SELECT id,source_key,sender_id,sender_name,sent_at,plain_text,role
+                FROM messages WHERE umo=? AND source_key=? AND is_deleted=0""", (self.umo, result["reply_to"])).fetchone()
+            if original is not None:
+                # A recent-message window may start at the tool result. Keep its
+                # actual request and author even when that request is outside it.
+                result["reply_to_message"] = dict(original)
         if "message_attachments" in self.tables:
             result["attachments"] = self._rows("SELECT position,attachment_type,extraction_status,descriptor_text,reference_sha256 FROM message_attachments WHERE message_id=?", (row["id"],))
-        return result
+        return text_view(result)
+
+    @_serialized
+    def messages(self, ids: Iterable[int]) -> list[dict]:
+        """Open retained source addresses in this group, in the requested order."""
+        ids = list(dict.fromkeys(int(value) for value in ids))
+        if not ids:
+            return []
+        rows = self._rows(f"SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND id IN ({','.join('?' for _ in ids)})",
+                          (self.umo, *ids))
+        by_id = {row["id"]: row for row in rows}
+        return [self._message(by_id[value]) for value in ids if value in by_id]
 
     @_serialized
     def recent(self, limit: int = 24, before: int | None = None) -> list[dict]:
@@ -555,8 +587,10 @@ class Store:
             args.extend(roles)
         words = _terms(terms)
         if words:
-            clauses.append("(" + " OR ".join("(instr(lower(m.plain_text),lower(?))>0 OR instr(lower(m.content_json),lower(?))>0)" for _ in words) + ")")
-            args.extend(word for word in words for _ in range(2))
+            # Check raw text first; only candidate hits need media decoding removed.
+            match = "((instr(lower(m.plain_text),lower(?))>0 AND instr(lower(mr_searchable_text(m.plain_text)),lower(?))>0) OR (instr(lower(m.content_json),lower(?))>0 AND instr(lower(mr_searchable_text(m.content_json)),lower(?))>0))"
+            clauses.append("(" + " OR ".join(match for _ in words) + ")")
+            args.extend(word for word in words for _ in range(4))
         if participant_id is not None:
             clauses.append("(m.sender_participant_id=? OR EXISTS(SELECT 1 FROM message_participants mp WHERE mp.message_id=m.id AND mp.participant_id=?))")
             args.extend((int(participant_id), int(participant_id)))
@@ -919,45 +953,68 @@ class Store:
         return [self._graph_record(r, include_sources=include_sources) for r in self._graph_rows(extra, args, limit)]
 
     @_serialized
-    def feedback_messages(self, window_seconds: int, after: int, limit: int = 500) -> list[dict]:
-        """Return the next new reaction and its conversation, with an id watermark.
+    def feedback_messages(self, window_seconds: int, after: int, limit: int = 500, *, newest: bool = True) -> list[dict]:
+        """Select a recent or historical conversation without skipping other work.
 
-        The first unprocessed user message must follow a retained bot response.
-        The model, not this query, determines whether it is meaningful feedback.
+        `after` is the old FIFO cursor, retained only as a legacy floor. New
+        progress is recorded per message, so completing a recent batch cannot
+        erase the older queue. Relevance within this conversation is for the model.
         """
-        first = self.db.execute("""SELECT u.* FROM messages u WHERE u.umo=? AND u.is_deleted=0
-            AND u.role='USER' AND u.id>?
-            AND EXISTS(SELECT 1 FROM messages b WHERE b.umo=u.umo AND b.is_deleted=0
-                AND b.role='BOT' AND b.sent_at>=u.sent_at-? AND (b.sent_at,b.id)<(u.sent_at,u.id))
-            ORDER BY u.id LIMIT 1""", (self.umo, int(after), int(window_seconds))).fetchone()
+        pending = """m.umo=? AND m.is_deleted=0 AND m.id>?
+            AND NOT EXISTS(SELECT 1 FROM mr_feedback_processed p WHERE p.umo=m.umo AND p.message_id=m.id)"""
+        reaction = """m.role='USER' AND EXISTS(SELECT 1 FROM messages b WHERE b.umo=m.umo AND b.is_deleted=0
+            AND b.role='BOT' AND b.sent_at>=m.sent_at-? AND (b.sent_at,b.id)<(m.sent_at,m.id))"""
+        direction = "DESC" if newest else "ASC"
+        first = self.db.execute(f"""SELECT m.* FROM messages m WHERE {pending} AND {reaction}
+            ORDER BY m.sent_at {direction},m.id {direction} LIMIT 1""",
+            (self.umo, int(after), int(window_seconds))).fetchone()
         if first is None:
             return []
-        bot = self.db.execute("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND role='BOT'
-            AND sent_at>=? AND (sent_at,id)<(?,?) ORDER BY sent_at DESC,id DESC LIMIT 1""",
-            (self.umo, first["sent_at"] - int(window_seconds), first["sent_at"], first["id"])).fetchone()
-        bot_message = self._message(dict(bot))
-        # Include the bot's original question when the send observation retained
-        # a reply relation. This is structural association, not text matching.
-        if bot_message["reply_to"]:
-            rows = self._rows("""SELECT m.* FROM messages m WHERE m.umo=? AND m.is_deleted=0
-                AND (m.sent_at,m.id)<=(?,?) AND
-                (m.source_key=? OR EXISTS(SELECT 1 FROM message_relations r WHERE r.source_message_id=m.id
-                    AND r.umo=m.umo AND r.target_source_key=? AND r.relation IN('REPLY_TO','RESPONDS_TO')))
-                ORDER BY m.sent_at,m.id""", (self.umo, bot["sent_at"], bot["id"],
-                                            bot_message["reply_to"], bot_message["reply_to"]))
-            prefix = [self._message(row) for row in rows]
+        if newest:
+            # Take a whole recent segment ending at the newest reaction, not
+            # just that one line. A late historical import sorts by event time.
+            candidates = self._rows(f"""SELECT m.*,({reaction}) AS is_reaction FROM messages m
+                WHERE {pending} AND (m.sent_at,m.id)<=(?,?)
+                ORDER BY m.sent_at DESC,m.id DESC LIMIT ?""",
+                (int(window_seconds), self.umo, int(after), first["sent_at"], first["id"], _limit(limit)))
+            candidates.reverse()
+            start = next(index for index, row in enumerate(candidates) if row["is_reaction"])
+            material_rows = candidates[start:]
         else:
-            prefix = [bot_message]
-        prefix = prefix[-max(1, _limit(limit) - 1):]
-        room = max(1, _limit(limit) - len(prefix))
-        rows = self._rows("""SELECT * FROM messages WHERE umo=? AND is_deleted=0
-            AND id>=? ORDER BY id LIMIT ?""", (self.umo, first["id"], room))
-        material = [self._message(row) for row in rows]
-        material_ids = {row["id"] for row in material}
+            material_rows = self._rows(f"""SELECT m.*,({reaction}) AS is_reaction FROM messages m
+                WHERE {pending} AND (m.sent_at,m.id)>=(?,?) ORDER BY m.sent_at,m.id LIMIT ?""",
+                (int(window_seconds), self.umo, int(after), first["sent_at"], first["id"], _limit(limit)))
+        while True:
+            first = next(row for row in material_rows if row["is_reaction"])
+            prefix = self._feedback_prefix(first, int(window_seconds))[-max(1, _limit(limit) - 1):]
+            material_ids = {row["id"] for row in material_rows}
+            prefix = [row for row in prefix if row["id"] not in material_ids]
+            room = max(1, _limit(limit) - len(prefix))
+            if len(material_rows) <= room:
+                break
+            material_rows = material_rows[-room:] if newest else material_rows[:room]
+            # Trimming can move the first reaction into another interaction.
+            # Rebuild its original bot/question prefix from that actual anchor.
+        material = [self._message(row) for row in material_rows]
         # The window describes a reaction's relation to a bot response. Waiting
         # until tonight must not expire already observed daytime feedback.
-        return [{**row, "context_only": True} for row in prefix if row["id"] not in material_ids] + [
+        return [{**row, "context_only": True} for row in prefix] + [
             {**row, "context_only": False} for row in material]
+
+    def _feedback_prefix(self, first: dict, window_seconds: int) -> list[dict]:
+        bot = self.db.execute("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND role='BOT'
+            AND sent_at>=? AND (sent_at,id)<(?,?) ORDER BY sent_at DESC,id DESC LIMIT 1""",
+            (self.umo, first["sent_at"] - window_seconds, first["sent_at"], first["id"])).fetchone()
+        bot_message = self._message(dict(bot))
+        if not bot_message["reply_to"]:
+            return [bot_message]
+        rows = self._rows("""SELECT m.* FROM messages m WHERE m.umo=? AND m.is_deleted=0
+            AND (m.sent_at,m.id)<=(?,?) AND (m.source_key=? OR EXISTS(
+                SELECT 1 FROM message_relations r WHERE r.source_message_id=m.id AND r.umo=m.umo
+                AND r.target_source_key=? AND r.relation IN('REPLY_TO','RESPONDS_TO')))
+            ORDER BY m.sent_at,m.id""", (self.umo, bot["sent_at"], bot["id"],
+                                         bot_message["reply_to"], bot_message["reply_to"]))
+        return [self._message(row) for row in rows]
 
     @staticmethod
     def _usage_kind(kind: str) -> str:
@@ -1124,6 +1181,15 @@ class Store:
     @_serialized
     def finish_learning_task(self, kind: str) -> None:
         with self.db:
+            task = self.learning_task(kind)
+            if (kind == "feedback" and task and task["material_ids"]
+                    and set(task["material_ids"]) <= set(task["completed_ids"])):
+                state = self.load_working_state()
+                order = task.get("working", {}).get("feedback_order", "oldest")
+                state["feedback_next_order"] = "oldest" if order == "recent" else "recent"
+                self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                    DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                    (self.umo, _encode(state), int(time.time())))
             self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=? AND kind=?",
                             (self.umo, self._usage_kind(kind)))
 
@@ -1169,17 +1235,8 @@ class Store:
                     ON CONFLICT(message_id) DO UPDATE SET status='DISTILLED',distilled_at=excluded.distilled_at,
                     content_sha256=excluded.content_sha256,last_error=''""", (int(time.time()), self.umo, value))
         elif material:
-            state = self.load_working_state()
-            cursor = int(state.get("feedback_after") or 0)
-            for value in material:
-                if value not in completed:
-                    break
-                cursor = max(cursor, value)
-            if cursor > int(state.get("feedback_after") or 0):
-                state["feedback_after"] = cursor
-                self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
-                    DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
-                    (self.umo, _encode(state), int(time.time())))
+            self.db.executemany("INSERT OR REPLACE INTO mr_feedback_processed VALUES(?,?,?)",
+                [(self.umo, value, int(time.time())) for value in progress.get("completed_ids", [])])
         self._write_learning_task(kind, task)
         return task
 

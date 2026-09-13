@@ -19,7 +19,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .mr_memory.agent import MemoryAgent, estimate_learning_input
+from .mr_memory.agent import MemoryAgent, checkpoint_learning_task, estimate_learning_input
 from .mr_memory.embedding import Embedder
 from .mr_memory.store import Store
 from .mr_memory.settings import normalize_settings
@@ -337,6 +337,18 @@ class MrMemoryPlugin(Star):
         store = await self.store_for(event)
         current = self.message(event)
         current["question"] = req.prompt or current["plain_text"]
+        # AstrBot's request role is independent of the platform's group roster.
+        # Give both models the live value rather than asking memory to infer it.
+        # This role is not a claim that every tool is available or authorized.
+        current["astrbot_runtime"] = {"requester_id": current["sender_id"], "is_admin": event.is_admin()}
+        runtime_prefix = "<mr_request_context>"
+        req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
+                                           if not str(getattr(part, "text", "")).startswith(runtime_prefix)]
+        req.extra_user_content_parts.append(TextPart(text=(
+            f"{runtime_prefix}\n当前 AstrBot 请求事件提供的运行身份（与平台群角色不同）：\n"
+            + json.dumps(current["astrbot_runtime"], ensure_ascii=False, separators=(",", ":"))
+            + "\n</mr_request_context>"
+        )).mark_as_temp())
         payload = {"status": "cancelled", "question": current["question"], "request_id": current["message_id"]}
         trace = RunTrace(store, "foreground", started_at, payload)
         await trace.start()
@@ -518,20 +530,24 @@ class MrMemoryPlugin(Star):
                 refreshed = [await asyncio.to_thread(store.reflections.get, row["id"]) for row in refs]
                 reflection_tasks = [row for row in refreshed if row and row["status"] != "resolved"]
                 working["reflections"] = reflection_tasks
-                # Keep the native prefix while it fits. If it cannot continue
-                # within available resources, a model-written checkpoint and
-                # real saved memories let it resume without the whole trace.
-                if (task.get("checkpoint") and task.get("continuation") and remaining is not None
-                        and estimate_learning_input(messages, working, feedback=feedback, task=task) * 2 > remaining):
-                    task = {**task, "continuation": {}}
-                if not task.get("continuation"):
+                # A completed material pass can still have real reflection work.
+                # Resume that work from the model's saved checkpoint and retain
+                # its later tool turns instead of replaying all processed text.
+                material_done = set(task["material_ids"]) <= set(task["completed_ids"])
+                native = task.get("continuation", {}).get("conversation")
+                if task.get("checkpoint") and native and (material_done or (remaining is not None
+                        and estimate_learning_input(messages, working, feedback=feedback, task=task) * 2 > remaining)):
+                    task = checkpoint_learning_task(task)
+                if not task.get("continuation", {}).get("conversation"):
                     memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
                                 for ref in task["memory_refs"]]
                     working["saved_memories"] = [row for row in memories if row]
             elif feedback:
                 reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due)
+                feedback_order = state.get("feedback_next_order", "recent")
                 messages = await asyncio.to_thread(store.feedback_messages,
-                    int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum) if not scheduled else []
+                    int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum,
+                    newest=feedback_order == "recent") if not scheduled else []
                 if messages and time.time() - messages[-1]["sent_at"] < self.config["feedback_debounce_seconds"]:
                     if not reflection_tasks:
                         return report("waiting", "等待当前互动结束")
@@ -550,7 +566,7 @@ class MrMemoryPlugin(Star):
                     waiting = await asyncio.to_thread(store.reflections.waiting) if messages else []
                     reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
                     working = {"interactions": await asyncio.to_thread(store.reflections.feedback_context, messages),
-                               "reflections": reflection_tasks}
+                               "reflections": reflection_tasks, "feedback_order": feedback_order}
                 else:
                     reflection_tasks = await asyncio.to_thread(store.reflections.waiting)
                     working = {"reflections": reflection_tasks} if reflection_tasks else {}
@@ -568,7 +584,15 @@ class MrMemoryPlugin(Star):
                     break
                 context = [row for row in messages if row.get("context_only")]
                 count = max(1, len(material) // 2)
-                messages = context + (material[:count] if feedback or task else material[-count:])
+                if feedback and task is None and working.get("feedback_order") == "recent":
+                    # Re-select the shorter interaction so its bot/question
+                    # prefix follows the new first reaction, too.
+                    messages = await asyncio.to_thread(store.feedback_messages,
+                        int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)),
+                        max(2, len(messages) // 2), newest=True)
+                else:
+                    keep_oldest = task is not None or feedback
+                    messages = context + (material[:count] if keep_oldest else material[-count:])
                 if feedback:
                     working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
                 estimate = estimate_learning_input(messages, working, feedback=feedback, task=task)

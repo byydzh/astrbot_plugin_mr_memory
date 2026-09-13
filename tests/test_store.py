@@ -81,6 +81,40 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"], roles=["BOT", "SYSTEM"])], [tool["id"], bot["id"]])
         self.assertEqual(self.store.search_messages(["青桥"], roles=[]), [])
 
+    def test_media_bytes_are_archived_but_not_searched_or_sent_as_prose(self):
+        from mr_memory.agent import _model_view
+
+        encoded = "base64://" + "AAAAtestneedleBBBB" * 20000
+        inline = "data:image/png;base64," + "BBBBtestneedleAAAA" * 20000
+        content = [{"type": "image", "file": encoded, "url": "https://example.test/diagram.png"},
+                   {"type": "tool_result", "result": json.dumps({"image": inline, "text": "海风图示"}, ensure_ascii=False)}]
+        picture = self.message(1, "[image]", role="BOT", content=content)
+        original = self.store.db.execute("SELECT content_json FROM messages WHERE id=?", (picture["id"],)).fetchone()[0]
+        self.assertEqual(json.loads(original), content)
+        self.assertEqual(self.store.search_messages(["testneedle"]), [])
+        self.assertEqual(self.store.search_messages(["海风"])[0]["id"], picture["id"])
+        self.assertIn("https://example.test/diagram.png", json.dumps(picture))
+        self.assertLess(len(json.dumps(picture)), 2500)
+        self.assertEqual(self.store.messages([picture["id"], 999999, picture["id"]]), [picture])
+        self.assertNotIn("testneedle", json.dumps(_model_view({"current": {"content": content}})))
+        # The same word remains searchable when someone actually writes it.
+        user = self.message(2, "请查 testneedle 的出处")
+        self.assertEqual([row["id"] for row in self.store.search_messages(["testneedle"])], [user["id"]])
+
+    def test_tool_result_keeps_request_author_outside_recent_window(self):
+        first = self.message(1, "请运行绘图", sender="10")
+        success = self.message(2, "执行成功", sender="99", role="SYSTEM", reply_to=first["source_key"])
+        second = self.message(3, "我也运行一次", sender="20")
+        self.message(4, "Permission denied", sender="99", role="SYSTEM", reply_to=second["source_key"])
+        recent = self.store.recent(limit=3)
+        self.assertNotIn(first["id"], [row["id"] for row in recent])
+        self.assertEqual(recent[0]["reply_to_message"]["sender_id"], "10")
+        self.assertEqual(recent[-1]["reply_to_message"]["sender_id"], "20")
+        self.assertEqual(recent[0]["reply_to_message"]["id"], first["id"])
+        self.assertEqual(self.store.search_messages(["执行成功"])[0], success)
+        self.store.delete_message("1")
+        self.assertNotIn("reply_to_message", self.store.messages([success["id"]])[0])
+
     def test_connection_serializes_reader_and_separate_transaction(self):
         entered, release, second_started, second_done = Event(), Event(), Event(), Event()
 

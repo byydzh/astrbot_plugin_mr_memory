@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -110,7 +111,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(request.func_tool.tools), 1)
         self.assertIs(request.extra_user_content_parts[0], text_part)
         self.assertIs(request.extra_user_content_parts[1], image_part)
-        self.assertEqual(len(request.extra_user_content_parts), 3)
+        self.assertEqual(len(request.extra_user_content_parts), 4)
         self.assertIn(result.background, request.extra_user_content_parts[-1].text)
         self.assertNotIn("旧的本次背景", request.extra_user_content_parts[-1].text)
         self.assertEqual(memory_agent.reconstruct.await_args.args[0]["question"], request.prompt)
@@ -119,6 +120,34 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin, "record_bot_event", new_callable=AsyncMock) as record:
             await current.send(MessageChain([Plain(text="只有请求钩子的发送")]))
             record.assert_awaited_once()
+
+    async def test_current_astrbot_identity_does_not_follow_group_role_or_previous_request(self):
+        store = await self.plugin.store_for(event())
+        store.cache_roster([
+            {"user_id": "1001", "nickname": "群内普通成员", "role": "member"},
+            {"user_id": "1002", "nickname": "群内管理员", "role": "admin"},
+        ], int(plugin_module.time.time()))
+        request = ProviderRequest(prompt="执行这次任务")
+        memory_agent = SimpleNamespace(reconstruct=AsyncMock(return_value=ReconstructionResult(
+            background="合成语义背景", status="completed")))
+        for account_id, astrbot_role, platform_role in (("1001", "admin", "member"), ("1002", "member", "admin")):
+            with self.subTest(account_id=account_id):
+                current = event()
+                current.role = astrbot_role
+                current.message_obj.sender.user_id = account_id
+                current.message_obj.message_id = f"request-{account_id}"
+                current.send = AsyncMock()
+                with patch.object(self.plugin, "agent", return_value=memory_agent):
+                    await self.plugin.inject_subconscious_memory(current, request)
+                model_current = memory_agent.reconstruct.await_args.args[0]
+                expected = {"requester_id": account_id, "is_admin": astrbot_role == "admin"}
+                self.assertEqual(model_current["astrbot_runtime"], expected)
+                person = next(p for p in model_current["participants"] if p["account_id"] == account_id)
+                self.assertEqual(person["role"], platform_role)
+                parts = [p for p in request.extra_user_content_parts
+                         if getattr(p, "text", "").startswith("<mr_request_context>")]
+                self.assertEqual(len(parts), 1)
+                self.assertEqual(json.loads(parts[0].text.splitlines()[2]), expected)
 
     async def test_user_generation_tools_and_sent_output_survive_store_reopen(self):
         current = event()
@@ -460,6 +489,39 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(selected), 0)
         self.assertLess(len(selected), 80)
         self.assertEqual(len(store.pending_messages(100)), 80)
+
+    async def test_recent_feedback_budget_shrink_keeps_latest_reactions_and_their_bot(self):
+        store = await self.plugin.store_for(event())
+        base = self.plugin.message(event())
+
+        def add(key, at, role="USER", reply_to=None):
+            return store.append_message({**base, "message_id": key, "sent_at": at,
+                "plain_text": key, "role": role, "reply_to": reply_to})
+
+        old_question = add("old-question", 1700000000)
+        old_bot = add("old-bot", 1700000001, "BOT", "old-question")
+        for index in range(5):
+            add(f"old-reaction-{index}", 1700000002 + index)
+        latest_question = add("latest-question", 1700000100)
+        latest_bot = add("latest-bot", 1700000101, "BOT", "latest-question")
+        latest_reactions = [add(f"latest-reaction-{index}", 1700000102 + index) for index in range(3)]
+        self.plugin.config.update(feedback_daily_token_budget=100, distillation_max_messages=20)
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="partial", usage={"input_other": 1}, model_attempts=1)))
+        with patch.object(plugin_module, "estimate_learning_input",
+                          side_effect=lambda messages, *args, **kwargs: 1000 if len(messages) > 6 else 10), \
+                patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            await self.plugin.learn(store, force=True, feedback=True)
+        selected, working = learning.consolidate.call_args.args
+        selected_ids = {row["id"] for row in selected}
+        self.assertEqual(working["feedback_order"], "recent")
+        self.assertLessEqual(len(selected), 6)
+        self.assertTrue({latest_question["id"], latest_bot["id"],
+                         *[row["id"] for row in latest_reactions]} <= selected_ids)
+        self.assertNotIn(old_question["id"], selected_ids)
+        self.assertNotIn(old_bot["id"], selected_ids)
+        self.assertTrue(all(row["id"] in selected_ids for row in store.learning_messages(store.learning_task("feedback"))))
 
     async def test_known_usage_does_not_erase_the_last_unmetered_call(self):
         store = await self.plugin.store_for(event())
