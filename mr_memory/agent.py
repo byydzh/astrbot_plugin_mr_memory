@@ -164,21 +164,22 @@ def _schema(description: str, properties: dict, required: tuple = ()) -> dict:
 
 TEXT = {"type": "string"}
 INTEGER = {"type": "integer"}
+ACCOUNT_ID = {"type": ["string", "integer"]}
 TERMS = {"type": "array", "items": TEXT}
 TOOL_SCHEMAS = {
-    "search_messages": _schema("词法搜索本群原文及工具内容，terms之间是OR，可不填。roles可自行限定USER群友发言、BOT机器人回答、SYSTEM工具活动，不填则都查；追溯群友自述时可选USER，避免把工具回显当成自述。sender_id只查这个账号发出的消息；related_account_id查发言、提及或回复涉及这个账号的消息，两者不同。按时间由新到旧返回，可限定Unix秒范围。", {
-        "terms": TERMS, "sender_id": TEXT, "related_account_id": TEXT,
+    "search_messages": _schema("词法搜索本群原文及工具内容，terms字符串数组中每项按完整子串匹配，空格不会自动拆词，各项之间是OR，可不填。按含义找不同措辞的记忆用semantic_search(query)。roles可自行限定USER群友发言、BOT机器人回答、SYSTEM工具活动，不填则都查；追溯群友自述时可选USER，避免把工具回显当成自述。sender_id只查这个账号发出的消息；related_account_id查发言、提及或回复涉及这个账号的消息，两者不同。按时间由新到旧返回，可限定Unix秒范围。", {
+        "terms": TERMS, "sender_id": ACCOUNT_ID, "related_account_id": ACCOUNT_ID,
         "roles": {"type": "array", "items": {"type": "string", "enum": ["USER", "BOT", "SYSTEM"]}},
         "start_at": INTEGER, "end_at": INTEGER, "limit": INTEGER}),
-    "search_memories": _schema("按词查记忆目录；terms之间是OR，可不填以浏览最近记忆。related_account_id查与该真实账号有关的记忆（主体或原文参与者），涉及不等于经历属于此人。返回摘要、实际来源作者和原文编号，用memory打开完整原文或context读前后文。", {
+    "search_memories": _schema("词法搜索记忆目录，关键词放在terms字符串数组中，每项按完整子串匹配，空格不会自动拆词，各项之间是OR；可不填以浏览最近记忆。用自然语言按含义找不同措辞的经历时用semantic_search(query)，本工具不接收query。related_account_id查与该真实账号有关的记忆（主体或原文参与者），涉及不等于经历属于此人。返回摘要、实际来源作者和原文编号，用memory打开完整原文或context读前后文。", {
         "terms": TERMS, "kind": {"type": "string", "enum": ["all", "episode", "semantic", "association", "topic"]},
-        "related_account_id": TEXT, "limit": INTEGER}),
+        "related_account_id": ACCOUNT_ID, "limit": INTEGER}),
     "memory": _schema("按已找到的kind和id打开记忆，附有关联原始发言；仍可用context继续展开前后文。", {
         "kind": {"type": "string", "enum": ["episode", "semantic", "topic", "association", "cue", "node"]},
         "id": {"type": ["string", "integer"]}, "include_history": {"type": "boolean"}}, ("kind", "id")),
     "semantic_search": _schema("用语义相似度找不同措辞的记忆目录；请结合当前发言者和语境描述想找的经历。用memory打开候选及完整原文。", {
         "query": TEXT, "limit": INTEGER}, ("query",)),
-    "context": _schema("按message_id（记忆中的source_ids或原文id）或source_key展开连续原文，含机器人回复及已记录动作。两种编号选一个。", {
+    "context": _schema("按message_id或source_key展开连续原文，含机器人回复及已记录动作。message_id是MR内部原文id（记忆中的source_ids），不是平台消息号；平台消息须使用已返回的完整source_key，不自行拼接地址。两种编号选一个。", {
         "message_id": INTEGER, "source_key": TEXT, "before": INTEGER, "after": INTEGER}),
     "member": _schema("查本群成员账号、显示名和别名候选；重名不表示同一个人。", {
         "name": TEXT, "account_ids": {"type": "array", "items": TEXT}}),
@@ -441,8 +442,17 @@ class MemoryAgent:
         if name not in TOOL_SCHEMAS or not isinstance(arguments, dict):
             raise ValueError("Unknown tool or non-object arguments")
         schema = TOOL_SCHEMAS[name]["parameters"]
-        if set(arguments) - set(schema["properties"]) or set(schema["required"]) - set(arguments):
-            raise ValueError("Unexpected or missing tool arguments")
+
+        def argument_error(problem):
+            accepted = json.dumps(schema["properties"], ensure_ascii=False, separators=(",", ":"))
+            return ValueError(f"Invalid arguments for {name}: {problem}. "
+                              f"Accepted parameters (names and types): {accepted}. "
+                              + TOOL_SCHEMAS[name]["description"])
+
+        unknown = sorted(set(arguments) - set(schema["properties"]))
+        missing = sorted(set(schema["required"]) - set(arguments))
+        if unknown or missing:
+            raise argument_error(f"unknown_fields={unknown}; missing_fields={missing}")
         for key, value in arguments.items():
             definition = schema["properties"][key]
             kinds = definition["type"] if isinstance(definition["type"], list) else [definition["type"]]
@@ -452,8 +462,11 @@ class MemoryAgent:
                      ("null" in kinds and value is None) or
                      ("array" in kinds and isinstance(value, list)))
             if not valid or ("enum" in definition and value not in definition["enum"]):
-                raise ValueError(f"Invalid tool argument: {key}")
+                raise argument_error(f"invalid_field={key}; received_type={type(value).__name__}")
         result = dict(arguments)
+        for key in ("sender_id", "related_account_id"):
+            if key in result:
+                result[key] = str(result[key])
         if "limit" in result:
             result["limit"] = max(1, min(80, result["limit"]))
         for key in ("before", "after"):
@@ -485,6 +498,10 @@ class MemoryAgent:
             args["before_time"] = cutoff
         method = "members" if name == "member" else name
         value = await asyncio.to_thread(getattr(self.store, method), **args)
+        if name == "context" and not value:
+            raise ValueError("Context anchor not found in this group at or before the request time. "
+                             "message_id is the MR internal message id (source_ids), not a platform message number. "
+                             "For a platform message, use its existing complete source_key; do not construct one.")
         if name in {"search_memories", "graph"}:
             return [{key: part for key, part in row.items() if key != "sources"} for row in value]
         return value

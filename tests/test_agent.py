@@ -60,6 +60,90 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wrong_search_query_returns_contract_to_next_turn(self):
+        wrong = {"query": "星舟 人物画像 喜好 性格", "limit": 20}
+        corrected = {"terms": ["星舟"], "limit": 20}
+        provider = Provider([
+            response(calls=[("search_memories", wrong, "wrong")]),
+            response(calls=[("search_memories", corrected, "corrected")]),
+            response("星舟喜欢群里一起玩桌游。"),
+        ])
+
+        class SearchStore(Store):
+            def __init__(self):
+                self.queries = []
+
+            def search_memories(self, **kwargs):
+                self.queries.append(kwargs)
+                return [{"kind": "semantic", "id": 17, "summary": "星舟喜欢桌游"}]
+
+        store = SearchStore()
+        with patch("mr_memory.agent._tool_set", return_value=object()):
+            result = await MemoryAgent(provider, store).reconstruct({"sent_at": 300}, [], {})
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(store.queries, [corrected])
+        delivered = json.loads(provider.requests[1][0]["messages"][-1]["content"])
+        self.assertEqual(delivered["status"], "error")
+        self.assertIn("unknown_fields=['query']", delivered["detail"])
+        self.assertIn('"terms":{"type":"array","items":{"type":"string"}}', delivered["detail"])
+        self.assertIn("semantic_search(query)", delivered["detail"])
+        self.assertEqual([call["status"] for call in result.tool_calls], ["error", "completed"])
+
+    def test_missing_query_reports_unknown_field_and_required_parameter_type(self):
+        with self.assertRaises(ValueError) as failure:
+            MemoryAgent._arguments("semantic_search", {"terms": ["星舟"]})
+        detail = str(failure.exception)
+        self.assertIn("unknown_fields=['terms']", detail)
+        self.assertIn("missing_fields=['query']", detail)
+        self.assertIn('"query":{"type":"string"}', detail)
+
+    async def test_numeric_search_account_ids_reach_store_as_the_same_exact_strings(self):
+        class SearchStore(Store):
+            def search_messages(self, **kwargs):
+                return kwargs
+
+            def search_memories(self, **kwargs):
+                return [kwargs]
+
+        agent = MemoryAgent(Provider([]), SearchStore())
+        for name, arguments in (
+            ("search_messages", {"sender_id": 123456, "related_account_id": 234567}),
+            ("search_memories", {"related_account_id": 234567}),
+        ):
+            with self.subTest(name=name):
+                expected = {key: str(value) for key, value in arguments.items()}
+                actual = await agent._execute(name, arguments, 300)
+                if name == "search_messages":
+                    expected["end_at"] = 300
+                    self.assertEqual(actual, expected)
+                else:
+                    self.assertEqual(actual, [expected])
+                self.assertEqual(actual, await agent._execute(
+                    name, {key: str(value) for key, value in arguments.items()}, 300))
+
+    async def test_context_missing_anchor_explains_ids_without_guessing_a_source(self):
+        source_key = "synthetic|group|123456"
+        rows = [{"id": 17, "source_key": source_key, "plain_text": "星舟今天约了桌游"}]
+
+        class ContextStore(Store):
+            def __init__(self):
+                self.requests = []
+
+            def context(self, **kwargs):
+                self.requests.append(kwargs)
+                return rows if kwargs.get("source_key") == source_key else []
+
+        store = ContextStore()
+        agent = MemoryAgent(Provider([]), store)
+        with self.assertRaises(ValueError) as failure:
+            await agent._execute("context", {"message_id": 123456}, 300)
+        detail = str(failure.exception)
+        self.assertIn("at or before the request time", detail)
+        self.assertIn("MR internal message id (source_ids)", detail)
+        self.assertIn("existing complete source_key", detail)
+        self.assertEqual(store.requests, [{"message_id": 123456, "before_time": 300}])
+        self.assertEqual(await agent._execute("context", {"source_key": source_key}, 300), rows)
+
     async def test_background_thinking_overrides_call_without_mutating_shared_provider(self):
         class ConfiguredProvider(Provider):
             provider_config = {"custom_extra_body": {"thinking": {"type": "disabled"}, "other": "kept"}}
