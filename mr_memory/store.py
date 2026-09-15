@@ -678,7 +678,7 @@ class Store:
                 result[field] = row[field]
         result["revision_no"] = 1 + self.db.execute("SELECT count(*) FROM mr_memory_revisions WHERE umo=? AND kind=? AND owner_id=?",
             (self.umo, kind, row["id"])).fetchone()[0]
-        attention = self.reflections.associated(kind, row["id"])
+        attention = self.reflections.associated(kind, row["id"], include_sources=include_sources)
         if attention:
             result["reflections"] = attention
         if "narrative_identity_bindings" in self.tables:
@@ -763,13 +763,11 @@ class Store:
                 f"SELECT 1 FROM messages WHERE umo=? AND is_deleted=1 AND id IN({','.join('?' for _ in source_ids)}) LIMIT 1",
                 [self.umo, *source_ids]).fetchone():
                 return None
-            current = self._memory_snapshot(kind, rows[0])["memory"]
-            if include_sources and kind != "node":
-                current["sources"] = self._messages_for_sources(current["source_keys"])
+            current = self._memory_snapshot(kind, rows[0], include_sources=include_sources)["memory"]
             current["history"] = self._memory_history(kind, int(id))
             return current
         if kind == "node":
-            return self._node(int(id))
+            return self._node(int(id), include_sources=include_sources)
         if kind in {"association", "plastic_edge"}:
             rows = self._graph_rows(" AND e.id=?", [int(id)])
             return self._graph_record(rows[0], include_sources=include_sources) if rows else None
@@ -809,17 +807,17 @@ class Store:
             revision["source_ids"] = json.loads(revision.pop("source_ids_json"))
         return rows
 
-    def _memory_snapshot(self, kind: str, row: dict) -> dict:
+    def _memory_snapshot(self, kind: str, row: dict, *, include_sources: bool = False) -> dict:
         if kind == "node":
-            memory = {"kind": "node", "id": row["id"], **self._node(row["id"])}
+            memory = {"kind": "node", "id": row["id"], **self._node(row["id"], include_sources=include_sources)}
         elif kind == "association":
-            enriched = {**row, "source": self._node(row["source_node_id"])["label"],
-                        "target": self._node(row["target_node_id"])["label"],
+            enriched = {**row, "source": self._node(row["source_node_id"], include_sources=False)["label"],
+                        "target": self._node(row["target_node_id"], include_sources=False)["label"],
                         "relation": self.db.execute("SELECT canonical_name FROM relation_types WHERE umo=? AND id=?",
                                                     (self.umo, row["relation_type_id"])).fetchone()[0]}
-            memory = self._graph_record(enriched, include_sources=False)
+            memory = self._graph_record(enriched, include_sources=include_sources)
         else:
-            memory = self._memory(kind, row, include_sources=False)
+            memory = self._memory(kind, row, include_sources=include_sources)
         snapshot = {"record": row, "memory": memory}
         if kind == "episode":
             snapshot["keywords"] = self._rows("SELECT cue,tag FROM episode_keywords WHERE episode_id=?", (row["id"],))
@@ -872,11 +870,11 @@ class Store:
     def _graph_record(self, row: dict, include_sources: bool = True) -> dict:
         result = self._memory("association", row, include_sources=include_sources)
         result.update({key: row[key] for key in ("statement", "source", "target", "relation", "source_node_id", "target_node_id", "epistemic_state", "uncertainty")})
-        result["source_node"] = self._node(row["source_node_id"])
-        result["target_node"] = self._node(row["target_node_id"])
+        result["source_node"] = self._node(row["source_node_id"], include_sources=include_sources)
+        result["target_node"] = self._node(row["target_node_id"], include_sources=include_sources)
         return result
 
-    def _node(self, node_id: int) -> dict | None:
+    def _node(self, node_id: int, *, include_sources: bool = True) -> dict | None:
         row = self.db.execute("SELECT id,label,description FROM plastic_nodes WHERE umo=? AND id=?",
                               (self.umo, int(node_id))).fetchone()
         if row is None:
@@ -884,7 +882,7 @@ class Store:
         result = {"node_id": row["id"], "label": row["label"], "description": row["description"],
                   "aliases": [r[0] for r in self.db.execute("SELECT alias FROM mr_node_aliases WHERE umo=? AND node_id=? ORDER BY alias",
                                                            (self.umo, row["id"]))]}
-        attention = self.reflections.associated("node", row["id"])
+        attention = self.reflections.associated("node", row["id"], include_sources=include_sources)
         if attention:
             result["reflections"] = attention
         return result
@@ -1449,7 +1447,7 @@ class Store:
     @_serialized
     def save_memories(self, items: Iterable[dict], sources: Iterable[str], mark_processed: bool = True,
                       *, run_id: int | None = None, learning_kind: str | None = None,
-                      progress: dict | None = None) -> list[dict]:
+                      progress: dict | None = None, learning_write: dict | None = None) -> list[dict]:
         if learning_kind is not None:
             learning_kind = self._usage_kind(learning_kind)
         keys = list(dict.fromkeys(str(s) for s in sources))
@@ -1586,6 +1584,14 @@ class Store:
                 outputs.append((kind, owner))
             if learning_kind is not None:
                 self._save_learning_progress(learning_kind, progress, outputs, run_id)
+                if learning_write is not None:
+                    task = self.learning_task(learning_kind)
+                    state = dict(learning_write["state"])
+                    receipts = dict(state.get("receipts", {}))
+                    receipts[learning_write["pending_id"]] = [{"kind": kind, "id": owner} for kind, owner in outputs]
+                    state["receipts"] = receipts
+                    task["continuation"] = {**task.get("continuation", {}), "write_state": state}
+                    self._write_learning_task(learning_kind, task)
             for key in keys if mark_processed and learning_kind is None else ():
                 message = source_rows[key]
                 raw = self.db.execute("SELECT content_sha256 FROM messages WHERE id=?", (message["id"],)).fetchone()

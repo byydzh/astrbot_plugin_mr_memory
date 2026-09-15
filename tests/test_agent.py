@@ -184,7 +184,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["tool_call_id"] for m in history if m["role"] == "tool"], ["semantic-1", "call-1", "call-2", "call-3"])
         self.assertIn("四人规则", history[-2]["content"])
         reopened = next(m for m in history if m.get("tool_call_id") == "call-2")
-        self.assertIn("星舟是我们做的桌游", reopened["content"])
+        self.assertEqual(json.loads(reopened["content"])[0]["source_ref"]["message_id"], 1)
+        self.assertNotIn("星舟是我们做的桌游", reopened["content"])
         self.assertEqual(result.usage, {"input_other": 30, "output": 12})
 
     async def test_independent_calls_and_turn_limit_remain_partial(self):
@@ -281,7 +282,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         seen = {}
         first = json.loads(_json([source, source], seen_messages=seen))
         self.assertEqual(first[0], source)
-        self.assertEqual(first[1]["message_id"], source["id"])
+        self.assertEqual(first[1]["source_ref"]["message_id"], source["id"])
+        self.assertEqual(first[1]["sender_id"], source["sender_id"])
         revised = {**source, "plain_text": "后来编辑后的原文"}
         self.assertEqual(json.loads(_json(revised, seen_messages=seen)), revised)
 
@@ -363,12 +365,21 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.task = {"material_ids": [1, 2], "completed_ids": []}
 
-            def save_memories(self, items, sources, *, learning_kind, progress, **kwargs):
-                self.task.update(progress)
-                self.saved_progress = copy.deepcopy(progress)
-                return [{"kind": "episode", "id": 37, "summary": "星舟是桌游", "source_ids": [1, 2],
+            def save_memories(self, items, sources, *, learning_kind, learning_write, **kwargs):
+                saved = [{"kind": "episode", "id": 37, "summary": "星舟是桌游", "source_ids": [1, 2],
                          "sources": [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"}],
                          "reflections": [{"sources": [{"id": 88, "source_key": "u88", "plain_text": "新的关注原文"}]}]}]
+                state = copy.deepcopy(learning_write["state"])
+                state["receipts"][learning_write["pending_id"]] = [{"kind": "episode", "id": 37}]
+                self.task.setdefault("continuation", {})["write_state"] = state
+                return saved
+
+            def learning_task(self, kind):
+                return copy.deepcopy(self.task)
+
+            def save_learning_progress(self, kind, progress, run_id=None):
+                self.task.update(progress)
+                self.saved_progress = copy.deepcopy(progress)
 
             def update_learning_task(self, kind, patch):
                 self.task.update(patch)
@@ -392,7 +403,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(row for row in prefix if row.get("tool_calls"))["reasoning_content"], first.reasoning_content)
         resumed = await MemoryAgent(provider, store, max_turns=1).consolidate(messages, {}, task=dict(store.task))
         self.assertEqual(resumed.status, "completed", resumed.detail)
-        self.assertEqual(resumed.progress["completed_ids"], [2])
+        self.assertEqual(store.saved_progress["completed_ids"], [2])
         self.assertEqual(provider.requests[1][0]["messages"][:len(prefix)], prefix)
         self.assertEqual(len(resumed.tool_calls), 0)
         new_message = {"id": 3, "source_key": "u3", "plain_text": "新提供的规则说明"}

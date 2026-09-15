@@ -56,7 +56,7 @@ class Reflection:
                 # treated as explicit, time-sensitive model appointments.
                 self.store.db.execute("ALTER TABLE mr_reflections ADD COLUMN next_review_explicit INTEGER NOT NULL DEFAULT 0")
 
-    def _record(self, row):
+    def _record(self, row, *, include_sources: bool = True):
         item = dict(row)
         item.pop("umo", None)
         item.pop("schedule_updated_at", None)
@@ -64,10 +64,13 @@ class Reflection:
         item["source_ids"] = json.loads(item.pop("source_ids_json"))
         item["memory_refs"] = json.loads(item.pop("memory_refs_json"))
         ids = item["source_ids"]
+        columns = "*" if include_sources else "id,source_key"
         rows = self.store._rows(
-            f"SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND id IN ({','.join('?' for _ in ids)}) ORDER BY sent_at,id",
+            f"SELECT {columns} FROM messages WHERE umo=? AND is_deleted=0 AND id IN ({','.join('?' for _ in ids)}) ORDER BY sent_at,id",
             [self.store.umo, *ids]) if ids else []
-        item["sources"] = [self.store._message(row) for row in rows]
+        item["source_keys"] = [row["source_key"] for row in rows]
+        if include_sources:
+            item["sources"] = [self.store._message(row) for row in rows]
         found = {row["id"] for row in rows}
         item["missing_source_ids"] = [id for id in ids if id not in found]
         return item
@@ -157,13 +160,13 @@ class Reflection:
         return [self._record(row) for row in rows]
 
     @_locked
-    def associated(self, kind: str, id: int, limit: int = 8) -> list[dict]:
+    def associated(self, kind: str, id: int, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
         rows = self.store._rows("""SELECT r.* FROM mr_reflections r WHERE umo=? AND status!='resolved'
             AND EXISTS(SELECT 1 FROM json_each(r.memory_refs_json) ref
                 WHERE json_extract(ref.value,'$.kind')=? AND CAST(json_extract(ref.value,'$.id') AS INTEGER)=?)
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
             (self.store.umo, str(kind), int(id), _limit(limit)))
-        return [self._record(row) for row in rows]
+        return [self._record(row, include_sources=include_sources) for row in rows]
 
     @_locked
     def reviewed(self, ids, default_next_at: float, call_started_at: float) -> None:
