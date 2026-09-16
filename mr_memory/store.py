@@ -610,6 +610,27 @@ class Store:
         return [self._message(r) for r in rows]
 
     @_serialized
+    def search_message_context(self, *, before: int = 0, after: int = 1, **query) -> dict:
+        """Return literal hits with their adjacent exchange, without classifying it.
+
+        Author/role filters select hits only. A reply or correction may be from
+        somebody else and need not quote the hit. Overlapping windows share one
+        chronological copy of each original, including generated/sent stages.
+        """
+        before, after = max(0, min(40, int(before))), max(0, min(40, int(after)))
+        matches = self.search_messages(**query)
+        end_at = query.get("end_at")
+        before_time = int(end_at) - 1 if end_at is not None else None
+        originals = {}
+        for hit in matches:
+            for row in self.context(message_id=hit["id"], before=before, after=after,
+                                    before_time=before_time):
+                originals[row["id"]] = row
+        return {"matches": [row["id"] for row in matches],
+                "context": sorted(originals.values(), key=lambda row: (row["sent_at"], row["id"])),
+                "window": {"before": before, "after": after, "end_at": end_at}}
+
+    @_serialized
     def context(self, source_key: str | None = None, before: int = 8, after: int = 8,
                 before_time: int | None = None, *, message_id: int | None = None) -> list[dict]:
         if (source_key is None) == (message_id is None):
@@ -1117,6 +1138,20 @@ class Store:
         return json.loads(row[0]) if row else None
 
     @_serialized
+    def resume_learning_task(self, kind: str) -> dict | None:
+        """Apply explicit progress retained by the old all-drafts barrier."""
+        kind = self._usage_kind(kind)
+        task = self.learning_task(kind)
+        writes = (task or {}).get("continuation", {}).get("write_state", {})
+        progress = writes.get("deferred_progress")
+        if task is not None and progress:
+            with self.db:
+                task = self._save_learning_progress(kind, progress, [], task.get("run_id"))
+                task["continuation"]["write_state"]["deferred_progress"] = {}
+                self._write_learning_task(kind, task)
+        return task
+
+    @_serialized
     def unfinished_learning(self, kind: str) -> dict | None:
         """Locate real writes from older unfinished runs without inventing their progress."""
         kind = self._usage_kind(kind)
@@ -1162,6 +1197,13 @@ class Store:
                 "checkpoint": "", "memory_refs": [], "working": working or {}, "created_at": int(time.time()),
                 "updated_at": int(time.time()), "run_id": None, "continuation": {}}
         with self.db:
+            state = self.load_working_state()
+            drafts = state.get("pending_learning_drafts", {}).pop(kind, {})
+            if drafts:
+                task["continuation"]["write_state"] = {"pending_items": drafts}
+                self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                    DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                    (self.umo, _encode(state), int(time.time())))
             self._write_learning_task(kind, task)
         return task
 
@@ -1178,16 +1220,23 @@ class Store:
 
     @_serialized
     def finish_learning_task(self, kind: str) -> None:
+        kind = self._usage_kind(kind)
         with self.db:
             task = self.learning_task(kind)
+            state = self.load_working_state()
+            drafts = (task or {}).get("continuation", {}).get("write_state", {}).get("pending_items", {})
+            for row in drafts.values():
+                row.setdefault("origin_run_id", task.get("run_id"))
+                row.setdefault("saved_memory_refs", task.get("memory_refs", []))
+            if drafts:
+                state.setdefault("pending_learning_drafts", {})[kind] = drafts
             if (kind == "feedback" and task and task["material_ids"]
                     and set(task["material_ids"]) <= set(task["completed_ids"])):
-                state = self.load_working_state()
                 order = task.get("working", {}).get("feedback_order", "oldest")
                 state["feedback_next_order"] = "oldest" if order == "recent" else "recent"
-                self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
-                    DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
-                    (self.umo, _encode(state), int(time.time())))
+            self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                (self.umo, _encode(state), int(time.time())))
             self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=? AND kind=?",
                             (self.umo, self._usage_kind(kind)))
 
@@ -1233,8 +1282,8 @@ class Store:
                     ON CONFLICT(message_id) DO UPDATE SET status='DISTILLED',distilled_at=excluded.distilled_at,
                     content_sha256=excluded.content_sha256,last_error=''""", (int(time.time()), self.umo, value))
         elif material:
-            self.db.executemany("INSERT OR REPLACE INTO mr_feedback_processed VALUES(?,?,?)",
-                [(self.umo, value, int(time.time())) for value in progress.get("completed_ids", [])])
+            self.db.executemany("INSERT OR IGNORE INTO mr_feedback_processed VALUES(?,?,?)",
+                [(self.umo, value, int(time.time())) for value in newly_completed])
         self._write_learning_task(kind, task)
         return task
 

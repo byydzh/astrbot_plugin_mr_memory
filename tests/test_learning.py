@@ -81,7 +81,11 @@ class LearningTaskTests(unittest.TestCase):
         second = self.message(3, "第二条反馈")
         self.store.start_learning_task("feedback", [first["id"], second["id"]], [context["id"]])
         self.store.save_working_state({"existing_setting": "保留", "feedback_after": context["id"]})
-        self.store.save_learning_progress("feedback", {"completed_ids": [second["id"]]})
+        with patch("mr_memory.store.time.time", return_value=1700000000):
+            self.store.save_learning_progress("feedback", {"completed_ids": [second["id"]]})
+        with patch("mr_memory.store.time.time", return_value=1700086400):
+            self.store.save_learning_progress("feedback", {"completed_ids": [second["id"]]})
+        self.assertEqual(self.store.db.execute("SELECT completed_at FROM mr_feedback_processed").fetchone()[0], 1700000000)
         self.assertEqual(self.store.load_working_state()["feedback_after"], context["id"])
         self.assertEqual([r[0] for r in self.store.db.execute("SELECT message_id FROM mr_feedback_processed")], [second["id"]])
         with self.assertRaisesRegex(ValueError, "not its context"):
@@ -311,14 +315,15 @@ class LearningCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(encoded, json.dumps(result.continuation))
         self.assertEqual(task["continuation"]["conversation"][0]["content"], encoded)
 
-    async def test_missing_source_is_reported_without_false_completion(self):
+    async def test_missing_source_keeps_draft_but_does_not_undo_explicit_material_progress(self):
         row = self.message(1, "待理解")
         task = self.store.start_learning_task("background", [row["id"]])
         result, _ = await self.run_agent([[("remember", {"items": [{"kind": "semantic", "content": "新认识",
             "source_ids": [999]}], "progress": {"completed_ids": [row["id"]]}, "finish": True}, "save")]], [row], task)
-        self.assertNotEqual(result.status, "completed")
+        self.assertEqual(result.status, "completed")
         self.assertIn("unavailable in this group: [999]", result.tool_calls[0]["result"]["detail"])
-        self.assertEqual(self.store.learning_task("background")["completed_ids"], [])
+        self.assertEqual(self.store.learning_task("background")["completed_ids"], [row["id"]])
+        self.assertEqual(len(result.continuation["write_state"]["pending_items"]), 1)
 
 
 if __name__ == "__main__":

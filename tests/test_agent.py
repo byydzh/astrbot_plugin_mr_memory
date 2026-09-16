@@ -49,6 +49,9 @@ class Store:
     def search_messages(self, **kwargs):
         return [{"id": 1, "source_key": "m1", "plain_text": "星舟是我们做的桌游", "sent_at": 100}]
 
+    def search_message_context(self, **kwargs):
+        return self.search_messages(**kwargs)
+
     def context(self, source_key, before_time, **kwargs):
         assert source_key == "m1"
         assert before_time == 300
@@ -60,6 +63,29 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconstruction_separates_continuing_notes_from_current_background(self):
+        prior = {"working_memory": "昨天的图属于甲，需要核对。"}
+        provider = Provider([response(json.dumps({
+            "background": "本次在改另一张图。",
+            "working_memory": "原图属于乙，作者在消息17纠正；另一张图正在改配色。"}, ensure_ascii=False))])
+        with patch("mr_memory.agent._tool_set", return_value=object()):
+            result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], prior)
+        self.assertEqual(result.background, "本次在改另一张图。")
+        self.assertIn("消息17纠正", result.working_memory)
+        self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"], prior)
+        self.assertEqual(len(provider.requests), 1)
+
+    async def test_missing_or_truncated_notes_do_not_become_background_or_clear_notes(self):
+        for text, expected_background, expected_note in (
+            ("本轮可用背景", "本轮可用背景", None),
+            ('{"background":"这次无须沿用旧笔记","working_memory":""}', "这次无须沿用旧笔记", ""),
+            ('{"background":"不完整', "", None),
+        ):
+            with self.subTest(text=text), patch("mr_memory.agent._tool_set", return_value=object()):
+                result = await MemoryAgent(Provider([response(text)]), Store()).reconstruct({"sent_at": 300}, [], {})
+            self.assertEqual(result.background, expected_background)
+            self.assertEqual(result.working_memory, expected_note)
+
     async def test_wrong_search_query_returns_contract_to_next_turn(self):
         wrong = {"query": "星舟 人物画像 喜好 性格", "limit": 20}
         corrected = {"terms": ["星舟"], "limit": 20}

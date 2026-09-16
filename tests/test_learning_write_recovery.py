@@ -42,7 +42,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(writer.pending_items), {"save:0"})
         self.assertNotIn("source_ids", writer.pending_items["save:0"]["item"])
         task = self.store.learning_task("background")
-        self.assertEqual(task["completed_ids"], [])
+        self.assertEqual(task["completed_ids"], self.ids)
         self.assertEqual(task["checkpoint"], self.args()["progress"]["checkpoint"])
         self.assertEqual(task["memory_refs"], [{"kind": "semantic", "id": outcome.written[0]["id"]}])
         compact = json.loads(json.dumps(task["continuation"]["write_state"]))
@@ -56,6 +56,55 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(writer.pending_items)
         self.assertEqual(self.store.learning_task("background")["completed_ids"], self.ids)
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM semantic_memories").fetchone()[0], 1)
+
+    async def test_completed_batch_transfers_pending_draft_to_next_batch_without_losing_it(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background", run_id=7)
+        writer.apply(self.args(), "save")
+        self.store.finish_learning_task("background")
+        self.assertIsNone(self.store.learning_task("background"))
+        self.store.close()
+        self.store = Store(self.scratch / "group.db", "test:GroupMessage:42")
+        task = self.store.start_learning_task("background", [])
+        writes = task["continuation"]["write_state"]
+        self.assertEqual(writes["pending_items"]["save:0"]["origin_run_id"], 7)
+        self.assertEqual(writes["pending_items"]["save:0"]["saved_memory_refs"][0]["kind"], "semantic")
+        self.assertFalse(self.store.load_working_state()["pending_learning_drafts"])
+        resumed = LearningWriter(self.store, {}, learning_kind="background", **writes)
+        repaired = resumed.apply({"retry": [{"pending_id": "save:0", "changes": {"source_ids": [self.ids[0]]}}]}, "repair")
+        self.assertEqual(len(repaired.written), 1)
+        self.assertEqual(self.store.learning_task("background")["material_ids"], [])
+        self.assertFalse(resumed.pending_items)
+
+    async def test_legacy_deferred_progress_resumes_without_requiring_a_model_call(self):
+        self.store.update_learning_task("background", {"continuation": {"write_state": {
+            "deferred_progress": self.args()["progress"],
+            "pending_items": {"old:0": {"item": self.args()["items"][0], "item_index": 0, "detail": "missing source_ids"}}}}})
+        task = self.store.resume_learning_task("background")
+        self.assertEqual(task["completed_ids"], self.ids)
+        self.assertFalse(task["continuation"]["write_state"]["deferred_progress"])
+        self.assertIn("old:0", task["continuation"]["write_state"]["pending_items"])
+        self.assertEqual(self.store.pending_status()["count"], 0)
+
+    async def test_final_json_checkpoint_keeps_later_tools_and_can_end_with_pending_draft(self):
+        args = self.args()
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        writer.apply(args, "save")
+        task = self.store.learning_task("background")
+        final = {"role": "assistant", "content": json.dumps(args, ensure_ascii=False)}
+        later = {"role": "tool", "tool_call_id": "later", "content": "后来读到的原文"}
+        task["continuation"].update({"conversation": [{"role": "user", "content": "旧材料" * 10000}, final,
+            {"role": "assistant", "tool_calls": [{"id": "later", "function": {"name": "context", "arguments": "{}"}}]}, later]})
+        compact = checkpoint_learning_task(task)
+        self.assertEqual(compact["continuation"]["checkpoint_tail"][0], final)
+        self.assertIn(later, compact["continuation"]["checkpoint_tail"])
+        class FinishAgent(MemoryAgent):
+            async def _model_turn(agent, *unused, **kwargs):
+                return SimpleNamespace(completion_text='{"items":[]}', tools_call_name=[], reasoning_content="",
+                    usage={"input_other": 100, "output": 10}, raw_completion={"choices": [{"finish_reason": "stop"}]})
+        with patch("mr_memory.agent._tool_set", return_value=object()):
+            result = await FinishAgent(None, self.store, max_turns=1).consolidate([], {}, task=compact)
+        self.assertEqual(result.status, "completed", result.detail)
+        self.assertIn("save:0", result.continuation["write_state"]["pending_items"])
 
     async def test_association_receipt_and_pending_state_commit_with_the_write(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")

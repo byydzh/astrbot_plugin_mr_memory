@@ -29,7 +29,7 @@ class WriteOutcome:
                 "pending_items": [{"pending_id": key, **value} for key, value in pending.items()],
                 "discarded": self.discarded, "progress_applied": self.progress_applied,
                 "detail": self.progress_error or "; ".join(row["detail"] for row in self.rejected),
-                "next": "已保存项不用重发；retry使用pending_id，只补changes中的字段。完成标记会在待修复草稿处理完后应用；需要原文时仍可按消息编号读取。"}
+                "next": "材料进度与草稿分别保存；待修草稿不阻止本批结束，会保留到后续学习。已保存项不用重发；retry使用pending_id补changes，或用discard_reason说明不再保存的原因。需要原文时仍可按消息编号读取。"}
 
 
 class LearningWriter:
@@ -127,7 +127,8 @@ class LearningWriter:
         if self.learning_kind is not None:
             options["learning_kind"] = self.learning_kind
         for key, index, item in work:
-            self.pending_items[key] = {"item_index": index, "item": copy.deepcopy(item),
+            self.pending_items[key] = {**self.pending_items.get(key, {}), "item_index": index, "item": copy.deepcopy(item),
+                                       "origin_run_id": self.pending_items.get(key, {}).get("origin_run_id", self.run_id),
                                        "detail": "This draft has not been saved yet"}
         self.persist()
         for key, index, item in work:
@@ -158,19 +159,19 @@ class LearningWriter:
                         self.pending_items.pop(key, None)
                         outcome.written.extend(saved)
                         continue
-                failure = {"item_index": index, "item": copy.deepcopy(item),
+                failure = {**self.pending_items[key], "item_index": index, "item": copy.deepcopy(item),
                            "detail": f"{type(exc).__name__}: {exc}"}
                 self.pending_items[key] = failure
                 outcome.rejected.append({"pending_id": key, **failure})
                 self.persist()
-        applicable = (dict(self.deferred_progress) if not self.pending_items else
-                      {key: value for key, value in self.deferred_progress.items() if key != "completed_ids"})
+        # Understanding a material and successfully persisting every proposed
+        # memory are independent. Keep failed drafts, not the whole batch, pending.
+        applicable = dict(self.deferred_progress)
         if applicable and self.learning_kind is not None:
             try:
                 self.store.save_learning_progress(self.learning_kind, applicable, self.run_id)
                 outcome.progress_applied = applicable
-                if not self.pending_items:
-                    self.deferred_progress = {}
+                self.deferred_progress = {}
             except Exception as exc:
                 outcome.progress_error = f"Learning progress has not been saved: {type(exc).__name__}: {exc}"
         self.persist()

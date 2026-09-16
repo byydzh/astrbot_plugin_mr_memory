@@ -77,6 +77,27 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("test cleanup path is outside the test workspace")
         shutil.rmtree(directory)
 
+    async def test_short_term_correction_survives_topic_change_and_missing_new_note(self):
+        current = event()
+        current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
+        store = await self.plugin.store_for(current)
+        correction = "原图属于乙；甲是上一张图，作者在消息17纠正过。"
+        replies = [
+            ReconstructionResult(background="本轮理解了作者纠正。", working_memory=correction, status="completed"),
+            ReconstructionResult(background="这轮只调整另一张图的颜色。", working_memory=correction, status="completed"),
+            ReconstructionResult(background="这轮背景可用，但没有返回新笔记。", status="completed"),
+        ]
+        memory_agent = SimpleNamespace(reconstruct=AsyncMock(side_effect=replies))
+        with patch.object(self.plugin, "agent", return_value=memory_agent):
+            for _ in replies:
+                request = ProviderRequest(prompt="合成问题")
+                await self.plugin.inject_subconscious_memory(current, request)
+                injected = next(p.text for p in request.extra_user_content_parts if p.text.startswith("<mr_group_context>"))
+                self.assertNotIn(correction, injected)
+        for call in memory_agent.reconstruct.call_args_list[1:]:
+            self.assertEqual(call.args[2]["working_memory"], correction)
+        self.assertEqual(store.load_working_state()["working_memory"], correction)
+
     async def test_injection_preserves_astrbot_request_when_working_state_write_fails(self):
         current = event()
         current.send = AsyncMock(return_value={"message_id": "synthetic-receipt"})

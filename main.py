@@ -376,9 +376,9 @@ class MrMemoryPlugin(Star):
             current["bot_name"] = next((person["name"] for person in current["participants"]
                                         if person["account_id"] == current["bot_id"]), "")
             current["roster_fetched_at"] = cached_roster.get("fetched_at") if cached_roster else None
-            # The last model interpretation is a recorded output, not a premise for
-            # every new question. Learned corrections remain searchable in the DB.
-            working = {key: working[key] for key in ("question", "request_at") if key in working}
+            # The model rewrites its short-term notes independently of the
+            # background selected for the main model's current answer.
+            working = {key: working[key] for key in ("question", "request_at", "working_memory") if key in working}
             await trace.emit("input", "已准备问题、发言者与近期对话", current=current,
                              messages=recent, working=working, message_count=len(recent), operation_id="prepare")
             prepared = True
@@ -405,22 +405,28 @@ class MrMemoryPlugin(Star):
                 payload["injected_chars"] = len(injected)
                 await trace.emit("inject", "已将语义背景交给 AstrBot", text=injected,
                                  chars=len(injected), memory_status=result.status)
-                # Disk bookkeeping cannot retract a usable background from this request.
+            else:
+                payload["injected_chars"] = 0
+                await trace.emit("inject", "本次没有可交付的语义背景", status="skipped", memory_status=result.status)
+            if result.background or result.working_memory is not None:
+                # A note can change independently of the background delivered now.
                 try:
                     async with self.state_locks[store.umo]:
                         state = await asyncio.to_thread(store.load_working_state)
                         if current["sent_at"] >= state.get("request_at", 0):
-                            await asyncio.to_thread(store.update_working_state, {
+                            update = {
                                 "background": result.background, "request_at": current["sent_at"],
-                                "question": current["question"], "status": result.status})
-                            await trace.emit("write", "已保存当次背景（未修改长期记忆）", target="working_state")
+                                "question": current["question"], "status": result.status}
+                            if result.working_memory is not None:
+                                update["working_memory"] = result.working_memory
+                            await asyncio.to_thread(store.update_working_state, update)
+                            await trace.emit("write", "已保存当次背景与短期理解（未修改长期记忆）", target="working_state",
+                                             working_memory_updated=result.working_memory is not None,
+                                             detail=result.working_memory_detail)
                 except Exception as exc:
                     await trace.emit("write", "当次背景保存失败，已交付的背景仍有效", status="error",
                                      target="working_state", detail=str(exc))
                     logger.exception("MR: could not persist working memory")
-            else:
-                payload["injected_chars"] = 0
-                await trace.emit("inject", "本次没有可交付的语义背景", status="skipped", memory_status=result.status)
             logger.info("MR: scope=%s request=%s background %s in %.2fs, tools=%s", store.umo,
                         current["message_id"], result.status, time.perf_counter() - started, len(result.tool_calls))
         except asyncio.CancelledError:
@@ -499,6 +505,9 @@ class MrMemoryPlugin(Star):
                 self.learning_status.setdefault(store.umo, {})[kind] = value
                 return value
 
+            # Persist the model's already-declared progress even while paid
+            # learning waits for its work window or rolling quota.
+            task = await asyncio.to_thread(store.resume_learning_task, kind)
             window = work_window(self.config)
             scheduled = []
             if not force and not window["open"]:
@@ -513,7 +522,6 @@ class MrMemoryPlugin(Star):
                 return report("budget_exhausted", "滚动24小时额度已用完", used_tokens=used)
             remaining = budget - used if budget > 0 else None
             maximum = int(self.config["distillation_max_messages"])
-            task = await asyncio.to_thread(store.learning_task, kind)
             resuming = task is not None
             reflection_tasks = []
             if task:
@@ -577,7 +585,11 @@ class MrMemoryPlugin(Star):
             # The configured message count is a maximum. Fit whole messages to
             # the available input/continuation budget; omitted messages remain
             # queued and can also be opened by the model's context tool.
-            estimate = estimate_learning_input(messages, working, feedback=feedback, task=task)
+            estimate_task = task
+            queued_drafts = state.get("pending_learning_drafts", {}).get(kind, {})
+            if task is None and queued_drafts:
+                estimate_task = {"continuation": {"write_state": {"pending_items": queued_drafts}}}
+            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task)
             while remaining is not None and estimate * 2 > remaining and not (task or {}).get("continuation"):
                 material = [row for row in messages if not row.get("context_only")]
                 if len(material) <= 1:
@@ -595,7 +607,7 @@ class MrMemoryPlugin(Star):
                     messages = context + (material[:count] if keep_oldest else material[-count:])
                 if feedback:
                     working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
-                estimate = estimate_learning_input(messages, working, feedback=feedback, task=task)
+                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task)
             required = estimate + 1 if (task or {}).get("continuation") else estimate * 2
             if remaining is not None and required > remaining:
                 return report("budget_wait", "剩余额度不足以读取并保存当前材料，等待滚动额度释放",
@@ -685,8 +697,9 @@ class MrMemoryPlugin(Star):
                     payload["detail"] = result.detail or "本批尚有材料未完成，已保存进度等待续接"
                 payload["written_count"] = len(written)
                 await self.index_pending(store, trace=trace)
-                return report("completed" if completed else payload["status"], "本批已完成" if completed else payload["detail"],
-                              written_count=len(written), message_count=len(messages), remaining_message_count=len(unfinished))
+                return report("completed" if completed else payload["status"], (result.detail or "本批材料已完成") if completed else payload["detail"],
+                              written_count=len(written), message_count=len(messages), remaining_message_count=len(unfinished),
+                              pending_draft_count=len(result.continuation.get("write_state", {}).get("pending_items", {})))
             except asyncio.CancelledError:
                 payload.update(status="cancelled", detail="Plugin unloaded during this call; token reservation retained")
                 raise
