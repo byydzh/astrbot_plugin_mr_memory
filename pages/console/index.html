@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MR · 群聊记忆</title>
-  <link rel="stylesheet" href="./style.css?v=20260911-learning" />
+  <link rel="stylesheet" href="./style.css?v=20260916-context-reset" />
   <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20260911-learning" defer></script>
+  <script src="./script.js?v=20260916-context-reset" defer></script>
 </head>
 <body>
 <main>
@@ -17,6 +17,11 @@
 
   <section data-view="runtime">
     <div id="policies" class="policies"></div>
+    <section class="context-repair" aria-labelledby="context-repair-title">
+      <div><h2 id="context-repair-title">主模型持续回答异常？</h2><p>可以尝试清理当前群的主会话上下文，下一次请求从新会话开始。旧会话完整保留，MR 记忆和群聊原文也会保留。</p><small id="context-repair-target">请先选择群聊</small></div>
+      <button id="reset-conversation" type="button" disabled>清理主会话上下文</button>
+      <p id="context-repair-result" class="context-repair-result" role="status" hidden></p>
+    </section>
     <section id="learning-plan" class="learning-plan" aria-label="后台工作安排"></section>
     <div id="metrics" class="metrics"></div>
     <section class="panel"><div class="panel-heading"><div><h2>最近调用</h2><p>点开一次活跃，沿着模型输出、搜索、写入和背景交接逐步阅读。</p></div><small id="runs-live-note">最近 30 次 · 时间为北京时间</small></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>任务 / 问题</th><th>状态 / 当前步骤</th><th>耗时</th><th>Token</th><th></th></tr></thead><tbody id="runs"></tbody></table></div></section>

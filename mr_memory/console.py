@@ -14,12 +14,14 @@ from astrbot.api.web import request
 from .store import Store
 from .settings import DEFAULTS
 from .schedule import work_window
+from .conversation import ConversationRepair
 
 
 class Console:
     def __init__(self, plugin):
         self.plugin = plugin
         self.handlers = []
+        self.conversation_repair = ConversationRepair(plugin.context)
         routes = (
             ("overview", self.overview, "GET"),
             ("scopes/<scope_id>/overview", self.scope_overview, "GET"),
@@ -33,6 +35,7 @@ class Console:
             ("scopes/<scope_id>/messages", self.messages, "GET"),
             ("scopes/<scope_id>/context/<message_id>", self.message_context, "GET"),
             ("scopes/<scope_id>/distill", self.distill, "POST"),
+            ("scopes/<scope_id>/conversation/reset", self.reset_conversation, "POST"),
         )
         for path, handler, method in routes:
             wrapped = partial(self.dispatch, handler)
@@ -266,6 +269,10 @@ class Console:
     async def distill(self, scope_id):
         store = await self.get_store(scope_id)
         return await self.plugin.consolidate(store, force=True)
+
+    async def reset_conversation(self, scope_id):
+        store = await self.get_store(scope_id)
+        return await self.conversation_repair.reset_main_conversation(store.umo)
 
 
 def register_console(plugin):

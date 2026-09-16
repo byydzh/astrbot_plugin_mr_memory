@@ -1,6 +1,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { scope: "", tab: "runtime", overview: null, next: null, query: "", graphQuery: "", runDetail: null, detailVersion: 0, pollTimer: null, pollBusy: false };
+const state = { scope: "", tab: "runtime", overview: null, next: null, query: "", graphQuery: "", runDetail: null, detailVersion: 0, pollTimer: null, pollBusy: false, resetBusy: false };
 const kinds = { foreground: "回答前回忆", recall: "回答前回忆", reconstruction: "回答前回忆", background: "后台学习", consolidation: "后台学习", feedback: "反馈学习", episode: "共同经历", semantic: "人物与事实", association: "语义连接", topic: "主题" };
 const statuses = { completed: "完成", partial: "部分完成", error: "失败", failed: "失败", timeout: "超时", running: "处理中", skipped: "未执行", empty: "没有相关内容", cancelled: "已取消" };
 const number = (value) => value == null ? "未记录" : Number(value).toLocaleString("zh-CN");
@@ -152,14 +152,17 @@ async function refresh() {
   }
   if (!overview.scopes.some((s) => s.id === state.scope)) state.scope = overview.scopes[0]?.id || "";
   select.value = state.scope; select.disabled = !state.scope; $("distill").disabled = !state.scope;
+  $("reset-conversation").disabled = !state.scope || state.resetBusy;
   $("connection").textContent = "已连接 AstrBot";
   if (overview.errors?.length) notice(overview.errors.join("\n"), true);
   if (!state.scope) {
     select.append(el("option", "还没有群聊记录"));
     $("scope-summary").textContent = "收到群消息后会建立记忆库";
+    $("context-repair-target").textContent = "请先选择群聊";
     empty($("metrics"), "暂无记忆库"); return;
   }
   const scope = overview.scopes.find((s) => s.id === state.scope);
+  $("context-repair-target").textContent = `操作对象：群 ${scope.group_id} · ${scope.platform_id}`;
   $("scope-summary").textContent = scope.enabled ? "此群已启用 MR" : "此群保留历史记录，当前未启用";
   $("scope-meta").textContent = scope.umo;
   const r = overview.runtime;
@@ -329,7 +332,7 @@ async function showContext(id) {
 
 $("close-detail").addEventListener("click", () => $("detail").close());
 $("detail").addEventListener("close", () => { state.detailVersion += 1; state.runDetail = null; schedulePoll(); });
-$("scope-select").addEventListener("change", () => { state.detailVersion += 1; state.runDetail = null; if ($("detail").open) $("detail").close(); state.scope = $("scope-select").value; clearTimeout(state.pollTimer); attempt(refresh); });
+$("scope-select").addEventListener("change", () => { state.detailVersion += 1; state.runDetail = null; if ($("detail").open) $("detail").close(); state.scope = $("scope-select").value; $("context-repair-result").hidden = true; clearTimeout(state.pollTimer); attempt(refresh); });
 document.addEventListener("visibilitychange", schedulePoll);
 window.addEventListener("pagehide", () => { clearTimeout(state.pollTimer); state.detailVersion += 1; state.runDetail = null; });
 $("refresh").addEventListener("click", () => attempt(refresh));
@@ -354,6 +357,29 @@ $("distill").addEventListener("click", () => attempt(async () => {
     if (scope === state.scope) await loadTab();
   } finally { $("distill").disabled = !state.scope; $("distill").textContent = "整理新消息"; }
 }));
+$("reset-conversation").addEventListener("click", async () => {
+  if (!state.scope || state.resetBusy) return;
+  const scope = state.scope;
+  const group = state.overview.scopes.find((item) => item.id === scope);
+  const label = `群 ${group.group_id} · ${group.platform_id}`;
+  const control = $("reset-conversation"), result = $("context-repair-result");
+  state.resetBusy = true; control.disabled = true; control.textContent = "正在开始新会话…";
+  result.hidden = false; result.classList.remove("error-text");
+  result.textContent = `正在处理 ${label}，保留旧会话并开始新会话…`;
+  try {
+    const data = await api(`scopes/${encodeURIComponent(scope)}/conversation/reset`, {}, true);
+    if (!["cleared", "already_empty", "no_conversation"].includes(data?.status)) throw new Error(data?.message || "未收到会话清理结果，请刷新后查看。");
+    const message = `${label}：${data.message}`;
+    if (scope === state.scope) { result.textContent = message; result.hidden = false; }
+    else notice(message);
+  } catch (error) {
+    const message = `${label}：${error.message || String(error)}`;
+    if (scope === state.scope) { result.textContent = message; result.classList.add("error-text"); result.hidden = false; }
+    else notice(message, true);
+  } finally {
+    state.resetBusy = false; control.disabled = !state.scope; control.textContent = "清理主会话上下文";
+  }
+});
 attempt(async () => {
   const deadline = performance.now() + 5000;
   while (!window.AstrBotPluginPage) {
