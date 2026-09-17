@@ -1,4 +1,4 @@
-"""Incremental private run events; persistence never gates model or tool work."""
+"""Incremental private run events, with explicit persistence for result references."""
 from __future__ import annotations
 
 import asyncio
@@ -46,7 +46,7 @@ class RunTrace:
             self._failed(exc)
         return self.id
 
-    async def emit(self, phase: str, title: str, status: str = "completed", **data) -> None:
+    async def emit(self, phase: str, title: str, status: str = "completed", **data) -> int | None:
         if self.id is None or self._finished:
             return
         try:
@@ -54,6 +54,7 @@ class RunTrace:
             visible = _visible(data)
             self._seq += 1
             self._queue.put_nowait((self._seq, at, phase, status, title, visible))
+            return self._seq
         except Exception as exc:
             self._failed(exc)
 
@@ -68,6 +69,11 @@ class RunTrace:
                 self._failed(exc)
             finally:
                 self._queue.task_done()
+
+    async def persisted(self, seq: int) -> bool:
+        """Only deferred tool bodies need a durable address before replacing them."""
+        await self._queue.join()
+        return self.id is not None and 0 < seq <= self._seq and not self.error
 
     async def finish(self, payload: dict) -> None:
         async with self._finish_lock:

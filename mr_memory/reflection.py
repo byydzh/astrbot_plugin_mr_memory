@@ -76,10 +76,10 @@ class Reflection:
         return item
 
     @_locked
-    def get(self, id: int) -> dict | None:
+    def get(self, id: int, *, include_sources: bool = True) -> dict | None:
         row = self.store.db.execute("SELECT * FROM mr_reflections WHERE umo=? AND id=?",
                                     (self.store.umo, int(id))).fetchone()
-        return self._record(row) if row else None
+        return self._record(row, include_sources=include_sources) if row else None
 
     @_locked
     def save(self, item: dict) -> dict:
@@ -142,7 +142,8 @@ class Reflection:
         return self.get(id)
 
     @_locked
-    def due(self, limit: int = 8, now: float | None = None, *, scheduled_only: bool = False) -> list[dict]:
+    def due(self, limit: int = 8, now: float | None = None, *, scheduled_only: bool = False,
+            include_sources: bool = True) -> list[dict]:
         now = time.time() if now is None else float(now)
         rows = self.store._rows("""SELECT * FROM mr_reflections WHERE umo=? AND
             ((status='pending' AND (next_review_at IS NULL OR next_review_at<=?)) OR
@@ -150,14 +151,14 @@ class Reflection:
             AND (?=0 OR (next_review_explicit=1 AND next_review_at IS NOT NULL))
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
             (self.store.umo, now, now, int(scheduled_only), _limit(limit)))
-        return [self._record(row) for row in rows]
+        return [self._record(row, include_sources=include_sources) for row in rows]
 
     @_locked
-    def waiting(self, limit: int = 8) -> list[dict]:
+    def waiting(self, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
         rows = self.store._rows("""SELECT * FROM mr_reflections WHERE umo=? AND status='waiting'
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
             (self.store.umo, _limit(limit)))
-        return [self._record(row) for row in rows]
+        return [self._record(row, include_sources=include_sources) for row in rows]
 
     @_locked
     def associated(self, kind: str, id: int, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
@@ -207,12 +208,22 @@ class Reflection:
 
     @_locked
     def interaction(self, request_id: str | None = None, run_id: int | None = None,
-                    detailed: bool = False) -> dict:
+                    detailed: bool = False, step: int | None = None) -> dict:
         """Read a specific request's recorded stages, without inferring causality.
 
         Detailed mode opens at most four linked MR runs and 100 response events.
         Later adjacent messages are context, not automatically user feedback.
         """
+        if step is not None:
+            if run_id is None or request_id is not None:
+                raise ValueError("A recorded step is addressed by run_id and step")
+            row = self.store.db.execute("""SELECT s.* FROM mr_run_steps s JOIN mr_runs r ON r.id=s.run_id
+                WHERE r.umo=? AND r.id=? AND s.seq=?""", (self.store.umo, int(run_id), int(step))).fetchone()
+            if row is None:
+                return {"status": "step_not_found", "run_id": run_id, "step": step}
+            value = dict(row)
+            value["data"] = json.loads(value.pop("data_json"))
+            return value
         selected = self.store.run_detail(int(run_id)) if run_id is not None else None
         if run_id is not None and selected is None:
             return {"status": "run_not_found", "run_id": run_id}

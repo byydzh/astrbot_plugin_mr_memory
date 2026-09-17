@@ -267,7 +267,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.status, "completed", finished.detail)
         self.assertEqual(finished.items, [])
 
-    async def test_failed_write_cannot_finish_empty_but_successful_retry_can(self):
+    async def test_failed_write_survives_completion_until_successful_retry(self):
         item = {"kind": "episode", "summary": "改到西门见", "source_ids": [1]}
         messages = [{"id": 1, "source_key": "u1", "plain_text": "改到西门见"}]
 
@@ -287,9 +287,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                     replies.append(response(calls=[("remember", {"items": [item]}, "retry")]))
                 replies.append(response('{"items":[]}'))
                 result = await MemoryAgent(Provider(replies), WriteStore()).consolidate(messages, {})
-                self.assertEqual(result.status, "completed" if retry else "partial")
+                self.assertEqual(result.status, "completed")
+                pending = result.continuation["write_state"]["pending_items"]
+                self.assertEqual(bool(pending), not retry)
                 if not retry:
-                    self.assertIn("database write failed", result.detail)
+                    self.assertIn("database write failed", next(iter(pending.values()))["detail"])
 
     def test_model_sees_natural_speakers_and_sources_without_person_codes(self):
         value = {"members": [{"id": 7, "account_id": "10", "name": "小桥"},

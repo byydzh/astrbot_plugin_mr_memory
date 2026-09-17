@@ -437,8 +437,10 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(messages), 2)
         self.assertNotIn("question", working)
         self.assertEqual(working["reflections"][0]["id"], task["id"])
-        self.assertEqual(working["reflections"][0]["sources"][0]["id"], source["id"])
+        self.assertEqual(working["reflections"][0]["source_ids"], [source["id"]])
+        self.assertNotIn("sources", working["reflections"][0])
         reviewed = store.reflections.get(task["id"])
+        self.assertEqual(reviewed["sources"][0]["id"], source["id"])
         self.assertIsNotNone(reviewed["last_reviewed_at"])
         self.assertIsNone(reviewed["next_review_at"])
         self.assertEqual(store.reflections.due(), [])
@@ -499,7 +501,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         store = await self.plugin.store_for(event())
         base = self.plugin.message(event())
         for index in range(80):
-            store.append_message({**base, "message_id": f"large-{index}", "plain_text": "合成群聊内容" * 100})
+            store.append_message({**base, "message_id": f"large-{index}", "plain_text": f"第{index}条：" + "合成群聊内容" * 100})
         self.plugin.config.update(private_daily_token_budget=100000, distillation_max_messages=80)
         learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
             status="partial", detail="尚未结束", usage={"input_other": 20}, model_attempts=1)))
@@ -507,9 +509,38 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.plugin, "index_pending", new=AsyncMock()):
             await self.plugin.learn(store, force=True)
         selected = learning.consolidate.call_args.args[0]
+        working = learning.consolidate.call_args.args[1]
         self.assertGreater(len(selected), 0)
         self.assertLess(len(selected), 80)
+        self.assertEqual(working["queue"]["pending_messages"], 80)
+        self.assertEqual(working["queue"]["this_batch_messages"], len(selected))
         self.assertEqual(len(store.pending_messages(100)), 80)
+
+    async def test_completed_batch_keeps_token_density_for_the_next_batch(self):
+        store = await self.plugin.store_for(event())
+        base = self.plugin.message(event())
+        store.append_message({**base, "message_id": "calibration"})
+        self.plugin.config.update(private_daily_token_budget=180000, distillation_max_messages=80)
+        sizes = []
+
+        async def learn(messages, working, **options):
+            sizes.append(len(messages))
+            if len(sizes) > 1:
+                self.assertEqual(options["task"]["continuation"]["input_tokens_per_byte"], 0.28)
+                self.assertEqual(options["task"]["continuation"]["output_token_reserve"], 25000)
+            return ConsolidationResult(status="completed", usage={"input_other": 20, "output": 10},
+                progress={"completed_ids": [row["id"] for row in messages]},
+                continuation={"input_tokens_per_byte": 0.28, "output_token_reserve": 25000}, model_attempts=1)
+
+        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            await self.plugin.learn(store, force=True)
+            self.assertIsNone(store.learning_task("background"))
+            for index in range(80):
+                store.append_message({**base, "message_id": f"calibrated-{index}", "plain_text": f"第{index}条：" + "合成群聊内容" * 100})
+            await self.plugin.learn(store, force=True)
+        self.assertEqual(sizes, [1, 80])
+        self.assertEqual(store.pending_status()["count"], 0)
 
     async def test_recent_feedback_budget_shrink_keeps_latest_reactions_and_their_bot(self):
         store = await self.plugin.store_for(event())

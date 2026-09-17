@@ -60,6 +60,17 @@ class ReflectionDirectoryTests(unittest.TestCase):
             self.assertEqual(complete["sources"][0]["sender_id"], "alice")
             self.assertEqual(complete["sources"][0]["plain_text"], self.source["plain_text"])
 
+    def test_learning_directories_open_sources_only_on_explicit_read(self):
+        concern = self.concern()
+        self.store.reflections.save({"id": concern["id"], "next_review_at": 1})
+        complete = self.store.reflections.get(concern["id"])
+        with patch.object(self.store, "_message", side_effect=AssertionError("directory opened raw text")):
+            for compact in (self.store.reflections.waiting(include_sources=False)[0],
+                            self.store.reflections.due(include_sources=False)[0],
+                            self.store.reflections.get(concern["id"], include_sources=False)):
+                self.assert_directory(compact, complete)
+        self.assertEqual(self.store.reflections.get(concern["id"])["sources"], complete["sources"])
+
     def test_graph_directory_propagates_view_to_both_node_reflections(self):
         edge = self.save({"kind": "association", "source": "小叶", "target": "朋友",
                           "relation": "提到", "statement": "小叶提到朋友办展览"})

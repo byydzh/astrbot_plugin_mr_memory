@@ -19,7 +19,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .mr_memory.agent import MemoryAgent, checkpoint_learning_task, estimate_learning_input
+from .mr_memory.agent import MemoryAgent, checkpoint_learning_task, compact_learning_task, estimate_learning_input
 from .mr_memory.embedding import Embedder
 from .mr_memory.store import Store
 from .mr_memory.settings import normalize_settings
@@ -512,7 +512,7 @@ class MrMemoryPlugin(Star):
             scheduled = []
             if not force and not window["open"]:
                 if feedback:
-                    scheduled = await asyncio.to_thread(store.reflections.due, scheduled_only=True)
+                    scheduled = await asyncio.to_thread(store.reflections.due, scheduled_only=True, include_sources=False)
                 if not scheduled:
                     return report("deferred", "等待服务当地工作时段", **window)
             state = await asyncio.to_thread(store.load_working_state)
@@ -521,6 +521,14 @@ class MrMemoryPlugin(Star):
             if budget > 0 and used >= budget:
                 return report("budget_exhausted", "滚动24小时额度已用完", used_tokens=used)
             remaining = budget - used if budget > 0 else None
+            calibration = state.get("learning_input_calibration", {}).get(kind, {})
+            density = (calibration.get("tokens_per_byte", 0.0)
+                       if calibration.get("provider_id") == self.config["subconscious_provider_id"] else 0.0)
+            output_reserve = min(int(self.config["distillation_max_output_tokens"]),
+                int(calibration.get("output_tokens", 0))) if density else 0
+            if task is not None and output_reserve:
+                task["continuation"]["output_token_reserve"] = max(output_reserve,
+                    task.get("continuation", {}).get("output_token_reserve", 0))
             maximum = int(self.config["distillation_max_messages"])
             resuming = task is not None
             reflection_tasks = []
@@ -535,7 +543,7 @@ class MrMemoryPlugin(Star):
                     working["scheduled_reflections"] = scheduled
                     working["focus"] = "工作时段外先处理这些模型预约到期的关注；其余材料可继续留待工作时段。"
                 refs = working.get("reflections", [])
-                refreshed = [await asyncio.to_thread(store.reflections.get, row["id"]) for row in refs]
+                refreshed = [await asyncio.to_thread(store.reflections.get, row["id"], include_sources=False) for row in refs]
                 reflection_tasks = [row for row in refreshed if row and row["status"] != "resolved"]
                 working["reflections"] = reflection_tasks
                 # A completed material pass can still have real reflection work.
@@ -546,12 +554,14 @@ class MrMemoryPlugin(Star):
                 if task.get("checkpoint") and native and (material_done or (remaining is not None
                         and estimate_learning_input(messages, working, feedback=feedback, task=task) * 2 > remaining)):
                     task = checkpoint_learning_task(task)
+                if remaining is not None and estimate_learning_input(messages, working, feedback=feedback, task=task) >= remaining:
+                    task = compact_learning_task(task)
                 if not task.get("continuation", {}).get("conversation"):
                     memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
                                 for ref in task["memory_refs"]]
                     working["saved_memories"] = [row for row in memories if row]
             elif feedback:
-                reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due)
+                reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due, include_sources=False)
                 feedback_order = state.get("feedback_next_order", "recent")
                 messages = await asyncio.to_thread(store.feedback_messages,
                     int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum,
@@ -571,16 +581,22 @@ class MrMemoryPlugin(Star):
                 if not messages and not reflection_tasks:
                     return report("idle", "没有待处理互动")
                 if feedback:
-                    waiting = await asyncio.to_thread(store.reflections.waiting) if messages else []
+                    waiting = await asyncio.to_thread(store.reflections.waiting, include_sources=False) if messages else []
                     reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
                     working = {"interactions": await asyncio.to_thread(store.reflections.feedback_context, messages),
                                "reflections": reflection_tasks, "feedback_order": feedback_order}
                 else:
-                    reflection_tasks = await asyncio.to_thread(store.reflections.waiting)
+                    reflection_tasks = await asyncio.to_thread(store.reflections.waiting, include_sources=False)
                     working = {"reflections": reflection_tasks} if reflection_tasks else {}
                 previous_learning = await asyncio.to_thread(store.unfinished_learning, kind)
                 if previous_learning:
                     working["previous_learning"] = previous_learning
+
+            if not feedback:
+                pending = await asyncio.to_thread(store.pending_status)
+                working["queue"] = {"pending_messages": pending["count"],
+                    "this_batch_messages": len([row for row in messages if not row.get("context_only")]),
+                    "meaning": "滚动额度由本群所有待整理批次共享，不是本批的目标消耗。当前材料理解并保存后，后续调用会继续其他批次。"}
 
             # The configured message count is a maximum. Fit whole messages to
             # the available input/continuation budget; omitted messages remain
@@ -589,8 +605,8 @@ class MrMemoryPlugin(Star):
             queued_drafts = state.get("pending_learning_drafts", {}).get(kind, {})
             if task is None and queued_drafts:
                 estimate_task = {"continuation": {"write_state": {"pending_items": queued_drafts}}}
-            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task)
-            while remaining is not None and estimate * 2 > remaining and not (task or {}).get("continuation"):
+            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density)
+            while remaining is not None and (estimate + output_reserve) * 2 > remaining and not (task or {}).get("continuation"):
                 material = [row for row in messages if not row.get("context_only")]
                 if len(material) <= 1:
                     break
@@ -607,8 +623,10 @@ class MrMemoryPlugin(Star):
                     messages = context + (material[:count] if keep_oldest else material[-count:])
                 if feedback:
                     working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
-                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task)
-            required = estimate + 1 if (task or {}).get("continuation") else estimate * 2
+                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density)
+            if not feedback:
+                working["queue"]["this_batch_messages"] = len([row for row in messages if not row.get("context_only")])
+            required = estimate + 1 if (task or {}).get("continuation") else (estimate + output_reserve) * 2
             if remaining is not None and required > remaining:
                 return report("budget_wait", "剩余额度不足以读取并保存当前材料，等待滚动额度释放",
                               used_tokens=used, required_tokens=required)
@@ -617,6 +635,9 @@ class MrMemoryPlugin(Star):
                 task = await asyncio.to_thread(store.start_learning_task, kind,
                     [row["id"] for row in messages if not row.get("context_only")],
                     [row["id"] for row in messages if row.get("context_only")], working)
+                if density:
+                    task["continuation"]["input_tokens_per_byte"] = density
+                    task["continuation"]["output_token_reserve"] = output_reserve
             task = {**task, "offered_ids": [row["id"] for row in messages if not row.get("context_only")]}
             agent = self.agent(store, background=True, feedback=feedback)
             reserved = remaining if remaining is not None else estimate + int(self.config["distillation_max_output_tokens"])
@@ -638,6 +659,12 @@ class MrMemoryPlugin(Star):
                 agent.trace = trace
                 result = await agent.consolidate(
                     messages, working, feedback=feedback, token_budget=remaining, task=task)
+                observed_density = result.continuation.get("input_tokens_per_byte", 0.0)
+                if observed_density:
+                    await self.update_state(store, {"learning_input_calibration": {
+                        **state.get("learning_input_calibration", {}), kind: {
+                            "provider_id": self.config["subconscious_provider_id"], "tokens_per_byte": observed_density,
+                            "output_tokens": max(output_reserve, result.continuation.get("output_token_reserve", 0))}}})
                 payload.update({key: value for key, value in asdict(result).items() if key != "continuation"},
                                usage_estimated=bool(result.unknown_usage_calls) or not bool(result.usage))
                 if result.usage and not result.unknown_usage_calls:

@@ -77,6 +77,8 @@ class LearningWriter:
     def apply(self, args: dict, call_id: str) -> WriteOutcome:
         if not isinstance(args, dict) or set(args) - {"items", "progress", "finish", "retry"}:
             raise ValueError("remember accepts items, progress, finish and retry")
+        if not args:
+            raise ValueError("remember received empty arguments; no memory or progress was saved. Supply items, progress, retry or finish.")
         items, retries, progress = args.get("items", []), args.get("retry", []), args.get("progress", {})
         if not isinstance(items, list) or not isinstance(retries, list):
             raise ValueError("remember.items and remember.retry must be lists")
