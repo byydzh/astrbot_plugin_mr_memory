@@ -179,21 +179,21 @@ class StoreContractTests(unittest.TestCase):
                          "account_id": first["sender_id"], "name_at_message": first["sender_name"], "role": "USER"}])
         self.assertEqual(len(self.store.graph(terms=["东门"])), 1)
         self.assertEqual(self.store.memory("semantic", str(saved[1]["id"]))["source_keys"], [first["source_key"], second["source_key"]])
-        self.assertEqual(self.store.db.execute("SELECT cue FROM episode_keywords").fetchone()[0], "青桥")
+        self.assertEqual(self.store.navigate(cue="青桥", aspect="")["items"][0]["id"], saved[0]["id"])
         self.assertEqual(self.store.pending_messages(20), [])
         self.store.db.execute("UPDATE message_processing SET status='FAILED' WHERE message_id=?", (first["id"],))
         self.store.db.commit()
         self.assertEqual(self.store.pending_messages(20)[0]["id"], first["id"])
         docs = self.store.pending_embeddings("fixture-model", 10)
-        self.assertEqual(len(docs), 3)
+        self.assertEqual(len(docs), 5)  # The two graph endpoints are independently searchable.
         self.store.close()
         self.store = Store(self.path, self.scope)
-        self.assertEqual(len(self.store.pending_embeddings("fixture-model", 10)), 3)
+        self.assertEqual(len(self.store.pending_embeddings("fixture-model", 10)), 5)
         for doc in docs:
             self.assertTrue(self.store.save_embedding(doc, "fixture-model", [1.0, 0.0]))
         self.assertEqual(self.store.pending_embeddings("fixture-model", 10), [])
         vectors = self.store.vector_rows("fixture-model")
-        self.assertEqual(len(vectors), 3)
+        self.assertEqual(len(vectors), 5)
         self.assertEqual(struct.unpack("<2f", vectors[0]["vector"]), (1.0, 0.0))
         self.assertEqual(self.store.vector_rows("another-model"), [])
         self.store.delete_message("1")
@@ -214,11 +214,11 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(self.store.activity(account_id="10", start_at=first["sent_at"], end_at=bot["sent_at"] + 1)["message_count"], 1)
         saved = self.remember([
             {"kind": "episode", "summary": "p7说以前五人寝，p14说现在两人寝"},
-            {"kind": "semantic", "content": "以前住五人寝", "participant_id": first["participant_id"]},
+            {"kind": "semantic", "content": "以前住五人寝", "subject": {"name": "小桥", "account_id": "10"}},
         ], [first["source_key"], second["source_key"], bot["source_key"]])
         self.assertEqual(saved[1]["subject"], {"name": "小桥", "account_id": "10"})
         self.assertEqual(saved[0]["summary"], "p7说以前五人寝，p14说现在两人寝")
-        sources = self.store.memory_sources("episode", saved[0]["id"])
+        sources = self.store.memory("episode", saved[0]["id"])["sources"]
         self.assertEqual(sources, saved[0]["sources"])
         self.assertEqual([m["sender_id"] for m in sources], ["10", "20", "99"])
         self.assertEqual(sources[1]["content"][0]["sender_id"], "10")
@@ -231,8 +231,8 @@ class StoreContractTests(unittest.TestCase):
         mention = self.message(4, "问问小桥", sender="40",
             content=[{"type": "mention", "account_id": "10", "display_name": "小桥"}])
         old, unrelated = self.remember([
-            {"kind": "semantic", "content": "p9是去过展览的那位小桥", "participant_id": first["participant_id"]},
-            {"kind": "semantic", "content": "另一位小桥还没去", "participant_id": other["participant_id"]},
+            {"kind": "semantic", "content": "p9是去过展览的那位小桥", "subject": {"name": "小桥", "account_id": "10"}},
+            {"kind": "semantic", "content": "另一位小桥还没去", "subject": {"name": "小桥", "account_id": "20"}},
         ], [other["source_key"]], mark_processed=False)
         natural = self.remember([
             {"kind": "semantic", "person": "小桥", "content": "小桥回忆曾去展览"}
@@ -243,13 +243,11 @@ class StoreContractTests(unittest.TestCase):
         association = self.remember([
             {"kind": "association", "source": "展览", "target": "讨论", "relation": "话题", "statement": "有人提及小桥讨论展览"}
         ], [mention["source_key"]], mark_processed=False)[0]
-        with self.store.db:
-            topic_id = self.store.db.execute("INSERT INTO topics(umo,name,summary) VALUES(?,?,?)",
-                (self.scope, "展览话题", "有关展览的交流")).lastrowid
-            self.store.db.execute("INSERT INTO topic_episodes(topic_id,episode_id) VALUES(?,?)", (topic_id, episode["id"]))
+        topic_id = self.store.save_memories([{"kind": "topic", "title": "展览话题", "content": "有关展览的交流",
+            "connections": [{"kind": "episode", "id": episode["id"], "relation": "包含经历", "purpose": "basis"}]}], mark_processed=False)[0]["id"]
         candidates = self.store.search_memories(related_account_id="10", limit=20)
         addresses = {(item["kind"], item["id"]) for item in candidates}
-        self.assertEqual(addresses, {("semantic", old["id"]), ("semantic", natural["id"]), ("episode", episode["id"]), ("topic", topic_id)})
+        self.assertTrue({("semantic", old["id"]), ("semantic", natural["id"]), ("episode", episode["id"]), ("topic", topic_id), ("association", association["id"])} <= addresses)
         self.assertNotIn(("semantic", unrelated["id"]), addresses)
         old_result = next(item for item in candidates if item["kind"] == "semantic" and item["id"] == old["id"])
         self.assertEqual(old_result["subject"]["account_id"], "10")
@@ -337,10 +335,8 @@ class StoreContractTests(unittest.TestCase):
         first = self.message(1, "小桥说展览周六开放")
         correction = self.message(2, "我说的是周日开放")
         episode = self.remember([{"kind": "episode", "summary": "小桥解释展览日程"}], [first["source_key"]])[0]
-        with self.store.db:
-            topic_id = self.store.db.execute("INSERT INTO topics(umo,name,summary) VALUES(?,?,?)",
-                (self.scope, "旧日程", "p3说展览周六开放")).lastrowid
-            self.store.db.execute("INSERT INTO topic_episodes(topic_id,episode_id) VALUES(?,?)", (topic_id, episode["id"]))
+        topic_id = self.store.save_memories([{"kind": "topic", "title": "旧日程", "content": "p3说展览周六开放",
+            "connections": [{"kind": "episode", "id": episode["id"], "relation": "包含经历", "purpose": "basis"}]}], mark_processed=False)[0]["id"]
         self.store.put_vector("topic", str(topic_id), "fixture", struct.pack("<2f", 1.0, 0.0), 2)
         revised = self.remember([
             {"kind": "topic", "id": topic_id, "title": "展览日程", "summary": "小桥说展览周日开放"}
@@ -356,8 +352,7 @@ class StoreContractTests(unittest.TestCase):
         vector = self.store.db.execute("SELECT owner_key,vector FROM memory_embeddings WHERE owner_type='topic'").fetchone()
         self.assertEqual(vector["owner_key"], str(topic_id))
         self.assertEqual(struct.unpack("<2f", vector["vector"]), (0.0, 1.0))
-        with self.assertRaisesRegex(ValueError, "existing id"):
-            self.remember([{"kind": "topic", "summary": "不新建topic"}], [first["source_key"]])
+        self.assertEqual(len(self.store.graph(ref={"kind": "topic", "id": topic_id})), 1)
         self.store.delete_message(correction["source_key"])
         self.assertIsNone(self.store.memory("topic", topic_id))
         self.assertEqual(self.store.search_memories(kind="topic"), [])

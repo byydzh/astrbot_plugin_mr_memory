@@ -62,7 +62,7 @@ class LearningTaskTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "this task's material"):
             self.store.save_memories([item], [evidence["source_key"]], learning_kind="background",
                                       progress={"completed_ids": [999]}, run_id=3)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM semantic_memories").fetchone()[0], 0)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='semantic'").fetchone()[0], 0)
         self.assertEqual(self.store.learning_task("background"), task)
         saved = self.store.save_memories([item], [evidence["source_key"]], learning_kind="background",
                                          progress={"completed_ids": [handled["id"]]}, run_id=4)

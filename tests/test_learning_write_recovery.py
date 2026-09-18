@@ -33,7 +33,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.scratch.rmdir()
 
     def args(self):
-        return {"items": [{"kind": "episode", "summary": "约在西门见"},
+        return {"items": [{"kind": "episode", "summary": "约在西门见", "source_ids": [999]},
                           {"kind": "semantic", "content": "群友2会带桌游", "source_ids": [self.ids[1]]}],
                 "progress": {"completed_ids": self.ids, "checkpoint": "已读完，原文编号可继续查阅"}, "finish": True}
 
@@ -85,7 +85,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
             async def _model_turn(agent, messages, prompt, tools, turn, **kwargs):
                 owner.assertIs(tools, schema)
                 owner.assertNotIn("tool_choice", kwargs)
-                owner.assertIn("仅提供remember保存工具", messages[-1]["content"])
+                owner.assertTrue(json.loads(messages[-1]["content"])["resource_state"]["save_this_turn"])
                 owner.assertEqual(turn, 1)
                 return SimpleNamespace(completion_text=json.dumps({"items": [], "finish": True,
                     "progress": {"completed_ids": owner.ids, "checkpoint": "两条临时安排已理解，无长期信息"}}, ensure_ascii=False),
@@ -99,7 +99,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.pending_status()["count"], 0)
         self.assertEqual(result.model_attempts, 1)
         self.assertEqual(result.continuation["output_token_reserve"], 6000)
-        tool_set.assert_called_with(learning=True, writing_only=True)
+        tool_set.assert_called_once_with(learning=True)
 
     async def test_final_native_dsml_preserves_complete_draft_and_progress(self):
         args = {"items": [{"kind": "episode", "summary": "小桥说 <北门> & 西门有别", "source_ids": self.ids}],
@@ -195,7 +195,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         outcome = writer.apply(self.args(), "save")
         self.assertEqual(len(outcome.written), 1)
         self.assertEqual(set(writer.pending_items), {"save:0"})
-        self.assertNotIn("source_ids", writer.pending_items["save:0"]["item"])
+        self.assertEqual(writer.pending_items["save:0"]["item"]["source_ids"], [999])
         task = self.store.learning_task("background")
         self.assertEqual(task["completed_ids"], self.ids)
         self.assertEqual(task["checkpoint"], self.args()["progress"]["checkpoint"])
@@ -210,7 +210,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repaired.written[0]["summary"], "约在西门见")
         self.assertFalse(writer.pending_items)
         self.assertEqual(self.store.learning_task("background")["completed_ids"], self.ids)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM semantic_memories").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='semantic'").fetchone()[0], 1)
 
     async def test_completed_batch_transfers_pending_draft_to_next_batch_without_losing_it(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background", run_id=7)
@@ -281,17 +281,17 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["receipts"]["one:0"]), 1)
         resumed = LearningWriter(self.store, self.sources, learning_kind="background", **state)
         resumed.apply(args, "one")
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM plastic_edges").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='association'").fetchone()[0], 1)
 
     async def test_duplicate_retry_does_not_create_two_associations(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
         writer.apply({"items": [{"kind": "association", "source": {"label": "小桥"},
-            "target": {"label": "桌游"}, "relation": "携带", "statement": "小桥说会带桌游"}]}, "draft")
+            "target": {"label": "桌游"}, "relation": "携带", "statement": "小桥说会带桌游", "source_ids": [999]}]}, "draft")
         retry = {"pending_id": "draft:0", "changes": {"source_ids": self.ids}}
         outcome = writer.apply({"retry": [retry, retry]}, "repair")
         self.assertEqual(len(outcome.written), 1)
         self.assertEqual(len(outcome.rejected), 1)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM plastic_edges").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='association'").fetchone()[0], 1)
 
     async def test_failed_detailed_receipt_does_not_repeat_a_committed_write(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
@@ -306,7 +306,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                                                 "source_ids": self.ids}]}, "save")
         self.assertEqual(len(outcome.written), 1)
         self.assertFalse(writer.pending_items)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM episodes").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='episode'").fetchone()[0], 1)
 
     async def test_partial_checkpoint_repairs_one_draft_without_repeating_old_retrieval(self):
         args = self.args()

@@ -6,7 +6,7 @@
   <title>MR · 群聊记忆</title>
   <link rel="stylesheet" href="./style.css?v=20260916-context-reset" />
   <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20260916-context-reset" defer></script>
+  <script src="./script.js?v=20260919-memory-graph" defer></script>
 </head>
 <body>
 <main>
@@ -29,7 +29,7 @@
   </section>
 
   <section data-view="memory" hidden>
-    <form id="memory-search" class="search-bar"><label class="grow">查找群内经历、人物与概念<input id="memory-query" type="search" placeholder="输入关键词或昵称" /></label><label>记忆类型<select id="memory-kind"><option value="all">经历、事实与主题</option value="episode">共同经历</option><option value="semantic">人物与事实</option><option value="association">语义连接</option><option value="topic">主题</option></select></label><button class="primary">搜索</button></form>
+    <form id="memory-search" class="search-bar"><label class="grow">查找群内经历、人物与概念<input id="memory-query" type="search" placeholder="输入关键词或昵称" /></label><label>记忆类型<select id="memory-kind"><option value="all">全部记忆与连接</option><option value="episode">共同经历</option><option value="semantic">形成的认识</option><option value="association">语义连接</option><option value="topic">主题</option><option value="pattern">跨经历的理解</option><option value="reflection">延续的思路</option><option value="node">人物与概念</option></select></label><button class="primary">搜索</button></form>
     <div class="memory-layout"><section class="panel"><div class="panel-heading"><div><h2>记忆条目</h2><p>最多显示最近 60 条匹配记录，点开可回到原始消息。</p></div></div><div id="memory-list" class="card-list"></div></section>
     <section class="panel"><div class="panel-heading"><div><h2>记忆图</h2><p id="graph-caption">数据库中保存的语义连接；点击节点展开相邻连接。</p></div><button id="graph-reset" type="button">返回概览</button></div><div class="graph-stage"><svg id="graph" viewBox="0 0 680 440" aria-label="语义记忆连接图"></svg></div><div id="edge-list" class="edge-list"></div></section></div>
   </section>

@@ -1,7 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { scope: "", tab: "runtime", overview: null, next: null, query: "", graphQuery: "", runDetail: null, detailVersion: 0, pollTimer: null, pollBusy: false, resetBusy: false };
-const kinds = { foreground: "回答前回忆", recall: "回答前回忆", reconstruction: "回答前回忆", background: "后台学习", consolidation: "后台学习", feedback: "反馈学习", episode: "共同经历", semantic: "人物与事实", association: "语义连接", topic: "主题" };
+const kinds = { foreground: "回答前回忆", recall: "回答前回忆", reconstruction: "回答前回忆", background: "后台学习", consolidation: "后台学习", feedback: "反馈学习", episode: "共同经历", semantic: "形成的认识", association: "语义连接", topic: "主题", pattern: "跨经历的理解", node: "人物与概念", reflection: "延续的思路" };
 const statuses = { completed: "完成", partial: "部分完成", error: "失败", failed: "失败", timeout: "超时", running: "处理中", skipped: "未执行", empty: "没有相关内容", cancelled: "已取消" };
 const number = (value) => value == null ? "未记录" : Number(value).toLocaleString("zh-CN");
 const duration = (value) => value == null ? "未记录" : `${(Number(value) / 1000).toFixed(1)} 秒`;
@@ -243,10 +243,29 @@ async function showMemory(kind, id) {
   proseSection(parent, item.title || item.relation || "记忆内容", item.summary || item.statement);
   if (item.source && item.target) parent.append(el("p", `${item.source} → ${item.relation} → ${item.target}`, "meta"));
   if (item.uncertainty) proseSection(parent, "尚不确定的部分", item.uncertainty);
+  if (item.last_reconsideration) proseSection(parent, "最近一次重新思考", item.last_reconsideration.note);
+  const links = item.navigation?.connections || [];
+  if (links.length) {
+    const section = el("section"); section.append(el("h3", "沿着连接继续阅读"));
+    for (const link of links) {
+      const outward = link.source_ref.kind === kind && String(link.source_ref.id) === String(id);
+      const target = outward ? link.target_ref : link.source_ref;
+      const targetMemory = outward ? link.target_memory : link.source_memory;
+      const row = el("div", null, "source-actions");
+      row.append(button(`${link.relation || "关联记忆"} · ${targetMemory?.title || kinds[target.kind] || target.kind}`, () => showMemory(target.kind, target.id)));
+      if (link.summary) row.append(el("span", link.summary, "footnote"));
+      section.append(row);
+    }
+    if (item.navigation.more) section.append(el("p", "还有更多连接，可从记忆图继续展开。", "footnote"));
+    parent.append(section);
+  }
+  for (const basis of item.basis || []) if (basis.basis_changed) {
+    parent.append(el("p", `这项认识的依据后来发生了变化：${basis.target.title || basis.target.kind}。目前尚需结合变化重新理解。`, "meta"));
+  }
   const sources = el("section"); sources.append(el("h3", "回到原始消息"));
   const actions = el("div", null, "source-actions");
   for (const messageId of item.source_ids || []) actions.append(button(`消息 ${messageId}`, () => showContext(messageId)));
-  if (!actions.children.length) actions.append(el("p", "这条旧记忆未保留可打开的原文关联。", "footnote"));
+  if (!actions.children.length) actions.append(el("p", links.length ? "这项理解可沿连接回到相关经历。" : "这条记忆没有直接关联原始消息。", "footnote"));
   sources.append(actions); parent.append(sources);
   details(parent, "记忆原始字段", item);
 }
@@ -256,17 +275,17 @@ function renderGraph(data) {
   const make = (tag, attrs) => { const n = document.createElementNS(ns, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v)); return n; };
   $("graph-caption").textContent = `${data.nodes.length} 个节点 · ${data.edges.length} 条实际连接（每次最多 ${data.limit} 条）；点击节点查看邻接，点击下方关系查看原文。`;
   const positions = new Map();
-  data.nodes.forEach((node, i) => { const a = i / Math.max(data.nodes.length, 1) * Math.PI * 2 - Math.PI / 2; const radius = i % 2 ? 145 : 195; positions.set(node.id, [340 + Math.cos(a) * radius * 1.35, 220 + Math.sin(a) * radius]); });
+  data.nodes.forEach((node, i) => { const a = i / Math.max(data.nodes.length, 1) * Math.PI * 2 - Math.PI / 2; const radius = i % 2 ? 145 : 195; positions.set(node.key, [340 + Math.cos(a) * radius * 1.35, 220 + Math.sin(a) * radius]); });
   for (const edge of data.edges) {
-    const [x1, y1] = positions.get(edge.source_node_id); const [x2, y2] = positions.get(edge.target_node_id);
+    const [x1, y1] = positions.get(edge.source_key); const [x2, y2] = positions.get(edge.target_key);
     const line = make("line", { x1, y1, x2, y2 }); const title = make("title", {}); title.textContent = edge.statement || edge.relation; line.append(title); svg.append(line);
   }
   for (const node of data.nodes) {
-    const [x, y] = positions.get(node.id); const group = make("g", { class: "node", tabindex: 0, role: "button", "aria-label": `展开 ${node.label} 的相邻连接` });
-    const title = make("title", {}); title.textContent = node.label;
+    const [x, y] = positions.get(node.key); const group = make("g", { class: "node", tabindex: 0, role: "button", "aria-label": `展开 ${node.label} 的相邻连接` });
+    const title = make("title", {}); title.textContent = `${kinds[node.kind] || node.kind} · ${node.label}`;
     const text = make("text", { x, y: y + 21, "text-anchor": "middle" }); text.textContent = node.label.length > 13 ? node.label.slice(0, 13) + "…" : node.label;
     group.append(make("circle", { cx: x, cy: y, r: 7 }), text, title);
-    const expand = () => attempt(async () => renderGraph(await api(path("graph"), { node_id: node.id })));
+    const expand = () => attempt(async () => renderGraph(await api(path("graph"), { kind: node.kind, id: node.id })));
     group.addEventListener("click", expand); group.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); expand(); } }); svg.append(group);
   }
   const list = $("edge-list"); list.replaceChildren();

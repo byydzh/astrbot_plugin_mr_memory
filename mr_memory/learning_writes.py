@@ -19,15 +19,17 @@ class WriteOutcome:
     discarded: list = field(default_factory=list)
     progress_applied: dict = field(default_factory=dict)
     progress_error: str = ""
+    reconsidered: list = field(default_factory=list)
 
     def receipt(self, pending: dict) -> list | dict:
-        if not pending and not self.rejected and not self.progress_error and not self.discarded:
+        if not pending and not self.rejected and not self.progress_error and not self.discarded and not self.reconsidered:
             return self.written
         return {"status": "partial" if pending or self.rejected or self.progress_error else "completed",
                 "written": self.written,
                 "rejected": [{key: value for key, value in row.items() if key != "item"} for row in self.rejected],
                 "pending_items": [{"pending_id": key, **value} for key, value in pending.items()],
                 "discarded": self.discarded, "progress_applied": self.progress_applied,
+                "reconsidered": self.reconsidered,
                 "detail": self.progress_error or "; ".join(row["detail"] for row in self.rejected),
                 "next": "材料进度与草稿分别保存；待修草稿不阻止本批结束，会保留到后续学习。已保存项不用重发；retry使用pending_id补changes，或用discard_reason说明不再保存的原因。需要原文时仍可按消息编号读取。"}
 
@@ -37,18 +39,25 @@ class LearningWriter:
 
     def __init__(self, store, sources: dict[int, str], *, run_id=None, learning_kind=None,
                  pending_items: dict | None = None, deferred_progress: dict | None = None,
-                 receipts: dict | None = None):
+                 receipts: dict | None = None, foreground=False):
         self.store, self.sources = store, sources
         self.run_id, self.learning_kind = run_id, learning_kind
         self.pending_items = copy.deepcopy(pending_items or {})
         self.deferred_progress = copy.deepcopy(deferred_progress or {})
         self.receipts = copy.deepcopy(receipts or {})
+        self.foreground = foreground
+        if foreground:
+            self.pending_items = store.recall_drafts()
+        self.known_drafts = set(self.pending_items)
 
     def state(self) -> dict:
         return copy.deepcopy({"pending_items": self.pending_items,
                               "deferred_progress": self.deferred_progress, "receipts": self.receipts})
 
     def persist(self):
+        if self.foreground:
+            self.store.recall_drafts(self.pending_items, self.known_drafts)
+            self.known_drafts.update(self.pending_items)
         if self.learning_kind is not None:
             task = self.store.learning_task(self.learning_kind)
             self.store.update_learning_task(self.learning_kind, {
@@ -58,7 +67,9 @@ class LearningWriter:
         if not isinstance(item, dict):
             raise ValueError("Memory item must be an object")
         if "source_ids" not in item:
-            raise ValueError("source_ids is missing; choose the actual evidence message IDs for this item")
+            # Derived thoughts may cite other memories through connections;
+            # updating an object without changing its sources keeps those sources.
+            return dict(item)
         if not isinstance(item["source_ids"], list):
             raise ValueError("source_ids must be a list of evidence message IDs")
         requested = list(dict.fromkeys(int(key) for key in item["source_ids"]))
@@ -75,8 +86,8 @@ class LearningWriter:
         return row
 
     def apply(self, args: dict, call_id: str) -> WriteOutcome:
-        if not isinstance(args, dict) or set(args) - {"items", "progress", "finish", "retry"}:
-            raise ValueError("remember accepts items, progress, finish and retry")
+        if not isinstance(args, dict) or set(args) - {"items", "progress", "finish", "retry", "revisited"}:
+            raise ValueError("remember accepts items, progress, finish, retry and revisited")
         if not args:
             raise ValueError("remember received empty arguments; no memory or progress was saved. Supply items, progress, retry or finish.")
         items, retries, progress = args.get("items", []), args.get("retry", []), args.get("progress", {})
@@ -141,16 +152,24 @@ class LearningWriter:
             try:
                 cleaned = self.clean_item(item)
                 write_options = dict(options)
+                if self.foreground:
+                    write_options["receipt_key"] = key
                 next_state = self.state()
                 next_state["pending_items"].pop(key, None)
                 if self.learning_kind is not None:
                     write_options["learning_write"] = {"pending_id": key, "state": next_state}
                 # Only this item's evidence needs loading for its transaction.
-                saved = self.store.save_memories([cleaned], cleaned["source_keys"], **write_options)
+                saved = self.store.save_memories([cleaned], cleaned.get("source_keys", []), **write_options)
                 outcome.written.extend(saved)
                 self.pending_items.pop(key, None)
                 self.receipts[key] = [{"kind": row["kind"], "id": row["id"]} for row in saved]
             except Exception as exc:
+                durable_receipt = self.store.write_receipt(key) if self.foreground else None
+                if durable_receipt is not None:
+                    self.receipts[key] = durable_receipt
+                    self.pending_items.pop(key, None)
+                    outcome.written.extend(durable_receipt)
+                    continue
                 if self.learning_kind is not None:
                     # The row may have committed before constructing its detailed
                     # read receipt failed. Its transactional address is decisive.
@@ -177,4 +196,9 @@ class LearningWriter:
             except Exception as exc:
                 outcome.progress_error = f"Learning progress has not been saved: {type(exc).__name__}: {exc}"
         self.persist()
+        for entry in args.get("revisited", []):
+            try:
+                outcome.reconsidered.extend(self.store.save_reconsideration([entry], self.run_id))
+            except Exception as exc:
+                outcome.rejected.append({"revisited": entry, "detail": f"{type(exc).__name__}: {exc}"})
         return outcome

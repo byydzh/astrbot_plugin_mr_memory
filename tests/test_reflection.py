@@ -107,10 +107,14 @@ class ReflectionTests(unittest.TestCase):
         self.assertEqual(self.reflections.get(appointed["id"])["next_review_at"], 300)
 
     def test_legacy_automatic_dates_are_not_inferred_to_be_model_appointments(self):
-        self.store.db.execute("ALTER TABLE mr_reflections DROP COLUMN next_review_explicit")
+        self.store.db.execute("""CREATE TABLE mr_reflections(id INTEGER PRIMARY KEY,umo TEXT,content TEXT,status TEXT,
+            next_review_at REAL,created_at REAL,updated_at REAL,schedule_updated_at REAL,
+            source_ids_json TEXT DEFAULT '[]',memory_refs_json TEXT DEFAULT '[]')""")
         self.store.db.execute("""INSERT INTO mr_reflections(umo,content,status,next_review_at,created_at,updated_at,schedule_updated_at)
                               VALUES(?,?,'pending',100,50,50,50)""", (self.scope, "旧版本默认重排"))
-        migrated = Reflection(self.store)
+        from mr_memory.memory_migration import migrate_reflections
+        migrate_reflections(self.store.memory_graph)
+        migrated = self.store.reflections
         self.assertEqual(len(migrated.due(now=200)), 1)
         self.assertEqual(migrated.due(now=200, scheduled_only=True), [])
 

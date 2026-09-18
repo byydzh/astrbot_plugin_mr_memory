@@ -148,9 +148,10 @@ class Console:
             counts = {}
             for key, table, clause in (
                 ("messages", "messages", " AND is_deleted=0"),
-                ("episodes", "episodes", " AND status<>'INVALIDATED'"),
-                ("semantics", "semantic_memories", " AND status='ACTIVE'"),
-                ("associations", "plastic_edges", " AND status IN('ACTIVE','WEAKENED') AND invalidation_reason=''"),
+                ("episodes", "mr_memory_objects", " AND kind='episode' AND status='ACTIVE'"),
+                ("semantics", "mr_memory_objects", " AND kind='semantic' AND status='ACTIVE'"),
+                ("associations", "mr_memory_objects", " AND kind='association' AND status='ACTIVE'"),
+                ("patterns", "mr_memory_objects", " AND kind NOT IN('episode','semantic','association','node') AND status='ACTIVE'"),
                 ("participants", "participants", ""),
                 ("embeddings", "memory_embeddings", ""),
             ):
@@ -191,21 +192,25 @@ class Console:
 
     async def memory(self, scope_id, kind, item_id):
         store = await self.get_store(scope_id)
-        item = await asyncio.to_thread(store.memory, kind, item_id)
+        item = await asyncio.to_thread(store.memory, kind, item_id, include_history=True)
         if item is None:
             raise FileNotFoundError("这条记忆不存在或已失效")
+        item["navigation"] = await asyncio.to_thread(store.navigate, ref={"kind": kind, "id": int(item_id)})
         return item
 
     async def graph(self, scope_id):
         store = await self.get_store(scope_id)
         node = request.query.get("node_id")
         terms = [request.query.get("query")] if request.query.get("query") else []
-        edges = await asyncio.to_thread(store.graph, node_id=int(node) if node else None, terms=terms, limit=80)
+        ref = {"kind": request.query.get("kind"), "id": int(request.query.get("id"))} if request.query.get("kind") and request.query.get("id") else None
+        edges = await asyncio.to_thread(store.graph, node_id=int(node) if node else None, ref=ref, terms=terms, limit=80)
         nodes = {}
         for edge in edges:
             for side in ("source", "target"):
-                node_id = edge[f"{side}_node_id"]
-                nodes[node_id] = {"id": node_id, "label": edge[side]}
+                address = edge[f"{side}_ref"]
+                key = f"{address['kind']}:{address['id']}"
+                nodes[key] = {"key": key, **address, "label": edge[side]}
+                edge[f"{side}_key"] = key
         return {"nodes": list(nodes.values()), "edges": edges, "limit": 80}
 
     async def participants(self, scope_id):

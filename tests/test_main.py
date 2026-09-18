@@ -126,6 +126,12 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.inject_subconscious_memory(current, request)
         self.assertEqual({name: getattr(request, name) for name in preserved}, preserved)
         model_current, _, model_working = memory_agent.reconstruct.call_args.args
+        self.assertEqual(model_current["main_context"]["tool_names"], ["synthetic_lookup"])
+        self.assertEqual(memory_agent.request_context.read("request")["items"], [preserved["prompt"]])
+        self.assertEqual(memory_agent.request_context.read("conversation")["items"], preserved["contexts"])
+        self.assertEqual(memory_agent.request_context.read("instructions")["items"], [preserved["system_prompt"]])
+        self.assertEqual(memory_agent.request_context.read("additional")["items"],
+                         [text_part.model_dump(exclude_none=True), image_part.model_dump(exclude_none=True)])
         self.assertNotIn("background", model_working)
         self.assertNotIn("previously_learned_feedback", model_current)
         self.assertIs(request.func_tool, tools)
@@ -515,6 +521,23 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(working["queue"]["pending_messages"], 80)
         self.assertEqual(working["queue"]["this_batch_messages"], len(selected))
         self.assertEqual(len(store.pending_messages(100)), 80)
+
+    async def test_recall_activity_remains_open_without_restarting_identical_idle_work(self):
+        store = await self.plugin.store_for(event())
+        memory = store.save_memories([{"kind": "pattern", "title": "共同活动", "content": "可继续理解的经历"}], [], mark_processed=False)[0]
+        store.recall_memory(memory, run_key="first")
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="completed", usage={"input_other": 20}, model_attempts=1)))
+        with patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "completed")
+            self.assertTrue(store.reconsider()["items"])  # Never pretends it was reviewed.
+            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "idle")
+            self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "idle")
+            store.recall_memory(memory, run_key="later")
+            self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "completed")
+            self.assertEqual(learning.consolidate.call_args.args[1]["memory_changes"]["items"], [])
+        self.assertEqual(learning.consolidate.await_count, 2)
 
     async def test_completed_batch_keeps_token_density_for_the_next_batch(self):
         store = await self.plugin.store_for(event())

@@ -41,6 +41,9 @@ class Provider:
 
 
 class Store:
+    def recall_drafts(self, pending=None, known=()):
+        return {}
+
     def memory(self, kind, id, *, include_sources=True):
         assert kind == "episode"
         assert str(id) == "17"
@@ -72,19 +75,33 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], prior)
         self.assertEqual(result.background, "本次在改另一张图。")
         self.assertIn("消息17纠正", result.working_memory)
-        self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"], prior)
+        self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"],
+                         {**prior, "pending_recall_writes": {}})
         self.assertEqual(len(provider.requests), 1)
 
     async def test_missing_or_truncated_notes_do_not_become_background_or_clear_notes(self):
         for text, expected_background, expected_note in (
             ("本轮可用背景", "本轮可用背景", None),
             ('{"background":"这次无须沿用旧笔记","working_memory":""}', "这次无须沿用旧笔记", ""),
+            ('{"background":"","working_memory":""}', "", ""),
             ('{"background":"不完整', "", None),
         ):
             with self.subTest(text=text), patch("mr_memory.agent._tool_set", return_value=object()):
                 result = await MemoryAgent(Provider([response(text)]), Store()).reconstruct({"sent_at": 300}, [], {})
             self.assertEqual(result.background, expected_background)
             self.assertEqual(result.working_memory, expected_note)
+            if expected_note is not None:
+                self.assertEqual(result.status, "completed")
+
+    async def test_tool_planning_is_not_delivered_as_background_after_empty_finish(self):
+        provider = Provider([
+            response("我先查一下原始交流", calls=[("search_messages", {"terms": ["星舟"]}, "read")]),
+            response('{"background":"","working_memory":"没有需要补充的背景"}')])
+        with patch("mr_memory.agent._tool_set", return_value=object()):
+            result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], {})
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.background, "")
+        self.assertEqual(result.messages[1]["content"], "我先查一下原始交流")
 
     async def test_wrong_search_query_returns_contract_to_next_turn(self):
         wrong = {"query": "星舟 人物画像 喜好 性格", "limit": 20}

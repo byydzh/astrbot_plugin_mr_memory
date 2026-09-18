@@ -11,16 +11,18 @@ from functools import wraps
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS mr_reflections (
- id INTEGER PRIMARY KEY AUTOINCREMENT, umo TEXT NOT NULL,
- content TEXT NOT NULL, priority REAL NOT NULL DEFAULT 1,
- status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','waiting','resolved')),
- source_ids_json TEXT NOT NULL DEFAULT '[]', memory_refs_json TEXT NOT NULL DEFAULT '[]',
- request_id TEXT, next_review_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
- last_reviewed_at REAL, schedule_updated_at REAL NOT NULL,
- next_review_explicit INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX IF NOT EXISTS idx_mr_reflections_due
- ON mr_reflections(umo,status,next_review_at,priority);
+CREATE VIEW IF NOT EXISTS mr_reflection_schedule AS
+ SELECT id,umo,content,revision revision_no,created_at,updated_at,
+ COALESCE(json_extract(attributes_json,'$.priority'),1) priority,
+ COALESCE(json_extract(attributes_json,'$.review_status'),'pending') status,
+ COALESCE(json_extract(attributes_json,'$.source_ids'),'[]') source_ids_json,
+ COALESCE(json_extract(attributes_json,'$.memory_refs'),'[]') memory_refs_json,
+ json_extract(attributes_json,'$.request_id') request_id,
+ json_extract(attributes_json,'$.next_review_at') next_review_at,
+ json_extract(attributes_json,'$.last_reviewed_at') last_reviewed_at,
+ COALESCE(json_extract(attributes_json,'$.schedule_updated_at'),updated_at) schedule_updated_at,
+ COALESCE(json_extract(attributes_json,'$.next_review_explicit'),0) next_review_explicit
+ FROM mr_memory_objects WHERE kind='reflection' AND status='ACTIVE';
 CREATE INDEX IF NOT EXISTS idx_mr_runs_reflection_request
  ON mr_runs(umo,CAST(json_extract(payload_json,'$.request_id') AS TEXT),id);
 CREATE INDEX IF NOT EXISTS idx_messages_reflection_request ON messages(umo,message_id);
@@ -39,10 +41,6 @@ def _locked(method):
     return call
 
 
-def _encode(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
 def _limit(value):
     return max(1, min(100, int(value)))
 
@@ -50,14 +48,10 @@ def _limit(value):
 class Reflection:
     def __init__(self, store):
         self.store = store
-        with self.store._lock, self.store.db:
-            if "next_review_explicit" not in {row[1] for row in self.store.db.execute("PRAGMA table_info(mr_reflections)")}:
-                # Old dates include automatic retry times. They cannot be
-                # treated as explicit, time-sensitive model appointments.
-                self.store.db.execute("ALTER TABLE mr_reflections ADD COLUMN next_review_explicit INTEGER NOT NULL DEFAULT 0")
 
     def _record(self, row, *, include_sources: bool = True):
         item = dict(row)
+        item["kind"] = "reflection"
         item.pop("umo", None)
         item.pop("schedule_updated_at", None)
         item["next_review_explicit"] = bool(item["next_review_explicit"])
@@ -77,7 +71,7 @@ class Reflection:
 
     @_locked
     def get(self, id: int, *, include_sources: bool = True) -> dict | None:
-        row = self.store.db.execute("SELECT * FROM mr_reflections WHERE umo=? AND id=?",
+        row = self.store.db.execute("SELECT * FROM mr_reflection_schedule WHERE umo=? AND id=?",
                                     (self.store.umo, int(id))).fetchone()
         return self._record(row, include_sources=include_sources) if row else None
 
@@ -124,28 +118,25 @@ class Reflection:
                                             (self.store.umo, str(value["request_id"]))))
         if any(self.store._forgotten(row["platform_id"], row["sender_id"]) for row in anchors):
             raise ValueError("Reflection refers to an explicitly forgotten source or request")
-        values = (content, float(value["priority"]), value["status"], _encode(sources), _encode(refs),
-                  str(value["request_id"]) if value["request_id"] is not None else None,
-                  float(value["next_review_at"]) if value["next_review_at"] is not None else None, now, int(explicit))
         with self.store.db:
-            if old:
-                schedule_changed = (value["status"] != old["status"] or "next_review_at" in item
-                                    or explicit != old["next_review_explicit"])
-                self.store.db.execute("""UPDATE mr_reflections SET content=?,priority=?,status=?,
-                    source_ids_json=?,memory_refs_json=?,request_id=?,next_review_at=?,updated_at=?,next_review_explicit=?,
-                    schedule_updated_at=CASE WHEN ? THEN ? ELSE schedule_updated_at END
-                    WHERE umo=? AND id=?""", (*values, schedule_changed, now, self.store.umo, int(id)))
-            else:
-                id = self.store.db.execute("""INSERT INTO mr_reflections(content,priority,status,
-                    source_ids_json,memory_refs_json,request_id,next_review_at,updated_at,next_review_explicit,umo,created_at,schedule_updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (*values, self.store.umo, now, now)).lastrowid
+            schedule_changed = (not old or value["status"] != old["status"] or "next_review_at" in item
+                                or explicit != old["next_review_explicit"])
+            saved = self.store.memory_graph.write({"kind": "reflection", **({"id": int(id)} if old else {}),
+                "content": content, "title": str(item.get("title") or content.splitlines()[0][:100]),
+                "priority": float(value["priority"]), "review_status": value["status"],
+                "source_ids": sources, "memory_refs": refs,
+                "request_id": str(value["request_id"]) if value["request_id"] is not None else None,
+                "next_review_at": float(value["next_review_at"]) if value["next_review_at"] is not None else None,
+                "next_review_explicit": int(explicit),
+                **({"schedule_updated_at": now} if schedule_changed else {})})
+            id = saved["id"]
         return self.get(id)
 
     @_locked
     def due(self, limit: int = 8, now: float | None = None, *, scheduled_only: bool = False,
             include_sources: bool = True) -> list[dict]:
         now = time.time() if now is None else float(now)
-        rows = self.store._rows("""SELECT * FROM mr_reflections WHERE umo=? AND
+        rows = self.store._rows("""SELECT * FROM mr_reflection_schedule WHERE umo=? AND
             ((status='pending' AND (next_review_at IS NULL OR next_review_at<=?)) OR
              (status='waiting' AND next_review_at IS NOT NULL AND next_review_at<=?))
             AND (?=0 OR (next_review_explicit=1 AND next_review_at IS NOT NULL))
@@ -155,14 +146,14 @@ class Reflection:
 
     @_locked
     def waiting(self, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
-        rows = self.store._rows("""SELECT * FROM mr_reflections WHERE umo=? AND status='waiting'
+        rows = self.store._rows("""SELECT * FROM mr_reflection_schedule WHERE umo=? AND status='waiting'
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
             (self.store.umo, _limit(limit)))
         return [self._record(row, include_sources=include_sources) for row in rows]
 
     @_locked
     def associated(self, kind: str, id: int, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
-        rows = self.store._rows("""SELECT r.* FROM mr_reflections r WHERE umo=? AND status!='resolved'
+        rows = self.store._rows("""SELECT r.* FROM mr_reflection_schedule r WHERE umo=? AND status!='resolved'
             AND EXISTS(SELECT 1 FROM json_each(r.memory_refs_json) ref
                 WHERE json_extract(ref.value,'$.kind')=? AND CAST(json_extract(ref.value,'$.id') AS INTEGER)=?)
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
@@ -175,15 +166,20 @@ class Reflection:
         now = time.time()
         with self.store.db:
             for id in dict.fromkeys(int(id) for id in ids):
-                self.store.db.execute("""UPDATE mr_reflections SET last_reviewed_at=?,
-                    next_review_explicit=CASE WHEN schedule_updated_at>? THEN next_review_explicit
-                        WHEN status='pending' THEN 0
-                        WHEN status='waiting' AND next_review_at<=? THEN 0 ELSE next_review_explicit END,
-                    next_review_at=CASE WHEN schedule_updated_at>? THEN next_review_at
-                        WHEN status='pending' THEN ?
-                        WHEN status='waiting' AND next_review_at<=? THEN NULL ELSE next_review_at END
-                    WHERE umo=? AND id=?""", (now, float(call_started_at), now, float(call_started_at),
-                                             float(default_next_at), now, self.store.umo, id))
+                row = self.store.db.execute("SELECT * FROM mr_reflection_schedule WHERE umo=? AND id=?",
+                                            (self.store.umo, id)).fetchone()
+                if row is None:
+                    continue
+                next_at, explicit = row["next_review_at"], row["next_review_explicit"]
+                if row["schedule_updated_at"] <= call_started_at:
+                    if row["status"] == "pending":
+                        next_at, explicit = float(default_next_at), 0
+                    elif row["status"] == "waiting" and next_at is not None and next_at <= now:
+                        next_at, explicit = None, 0
+                # Scheduling changes are bookkeeping, not a new semantic revision.
+                self.store.db.execute("""UPDATE mr_memory_objects SET attributes_json=json_set(attributes_json,
+                    '$.last_reviewed_at',?,'$.next_review_at',?,'$.next_review_explicit',?)
+                    WHERE umo=? AND kind='reflection' AND id=?""", (now, next_at, explicit, self.store.umo, id))
 
     def _events(self, request_id: str) -> tuple[list[dict], bool]:
         rows = self.store._rows("""SELECT DISTINCT m.* FROM message_relations r
@@ -249,7 +245,7 @@ class Reflection:
         request = self.store._message(dict(request_row)) if request_row and not request_row["is_deleted"] else None
         events, events_more = self._events(request_id)
         reflection_rows = self.store._rows("""SELECT id,status,content,priority,created_at,updated_at,
-            source_ids_json,memory_refs_json FROM mr_reflections WHERE umo=? AND request_id=?
+            source_ids_json,memory_refs_json FROM mr_reflection_schedule WHERE umo=? AND request_id=?
             ORDER BY updated_at DESC,id DESC LIMIT 13""", (self.store.umo, request_id))
         previous_understandings = []
         for row in reflection_rows[:12]:
