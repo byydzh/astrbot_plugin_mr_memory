@@ -176,6 +176,9 @@ class Store:
                     WHERE t.umo=? AND t.kind='feedback' AND m.is_deleted=0""", (self.umo,))
         self.reflections = Reflection(self)
         self.memory_graph = MemoryGraph(self)
+        from .cognition import Cognition
+        self.cognition = Cognition(self)
+        self.cognition.migrate_notes()
 
     @_serialized
     def close(self) -> None:
@@ -307,6 +310,7 @@ class Store:
         affected = {(row["kind"], row["id"]) for row in self._rows(
             f"""SELECT kind,id FROM mr_memory_objects WHERE umo=? AND EXISTS(
                 SELECT 1 FROM json_each(attributes_json,'$.source_ids') s WHERE s.value IN({marks}))""", [self.umo, *ids])}
+        affected.update(("message", int(value)) for value in ids)
         edges = self._rows("SELECT id,attributes_json FROM mr_memory_objects WHERE umo=? AND kind='association'", (self.umo,))
         changed = True
         while changed:
@@ -354,8 +358,14 @@ class Store:
             self._clear_memory_derivatives("reflection", row["id"])
             self.db.execute("DELETE FROM mr_memory_revisions WHERE umo=? AND kind='reflection' AND owner_id=?", (self.umo, row["id"]))
         for kind, owner in refs:
-            self.db.execute("DELETE FROM mr_memory_recalls WHERE umo=? AND kind=? AND owner_id=?", (self.umo, kind, owner))
-            self.db.execute("DELETE FROM mr_memory_rehearsals WHERE umo=? AND kind=? AND owner_id=?", (self.umo, kind, owner))
+            for table in ("mr_memory_recalls", "mr_memory_rehearsals"):
+                if table in self.tables:
+                    self.db.execute(f"DELETE FROM {table} WHERE umo=? AND kind=? AND owner_id=?", (self.umo, kind, owner))
+            self.db.execute("DELETE FROM mr_working_set WHERE umo=? AND kind=? AND owner_id=?", (self.umo, kind, owner))
+            self.db.execute("""DELETE FROM mr_cognition_turns WHERE umo=? AND EXISTS(
+                SELECT 1 FROM json_each(payload_json,'$.available_memories') r
+                WHERE json_extract(r.value,'$.kind')=? AND json_extract(r.value,'$.id')=?)""", (self.umo, kind, owner))
+        self.db.execute(f"DELETE FROM mr_cognition_turns WHERE umo=? AND observation_id IN({marks})", [self.umo, *ids])
 
     @_serialized
     def delete_message(self, message_id: str) -> int:
@@ -628,18 +638,17 @@ class Store:
         return self.memory_graph.navigate(**query)
 
     @_serialized
-    def recall_memory(self, ref, *, run_key, run_id=None, purpose="recall"):
-        with self.db:
-            self.memory_graph.activate(ref, run_key=run_key, run_id=run_id, purpose=purpose)
+    def reconsider(self, limit=8, offset=0, ref=None, after=0, kind=None):
+        return self.cognition.reconsider(limit, offset, ref, after, kind)
 
     @_serialized
-    def reconsider(self, limit=8, offset=0, order="recent"):
-        return self.memory_graph.reconsider(limit, offset, order)
+    def workspace(self):
+        return self.cognition.workspace()
 
     @_serialized
-    def save_reconsideration(self, entries, run_id=None):
+    def record_cognition(self, **experience):
         with self.db:
-            return self.memory_graph.rehearsed(entries, run_id)
+            self.cognition.record(**experience)
 
     @_serialized
     def memory_changes(self, after=0, limit=20):
@@ -1118,6 +1127,8 @@ class Store:
             return
         text = "\n".join(str(entry.get(k) or "") for k in ("title", "summary", "source", "relation", "target")).strip()
         text += "\n" + " / ".join(entry.get("aliases", []))
+        if entry.get("representation"):
+            text += "\n" + _encode(entry["representation"])
         text += "\n" + "\n".join(cue["cue"] + " / " + cue["aspect"] for cue in entry.get("cues", []))
         if kind == "association":
             text += "\n" + "\n".join(

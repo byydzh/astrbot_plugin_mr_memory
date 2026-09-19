@@ -379,11 +379,10 @@ class MrMemoryPlugin(Star):
             current["bot_name"] = next((person["name"] for person in current["participants"]
                                         if person["account_id"] == current["bot_id"]), "")
             current["roster_fetched_at"] = cached_roster.get("fetched_at") if cached_roster else None
-            # The model rewrites its short-term notes independently of the
-            # background selected for the main model's current answer.
+            # Continuing understanding is read from the shared graph by the agent.
             changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0))
             recent_learning = await asyncio.to_thread(store.memory_directory, working.get("recent_learning_refs", []))
-            working = {key: working[key] for key in ("question", "request_at", "working_memory", "pending_recall_writes") if key in working}
+            working = {key: working[key] for key in ("question", "request_at", "pending_recall_writes") if key in working}
             working["memory_changes"] = changes
             working["recent_learning"] = [item for item in recent_learning if item]
             await trace.emit("input", "已准备问题、发言者与近期对话", current=current,
@@ -416,8 +415,7 @@ class MrMemoryPlugin(Star):
             else:
                 payload["injected_chars"] = 0
                 await trace.emit("inject", "本次没有可交付的语义背景", status="skipped", memory_status=result.status)
-            if result.background or result.working_memory is not None:
-                # A note can change independently of the background delivered now.
+            if result.background:
                 try:
                     async with self.state_locks[store.umo]:
                         state = await asyncio.to_thread(store.load_working_state)
@@ -425,13 +423,9 @@ class MrMemoryPlugin(Star):
                             update = {
                                 "background": result.background, "request_at": current["sent_at"],
                                 "question": current["question"], "status": result.status}
-                            if result.working_memory is not None:
-                                update["working_memory"] = result.working_memory
                             update["memory_change_cursor"] = changes["cursor"]
                             await asyncio.to_thread(store.update_working_state, update)
-                            await trace.emit("write", "已保存背景、继续思路与记忆变化进度", target="working_state",
-                                             working_memory_updated=result.working_memory is not None,
-                                             detail=result.working_memory_detail)
+                            await trace.emit("write", "已记录本次背景与记忆目录进度", target="working_state")
                 except Exception as exc:
                     await trace.emit("write", "当次背景保存失败，已交付的背景仍有效", status="error",
                                      target="working_state", detail=str(exc))
@@ -541,8 +535,9 @@ class MrMemoryPlugin(Star):
             maximum = int(self.config["distillation_max_messages"])
             resuming = task is not None
             reflection_tasks = []
-            memory_activity = await asyncio.to_thread(store.reconsider)
-            new_activity = bool(memory_activity.get("items")) and memory_activity["cursor"] > state.get("memory_activity_offered", 0)
+            memory_activity = await asyncio.to_thread(store.reconsider, after=state.get("cognition_offered", 0), kind="foreground")
+            new_activity = bool(memory_activity.get("items"))
+            workspace = await asyncio.to_thread(store.workspace)
             if task:
                 messages = await asyncio.to_thread(store.learning_messages, task)
                 done = set(task["completed_ids"])
@@ -563,9 +558,9 @@ class MrMemoryPlugin(Star):
                 material_done = set(task["material_ids"]) <= set(task["completed_ids"])
                 native = task.get("continuation", {}).get("conversation")
                 if task.get("checkpoint") and native and (material_done or (remaining is not None
-                        and estimate_learning_input(messages, working, feedback=feedback, task=task) * 2 > remaining)):
+                        and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace) * 2 > remaining)):
                     task = checkpoint_learning_task(task)
-                if remaining is not None and estimate_learning_input(messages, working, feedback=feedback, task=task) >= remaining:
+                if remaining is not None and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace) >= remaining:
                     task = compact_learning_task(task)
                 if not task.get("continuation", {}).get("conversation"):
                     memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
@@ -631,7 +626,7 @@ class MrMemoryPlugin(Star):
             queued_drafts = state.get("pending_learning_drafts", {}).get(kind, {})
             if task is None and queued_drafts:
                 estimate_task = {"continuation": {"write_state": {"pending_items": queued_drafts}}}
-            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density)
+            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density, workspace=workspace)
             while remaining is not None and (estimate + output_reserve) * 2 > remaining and not (task or {}).get("continuation"):
                 material = [row for row in messages if not row.get("context_only")]
                 if len(material) <= 1:
@@ -649,7 +644,7 @@ class MrMemoryPlugin(Star):
                     messages = context + (material[:count] if keep_oldest else material[-count:])
                 if feedback:
                     working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
-                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density)
+                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density, workspace=workspace)
             if not feedback:
                 working["queue"]["this_batch_messages"] = len([row for row in messages if not row.get("context_only")])
             required = estimate + 1 if (task or {}).get("continuation") else (estimate + output_reserve) * 2
@@ -698,24 +693,8 @@ class MrMemoryPlugin(Star):
                 elif result.model_attempts == 0:
                     await asyncio.to_thread(store.settle_usage, usage_id, 0)
                     payload["usage_estimated"] = False
-                source_keys = [m["source_key"] for m in messages]
-                learned_sources = list(dict.fromkeys(source_keys +
-                    [key for item in result.items for key in item.get("source_keys", [])]))
-                if result.items:
-                    await trace.emit("write", "保存模型结束时形成的长期记忆", status="running",
-                                     target="long_term_memory", items=result.items, operation_id="final_memories")
-                try:
-                    saved = await asyncio.to_thread(store.save_memories, result.items, learned_sources, mark_processed=False,
-                                                    run_id=trace.id, learning_kind=kind, progress=result.progress)
-                except BaseException as exc:
-                    if result.items:
-                        await trace.emit("write", "末次长期记忆保存未完成", target="long_term_memory", operation_id="final_memories",
-                                         status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error", detail=str(exc))
-                    raise
-                if result.items:
-                    await trace.emit("write", "已保存末次长期记忆", target="long_term_memory", result=saved,
-                                     written_count=len(saved), operation_id="final_memories")
-                written = result.written + saved
+                # Tool writes and final JSON use the same transactional writer.
+                written = result.written
                 written = list({(row["kind"], row["id"]): row for row in written}.values())
                 payload["written"] = written
                 progress = await asyncio.to_thread(store.learning_task, kind)
@@ -742,7 +721,7 @@ class MrMemoryPlugin(Star):
                     # Keep the history readable, but do not start an identical
                     # paid task every interval when the model leaves it open.
                     if memory_activity.get("items"):
-                        await self.update_state(store, {"memory_activity_offered": memory_activity["cursor"]})
+                        await self.update_state(store, {"cognition_offered": memory_activity["cursor"]})
                     await self.update_state(store, {"learning_memory_change_cursor": changes["cursor"]})
                     await asyncio.to_thread(store.finish_learning_task, kind)
                 else:

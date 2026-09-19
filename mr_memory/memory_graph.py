@@ -28,16 +28,6 @@ CREATE INDEX IF NOT EXISTS mr_memory_cue_lookup ON mr_memory_cues(umo,cue,aspect
 CREATE TABLE IF NOT EXISTS mr_memory_changes (
  seq INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,kind TEXT NOT NULL,
  owner_id INTEGER NOT NULL,revision INTEGER NOT NULL,at REAL NOT NULL,reason TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS mr_memory_recalls (
- seq INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,kind TEXT NOT NULL,
- owner_id INTEGER NOT NULL,revision INTEGER NOT NULL,run_key TEXT NOT NULL,
- run_id INTEGER,purpose TEXT NOT NULL,at REAL NOT NULL,
- UNIQUE(umo,kind,owner_id,revision,run_key,purpose));
-CREATE INDEX IF NOT EXISTS mr_memory_recall_owner ON mr_memory_recalls(umo,kind,owner_id,seq);
-CREATE TABLE IF NOT EXISTS mr_memory_rehearsals (
- umo TEXT NOT NULL,kind TEXT NOT NULL,owner_id INTEGER NOT NULL,
- through_seq INTEGER NOT NULL,note TEXT NOT NULL,run_id INTEGER,at REAL NOT NULL,
- PRIMARY KEY(umo,kind,owner_id));
 CREATE TABLE IF NOT EXISTS mr_graph_migrations (umo TEXT PRIMARY KEY,version INTEGER NOT NULL);
 """
 
@@ -66,6 +56,16 @@ class MemoryGraph:
             migrate(self)
 
     def raw(self, kind, owner):
+        if kind == "message":
+            row = self.db.execute("SELECT * FROM messages WHERE umo=? AND id=?", (self.umo, int(owner))).fetchone()
+            if row is None:
+                return None
+            return {"umo": self.umo, "kind": "message", "id": row["id"],
+                    "title": row["sender_name"] + "的原始发言", "content": row["plain_text"],
+                    "attributes_json": encode({"source_ids": [row["id"]], "sender_id": row["sender_id"],
+                                               "sender_name": row["sender_name"], "role": row["role"], "sent_at": row["sent_at"]}),
+                    "revision": row["revision_no"], "status": "INVALIDATED" if row["is_deleted"] else "ACTIVE",
+                    "created_at": row["created_at"], "updated_at": row["updated_at"]}
         row = self.db.execute("SELECT * FROM mr_memory_objects WHERE umo=? AND kind=? AND id=?",
                               (self.umo, canonical(kind), int(owner))).fetchone()
         return dict(row) if row else None
@@ -132,12 +132,17 @@ class MemoryGraph:
             basis = self.connections({"kind": row["kind"], "id": row["id"]}, purpose="basis")
             if basis:
                 result["basis"] = basis
-            rehearsal = self.db.execute("SELECT through_seq,note,at FROM mr_memory_rehearsals WHERE umo=? AND kind=? AND owner_id=?",
-                                        (self.umo, row["kind"], row["id"])).fetchone()
-            if rehearsal:
-                result["last_reconsideration"] = dict(rehearsal)
+            if "mr_memory_rehearsals" in self.store.tables:
+                rehearsal = self.db.execute("SELECT through_seq,note,at FROM mr_memory_rehearsals WHERE umo=? AND kind=? AND owner_id=?",
+                                            (self.umo, row["kind"], row["id"])).fetchone()
+                if rehearsal:
+                    result["last_reconsideration"] = dict(rehearsal)
         if include_history:
             result["history"] = self.store._memory_history(row["kind"], row["id"])
+        if getattr(self.store, "cognition", None) is not None:
+            selected = self.db.execute("SELECT state_json FROM mr_working_set WHERE umo=? AND kind=? AND owner_id=?",
+                                       (self.umo, row["kind"], row["id"])).fetchone()
+            result["attention"] = json.loads(selected[0]) if selected else None
         return result
 
     def connections(self, ref, *, purpose=None):
@@ -277,6 +282,11 @@ class MemoryGraph:
         stored = self.raw(kind, item["id"]) if item.get("id") is not None else None
         if item.get("id") is not None and not stored:
             raise ValueError(f"No {kind} memory with id {item['id']}")
+        if stored and "attention" in item and not (set(item) - {"kind", "id", "revision_no", "attention", "source_keys"}):
+            self.store.cognition.select({"kind": kind, "id": stored["id"]}, item["attention"])
+            return self.get(kind, stored["id"], include_sources=False)
+        if kind == "message":
+            raise ValueError("Original messages are observations maintained by capture; save interpretations as a memory connected to this message")
         if stored and item.get("revision_no") is not None and int(item["revision_no"]) != stored["revision"]:
             raise ValueError("Memory changed since it was read; open and merge its current version: " + encode(self.brief(reference(stored))))
         # Capture before an endpoint edit recursively changes an existing node.
@@ -285,7 +295,7 @@ class MemoryGraph:
             previous_memory.pop("history", None)
         attrs = json.loads(stored["attributes_json"]) if stored else {}
         old = dict(attrs)
-        reserved = {"id", "kind", "title", "label", "name", "summary", "content", "statement", "description", "reason", "action", "revision_no", "cues", "connections", "source_keys", "source", "target"}
+        reserved = {"id", "kind", "title", "label", "name", "summary", "content", "statement", "description", "reason", "action", "revision_no", "cues", "connections", "source_keys", "source", "target", "attention"}
         attrs.update({key: value for key, value in item.items() if key not in reserved})
         if kind == "reflection":
             attrs.setdefault("review_status", "pending")
@@ -303,7 +313,7 @@ class MemoryGraph:
                 attrs["ended_at"] = max(row["sent_at"] for row in source_messages)
         title = next((str(item[k]) for k in ("title", "label", "name") if k in item), stored["title"] if stored else str(item.get("aspect", item.get("person", ""))))
         content = next((str(item[k]) for k in ("content", "summary", "statement", "description") if k in item), stored["content"] if stored else "")
-        action = item.get("action", "revise")
+        action = item.get("action") if item.get("action") is not None else "revise"
         if action not in {"revise", "withdraw"}:
             raise ValueError("Use revise or withdraw")
         if action == "withdraw" and not stored:
@@ -336,6 +346,8 @@ class MemoryGraph:
             identical = self.db.execute("SELECT id FROM mr_memory_objects WHERE umo=? AND kind=? AND title=? AND content=? AND attributes_json=? AND status='ACTIVE'",
                                         (self.umo, kind, title, content, encode(attrs))).fetchone()
             if identical:
+                if "attention" in item:
+                    self.store.cognition.select({"kind": kind, "id": identical[0]}, item["attention"])
                 return self.get(kind, identical[0], include_sources=False)
         owner = stored["id"] if stored else self.db.execute("SELECT COALESCE(max(id),0)+1 FROM mr_memory_objects WHERE umo=? AND kind=?", (self.umo, kind)).fetchone()[0]
         now, reason = time.time(), str(item.get("reason", ""))
@@ -360,6 +372,8 @@ class MemoryGraph:
                                 (self.umo, kind, owner, str(cue["cue"]), str(cue.get("aspect", ""))))
         self.store._clear_memory_derivatives(kind, owner)
         self.store._queue_embedding(kind, owner)
+        if "attention" in item:
+            self.store.cognition.select({"kind": kind, "id": owner}, item["attention"])
         if kind == "reflection" and "memory_refs" in item:
             self.focus_connections(owner, attrs["memory_refs"])
         # The model supplies connection meaning; the write merely connects addresses.
@@ -379,56 +393,6 @@ class MemoryGraph:
                 self.store._clear_memory_derivatives("association", edge["id"])
                 self.store._queue_embedding("association", edge["id"])
         return self.get(kind, owner, include_sources=False, include_history=action == "withdraw")
-
-    def activate(self, ref, *, run_key, run_id=None, purpose="recall"):
-        row = self.raw(ref["kind"], ref["id"])
-        if row and row["status"] == "ACTIVE":
-            self.db.execute("INSERT OR IGNORE INTO mr_memory_recalls(umo,kind,owner_id,revision,run_key,run_id,purpose,at) VALUES(?,?,?,?,?,?,?,?)",
-                            (self.umo, row["kind"], row["id"], row["revision"], run_key, run_id, purpose, time.time()))
-
-    def reconsider(self, limit=8, offset=0, order="recent"):
-        limit, offset = max(1, min(100, int(limit))), max(0, int(offset))
-        ordering = {"recent": "last_at DESC", "frequent": "recalls DESC,last_at DESC", "oldest": "first_at"}.get(order)
-        if ordering is None:
-            raise ValueError("Choose recent, frequent or oldest for the activity directory")
-        rows = self.store._rows("""SELECT a.kind,a.owner_id id,count(DISTINCT a.run_key) recalls,
-            max(a.seq) through_seq,min(a.at) first_at,max(a.at) last_at
-            FROM mr_memory_recalls a JOIN mr_memory_objects m ON m.umo=a.umo AND m.kind=a.kind AND m.id=a.owner_id
-            LEFT JOIN mr_memory_rehearsals r ON r.umo=a.umo AND r.kind=a.kind AND r.owner_id=a.owner_id
-            WHERE a.umo=? AND a.purpose='recall' AND a.seq>COALESCE(r.through_seq,0) AND m.status='ACTIVE'
-            GROUP BY a.kind,a.owner_id ORDER BY """ + ordering + " LIMIT ? OFFSET ?", (self.umo, limit + 1, offset))
-        for row in rows[:limit]:
-            row["memory"] = self.brief(row)
-            row["interactions"] = self.store._rows("""SELECT seq,run_id,revision,at FROM mr_memory_recalls
-                WHERE umo=? AND kind=? AND owner_id=? AND purpose='recall' AND seq<=?
-                ORDER BY seq DESC LIMIT 8""", (self.umo, row["kind"], row["id"], row["through_seq"]))
-            row["co_recalled"] = self.store._rows("""SELECT b.kind,b.owner_id id,count(DISTINCT b.run_key) together
-                FROM mr_memory_recalls a JOIN mr_memory_recalls b ON b.umo=a.umo AND b.run_key=a.run_key AND b.purpose='recall'
-                WHERE a.umo=? AND a.kind=? AND a.owner_id=? AND a.seq<=? AND (b.kind<>a.kind OR b.owner_id<>a.owner_id)
-                GROUP BY b.kind,b.owner_id ORDER BY together DESC LIMIT 8""", (self.umo, row["kind"], row["id"], row["through_seq"]))
-        cursor = self.db.execute("SELECT COALESCE(max(seq),0) FROM mr_memory_recalls WHERE umo=? AND purpose='recall'",
-                                 (self.umo,)).fetchone()[0]
-        return {"items": rows[:limit], "more": len(rows) > limit, "next_offset": offset + limit, "cursor": cursor,
-                "meaning": "实际回忆过的记忆及共同唤起线索。频率不是正确性；可重温原互动、比较、归纳或改变连接。"}
-
-    def rehearsed(self, entries, run_id=None):
-        result = []
-        for entry in entries:
-            ref = reference(entry)
-            through = int(entry["through_seq"])
-            exists = self.db.execute("SELECT 1 FROM mr_memory_recalls WHERE umo=? AND kind=? AND owner_id=? AND seq=? AND purpose='recall'",
-                                     (self.umo, ref["kind"], ref["id"], through)).fetchone()
-            if not exists:
-                raise ValueError("through_seq must refer to a supplied recall of this memory")
-            note = str(entry.get("note", "")).strip()
-            if not note:
-                raise ValueError("Describe what this reconsideration established or left open")
-            self.db.execute("""INSERT INTO mr_memory_rehearsals VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(umo,kind,owner_id) DO UPDATE SET through_seq=excluded.through_seq,note=excluded.note,
-                run_id=excluded.run_id,at=excluded.at WHERE excluded.through_seq>=mr_memory_rehearsals.through_seq""",
-                (self.umo, ref["kind"], ref["id"], through, note, run_id, time.time()))
-            result.append({**ref, "through_seq": through, "note": note})
-        return result
 
     def changes(self, after=0, limit=20):
         rows = self.store._rows("SELECT kind,id,change_seq FROM mr_memory_objects WHERE umo=? AND change_seq>? ORDER BY change_seq LIMIT ?",

@@ -82,30 +82,18 @@ class MemoryGraphTests(unittest.TestCase):
         self.assertTrue(self.store.memory("pattern", pattern["id"])["basis"][0]["basis_changed"])
         self.assertEqual(self.store.reflections.waiting()[0]["content"], self.store.memory("reflection", thought["id"])["content"])
 
-    def test_recall_experience_is_not_ui_read_or_learning_echo(self):
-        first = self.save(kind="pattern", title="认识", content="一个认识")
-        second = self.save(kind="episode", title="经历", content="另一个经历")
+    def test_graph_reads_do_not_invent_cognitive_experience(self):
+        first = self.save(kind="pattern", title="认识", content="一个认识", attention=True)
         self.store.memory("pattern", first["id"])
+        self.store.workspace()
         self.assertEqual(self.store.reconsider()["items"], [])
-        for key in ("a", "a", "b"):
-            self.store.recall_memory(first, run_key=key)
-        self.store.recall_memory(second, run_key="b")
-        self.store.recall_memory(first, run_key="learning", purpose="learning")
-        attention = next(r for r in self.store.reconsider()["items"] if r["kind"] == "pattern")
-        self.assertEqual(attention["recalls"], 2)
-        self.assertEqual(attention["co_recalled"][0]["kind"], "episode")
-        self.store.recall_memory(first, run_key="c")
-        self.store.save_reconsideration([{**attention, "note": "这次重温形成了下一步问题"}])
-        pending = next(r for r in self.store.reconsider()["items"] if r["kind"] == "pattern")
-        self.assertEqual(pending["recalls"], 1)
-        self.assertEqual(self.store.memory("pattern", first["id"])["last_reconsideration"]["note"], "这次重温形成了下一步问题")
 
     def test_foreground_can_write_then_read_same_graph(self):
         provider = Provider([
             response(calls=[("remember", {"items": [{"kind": "pattern", "title": "新的认识", "content": "这次形成的理解",
                                                         "source_ids": [self.message["id"]]}]}, "save")]),
             response(calls=[("memory", {"kind": "pattern", "id": 1}, "read")]),
-            response('{"background":"本轮背景","working_memory":"pattern/1值得继续理解"}')])
+            response('{"background":"本轮背景","recollection":{"发现":"新的联系"}}')])
         async def run():
             with patch("mr_memory.agent._tool_set", return_value=object()):
                 return await MemoryAgent(provider, self.store, max_turns=4).reconstruct(self.message, [self.message], {})
@@ -113,10 +101,13 @@ class MemoryGraphTests(unittest.TestCase):
         self.assertEqual(result.status, "completed", result.detail)
         self.assertEqual(len(result.written), 1)
         self.assertEqual(result.tool_calls[1]["result"]["summary"], "这次形成的理解")
-        self.assertEqual(self.store.reconsider()["items"][0]["kind"], "pattern")
+        experience = self.store.reconsider()["items"][0]
+        self.assertEqual(experience["kind"], "foreground")
+        self.assertEqual(experience["available_memories"][0]["kind"], "pattern")
+        self.assertEqual(experience["recollection"], {"发现": "新的联系"})
 
     def test_final_background_can_commit_understanding_without_another_model_turn(self):
-        provider = Provider([response(json.dumps({"background": "本轮背景", "working_memory": "接着讨论方案",
+        provider = Provider([response(json.dumps({"background": "本轮背景",
             "items": [{"kind": "pattern", "title": "协作方式", "content": "共同修改形成的理解", "source_ids": [self.message["id"]]}]}))])
         async def run():
             with patch("mr_memory.agent._tool_set", return_value=object()):

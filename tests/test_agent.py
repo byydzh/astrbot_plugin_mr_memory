@@ -41,6 +41,12 @@ class Provider:
 
 
 class Store:
+    def workspace(self):
+        return {"active": []}
+
+    def record_cognition(self, **experience):
+        self.experience = experience
+
     def recall_drafts(self, pending=None, known=()):
         return {}
 
@@ -66,42 +72,41 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reconstruction_separates_continuing_notes_from_current_background(self):
-        prior = {"working_memory": "昨天的图属于甲，需要核对。"}
+    async def test_reconstruction_separates_experience_from_delivered_background(self):
+        prior = {"question": "上次的话题"}
         provider = Provider([response(json.dumps({
             "background": "本次在改另一张图。",
-            "working_memory": "原图属于乙，作者在消息17纠正；另一张图正在改配色。"}, ensure_ascii=False))])
+            "recollection": {"发现": "这次换了讨论对象"}}, ensure_ascii=False))])
         with patch("mr_memory.agent._tool_set", return_value=object()):
             result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], prior)
         self.assertEqual(result.background, "本次在改另一张图。")
-        self.assertIn("消息17纠正", result.working_memory)
+        self.assertEqual(result.recollection, {"发现": "这次换了讨论对象"})
         self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"],
                          {**prior, "pending_recall_writes": {}})
         self.assertEqual(len(provider.requests), 1)
 
-    async def test_missing_or_truncated_notes_do_not_become_background_or_clear_notes(self):
-        for text, expected_background, expected_note in (
-            ("本轮可用背景", "本轮可用背景", None),
-            ('{"background":"这次无须沿用旧笔记","working_memory":""}', "这次无须沿用旧笔记", ""),
-            ('{"background":"","working_memory":""}', "", ""),
-            ('{"background":"不完整', "", None),
+    async def test_missing_or_truncated_envelope_does_not_create_memory_changes(self):
+        for text, expected_background in (
+            ("本轮可用背景", "本轮可用背景"),
+            ('{"background":"这次没有延续变化"}', "这次没有延续变化"),
+            ('{"background":""}', ""),
+            ('{"background":"不完整', ""),
         ):
             with self.subTest(text=text), patch("mr_memory.agent._tool_set", return_value=object()):
                 result = await MemoryAgent(Provider([response(text)]), Store()).reconstruct({"sent_at": 300}, [], {})
             self.assertEqual(result.background, expected_background)
-            self.assertEqual(result.working_memory, expected_note)
-            if expected_note is not None:
-                self.assertEqual(result.status, "completed")
+            self.assertEqual(result.recollection, {})
+            self.assertEqual(result.written, [])
 
     async def test_tool_planning_is_not_delivered_as_background_after_empty_finish(self):
         provider = Provider([
             response("我先查一下原始交流", calls=[("search_messages", {"terms": ["星舟"]}, "read")]),
-            response('{"background":"","working_memory":"没有需要补充的背景"}')])
+            response('{"background":""}')])
         with patch("mr_memory.agent._tool_set", return_value=object()):
             result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], {})
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.background, "")
-        self.assertEqual(result.messages[1]["content"], "我先查一下原始交流")
+        self.assertEqual(next(m for m in result.messages if m["role"] == "assistant")["content"], "我先查一下原始交流")
 
     async def test_wrong_search_query_returns_contract_to_next_turn(self):
         wrong = {"query": "星舟 人物画像 喜好 性格", "limit": 20}

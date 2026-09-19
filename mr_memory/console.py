@@ -166,13 +166,13 @@ class Console:
         store = await self.get_store(scope_id)
         counts = await asyncio.to_thread(self.inventory, store)
         state = await asyncio.to_thread(store.load_working_state)
-        return {"counts": counts, "state": state, **await self.learning_overview(store),
+        return {"counts": counts, "state": state, "workspace": await asyncio.to_thread(store.workspace), **await self.learning_overview(store),
                 "background_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "background"),
                 "feedback_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "feedback")}
 
     async def runs(self, scope_id):
         store = await self.get_store(scope_id)
-        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30),
+        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30), "workspace": await asyncio.to_thread(store.workspace),
                 **await self.learning_overview(store)}
 
     async def run(self, scope_id, run_id):
@@ -196,6 +196,7 @@ class Console:
         if item is None:
             raise FileNotFoundError("这条记忆不存在或已失效")
         item["navigation"] = await asyncio.to_thread(store.navigate, ref={"kind": kind, "id": int(item_id)})
+        item["experiences"] = await asyncio.to_thread(store.reconsider, ref={"kind": kind, "id": int(item_id)}, limit=5)
         return item
 
     async def graph(self, scope_id):

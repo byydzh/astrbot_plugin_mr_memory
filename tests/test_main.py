@@ -77,14 +77,15 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("test cleanup path is outside the test workspace")
         shutil.rmtree(directory)
 
-    async def test_short_term_correction_survives_topic_change_and_missing_new_note(self):
+    async def test_hook_delivers_background_without_forking_graph_understanding(self):
         current = event()
         current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
         store = await self.plugin.store_for(current)
         correction = "原图属于乙；甲是上一张图，作者在消息17纠正过。"
+        store.save_memories([{"kind": "understanding", "content": correction, "attention": "接着理解"}], mark_processed=False)
         replies = [
-            ReconstructionResult(background="本轮理解了作者纠正。", working_memory=correction, status="completed"),
-            ReconstructionResult(background="这轮只调整另一张图的颜色。", working_memory=correction, status="completed"),
+            ReconstructionResult(background="本轮理解了作者纠正。", status="completed"),
+            ReconstructionResult(background="这轮只调整另一张图的颜色。", status="completed"),
             ReconstructionResult(background="这轮背景可用，但没有返回新笔记。", status="completed"),
         ]
         memory_agent = SimpleNamespace(reconstruct=AsyncMock(side_effect=replies))
@@ -95,8 +96,9 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 injected = next(p.text for p in request.extra_user_content_parts if p.text.startswith("<mr_group_context>"))
                 self.assertNotIn(correction, injected)
         for call in memory_agent.reconstruct.call_args_list[1:]:
-            self.assertEqual(call.args[2]["working_memory"], correction)
-        self.assertEqual(store.load_working_state()["working_memory"], correction)
+            self.assertNotIn("working_memory", call.args[2])
+        self.assertNotIn("working_memory", store.load_working_state())
+        self.assertEqual(store.workspace()["active"][0]["memory"]["content"], correction)
 
     async def test_injection_preserves_astrbot_request_when_working_state_write_fails(self):
         current = event()
@@ -379,11 +381,12 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         saved = store.save_memories([{"kind": "semantic", "content": "读旧原文后的新理解",
                                     "source_keys": [older["source_key"]]}],
                                    [older["source_key"]], mark_processed=False)
-        result = ConsolidationResult(status="completed", written=saved, usage={"input_other": 25, "output": 5},
-            progress={"completed_ids": [current["id"]]},
-            items=[{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
-                    "source_keys": [older["source_key"], current["source_key"]]}])
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=result))
+        async def finish(*args, **kwargs):
+            final = store.save_memories([{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
+                    "source_ids": [older["id"], current["id"]]}], mark_processed=False,
+                    learning_kind="background", progress={"completed_ids": [current["id"]]})
+            return ConsolidationResult(status="completed", written=saved+final, usage={"input_other": 25, "output": 5})
+        learning = SimpleNamespace(consolidate=AsyncMock(side_effect=finish))
         with patch.object(store, "pending_messages", return_value=[current]), \
                 patch.object(self.plugin, "agent", return_value=learning), \
                 patch.object(self.plugin, "index_pending", new=AsyncMock()):
@@ -525,7 +528,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_recall_activity_remains_open_without_restarting_identical_idle_work(self):
         store = await self.plugin.store_for(event())
         memory = store.save_memories([{"kind": "pattern", "title": "共同活动", "content": "可继续理解的经历"}], [], mark_processed=False)[0]
-        store.recall_memory(memory, run_key="first")
+        store.record_cognition(run_key="first", run_id=None, kind="foreground", current={}, payload={
+            "available_memories": [{"kind": memory["kind"], "id": memory["id"], "revision_no": 1}], "recollection": "一次理解"})
         learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
             status="completed", usage={"input_other": 20}, model_attempts=1)))
         with patch.object(self.plugin, "agent", return_value=learning), \
@@ -534,7 +538,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(store.reconsider()["items"])  # Never pretends it was reviewed.
             self.assertEqual((await self.plugin.learn(store, force=True))["status"], "idle")
             self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "idle")
-            store.recall_memory(memory, run_key="later")
+            store.record_cognition(run_key="later", run_id=None, kind="foreground", current={}, payload={
+                "available_memories": [{"kind": memory["kind"], "id": memory["id"], "revision_no": 1}], "recollection": "后来的理解"})
             self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "completed")
             self.assertEqual(learning.consolidate.call_args.args[1]["memory_changes"]["items"], [])
         self.assertEqual(learning.consolidate.await_count, 2)

@@ -59,6 +59,31 @@ function details(parent, title, value) {
 function proseSection(parent, heading, text, missing = "没有保存这部分内容") {
   const section = el("section"); section.append(el("h3", heading), el("div", text || missing, "prose")); parent.append(section);
 }
+function representationView(value) {
+  if (value == null || typeof value !== "object") return el("span", value == null ? "null" : String(value));
+  const list = el(Array.isArray(value) ? "ol" : "dl", null, "representation");
+  for (const [key, part] of Object.entries(value)) {
+    if (Array.isArray(value)) { const row = el("li"); row.append(representationView(part)); list.append(row); }
+    else { const body = el("dd"); body.append(representationView(part)); list.append(el("dt", key), body); }
+  }
+  return list;
+}
+function renderWorkspace(data) {
+  if (!data.workspace) return;
+  const signature = JSON.stringify([state.scope, data.workspace]);
+  if (signature === state.workspaceSignature) return;
+  state.workspaceSignature = signature;
+  const parent = $("workspace"); parent.replaceChildren();
+  for (const selected of data.workspace.active || []) {
+    const item = selected.memory;
+    const card = button("", () => showMemory(item.kind, item.id), "memory-card");
+    const attention = item.attention;
+    card.append(el("strong", item.title || item.kind), el("p", item.content || item.summary),
+      el("small", typeof attention === "string" ? attention : attention?.reason || "已选入持续注意"));
+    parent.append(card);
+  }
+  if (!parent.children.length) empty(parent, "目前没有选入持续注意的认识。记忆仍可主动搜索；形成的理解可由模型选择带入后续交流。");
+}
 function openDetail(title) {
   state.detailVersion += 1; state.runDetail = null;
   $("detail-title").textContent = title;
@@ -94,6 +119,7 @@ async function loadRuns() {
   if (scope !== state.scope || state.tab !== "runtime") return;
   renderRuns(data.runs || []);
   renderLearning(data);
+  renderWorkspace(data);
 }
 
 function renderLearning(data) {
@@ -204,6 +230,7 @@ async function loadTab() {
     ].map(([label, value, caption]) => { const card = el("article", null, "metric"); card.append(el("span", label), el("strong", value), el("small", caption)); return card; }));
     renderRuns(rows);
     renderLearning(overview);
+    renderWorkspace(overview);
   } else if (state.tab === "memory") { await searchMemory(); }
   else if (state.tab === "people") { await searchPeople(); }
   else { await searchMessages(); }
@@ -243,6 +270,23 @@ async function showMemory(kind, id) {
   proseSection(parent, item.title || item.relation || "记忆内容", item.summary || item.statement);
   if (item.source && item.target) parent.append(el("p", `${item.source} → ${item.relation} → ${item.target}`, "meta"));
   if (item.uncertainty) proseSection(parent, "尚不确定的部分", item.uncertainty);
+  if (item.attention != null) { const section = el("section"); section.append(el("h3", "为什么仍在关注"), representationView(item.attention)); parent.append(section); }
+  if (item.representation && Object.keys(item.representation).length) {
+    const section = el("section"); section.append(el("h3", "它如何组织这项认识"), representationView(item.representation)); parent.append(section);
+  }
+  if (item.experiences?.items?.length) {
+    const section = el("section"); section.append(el("h3", "带着这项认识经历了什么"), el("p", "以下过程曾向模型提供这项记忆。具体如何发挥作用，需要结合当时理解及后续交流阅读。", "footnote"));
+    for (const experience of item.experiences.items) {
+      const row = el("details"), label = experience.request?.question || experience.request?.plain_text || kinds[experience.kind] || experience.kind;
+      row.append(el("summary", `${date(experience.at)} · ${label}`));
+      if (experience.background) proseSection(row, "当时提供的背景", experience.background);
+      if (Object.keys(experience.recollection || {}).length) row.append(representationView(experience.recollection));
+      for (const reply of experience.actual_response || []) if (reply.plain_text) proseSection(row, "后来的回复", reply.plain_text);
+      if (experience.run_id) row.append(button("阅读完整过程", () => showRun(experience.run_id)));
+      section.append(row);
+    }
+    parent.append(section);
+  }
   if (item.last_reconsideration) proseSection(parent, "最近一次重新思考", item.last_reconsideration.note);
   const links = item.navigation?.connections || [];
   if (links.length) {

@@ -27,8 +27,8 @@ def memory_text_arguments(text: str) -> dict | None:
             raise ValueError("Incomplete or repeated DSML remember parameter")
         arguments[match[1]] = match[3] if match[2] == "true" else json.loads(match[3])
         position = match.end()
-    if not arguments or set(arguments) - {"items", "progress", "retry", "finish"}:
-        raise ValueError("DSML remember accepts items, progress, retry and finish")
+    if not arguments or set(arguments) - {"items", "progress", "retry", "finish", "recollection"}:
+        raise ValueError("DSML remember accepts items, progress, retry, finish and recollection")
     return arguments
 
 
