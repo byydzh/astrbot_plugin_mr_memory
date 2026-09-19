@@ -382,7 +382,7 @@ class MrMemoryPlugin(Star):
             # Continuing understanding is read from the shared graph by the agent.
             changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0))
             recent_learning = await asyncio.to_thread(store.memory_directory, working.get("recent_learning_refs", []))
-            working = {key: working[key] for key in ("question", "request_at", "pending_recall_writes") if key in working}
+            working = {key: working[key] for key in ("question", "request_at") if key in working}
             working["memory_changes"] = changes
             working["recent_learning"] = [item for item in recent_learning if item]
             await trace.emit("input", "已准备问题、发言者与近期对话", current=current,
@@ -537,7 +537,8 @@ class MrMemoryPlugin(Star):
             resuming = task is not None
             reflection_tasks = []
             memory_activity = await asyncio.to_thread(store.reconsider, after=state.get("cognition_offered", 0), kind="foreground")
-            new_activity = bool(memory_activity.get("items"))
+            recall_drafts = await asyncio.to_thread(store.recall_drafts) if not feedback else {}
+            new_activity = bool(memory_activity.get("items") or recall_drafts)
             workspace = await asyncio.to_thread(store.workspace)
             if task:
                 messages = await asyncio.to_thread(store.learning_messages, task)
@@ -607,6 +608,10 @@ class MrMemoryPlugin(Star):
             # by intervening interactions, rather than resume a frozen worldview.
             if memory_activity.get("items"):
                 working["memory_activity"] = memory_activity
+            if recall_drafts:
+                resumed_drafts = (task or {}).get("continuation", {}).get("write_state", {}).get("pending_items", {})
+                working["pending_recall_writes"] = {key: value for key, value in recall_drafts.items()
+                                                   if key not in resumed_drafts}
             change_cursor = state.get("learning_memory_change_cursor", 0)
             if task:
                 change_cursor = task.get("continuation", {}).get("working", task["working"]).get("memory_change_cursor", change_cursor)

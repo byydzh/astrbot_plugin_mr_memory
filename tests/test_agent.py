@@ -44,6 +44,9 @@ class Store:
     def workspace(self):
         return {"active": []}
 
+    def continuity(self, before):
+        return None
+
     def record_cognition(self, **experience):
         self.experience = experience
 
@@ -82,7 +85,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.background, "本次在改另一张图。")
         self.assertEqual(result.recollection, {"发现": "这次换了讨论对象"})
         self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"],
-                         {**prior, "pending_recall_writes": {}})
+                         {**prior, "continuity": None})
         self.assertEqual(len(provider.requests), 1)
 
     async def test_missing_or_truncated_envelope_does_not_create_memory_changes(self):

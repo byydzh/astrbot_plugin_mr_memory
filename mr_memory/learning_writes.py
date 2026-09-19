@@ -37,7 +37,8 @@ class LearningWriter:
 
     def __init__(self, store, sources: dict[int, str], *, run_id=None, learning_kind=None,
                  pending_items: dict | None = None, deferred_progress: dict | None = None,
-                 receipts: dict | None = None, foreground=False, handles=None, recollection=None):
+                 receipts: dict | None = None, foreground=False, handles=None, recollection=None,
+                 recover_recall=False, recall_draft_ids=None):
         self.store, self.sources = store, sources
         self.run_id, self.learning_kind = run_id, learning_kind
         self.pending_items = copy.deepcopy(pending_items or {})
@@ -46,19 +47,28 @@ class LearningWriter:
         self.handles = copy.deepcopy(handles or {})
         self.recollection = copy.deepcopy({} if recollection is None else recollection)
         self.foreground = foreground
-        if foreground:
-            self.pending_items = store.recall_drafts()
+        self.recall_draft_ids = set(recall_draft_ids or ())
+        if recover_recall:
+            queued = store.recall_drafts()
+            self.pending_items = {**queued, **self.pending_items}
+            self.recall_draft_ids.update(queued)
         self.known_drafts = set(self.pending_items)
 
     def state(self) -> dict:
         return copy.deepcopy({"pending_items": self.pending_items,
                               "deferred_progress": self.deferred_progress, "receipts": self.receipts,
-                              "handles": self.handles, "recollection": self.recollection})
+                              "handles": self.handles, "recollection": self.recollection,
+                              "recall_draft_ids": sorted(self.recall_draft_ids)})
 
     def persist(self):
         if self.foreground:
             self.store.recall_drafts(self.pending_items, self.known_drafts)
             self.known_drafts.update(self.pending_items)
+        elif self.recall_draft_ids:
+            # Background learning owns old foreground failures. New foreground
+            # drafts arriving during this call are outside this writer's set.
+            self.store.recall_drafts({key: value for key, value in self.pending_items.items()
+                                     if key in self.recall_draft_ids}, self.recall_draft_ids)
         if self.learning_kind is not None:
             task = self.store.learning_task(self.learning_kind)
             self.store.update_learning_task(self.learning_kind, {

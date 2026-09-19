@@ -63,16 +63,43 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         expanded = json.loads(_json({**full, "attachments": [{"description": "新获取的图片描述"}]}, seen_messages=seen))
         self.assertEqual(expanded["attachments"], [{"description": "新获取的图片描述"}])
 
+    def test_shared_reflection_and_basis_are_one_version_not_repeated_bodies(self):
+        thought = {"kind": "reflection", "id": 3, "revision_no": 2,
+                   "content": "共同经历留下的解释仍待修正", "belief": {"stance": "tentative"}}
+        edge = {"kind": "association", "id": 7, "revision_no": 1,
+                "context": "这个解释由那次经历形成", "purpose": "basis", "target": {"kind": "episode", "id": 1}}
+        view = [{"kind": "node", "id": i, "revision_no": 1, "summary": "当前理解",
+                 "description": "当前理解", "reflections": [thought], "basis": [edge], "connections": [edge]}
+                for i in (1, 2)]
+        seen = {}
+        encoded = _json(view, seen_messages=seen)
+        result = json.loads(encoded)
+        self.assertEqual(encoded.count(thought["content"]), 1)
+        self.assertEqual(encoded.count(edge["context"]), 1)
+        self.assertNotIn("basis", result[0])
+        self.assertNotIn("description", result[0])
+        self.assertEqual(result[1]["reflections"][0]["memory_ref"]["revision_no"], 2)
+        # A brief must not erase the complete prior view; a changed version
+        # must still carry its full content even when some words are unchanged.
+        _json({k: thought[k] for k in ("kind", "id", "revision_no")}, seen_messages=seen)
+        self.assertNotIn("content", json.loads(_json(thought, seen_messages=seen)))
+        new = json.loads(_json({**thought, "revision_no": 3, "content": "后来经历改变了理解"}, seen_messages=seen))
+        self.assertEqual(new["content"], "后来经历改变了理解")
+        self.assertEqual(new["belief"], thought["belief"])
+
     async def test_final_turn_keeps_tool_table_and_sets_native_tool_choice(self):
-        provider = Provider([response(calls=[("search_messages", {}, "read")]), response("已读到的共同经历")])
+        provider = Provider([response(calls=[("search_messages", {}, "read")]),
+                             response('{"background":"已读到的共同经历"}')])
         tools = object()
         with patch("mr_memory.agent._tool_set", return_value=tools):
             result = await MemoryAgent(provider, Store(), max_turns=2).reconstruct({"sent_at": 300}, [], {})
-        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.background, "已读到的共同经历")
         self.assertEqual(len(provider.requests), 2)
         self.assertTrue(all(request[1] is tools for request in provider.requests))
         self.assertNotIn("tool_choice", provider.requests[0][0])
         self.assertEqual(provider.requests[1][0]["tool_choice"], "none")
+        self.assertEqual(provider.requests[1][0]["response_format"], {"type": "json_object"})
         self.assertEqual(provider.requests[1][0]["messages"][:len(provider.requests[0][0]["messages"])],
                          provider.requests[0][0]["messages"])
 

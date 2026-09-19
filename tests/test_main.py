@@ -544,6 +544,20 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(learning.consolidate.call_args.args[1]["memory_changes"]["items"], [])
         self.assertEqual(learning.consolidate.await_count, 2)
 
+    async def test_queued_foreground_draft_starts_background_without_new_messages(self):
+        from astrbot_plugin_mr_memory.mr_memory.learning_writes import LearningWriter
+        store = await self.plugin.store_for(event())
+        writer = LearningWriter(store, {}, foreground=True)
+        writer.apply({"items": [{"kind": "perspective", "content": "待修理解", "source_ids": [999]}]}, "queued")
+        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
+            status="completed", usage={"input_other": 20}, model_attempts=1)))
+        with patch.object(self.plugin, "agent", return_value=learning), \
+                patch.object(self.plugin, "index_pending", new=AsyncMock()):
+            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "completed")
+        self.assertFalse(learning.consolidate.call_args.args[0])
+        self.assertIn("queued:0", learning.consolidate.call_args.args[1]["pending_recall_writes"])
+        self.assertEqual(store.pending_status()["count"], 0)
+
     async def test_completed_batch_keeps_token_density_for_the_next_batch(self):
         store = await self.plugin.store_for(event())
         base = self.plugin.message(event())

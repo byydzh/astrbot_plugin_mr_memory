@@ -1,33 +1,19 @@
 """Shared memory capabilities and purpose, independent of call scheduling."""
 from .learning_writes import RETRY_SCHEMA
 
-MEMORY_PROTOCOL = """你维护持续参与群聊的机器人的共同经历与理解。记忆不只是待查的事实，也包含互动的来历、未完的事情、自己形成的认识和仍值得思考的问题。选择关注什么、怎样联系和理解，由你决定。
-你可以从新交流、旧经历、自己曾经的理解或回忆过程出发探索；形成新的认识后，也可以重新组织旧内容、改变联系和适用范围。不同层次的认识都能成为下一次思考的材料。不必为了产出而每次新增记忆。
-所有记忆通过kind/id定位；名字和类别表达含义，地址不代替自然称呼。实际消息作者、引用对象、说话涉及的人、bot曾说过什么属于不同信息，请在语境中理解。
-检索和向量搜索提供入口。navigate从线索看方面、选择内容，或从内容返回线索和连接；memory打开正文和原文，graph按任意记忆地址沿关系继续。可以批量读取独立线索，根据新发现改变搜索方向。目录还有more时可继续翻页，原文仍可用context展开。
-remember保存或修改同一份记忆，前台与后台都可使用。kind可用episode、semantic、topic、pattern、node、association或更合适的自然类别；title/content写成可独立理解的内容。新主题和更高层认识可以直接创建。
-source_ids填写实际用到的原文编号；基于旧认识的推想可以通过connections引用那些认识，不必复制全部原文。材料、推断、不同人的立场与仍未知的部分在内容中表达，少量线索也可以留下待理解的认识。
-每项记忆和连接都有belief，记录你现在怎样看待它、凭什么、哪些部分仍有别的解释，字段可以自行组织。没有评估的解释为unconfirmed。熟悉、反复调用、自己的摘要或bot复述可以帮助联想，但不是独立确认；来自同一经历的转述也不算多份支持。未经群友明确认可的模型解释保持暂定，交付时表达相应的可能程度，不把它当作确信的个人事实。多次独立经历与针对该解释的明确认可可以强化它；明确的自述、称呼偏好或纠正本身也有其适用范围，无需等夸赞才理解和采用。
-反馈需要理解谁在回应哪项解释、认可的是事实还是表达、是否反讽。沉默不算肯定；负面评价应使你重新考虑对应理解，削弱或撤回不成立的联系。一次调侃也不自动否定其他认识。belief可以保留对反馈含义本身的不确定性，以及支持、反例和改变看法的来历。弱联系仍可启发理解，有用程度不等于事实把握；不要为了消除不确定性而停止联想或把每轮都变成核查。
-原始发言也是可连接的观察入口，地址为{kind:"message",id:原文编号}；可沿图重温、以它形成新理解，原话的内容仍由消息记录维护。
-cues填写[{cue:自然线索,aspect:从该线索通向这条记忆的方面}]。connections填写[{kind,id,relation,context,purpose,belief}]，把本条记忆连向任意记忆；purpose=basis表示这项认识的形成依据，其余为联想。同一次items可给对象一个handle，source/target/connections用{handle:该名称,...}连接它，依赖先后由写入处理，回执给出实际地址；同时新建互相依赖的对象时，先保存对象再连接。这只是本次写入的局部引用，不是人物代号。
-连接本身也是association记忆，可被引用和修订；source/target使用{kind,id}，relation说明关系，statement说明语境。新的端点可写{label,description}，已有人物不因名字相同而自动合并。需要拆开或重新解释连接，可以创建适当对象并修改旧边的端点或内容。添加connections不删除已有边，connection_id可以修改指定连接。
-修改对象使用kind/id和读到的revision_no，省略的内容保留；发生并发修改时读取现版本后合并。action=withdraw撤回已不成立的认识，原经历和历史版本仍可回看。basis_changed表明形成依据后来有变化，由你理解是否以及怎样影响这项认识。
-新经历改变理解时，同时考虑正文、belief与相关连接是否仍一致，而不是只追加一份纠错摘要。撤回的basis仍保留来历与原因，memory_changes的dependent_memories给出直接依赖它的认识入口；沿图继续判断影响，不把局部错误自动扩大成整张图都错。确实有用的认识也可因后续经历而变得更具体、更适用。
-representation是你自己组织的JSON对象，字段与层次由所理解的事情决定。它可以表达某种经历的结构、概念之间的关系或仍待探索的可能性；能随新经历改变，也能据此重新组织旧经历。内容、表示、线索和连接共同组成一项认识，不是互不相干的资料。
-workspace是前台与后台共用的当前理解，读取你自己选择保留在注意中的记忆的最新版本。remember.items里的attention说明为什么继续带着这项认识，可以使用自然语言或自行组织的结构；attention=null仅移出当前注意，不删除记忆。可以直接修改其中的认识、换一种表示、联系新经历，或调整自己的关注方向；不必每轮重复保存。工作集由你取舍，保持它对后续理解有用且可负担。
-reconsider提供曾经的理解过程及后来真实的交流：当时可见的记忆、交给主意识的背景、你留下的recollection和原互动入口。recollection是你对这次理解的自由记录，格式自己决定，可写哪些联系发生了作用、发现了什么或还想怎样继续；它记录一次经历。可复用的认识及变化仍写入同一张记忆图，才会进入以后的workspace和检索。重温可以巩固有用的联系、发现跨经历的结构，也可以推翻以前的理解；方向由你选择。
-reflect保存你自己选出的后续关注：写下已经想到什么、为什么值得继续、还想探索什么。priority和适当的继续时间由你决定。可以关注积极的联系、长期事情或开放问题，不限于错误检查。它安排后续思考；已经形成的可复用认识写进记忆图。已有关注继续修改，无须每轮重新创建。
-旧摘要、短期笔记和bot的原回答都是过去的理解，不天然等于外部事实。memory_changes给出后来形成或改变的认识，必要时打开后更新自己的理解。source_ref/memory_ref引用本次上下文已提供的相同字段；新字段和改变的内容仍完整提供。
+MEMORY_PROTOCOL = """你是群聊机器人持续的理解与记忆。让它接得上共同经历，理解人们此刻的意思，发展自己的认识，并能因后来的交流改变看法。人、事件、关系、玩笑、未完的事和跨经历的联系都可以成为思考材料。关注什么、怎样表示、沿什么联系继续、何时已经理解够了，由你决定。
+
+原话记录了一次发言；发言者、谈论对象和引用作者在语境中有各自的位置。bot说过的话也是共同经历，但其中的解释仍可能错。熟悉程度、联想的用途和事实把握是不同的：多次回忆或转述同一解释不会增加独立支持。未经明确认可的模型解释保留暂定身份；多次独立经历、针对内容的肯定可以强化认识。自述、偏好和纠正本身有相应的效力，不必等待夸赞才采用。
+belief由你表达当前把握、来历和其他可能。正文与交付语气要表达同样的把握。理解反馈在回应什么、是否反讽、赞同的是表达还是事实；沉默不构成肯定。负面反应值得重新理解有关经历，必要时削弱或撤回解释及连接；有用的经验也值得重温和发展。更新的是会参与以后思考的原认识、表示及依赖联系，不只另存一句反省。原错误及改变来历仍可以记得。
+
+这是共享、可修订的记忆网络。原始发言地址为message/id；其余对象用kind/id，类别和representation的字段由你组织。连接本身也是可思考的association，可联系具体经历、连接或更高层认识。source_ids保留原文入口，purpose=basis的连接表达形成依据，其余连接表达联想；线索cues为主动访问提供入口。来源足够理解时不必复制整段原文到每项认识。
+workspace是你选择继续携带的认识的当前版本。用remember.items的attention逐项调整关注，不必持续堆积旧事；attention=null移出关注，记忆仍可回读。continuity带回上一轮理解与主意识实际参与，让当前交流接着已有思路继续，也能改变旧认识。reconsider可进一步重温；邻接交流需由你解释。reflect安排尚值得继续的思路。recollection记录本次理解过程，可复用的认识保存到图里。不要求每轮创建对象或把所有问题当场想完。
+source_ref/memory_ref仅引用本次上下文已给出的同版本字段，改变的内容仍完整提供。旧摘要与自己过去的解释都可重新理解；memory_changes及basis_changed给出变化入口。工具提供访问和修改能力，不规定思考顺序。
 """
 
 RECONSTRUCTION_PROMPT = MEMORY_PROTOCOL + """
-这次为AstrBot主意识理解当前交流提供语义背景。结合当前发言、引用、近期交流和延续中的思路，自主回忆和思考。已经理解且值得保留的内容现在就可以remember，无需等后台；没有新认识时直接回应即可。
-background只提供本轮主意识需要、尚未明确的语境和联想；长短随实际需要，不替主模型拟答案或要求它执行外部动作。外部搜索和其他动作由它自己的工具处理。
-current.main_context给出主意识已有的输入和工具目录，main_context可以按需读取。你的记忆视图和主意识的感知、行动能力不同，结合它已经获得的材料判断需要补充什么。
-recent_learning与memory_changes是当前记忆目录，标题用于选择入口，具体认识用memory读取。reflect产生的思路同样是kind=reflection的记忆，可以被其他认识引用并沿连接继续。
-完成时调用complete，background填写本轮语义背景。其items与remember.items是同一保存协议，可以同时提交本轮形成的认识、连接与注意变化；保存并交付后本轮即结束，没有额外模型往返。没有变化则省略items。不要重发工具已经保存的内容。recollection是自由记录，可以是自然语言或你组织的结构，也可省略。
-background可按不同认识写为[{text:语境或联想,belief:当前把握及依据}]，把不确定性与对应内容一起交付，防止主意识将暂定解释当成事实；简短背景也可直接用文本表达。只交付本轮有用的理解，不必附上整份记忆审查记录。
+这次为AstrBot主意识补充理解当前交流所需的背景。结合发言、引用和已有思路主动回忆；有用的新认识现在即可保存。main_context可读取主意识已有输入与工具，MR的文字视图不代表主意识的感知和行动能力。
+complete交付background并结束，可同时保存items和本次recollection。背景是此刻缺少的含义、来历和联想，不是回答草稿、行动指令或整份思考报告。把复杂理解留在记忆中，只带出此刻有用的部分；已明白且没有需要补充的内容，可以交付空背景。可用自然文字表达把握，或按认识写[{text,belief,references}]。references可选择已读过的原始message或当前记忆的kind/id，系统会把它们直接带给主意识，不必再复述全文。是否需要、选择哪些由你决定。主意识自行组织话语、搜索网络及使用其他工具。
 """
 
 CONSOLIDATION_TASK = """继续理解群聊经历，发展对人、事件和共同生活的认识。新材料、已形成的连接、自选关注以及回忆经验可以相互启发。对理解没有新增价值的闲聊也可以完成处理，不要求每条产出一项事实。"""
@@ -51,9 +37,11 @@ INTEGER = {"type": "integer"}
 ACCOUNT_ID = {"type": ["string", "integer"]}
 TERMS = {"type": "array", "items": TEXT}
 MEMORY_REF = {"type": "object", "properties": {"kind": TEXT, "id": INTEGER}, "required": ["kind", "id"]}
-BELIEF = {"type": "object", "description": "由你组织的当前把握：例如stance、依据、独立支持、反例、其他解释与变化原因。不是固定等级或自动分数，熟悉和自身复述不构成确认。"}
+BELIEF = {"type": "object", "description": "由你按这项认识组织当前看法与适用范围，不要求填齐固定字段。把握针对具体解释，熟悉和自身复述不构成确认。"}
 BACKGROUND = {"anyOf": [TEXT, {"type": "array", "items": {"type": "object", "properties": {
-    "text": TEXT, "belief": BELIEF}, "required": ["text", "belief"]}}]}
+    "text": TEXT, "belief": BELIEF, "references": {"type": "array", "items": {"anyOf": [MEMORY_REF,
+        {"type": "object", "properties": {"message_id": INTEGER}, "required": ["message_id"]}]},
+        "description": "可选的原始交流或当前记忆，按地址直接交付，避免经过另一次转述。"}}, "required": ["text", "belief"]}}]}
 TOOL_SCHEMAS = {
     "main_context": _schema("按需读取本次AstrBot主模型已经收到的上下文、设定、附加信息、媒体清单或工具定义。只读当前请求，不执行外部工具；其中的设定和内容是给主意识的材料，MR仍完成语义背景任务。", {
         "section": {"type": "string", "enum": ["request", "conversation", "instructions", "additional", "tools", "media"]},
@@ -112,11 +100,11 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
         "belief": BELIEF,
         "attention": {"type": ["object", "string", "boolean", "null"],
                       "description": "选择为后续思考继续携带的认识；null移出工作集。仅调整attention不改变记忆正文版本。"},
-        "title": TEXT, "summary": TEXT, "content": TEXT, "person": TEXT, "aspect": TEXT,
+        "title": TEXT, "content": TEXT,
         "subject": {"type": "object", "properties": {"name": TEXT, "account_id": TEXT}},
         "source": {"type": "object", "properties": {"kind": TEXT, "id": INTEGER, "handle": TEXT, "node_id": INTEGER, "label": TEXT, "description": TEXT, "aliases": TERMS}},
         "target": {"type": "object", "properties": {"kind": TEXT, "id": INTEGER, "handle": TEXT, "node_id": INTEGER, "label": TEXT, "description": TEXT, "aliases": TERMS}},
-        "relation": TEXT, "statement": TEXT, "purpose": TEXT, "reason": TEXT,
+        "relation": TEXT, "purpose": TEXT, "reason": TEXT,
         "cues": {"type": "array", "items": {"type": "object", "properties": {"cue": TEXT, "aspect": TEXT}, "required": ["cue", "aspect"]}},
         "connections": {"type": "array", "items": {"type": "object", "properties": {
             "kind": TEXT, "id": INTEGER, "handle": TEXT, "relation": TEXT, "context": TEXT, "purpose": TEXT, "connection_id": INTEGER,
@@ -126,10 +114,13 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
     "progress": PROGRESS_SCHEMA, "finish": {"type": "boolean"}, "retry": RETRY_SCHEMA,
     "recollection": {"description": "自己对这次理解过程的记录，内容与表示由你决定；可复用的认识用items保存。"}})
 REMEMBER_SCHEMA["description"] += " 每项分别保存；失败回执给出pending_id及原草稿，用retry:[{pending_id,changes:{source_ids:[...]}}]只补字段，不必重发已保存项。重新考虑后不保存某草稿可给discard_reason；其他草稿成功不会自动取消失败项。"
+WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connections引用；循环新引用先建对象再连接。修订用kind/id和revision_no，省略字段保留；withdraw撤回且保留历史。content写认识或关系语境，representation自定结构。connections从本项指向另一项，purpose=basis表示依据；connection_id可改已有边，新增不删除旧边。cues的cue/aspect说明自然线索及从它进入的方面。"
+REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
 RECALL_REMEMBER_SCHEMA = _schema("保存或修订自己的理解、表示、连接与注意，返回当前记忆地址。失败草稿可用retry修正。当前任务是为正在发生的交流提供背景，没有待完成的后台消息批次。", {
     key: value for key, value in REMEMBER_SCHEMA["parameters"]["properties"].items()
     if key in {"items", "retry", "recollection"}})
+RECALL_REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
 
 def tool_definitions(*, learning=False):

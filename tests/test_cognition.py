@@ -81,6 +81,81 @@ class CognitionTests(unittest.TestCase):
         self.assertEqual(self.store.workspace()["active"], [])
         self.assertEqual(self.store.memory("perspective", selected["id"])["revision_no"], selected["revision_no"])
 
+    def test_attention_edits_leave_other_work_and_memories_intact(self):
+        old = self.store.save_memories([{"kind": "perspective", "content": "旧关注", "attention": True}],
+                                      mark_processed=False)[0]
+        writer = LearningWriter(self.store, {}, foreground=True)
+        other = self.store.save_memories([{"kind": "perspective", "content": "另一任务的新关注", "attention": True}],
+                                        mark_processed=False)[0]
+        result = writer.apply({"items": [{"kind": "perspective", "content": "新的方向", "attention": True},
+                                        {"kind": old["kind"], "id": old["id"], "attention": None}]}, "refocus")
+        self.assertFalse(result.rejected, result.rejected)
+        active = self.store.workspace()["active"]
+        self.assertEqual({row["memory"]["content"] for row in active}, {"另一任务的新关注", "新的方向"})
+        self.assertGreater(active[0]["characters"], 0)
+        self.assertEqual(self.store.memory(old["kind"], old["id"])["content"], "旧关注")
+        self.assertEqual(self.store.memory(other["kind"], other["id"])["revision_no"], 1)
+
+    def test_old_foreground_drafts_move_to_background_without_losing_concurrent_drafts(self):
+        first = LearningWriter(self.store, {}, foreground=True)
+        first.apply({"items": [{"kind": "perspective", "content": "旧失败草稿", "source_ids": [999]}]}, "old")
+        provider = Provider([response('{"background":"本次的背景"}')])
+        self.run_agent(provider)
+        sent = json.dumps(provider.requests, ensure_ascii=False, default=str)
+        self.assertNotIn("旧失败草稿", sent)
+        self.assertIn("old:0", self.store.recall_drafts())
+
+        background = LearningWriter(self.store, {}, recover_recall=True)
+        concurrent = LearningWriter(self.store, {}, foreground=True)
+        concurrent.apply({"items": [{"kind": "perspective", "content": "稍后失败草稿", "source_ids": [998]}]}, "new")
+        repaired = background.apply({"retry": [{"pending_id": "old:0", "changes": {"source_ids": [self.message["id"]]}}]}, "repair")
+        self.assertFalse(repaired.rejected)
+        self.assertEqual(set(self.store.recall_drafts()), {"new:0"})
+        self.assertEqual(repaired.written[0]["content"], "旧失败草稿")
+
+        task = self.store.start_learning_task("background", [])
+        provider = Provider([response('{"items":[],"retry":[{"pending_id":"new:0","discard_reason":"重新理解后不保留该草稿"}]}')])
+        self.run_agent(provider, task=task)
+        self.assertIn("稍后失败草稿", json.dumps(provider.requests, ensure_ascii=False, default=str))
+        self.assertFalse(self.store.recall_drafts())
+
+    def test_handoff_carries_selected_original_author_and_current_belief_once(self):
+        saved = self.store.save_memories([{"kind": "perspective", "content": "可更改的理解",
+            "belief": {"把握": "只是一个可能"}}], mark_processed=False)[0]
+        ref = {"kind": "message", "id": self.message["id"]}
+        packet = [{"text": "此刻的含义", "belief": {"把握": "暂时理解"}, "references": [ref,
+            {"kind": saved["kind"], "id": saved["id"]}]},
+            {"text": "另一层联想", "belief": {}, "references": [{"message_id": self.message["id"]}, {"kind": "message", "id": 999}, {"id": None}]}]
+        provider = Provider([response(json.dumps({"background": packet}, ensure_ascii=False))])
+        result = self.run_agent(provider)
+        self.assertEqual(result.status, "completed", result.detail)
+        self.assertEqual(result.background.count(self.message["plain_text"]), 1)
+        for text in ('"sender_id":"10"', '"sender_name":"甲"', "只是一个可能", '"status":"unavailable"', '"status":"invalid_address"', "另一层联想"):
+            self.assertIn(text, result.background)
+        wrapped = Provider([response(json.dumps({"background": json.dumps(packet, ensure_ascii=False)}, ensure_ascii=False))])
+        self.assertEqual(self.run_agent(wrapped).background, result.background)
+
+    def test_next_input_contains_previous_understanding_and_observed_reply_only_so_far(self):
+        self.run_agent(Provider([response('{"background":"先前给出的背景","recollection":"当时的理解"}')]))
+        for mid, role, text, at in [("reply", "BOT", "bot实际说过的话", 1800000001),
+                                    ("later", "USER", "群友后来继续说的话", 1800000002),
+                                    ("future", "BOT", "还没有发生的话", 1800000005)]:
+            self.store.append_message({"platform": "test", "platform_id": "test", "umo": self.store.umo,
+                "group_id": "42", "message_id": mid, "sender_id": "20", "sender_name": "乙",
+                "sent_at": at, "plain_text": text, "role": role,
+                "reply_to": "request" if role == "BOT" else None, "content": []})
+        provider = Provider([response('{"background":"新的背景"}')])
+        current = {**self.message, "id": None, "message_id": "next", "sent_at": 1800000003}
+        async def run():
+            with patch("mr_memory.agent._tool_set", return_value=object()):
+                return await MemoryAgent(provider, self.store).reconstruct(current, [], {})
+        result = asyncio.run(run())
+        self.assertEqual(result.status, "completed", result.detail)
+        sent = "\n".join(m.get("content", "") for m in provider.requests[0][0]["messages"])
+        for text in ("当时的理解", "先前给出的背景", "bot实际说过的话", "群友后来继续说的话"):
+            self.assertIn(text, sent)
+        self.assertNotIn("还没有发生的话", sent)
+
     def test_reconsider_joins_later_actual_reply_without_claiming_visibility_is_use(self):
         self.store.save_memories([{"kind": "perspective", "content": "可供理解的认识", "attention": True}], mark_processed=False)
         self.run_agent(Provider([response('{"background":"当前背景","recollection":{"想法":"还想再联系另一次经历"}}')]))
@@ -127,16 +202,21 @@ class CognitionTests(unittest.TestCase):
         self.assertEqual(memory["content"], "改写后的理解")
         self.assertEqual(memory["belief"]["stance"], "范围缩小")
         self.assertEqual(memory["basis"][0]["target"]["kind"], "topic")
-    def test_complete_on_last_allowed_turn_is_a_completed_delivery(self):
+    def test_last_allowed_turn_delivers_background_and_revisable_memory(self):
         provider = Provider([response(calls=[("workspace", {}, "read")]),
-                             response(calls=[("complete", {"background": "本次语境"}, "finish")])])
+                             response(json.dumps({"background": "本次语境", "items": [
+                                 {"kind": "thought", "content": "留下继续理解的思路"}],
+                                 "recollection": "这次仍未解决的疑问"}))])
         async def run():
             with patch("mr_memory.agent._tool_set", return_value=object()):
                 return await MemoryAgent(provider, self.store, max_turns=2).reconstruct(self.message, [self.message], {})
         result = asyncio.run(run())
         self.assertEqual(result.status, "completed", result.detail)
         self.assertEqual(result.background, "本次语境")
-        self.assertIsNone(provider.requests[-1][0].get("tool_choice"))
+        self.assertEqual(provider.requests[-1][0].get("tool_choice"), "none")
+        self.assertEqual(len(result.written), 1)
+        self.assertEqual(result.recollection, "这次仍未解决的疑问")
+        self.assertEqual(self.store.memory("thought", result.written[0]["id"])["content"], "留下继续理解的思路")
         resources = [json.loads(row["content"])["resource_state"]
                      for row in provider.requests[-1][0]["messages"]
                      if row.get("role") == "user" and row.get("content", "").startswith('{"resource_state":')]

@@ -646,6 +646,10 @@ class Store:
         return self.cognition.workspace()
 
     @_serialized
+    def continuity(self, before):
+        return self.cognition.continuity(before)
+
+    @_serialized
     def record_cognition(self, **experience):
         with self.db:
             self.cognition.record(**experience)

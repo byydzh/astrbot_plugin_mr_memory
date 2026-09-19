@@ -89,10 +89,29 @@ class Cognition:
             if memory is None:
                 continue
             memory["connections"] = self.store.memory_graph.connections({"kind": row["kind"], "id": row["owner_id"]})
-            active.append({"memory": memory})
+            active.append({"memory": memory, "characters": len(encode(memory))})
         catalog = self.store._rows("SELECT kind,count(*) count FROM mr_memory_objects WHERE umo=? AND status='ACTIVE' GROUP BY kind ORDER BY kind", (self.store.umo,))
         return {"active": active, "catalog": catalog,
-            "meaning": "这些是你选择继续用于理解的认识，正文按图中当前版本读取。可用remember修改其内容、表示、联系及attention；attention=null只移出当前注意，记忆仍可搜索。"}
+            "characters": sum(row["characters"] for row in active),
+            "meaning": "这些是你选择继续用于理解的认识，正文按图中当前版本读取。characters是本视图字符量，不是Token。用remember.items的kind/id/attention逐项调整关注；attention=null移出注意，不删除记忆，也不影响其他并行工作留下的关注。"}
+
+    def continuity(self, before):
+        row = self.db.execute("""SELECT c.* FROM mr_cognition_turns c JOIN messages m
+            ON m.umo=c.umo AND m.id=c.observation_id WHERE c.umo=? AND c.kind='foreground'
+            AND m.sent_at<? ORDER BY m.sent_at DESC,c.id DESC LIMIT 1""",
+            (self.store.umo, int(before))).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"])
+        events, more = self.store.reflections._events(row["request_id"]) if row["request_id"] else ([], False)
+        events = [event for event in events if event["sent_at"] < before]
+        subsequent = self.store.reflections.following_context(events, {"id": row["observation_id"]})
+        return {"id": row["id"], "request_id": row["request_id"],
+                **{key: payload.get(key) for key in ("request", "recollection", "background", "status")},
+                "actual_response": [self.store.reflections._event_summary(event) for event in events],
+                "more_response_events": more,
+                "subsequent_context": [item for item in subsequent if item["sent_at"] < before],
+                "meaning": "上一轮自己当时的理解，以及此后实际记录到的参与和交流。自己的解释可继续修订，邻接交流不自动算认可。可用reconsider、interaction、context继续展开。"}
 
     def record(self, *, run_key, run_id, kind, current, payload):
         request_id = current.get("message_id")

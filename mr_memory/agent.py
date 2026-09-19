@@ -15,6 +15,7 @@ from uuid import uuid4
 from .content import text_view
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
+from .handoff import format_background as _background_text
 from .memory_protocol import (RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
     CONSOLIDATION_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions)
 from .tool_calls import response_calls, memory_text_arguments
@@ -86,9 +87,14 @@ def _model_view(value: Any) -> Any:
     if "source_ids" in result:
         result.pop("source_keys", None)
     if "kind" in result and "summary" in result:
-        for key in ("content", "statement"):
+        for key in ("content", "statement", "description"):
             if result.get(key) == result["summary"]:
                 result.pop(key, None)
+    # The working view includes every connection; its basis subset need not
+    # repeat the same edges. Standalone memory reads still carry their basis.
+    if result.get("basis") and isinstance(result.get("connections"), list):
+        if all(edge in result["connections"] for edge in result["basis"]):
+            result.pop("basis")
     if "plain_text" in result and isinstance(result.get("id"), int):
         result.pop("source_key", None)
     body = result.get("plain_text")
@@ -123,15 +129,23 @@ def _json(value: Any, *, seen_messages: dict | None = None) -> str:
             if repeated:
                 part = {key: item for key, item in part.items() if key not in repeated}
                 part["source_ref"] = {"message_id": part["id"], "fields": repeated}
-        if "kind" in part and "id" in part and "summary" in part:
-            key = f"memory:{part['kind']}:{part['id']}"
+        if (isinstance(part.get("kind"), str) and type(part.get("id")) is int
+                and (type(part.get("revision_no")) is int or "summary" in part)):
+            # Reflections and connection views have content/context rather than
+            # summary. They are the same addressed object, not new evidence.
+            revision = part.get("revision_no")
+            key = f"memory:{part['kind']}:{part['id']}:{revision}"
             previous = seen.get(key, {})
             seen[key] = {**previous, **part}
-            repeated = [name for name in ("summary", "content", "statement", "source_speakers", "subject", "representation", "belief")
+            repeated = [name for name in ("summary", "content", "statement", "description", "context",
+                        "source_speakers", "subject", "representation", "belief", "reflections", "sources",
+                        "basis", "connections", "cues", "attention")
                         if name in part and name in previous and part[name] == previous[name]]
             if repeated:
                 part = {name: item for name, item in part.items() if name not in repeated}
                 part["memory_ref"] = {"kind": part["kind"], "id": part["id"], "fields": repeated}
+                if revision is not None:
+                    part["memory_ref"]["revision_no"] = revision
         return {key: item if key in {"representation", "recollection", "attention", "belief"} else once(item) for key, item in part.items()}
 
     # Overlapping memories often cite the same dialogue. Keep its complete text
@@ -249,26 +263,7 @@ def _memory_output(text: str) -> dict:
     raise ValueError("Memory output must end with a complete JSON items list")
 
 
-def _background_text(value):
-    """Carry an interpretation's own uncertainty with it into the main context."""
-    if isinstance(value, str):
-        return value.strip()
-    if not isinstance(value, list):
-        raise ValueError("background needs text or a list of text/belief interpretations")
-    parts = []
-    for part in value:
-        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
-            raise ValueError("Each background interpretation needs text")
-        belief = part.get("belief") or {"stance": "unconfirmed"}
-        if part["text"].strip():
-            # Put the qualification first so a configured length cap cannot leave
-            # a bare assertion whose uncertainty was cut from its tail.
-            parts.append("当前把握与依据：" + json.dumps(belief, ensure_ascii=False, separators=(",", ":"))
-                         + "\n" + part["text"].strip())
-    return "\n\n".join(parts)
-
-
-def _reconstruction_output(text: str) -> tuple[str, Any, str, dict]:
+def _reconstruction_output(text: str, store=None, before=None) -> tuple[str, Any, str, dict]:
     """Read the delivered background, memory changes and experience of this turn."""
     value = text.strip()
     if value.startswith("```json"):
@@ -283,7 +278,7 @@ def _reconstruction_output(text: str) -> tuple[str, Any, str, dict]:
         return "", {}, "本次结构化输出未完整返回", {}
     writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
     try:
-        background = _background_text(result.get("background"))
+        background = _background_text(result.get("background"), store, before)
     except ValueError as exc:
         return "", {}, str(exc), writes
     recollection = result.get("recollection", {})
@@ -506,7 +501,8 @@ class MemoryAgent:
             except Exception:
                 pass
 
-    async def _model_turn(self, messages, prompt, tools, turn, *, max_output_tokens=None, tool_choice=None):
+    async def _model_turn(self, messages, prompt, tools, turn, *, max_output_tokens=None, tool_choice=None,
+                          response_format=None):
         # Count bodies actually sent to the model. A deferred tool result or a
         # model's own proposed memory is not evidence that it read that memory.
         for message in messages:
@@ -522,7 +518,7 @@ class MemoryAgent:
         await self._emit("model", f"第 {turn} 轮模型调用", "running", turn=turn)
         try:
             response = await self._generate(messages, prompt, tools, max_output_tokens=max_output_tokens,
-                                            tool_choice=tool_choice)
+                                            tool_choice=tool_choice, response_format=response_format)
         except asyncio.CancelledError:
             await self._emit("model", f"第 {turn} 轮模型调用已取消", "cancelled", turn=turn,
                              elapsed_ms=(time.monotonic() - began) * 1000)
@@ -540,7 +536,8 @@ class MemoryAgent:
                          tool_names=list(getattr(response, "tools_call_name", None) or []))
         return response
 
-    async def _generate(self, messages, system_prompt, tools=None, *, max_output_tokens=None, tool_choice=None):
+    async def _generate(self, messages, system_prompt, tools=None, *, max_output_tokens=None, tool_choice=None,
+                        response_format=None):
         # AstrBot's public text_chat drops generation kwargs on this provider.
         # Keep its client/parser while placing native options in the prepared payload.
         # Keep the configured client/model; isolate per-call thinking options from
@@ -555,6 +552,8 @@ class MemoryAgent:
                        max_tokens=self.max_output_tokens if max_output_tokens is None else max_output_tokens)
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
+        if response_format is not None:
+            payload["response_format"] = response_format
         return await provider._query(payload, tools, request_max_retries=1)
 
     @staticmethod
@@ -644,7 +643,8 @@ class MemoryAgent:
         sources = {row["id"]: row["source_key"] for row in [*recent, current] if "id" in row and "source_key" in row}
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 foreground=True)
-        working = {**working, "pending_recall_writes": writer.pending_items}
+        working = {key: value for key, value in working.items() if key != "pending_recall_writes"}
+        working["continuity"] = await asyncio.to_thread(self.store.continuity, cutoff)
         async def persist_changes(args, key):
             operation = asyncio.create_task(asyncio.to_thread(writer.apply, args, self.run_key + ":" + key))
             try:
@@ -672,10 +672,16 @@ class MemoryAgent:
                         "previous_round_seconds": round(last_round_seconds, 1),
                         "usage_so_far": result.usage,
                         "meaning": "当前交流正在等待这份背景。结合继续思考可能增加的理解与代价，自行决定是否继续；资源是上限，不需要用完。仍值得探索的思路可以留待以后。"}})})
-                    forced_finish = bool(result.tool_calls) and (turn == self.max_turns - 1 or remaining <= 6 + last_round_seconds)
+                    forced_finish = turn == self.max_turns - 1 or (turn > 0 and remaining <= 6 + last_round_seconds)
                     if forced_finish:
-                        messages.append({"role": "user", "content": "本次检索预算即将用尽。根据已读材料给出背景，并明确仍未解决的缺口。"})
-                    response = await self._model_turn(messages, RECONSTRUCTION_PROMPT, tools, turn + 1)
+                        messages.append({"role": "user", "content":
+                            "这是本次可用的最后一轮，交付已经形成的理解，不再发起工具调用。"
+                            "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 items、retry、recollection。"
+                            "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。"})
+                    response = await self._model_turn(
+                        messages, RECONSTRUCTION_PROMPT, tools, turn + 1,
+                        tool_choice="none" if forced_finish else None,
+                        response_format={"type": "json_object"} if forced_finish else None)
                     _add_usage(result.usage, response)
                     native_calls = response_calls(response)
                     names = [call.name for call in native_calls]
@@ -683,7 +689,7 @@ class MemoryAgent:
                     if names and text:
                         # Tool-planning prose is part of this agent's conversation,
                         # not a completed background for the main model.
-                        background, recollection, detail, _ = _reconstruction_output(text)
+                        background, recollection, detail, _ = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
                         if not detail:
                             result.background = background
                         result.status = "partial"
@@ -691,7 +697,8 @@ class MemoryAgent:
                         if not text:
                             result.detail = "Provider returned neither text nor tool calls"
                             break
-                        background, recollection, detail, final_writes = _reconstruction_output(text)
+                        messages.append({"role": "assistant", "content": text})
+                        background, recollection, detail, final_writes = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
                         result.background = background
                         result.status = "partial" if _finish_reason(response) == "length" else "completed"
                         if not background and detail:
@@ -699,7 +706,6 @@ class MemoryAgent:
                             result.detail = detail
                         if result.status == "partial":
                             result.detail = result.detail or "Model turn or output budget reached; background may be incomplete"
-                        messages.append({"role": "assistant", "content": text})
                         if final_writes:
                             await self._emit("write", "保存最终输出中的记忆变化", "running", operation_id="final_memories", items=final_writes)
                             try:
@@ -734,7 +740,7 @@ class MemoryAgent:
                             if call.error:
                                 raise ValueError(call.error)
                             if name == "complete":
-                                result.background = _background_text(args.get("background"))
+                                result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff)
                                 changes = {key: value for key, value in args.items() if key != "background"}
                                 outcome = await persist_changes(changes, call_id) if changes else None
                                 value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
@@ -813,7 +819,9 @@ class MemoryAgent:
         learning_kind = "feedback" if feedback else "background"
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 learning_kind=learning_kind if task is not None else None,
+                                recover_recall=not feedback,
                                 **previous.get("write_state", {}))
+        working = {key: value for key, value in working.items() if key != "pending_recall_writes"}
         cancelled = False
 
         def read_sources(value):
@@ -855,19 +863,23 @@ class MemoryAgent:
         try:
             read_sources(messages)
             read_sources(working)
-            if not messages and not working and not conversation and not (task or {}).get("checkpoint"):
+            if not messages and not working and not conversation and not (task or {}).get("checkpoint") and not writer.pending_items:
                 raise ValueError("Consolidation requires an experience or a reflection to revisit")
             tools = _tool_set(learning=True)
             cutoff = int(time.time())
             async with asyncio.timeout(self.timeout_seconds):
                 purpose = REFLECTION_TASK if feedback else CONSOLIDATION_TASK
                 material = _learning_material(messages, working, task)
+                if writer.pending_items:
+                    material["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
                 if not conversation:
                     conversation = _checkpoint_conversation(messages, working, task)
                     conversation[0]["content"] = _learning_json(material, seen_messages=seen_messages)
                 else:
                     # Previous messages remain byte-for-byte intact for prefix reuse.
                     update = _learning_resume_update(messages, working, task, previous)
+                    if writer.pending_items:
+                        update["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
                     conversation.append({"role": "user", "content": _learning_json(update, seen_messages=seen_messages)})
                 saving = False
                 for turn in itertools.count():

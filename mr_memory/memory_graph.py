@@ -144,11 +144,6 @@ class MemoryGraph:
             basis = self.connections({"kind": row["kind"], "id": row["id"]}, purpose="basis")
             if basis:
                 result["basis"] = basis
-            if "mr_memory_rehearsals" in self.store.tables:
-                rehearsal = self.db.execute("SELECT through_seq,note,at FROM mr_memory_rehearsals WHERE umo=? AND kind=? AND owner_id=?",
-                                            (self.umo, row["kind"], row["id"])).fetchone()
-                if rehearsal:
-                    result["last_reconsideration"] = dict(rehearsal)
         if include_history:
             result["history"] = self.store._memory_history(row["kind"], row["id"])
         if getattr(self.store, "cognition", None) is not None:
