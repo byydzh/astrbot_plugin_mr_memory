@@ -240,6 +240,43 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("old:0", task["continuation"]["write_state"]["pending_items"])
         self.assertEqual(self.store.pending_status()["count"], 0)
 
+    async def test_invalid_saved_progress_can_resume_and_be_corrected(self):
+        self.store.save_learning_progress("background", {"completed_ids": self.ids[:1]})
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        rejected = writer.apply({"progress": {"completed_ids": [999, self.ids[1]],
+            "checkpoint": "Needs correction"}}, "bad")
+        self.assertIn("this task's material", rejected.progress_error)
+        self.store.close()
+        self.store = Store(self.scratch / "group.db", "test:GroupMessage:42")
+
+        task = self.store.resume_learning_task("background")
+        self.assertEqual(task["completed_ids"], self.ids[:1])
+        self.assertEqual(self.store.pending_status()["count"], 1)
+        self.assertIn("this task's material", task["continuation"]["pending_write_errors"]["remember"])
+        self.assertEqual(task["continuation"]["write_state"]["deferred_progress"]["completed_ids"],
+                         [999, self.ids[1]])
+        writer = LearningWriter(self.store, self.sources, learning_kind="background",
+                                **task["continuation"]["write_state"])
+        repaired = writer.apply({"progress": {"completed_ids": [str(self.ids[1])],
+            "checkpoint": "Corrected"}}, "repair")
+        self.assertFalse(repaired.progress_error)
+        self.assertFalse(writer.deferred_progress)
+        self.assertEqual(self.store.learning_task("background")["completed_ids"], self.ids)
+        self.assertEqual(self.store.pending_status()["count"], 0)
+
+    async def test_feedback_progress_correction_does_not_complete_other_material(self):
+        self.store.start_learning_task("feedback", self.ids[:1], self.ids[1:])
+        writer = LearningWriter(self.store, self.sources, learning_kind="feedback")
+        writer.apply({"progress": {"completed_ids": self.ids}}, "bad")
+        task = self.store.resume_learning_task("feedback")
+        self.assertEqual(task["completed_ids"], [])
+        writer = LearningWriter(self.store, self.sources, learning_kind="feedback",
+                                **task["continuation"]["write_state"])
+        repaired = writer.apply({"progress": {"completed_ids": self.ids[:1]}}, "repair")
+        self.assertFalse(repaired.progress_error)
+        self.assertEqual([row[0] for row in self.store.db.execute(
+            "SELECT message_id FROM mr_feedback_processed")], self.ids[:1])
+
     async def test_final_json_checkpoint_keeps_later_tools_and_can_end_with_pending_draft(self):
         args = self.args()
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
