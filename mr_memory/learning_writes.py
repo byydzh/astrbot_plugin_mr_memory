@@ -127,11 +127,9 @@ class LearningWriter:
         if "recollection" in args:
             self.recollection = copy.deepcopy(args["recollection"])
         if progress:
-            completed = list(dict.fromkeys([*self.deferred_progress.get("completed_ids", []),
-                                           *progress.get("completed_ids", [])]))
+            # Persisted progress is already cumulative in Store. This is an
+            # unaccepted proposal: replacement must be able to remove bad IDs.
             self.deferred_progress.update(copy.deepcopy(progress))
-            if "completed_ids" in progress:
-                self.deferred_progress["completed_ids"] = completed
         outcome = WriteOutcome()
         work = []
         for index, item in enumerate(items):

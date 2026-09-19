@@ -873,10 +873,21 @@ class Store:
         writes = (task or {}).get("continuation", {}).get("write_state", {})
         progress = writes.get("deferred_progress")
         if task is not None and progress:
-            with self.db:
-                task = self._save_learning_progress(kind, progress, [], task.get("run_id"))
-                task["continuation"]["write_state"]["deferred_progress"] = {}
-                self._write_learning_task(kind, task)
+            try:
+                with self.db:
+                    task = self._save_learning_progress(kind, progress, [], task.get("run_id"))
+                    task["continuation"]["write_state"]["deferred_progress"] = {}
+                    self._write_learning_task(kind, task)
+            except (TypeError, ValueError) as exc:
+                # An invalid saved proposal needs model correction, just like
+                # a rejected live write. Do not crash before that model can run.
+                task = self.learning_task(kind)
+                errors = task["continuation"].setdefault("pending_write_errors", {})
+                detail = f"Learning progress has not been saved: {type(exc).__name__}: {exc}"
+                if errors.get("remember") != detail:
+                    errors["remember"] = detail
+                    with self.db:
+                        self._write_learning_task(kind, task)
         return task
 
     @_serialized
