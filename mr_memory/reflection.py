@@ -202,6 +202,15 @@ class Reflection:
         result["tool_names"] = [part["name"] for part in content if isinstance(part, dict) and part.get("name")]
         return result
 
+    def following_context(self, events, request):
+        """Nearby interaction is material for interpretation, not a feedback label."""
+        anchors = [event for event in events if event["role"] == "BOT"]
+        anchor = anchors[-1] if anchors else request
+        if not anchor:
+            return []
+        return [message for message in self.store.context(message_id=anchor["id"], before=0, after=12)
+                if message["id"] != anchor["id"]]
+
     @_locked
     def interaction(self, request_id: str | None = None, run_id: int | None = None,
                     detailed: bool = False, step: int | None = None) -> dict:
@@ -278,13 +287,7 @@ class Reflection:
             view["background"] = run.get("background")
             result["runs"].append(view)
         result["response_events"] = events if detailed else [self._event_summary(event) for event in events]
-        anchors = [event for event in events if event["role"] == "BOT"]
-        anchor = anchors[-1] if anchors else request
-        if anchor:
-            following = self.store.context(message_id=anchor["id"], before=0, after=12)
-            result["subsequent_context"] = [message for message in following if message["id"] != anchor["id"]]
-        else:
-            result["subsequent_context"] = []
+        result["subsequent_context"] = self.following_context(events, request)
         return result
 
     @staticmethod

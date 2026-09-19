@@ -105,7 +105,7 @@ class LearningWriter:
                 saved = self.store.learning_task(self.learning_kind).get("continuation", {}).get("write_state", {}).get("receipts", {}).get(key)
             target = saved[0] if saved else None
         if target is None:
-            raise ValueError(f"Memory handle {handle!r} has not been saved yet; save its item earlier in this list")
+            raise ValueError(f"Memory handle {handle!r} has no saved address; supply its object or resolve its unfinished draft")
         return {**{key: value for key, value in ref.items() if key != "handle"}, **{key: target[key] for key in ("kind", "id")}}
 
     def remember_handle(self, item, saved):
@@ -181,6 +181,23 @@ class LearningWriter:
                                        "origin_run_id": self.pending_items.get(key, {}).get("origin_run_id", self.run_id),
                                        "detail": "This draft has not been saved yet"}
         self.persist()
+        # Resolve acyclic batch references before saving their owners. List order
+        # should not strand a revision merely because its new basis follows it.
+        waiting = list(work)
+        work = []
+        while waiting:
+            pending_keys = {key for key, _, _ in waiting}
+            ready = [row for row in waiting if not any(
+                address.get("receipt_key") in pending_keys
+                for address in self.pending_items[row[0]].get("bindings", {}).values())]
+            if not ready:
+                # Missing/cyclic drafts keep the existing explicit error and
+                # recovery path; no incomplete memory is reported as saved.
+                work.extend(waiting)
+                break
+            work.extend(ready)
+            chosen = {row[0] for row in ready}
+            waiting = [row for row in waiting if row[0] not in chosen]
         for key, index, item in work:
             if key in self.receipts:
                 self.remember_handle(item, self.receipts[key])

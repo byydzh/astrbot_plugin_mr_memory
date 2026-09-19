@@ -92,7 +92,41 @@ class CognitionTests(unittest.TestCase):
         self.assertEqual(experience["actual_response"][0]["plain_text"], "实际发出的回答")
         self.assertEqual(experience["available_memories"][0]["revision_no"], 1)
         self.assertEqual(experience["recollection"]["想法"], "还想再联系另一次经历")
+        self.store.append_message({"platform": "test", "platform_id": "test", "umo": self.store.umo,
+            "group_id": "42", "message_id": "later", "sender_id": "20", "sender_name": "乙",
+            "sent_at": 1800000002, "plain_text": "后续交流", "role": "USER", "content": []})
+        self.store.save_memories([{"kind": "perspective", "id": 1, "belief": {"stance": "改变了看法"}}], mark_processed=False)
+        review = self.store.reconsider(ref={"kind": "perspective", "id": 1})
+        experience = review["items"][0]
+        self.assertEqual(experience["available_memories"][0]["belief"], {"stance": "unconfirmed"})
+        self.assertEqual(review["current_memories"][0]["belief"], {"stance": "改变了看法"})
+        self.assertEqual(experience["subsequent_context"][0]["plain_text"], "后续交流")
 
+    def test_native_and_text_completion_preserve_each_interpretations_uncertainty(self):
+        belief = {"stance": "可能", "basis": {"participant_id": "按模型含义保留"}}
+        payload = {"background": [{"text": "这可能与先前的安排有关", "belief": belief}]}
+        for reply in (response(calls=[("complete", payload, "finish")]), response(json.dumps(payload))):
+            provider = Provider([reply])
+            result = self.run_agent(provider)
+            self.assertEqual(result.status, "completed", result.detail)
+            self.assertIn(json.dumps(belief, ensure_ascii=False, separators=(",", ":")), result.background)
+            self.assertTrue(result.background.endswith(payload["background"][0]["text"]))
+            self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(json.loads(_json({"belief": belief}))["belief"], belief)
+
+    def test_forward_batch_reference_does_not_strand_a_revised_understanding(self):
+        old = self.store.save_memories([{"kind": "pattern", "content": "原理解"}], mark_processed=False)[0]
+        writer = LearningWriter(self.store, {}, foreground=True)
+        result = writer.apply({"items": [
+            {"kind": "pattern", "id": old["id"], "revision_no": 1, "content": "改写后的理解",
+             "belief": {"stance": "范围缩小"}, "connections": [{"handle": "new_basis", "relation": "重新理解的依据", "purpose": "basis"}]},
+            {"kind": "topic", "content": "新发现的语境", "handle": "new_basis"}]}, "revise")
+        self.assertFalse(result.rejected, result.rejected)
+        self.assertFalse(writer.pending_items)
+        memory = self.store.memory("pattern", old["id"])
+        self.assertEqual(memory["content"], "改写后的理解")
+        self.assertEqual(memory["belief"]["stance"], "范围缩小")
+        self.assertEqual(memory["basis"][0]["target"]["kind"], "topic")
     def test_complete_on_last_allowed_turn_is_a_completed_delivery(self):
         provider = Provider([response(calls=[("workspace", {}, "read")]),
                              response(calls=[("complete", {"background": "本次语境"}, "finish")])])

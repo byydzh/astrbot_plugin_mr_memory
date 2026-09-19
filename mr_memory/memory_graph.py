@@ -46,6 +46,13 @@ def reference(value):
     return {"kind": canonical(str(value["kind"])), "id": int(value["id"])}
 
 
+def belief_view(kind, attrs):
+    """Expose the model's assessment without converting reuse into evidence."""
+    if kind == "message":
+        return {"stance": "observed", "scope": "记录了这次发言；不表示发言内容或对它的解释已被证实"}
+    return attrs.get("belief") or {"stance": "unconfirmed"}
+
+
 class MemoryGraph:
     def __init__(self, store):
         self.store, self.db, self.umo = store, store.db, store.umo
@@ -74,8 +81,12 @@ class MemoryGraph:
         row = self.raw(ref["kind"], ref["id"])
         if not row:
             return {**ref, "status": "unavailable"}
+        change = self.db.execute("SELECT reason FROM mr_memory_changes WHERE seq=?",
+                                 (row.get("change_seq", 0),)).fetchone()
         return {"kind": row["kind"], "id": row["id"], "title": row["title"],
-                "revision_no": row["revision"], "status": row["status"]}
+                "revision_no": row["revision"], "status": row["status"],
+                "belief": belief_view(row["kind"], json.loads(row["attributes_json"])),
+                **({"change_reason": change[0]} if change and change[0] else {})}
 
     def cues(self, kind, owner):
         return self.store._rows("SELECT cue,aspect FROM mr_memory_cues WHERE umo=? AND kind=? AND owner_id=? ORDER BY cue,aspect",
@@ -97,6 +108,7 @@ class MemoryGraph:
         attrs = json.loads(row["attributes_json"])
         sources = self.source_rows(row, full=include_sources)
         result = {**attrs, "kind": row["kind"], "id": row["id"], "title": row["title"],
+                  "belief": belief_view(row["kind"], attrs),
                   "summary": row["content"], "content": row["content"], "status": row["status"],
                   "revision_no": row["revision"], "created_at": row["created_at"], "updated_at": row["updated_at"],
                   "source_ids": [r["id"] for r in sources], "source_keys": [r["source_key"] for r in sources],
@@ -146,7 +158,8 @@ class MemoryGraph:
         return result
 
     def connections(self, ref, *, purpose=None):
-        rows = self.store._rows("""SELECT * FROM mr_memory_objects WHERE umo=? AND kind='association' AND status='ACTIVE'
+        rows = self.store._rows("""SELECT * FROM mr_memory_objects WHERE umo=? AND kind='association'
+            AND (status='ACTIVE' OR (status='RETRACTED' AND json_extract(attributes_json,'$.purpose')='basis'))
             AND json_extract(attributes_json,'$.source_ref.kind')=?
             AND json_extract(attributes_json,'$.source_ref.id')=? ORDER BY id""", (self.umo, ref["kind"], ref["id"]))
         result = []
@@ -155,11 +168,12 @@ class MemoryGraph:
             if purpose is not None and attrs.get("purpose") != purpose:
                 continue
             target = self.brief(attrs["target_ref"])
-            result.append({"kind": "association", "id": row["id"], "relation": attrs.get("relation", ""),
+            result.append({**self.brief(row), "relation": attrs.get("relation", ""),
                            "context": row["content"], "purpose": attrs.get("purpose", "association"),
                            "target": target, "based_on_revision": attrs.get("target_revision"),
                            "basis_changed": attrs.get("purpose") == "basis" and (
-                               target.get("revision_no") != attrs.get("target_revision") or target.get("status") != "ACTIVE")})
+                               row["status"] != "ACTIVE" or target.get("revision_no") != attrs.get("target_revision")
+                               or target.get("status") != "ACTIVE")})
         return result
 
     def search(self, kind="all", terms=(), participant_id=None, limit=12, *, related_account_id=None, include_sources=False):
@@ -220,7 +234,7 @@ class MemoryGraph:
             ref = reference(ref)
             links = self.graph(ref=ref, limit=limit + 1, offset=offset)
             entries = [{key: value for key, value in row.items() if key in {
-                "kind", "id", "source_ref", "target_ref", "relation", "summary", "purpose", "target_revision"}} for row in links]
+                "kind", "id", "source_ref", "target_ref", "relation", "summary", "purpose", "target_revision", "belief"}} for row in links]
             for entry in entries:
                 entry["source_memory"] = self.brief(entry["source_ref"])
                 entry["target_memory"] = self.brief(entry["target_ref"])
@@ -236,6 +250,7 @@ class MemoryGraph:
         base = " FROM mr_memory_cues c JOIN mr_memory_objects m ON m.umo=c.umo AND m.kind=c.kind AND m.id=c.owner_id WHERE " + " AND ".join(clauses)
         if cue is not None and aspect is not None:
             rows = self.store._rows("SELECT m.kind,m.id,m.title,m.revision revision_no" + base + " ORDER BY m.updated_at DESC,m.id LIMIT ? OFFSET ?", [*args, limit + 1, offset])
+            rows = [self.brief(row) for row in rows]
         else:
             rows = self.store._rows("SELECT c.cue,c.aspect,count(*) memories" + base + " GROUP BY c.cue,c.aspect ORDER BY c.cue,c.aspect LIMIT ? OFFSET ?", [*args, limit + 1, offset])
         return {"items": rows[:limit], "more": len(rows) > limit, "next_offset": offset + limit}
@@ -297,6 +312,7 @@ class MemoryGraph:
         old = dict(attrs)
         reserved = {"id", "kind", "title", "label", "name", "summary", "content", "statement", "description", "reason", "action", "revision_no", "cues", "connections", "source_keys", "source", "target", "attention"}
         attrs.update({key: value for key, value in item.items() if key not in reserved})
+        attrs.setdefault("belief", belief_view(kind, attrs))
         if kind == "reflection":
             attrs.setdefault("review_status", "pending")
             attrs.setdefault("priority", 1)
@@ -382,6 +398,7 @@ class MemoryGraph:
             self.write({"kind": "association", "source": {"kind": kind, "id": owner}, "target": target,
                         "relation": link["relation"], "purpose": link.get("purpose", "association"),
                         "statement": link.get("context") or link["relation"], "source_ids": [],
+                        **{key: link[key] for key in ("belief", "reason", "revision_no") if key in link},
                         **({"id": link["connection_id"]} if link.get("connection_id") is not None else {})}, run_id=run_id)
         # A relabelled endpoint changes the searchable description of its incident edges.
         if stored and (title != stored["title"] or content != stored["content"] or attrs.get("aliases") != old.get("aliases")):
@@ -398,5 +415,15 @@ class MemoryGraph:
         rows = self.store._rows("SELECT kind,id,change_seq FROM mr_memory_objects WHERE umo=? AND change_seq>? ORDER BY change_seq LIMIT ?",
                                 (self.umo, int(after), max(1, min(100, int(limit))) + 1))
         chosen = rows[:limit]
-        return {"items": [{**self.brief(row), "change_seq": row["change_seq"]} for row in chosen],
+        items = []
+        for row in chosen:
+            # Return formation links, not a verdict that dependent ideas are false.
+            edges = self.store._rows("""SELECT attributes_json FROM mr_memory_objects WHERE umo=? AND kind='association'
+                AND json_extract(attributes_json,'$.purpose')='basis' AND
+                ((json_extract(attributes_json,'$.target_ref.kind')=? AND json_extract(attributes_json,'$.target_ref.id')=?)
+                 OR (?='association' AND id=?))""", (self.umo, row["kind"], row["id"], row["kind"], row["id"]))
+            refs = {encode(json.loads(edge["attributes_json"])["source_ref"]) for edge in edges}
+            items.append({**self.brief(row), "change_seq": row["change_seq"],
+                          "dependent_memories": [self.brief(json.loads(ref)) for ref in sorted(refs)]})
+        return {"items": items,
                 "cursor": chosen[-1]["change_seq"] if chosen else after, "more": len(rows) > limit}

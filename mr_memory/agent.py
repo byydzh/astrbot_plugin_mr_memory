@@ -59,7 +59,7 @@ def _model_view(value: Any) -> Any:
         return [_model_view(item) for item in value]
     if not isinstance(value, dict):
         return text_view(value)
-    result = {key: item if key in {"representation", "recollection", "attention"} else _model_view(item) for key, item in value.items()}
+    result = {key: item if key in {"representation", "recollection", "attention", "belief"} else _model_view(item) for key, item in value.items()}
     if result.get("context_only") is False:
         result.pop("context_only")
     # Revision snapshots retain the readable memory plus SQL-only information.
@@ -127,12 +127,12 @@ def _json(value: Any, *, seen_messages: dict | None = None) -> str:
             key = f"memory:{part['kind']}:{part['id']}"
             previous = seen.get(key, {})
             seen[key] = {**previous, **part}
-            repeated = [name for name in ("summary", "content", "statement", "source_speakers", "subject", "representation")
+            repeated = [name for name in ("summary", "content", "statement", "source_speakers", "subject", "representation", "belief")
                         if name in part and name in previous and part[name] == previous[name]]
             if repeated:
                 part = {name: item for name, item in part.items() if name not in repeated}
                 part["memory_ref"] = {"kind": part["kind"], "id": part["id"], "fields": repeated}
-        return {key: item if key in {"representation", "recollection", "attention"} else once(item) for key, item in part.items()}
+        return {key: item if key in {"representation", "recollection", "attention", "belief"} else once(item) for key, item in part.items()}
 
     # Overlapping memories often cite the same dialogue. Keep its complete text
     # once in the conversation; references retain every memory's source links.
@@ -146,7 +146,7 @@ def _restore_seen(values):
 def _message_tables(value):
     """Share repeated field names/values; preserve every per-message value."""
     if isinstance(value, dict):
-        return {key: item if key in {"representation", "recollection", "attention"} else _message_tables(item) for key, item in value.items()}
+        return {key: item if key in {"representation", "recollection", "attention", "belief"} else _message_tables(item) for key, item in value.items()}
     if not isinstance(value, list):
         return value
     rows = [_message_tables(item) for item in value]
@@ -249,6 +249,25 @@ def _memory_output(text: str) -> dict:
     raise ValueError("Memory output must end with a complete JSON items list")
 
 
+def _background_text(value):
+    """Carry an interpretation's own uncertainty with it into the main context."""
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        raise ValueError("background needs text or a list of text/belief interpretations")
+    parts = []
+    for part in value:
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+            raise ValueError("Each background interpretation needs text")
+        belief = part.get("belief") or {"stance": "unconfirmed"}
+        if part["text"].strip():
+            # Put the qualification first so a configured length cap cannot leave
+            # a bare assertion whose uncertainty was cut from its tail.
+            parts.append("当前把握与依据：" + json.dumps(belief, ensure_ascii=False, separators=(",", ":"))
+                         + "\n" + part["text"].strip())
+    return "\n\n".join(parts)
+
+
 def _reconstruction_output(text: str) -> tuple[str, Any, str, dict]:
     """Read the delivered background, memory changes and experience of this turn."""
     value = text.strip()
@@ -263,9 +282,10 @@ def _reconstruction_output(text: str) -> tuple[str, Any, str, dict]:
     except ValueError:
         return "", {}, "本次结构化输出未完整返回", {}
     writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
-    background = result.get("background")
-    if not isinstance(background, str):
-        return "", {}, "本次未返回文本背景", writes
+    try:
+        background = _background_text(result.get("background"))
+    except ValueError as exc:
+        return "", {}, str(exc), writes
     recollection = result.get("recollection", {})
     return background.strip(), recollection, "", writes
 
@@ -714,9 +734,7 @@ class MemoryAgent:
                             if call.error:
                                 raise ValueError(call.error)
                             if name == "complete":
-                                if not isinstance(args.get("background"), str):
-                                    raise ValueError("complete.background must contain the background text")
-                                result.background = args["background"].strip()
+                                result.background = _background_text(args.get("background"))
                                 changes = {key: value for key, value in args.items() if key != "background"}
                                 outcome = await persist_changes(changes, call_id) if changes else None
                                 value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
@@ -807,7 +825,7 @@ class MemoryAgent:
                 if type(source_id) is int and value.get("source_key") and "plain_text" in value:
                     sources[source_id] = str(value["source_key"])
                 for key, part in value.items():
-                    if key in {"representation", "recollection", "attention"}:
+                    if key in {"representation", "recollection", "attention", "belief"}:
                         continue
                     if isinstance(part, (list, dict)):
                         read_sources(part)

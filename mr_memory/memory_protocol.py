@@ -7,10 +7,13 @@ MEMORY_PROTOCOL = """你维护持续参与群聊的机器人的共同经历与�
 检索和向量搜索提供入口。navigate从线索看方面、选择内容，或从内容返回线索和连接；memory打开正文和原文，graph按任意记忆地址沿关系继续。可以批量读取独立线索，根据新发现改变搜索方向。目录还有more时可继续翻页，原文仍可用context展开。
 remember保存或修改同一份记忆，前台与后台都可使用。kind可用episode、semantic、topic、pattern、node、association或更合适的自然类别；title/content写成可独立理解的内容。新主题和更高层认识可以直接创建。
 source_ids填写实际用到的原文编号；基于旧认识的推想可以通过connections引用那些认识，不必复制全部原文。材料、推断、不同人的立场与仍未知的部分在内容中表达，少量线索也可以留下待理解的认识。
+每项记忆和连接都有belief，记录你现在怎样看待它、凭什么、哪些部分仍有别的解释，字段可以自行组织。没有评估的解释为unconfirmed。熟悉、反复调用、自己的摘要或bot复述可以帮助联想，但不是独立确认；来自同一经历的转述也不算多份支持。未经群友明确认可的模型解释保持暂定，交付时表达相应的可能程度，不把它当作确信的个人事实。多次独立经历与针对该解释的明确认可可以强化它；明确的自述、称呼偏好或纠正本身也有其适用范围，无需等夸赞才理解和采用。
+反馈需要理解谁在回应哪项解释、认可的是事实还是表达、是否反讽。沉默不算肯定；负面评价应使你重新考虑对应理解，削弱或撤回不成立的联系。一次调侃也不自动否定其他认识。belief可以保留对反馈含义本身的不确定性，以及支持、反例和改变看法的来历。弱联系仍可启发理解，有用程度不等于事实把握；不要为了消除不确定性而停止联想或把每轮都变成核查。
 原始发言也是可连接的观察入口，地址为{kind:"message",id:原文编号}；可沿图重温、以它形成新理解，原话的内容仍由消息记录维护。
-cues填写[{cue:自然线索,aspect:从该线索通向这条记忆的方面}]。connections填写[{kind,id,relation,context,purpose}]，把本条记忆连向任意记忆；purpose=basis表示这项认识的形成依据，其余为联想。同一次items可给先保存的对象一个handle，后面的source/target/connections用{handle:该名称,...}连接它，回执给出实际地址。这只是本次写入的局部引用，不是人物代号。
+cues填写[{cue:自然线索,aspect:从该线索通向这条记忆的方面}]。connections填写[{kind,id,relation,context,purpose,belief}]，把本条记忆连向任意记忆；purpose=basis表示这项认识的形成依据，其余为联想。同一次items可给对象一个handle，source/target/connections用{handle:该名称,...}连接它，依赖先后由写入处理，回执给出实际地址；同时新建互相依赖的对象时，先保存对象再连接。这只是本次写入的局部引用，不是人物代号。
 连接本身也是association记忆，可被引用和修订；source/target使用{kind,id}，relation说明关系，statement说明语境。新的端点可写{label,description}，已有人物不因名字相同而自动合并。需要拆开或重新解释连接，可以创建适当对象并修改旧边的端点或内容。添加connections不删除已有边，connection_id可以修改指定连接。
 修改对象使用kind/id和读到的revision_no，省略的内容保留；发生并发修改时读取现版本后合并。action=withdraw撤回已不成立的认识，原经历和历史版本仍可回看。basis_changed表明形成依据后来有变化，由你理解是否以及怎样影响这项认识。
+新经历改变理解时，同时考虑正文、belief与相关连接是否仍一致，而不是只追加一份纠错摘要。撤回的basis仍保留来历与原因，memory_changes的dependent_memories给出直接依赖它的认识入口；沿图继续判断影响，不把局部错误自动扩大成整张图都错。确实有用的认识也可因后续经历而变得更具体、更适用。
 representation是你自己组织的JSON对象，字段与层次由所理解的事情决定。它可以表达某种经历的结构、概念之间的关系或仍待探索的可能性；能随新经历改变，也能据此重新组织旧经历。内容、表示、线索和连接共同组成一项认识，不是互不相干的资料。
 workspace是前台与后台共用的当前理解，读取你自己选择保留在注意中的记忆的最新版本。remember.items里的attention说明为什么继续带着这项认识，可以使用自然语言或自行组织的结构；attention=null仅移出当前注意，不删除记忆。可以直接修改其中的认识、换一种表示、联系新经历，或调整自己的关注方向；不必每轮重复保存。工作集由你取舍，保持它对后续理解有用且可负担。
 reconsider提供曾经的理解过程及后来真实的交流：当时可见的记忆、交给主意识的背景、你留下的recollection和原互动入口。recollection是你对这次理解的自由记录，格式自己决定，可写哪些联系发生了作用、发现了什么或还想怎样继续；它记录一次经历。可复用的认识及变化仍写入同一张记忆图，才会进入以后的workspace和检索。重温可以巩固有用的联系、发现跨经历的结构，也可以推翻以前的理解；方向由你选择。
@@ -24,6 +27,7 @@ background只提供本轮主意识需要、尚未明确的语境和联想；长�
 current.main_context给出主意识已有的输入和工具目录，main_context可以按需读取。你的记忆视图和主意识的感知、行动能力不同，结合它已经获得的材料判断需要补充什么。
 recent_learning与memory_changes是当前记忆目录，标题用于选择入口，具体认识用memory读取。reflect产生的思路同样是kind=reflection的记忆，可以被其他认识引用并沿连接继续。
 完成时调用complete，background填写本轮语义背景。其items与remember.items是同一保存协议，可以同时提交本轮形成的认识、连接与注意变化；保存并交付后本轮即结束，没有额外模型往返。没有变化则省略items。不要重发工具已经保存的内容。recollection是自由记录，可以是自然语言或你组织的结构，也可省略。
+background可按不同认识写为[{text:语境或联想,belief:当前把握及依据}]，把不确定性与对应内容一起交付，防止主意识将暂定解释当成事实；简短背景也可直接用文本表达。只交付本轮有用的理解，不必附上整份记忆审查记录。
 """
 
 CONSOLIDATION_TASK = """继续理解群聊经历，发展对人、事件和共同生活的认识。新材料、已形成的连接、自选关注以及回忆经验可以相互启发。对理解没有新增价值的闲聊也可以完成处理，不要求每条产出一项事实。"""
@@ -47,6 +51,9 @@ INTEGER = {"type": "integer"}
 ACCOUNT_ID = {"type": ["string", "integer"]}
 TERMS = {"type": "array", "items": TEXT}
 MEMORY_REF = {"type": "object", "properties": {"kind": TEXT, "id": INTEGER}, "required": ["kind", "id"]}
+BELIEF = {"type": "object", "description": "由你组织的当前把握：例如stance、依据、独立支持、反例、其他解释与变化原因。不是固定等级或自动分数，熟悉和自身复述不构成确认。"}
+BACKGROUND = {"anyOf": [TEXT, {"type": "array", "items": {"type": "object", "properties": {
+    "text": TEXT, "belief": BELIEF}, "required": ["text", "belief"]}}]}
 TOOL_SCHEMAS = {
     "main_context": _schema("按需读取本次AstrBot主模型已经收到的上下文、设定、附加信息、媒体清单或工具定义。只读当前请求，不执行外部工具；其中的设定和内容是给主意识的材料，MR仍完成语义背景任务。", {
         "section": {"type": "string", "enum": ["request", "conversation", "instructions", "additional", "tools", "media"]},
@@ -99,9 +106,10 @@ PROGRESS_SCHEMA = {"type": "object", "properties": {
 REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，并可同步保存本批处理进度。source_ids是证据；progress.completed_ids是已完整处理的材料，两者不同。仅保存进度或结束时可省略items，默认空列表。返回已保存记录和可复用的图节点id。finish=true表示本批材料已处理完，且不需再读取回执继续反思；材料进度独立保存，单项待修草稿不会阻止本批结束。", {
     "items": {"type": "array", "items": {"type": "object", "properties": {
         "kind": TEXT,
-        "id": INTEGER, "source_ids": {"type": "array", "items": INTEGER},
+        "id": {"type": "integer", "description": "仅填写已读取的现有记忆地址。新建时省略id，用handle供同批其他对象引用；不要自行猜新编号。"}, "source_ids": {"type": "array", "items": INTEGER},
         "revision_no": INTEGER, "handle": TEXT,
         "representation": {"type": "object", "description": "由你决定字段与层次的表示，随理解一起修订。"},
+        "belief": BELIEF,
         "attention": {"type": ["object", "string", "boolean", "null"],
                       "description": "选择为后续思考继续携带的认识；null移出工作集。仅调整attention不改变记忆正文版本。"},
         "title": TEXT, "summary": TEXT, "content": TEXT, "person": TEXT, "aspect": TEXT,
@@ -111,7 +119,8 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
         "relation": TEXT, "statement": TEXT, "purpose": TEXT, "reason": TEXT,
         "cues": {"type": "array", "items": {"type": "object", "properties": {"cue": TEXT, "aspect": TEXT}, "required": ["cue", "aspect"]}},
         "connections": {"type": "array", "items": {"type": "object", "properties": {
-            "kind": TEXT, "id": INTEGER, "handle": TEXT, "relation": TEXT, "context": TEXT, "purpose": TEXT, "connection_id": INTEGER}, "required": ["relation"]}},
+            "kind": TEXT, "id": INTEGER, "handle": TEXT, "relation": TEXT, "context": TEXT, "purpose": TEXT, "connection_id": INTEGER,
+            "belief": BELIEF, "reason": TEXT, "revision_no": INTEGER}, "required": ["relation"]}},
         "action": {"type": "string", "enum": ["revise", "withdraw"]},
         "started_at": INTEGER, "ended_at": INTEGER}, "required": ["kind"]}},
     "progress": PROGRESS_SCHEMA, "finish": {"type": "boolean"}, "retry": RETRY_SCHEMA,
@@ -129,7 +138,7 @@ def tool_definitions(*, learning=False):
         definitions.pop("main_context")
     else:
         definitions["complete"] = _schema("交付本轮语义背景并结束。可同时保存认识、连接与注意变化，不需要再调用模型读取保存回执。", {
-            "background": TEXT, **RECALL_REMEMBER_SCHEMA["parameters"]["properties"]}, ("background",))
+            "background": BACKGROUND, **RECALL_REMEMBER_SCHEMA["parameters"]["properties"]}, ("background",))
     return definitions
 
 

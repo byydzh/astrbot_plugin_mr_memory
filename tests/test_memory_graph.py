@@ -70,6 +70,35 @@ class MemoryGraphTests(unittest.TestCase):
         self.assertEqual(self.store.memory("episode", episode["id"])["source_ids"], [self.message["id"]])
         self.assertIn("topic", {m["kind"] for m in self.store.search_memories()})
 
+    def test_belief_survives_navigation_and_reuse_without_reinforcement(self):
+        belief = {"stance": "暂定", "alternatives": ["另一个解释"], "support": {"participant_id": "自由语义字段"}}
+        memory = self.save(kind="pattern", title="理解", content="尚待理解的联系", belief=belief,
+                           attention=True, cues=[{"cue": "安排", "aspect": "理解"}])
+        for _ in range(3):
+            self.assertEqual(self.store.workspace()["active"][0]["memory"]["belief"], belief)
+            self.assertEqual(self.store.navigate(cue="安排", aspect="理解")["items"][0]["belief"], belief)
+        self.assertEqual(self.store.memory("pattern", memory["id"])["revision_no"], 1)
+        other = self.save(kind="pattern", content="未评估的解释")
+        self.assertEqual(other["belief"], {"stance": "unconfirmed"})
+
+    def test_withdrawn_basis_remains_visible_to_its_dependent_memory(self):
+        episode = self.save(kind="episode", content="共同经历", source_ids=[self.message["id"]])
+        pattern = self.save(kind="pattern", content="当时的解释", attention=True, connections=[{
+            "kind": "episode", "id": episode["id"], "relation": "由此推想", "purpose": "basis",
+            "belief": {"stance": "可能有关"}}])
+        edge = pattern["basis"][0]
+        self.assertEqual(edge["belief"]["stance"], "可能有关")
+        self.save(kind="association", id=edge["id"], action="withdraw", reason="后续交流改变了理解",
+                  belief={"stance": "这条推论不成立"})
+        updated = self.store.workspace()["active"][0]["memory"]
+        self.assertEqual(updated["basis"][0]["status"], "RETRACTED")
+        self.assertTrue(updated["basis"][0]["basis_changed"])
+        self.assertEqual(updated["basis"][0]["change_reason"], "后续交流改变了理解")
+        self.assertEqual(self.store.graph(ref={"kind": "pattern", "id": pattern["id"]}), [])
+        change = next(row for row in self.store.memory_changes()["items"] if row["kind"] == "association")
+        self.assertEqual(change["dependent_memories"][0]["id"], pattern["id"])
+        self.assertEqual(self.store.memory("episode", episode["id"])["content"], "共同经历")
+
     def test_thought_can_become_the_basis_of_another_memory(self):
         episode = self.save(kind="episode", title="共同经历", content="一起修改方案")
         thought = self.store.reflections.save({"content": "这种协作方式还有哪些适用情境", "memory_refs": [

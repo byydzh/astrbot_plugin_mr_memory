@@ -68,6 +68,14 @@ function representationView(value) {
   }
   return list;
 }
+function beliefView(value) {
+  if (value?.stance === "unconfirmed" && Object.keys(value).length === 1)
+    return el("p", "尚未确认；目前保留为可继续理解的线索。");
+  if (!value || typeof value !== "object" || Array.isArray(value)) return representationView(value);
+  const labels = {stance: "当前看法", scope: "适用范围", reason: "理由", support: "支持", alternatives: "其他解释"};
+  return representationView(Object.fromEntries(Object.entries(value).map(([key, part]) =>
+    [labels[key] || key, key === "stance" && part === "observed" ? "原始发言记录" : part])));
+}
 function renderWorkspace(data) {
   if (!data.workspace) return;
   const signature = JSON.stringify([state.scope, data.workspace]);
@@ -270,6 +278,7 @@ async function showMemory(kind, id) {
   proseSection(parent, item.title || item.relation || "记忆内容", item.summary || item.statement);
   if (item.source && item.target) parent.append(el("p", `${item.source} → ${item.relation} → ${item.target}`, "meta"));
   if (item.uncertainty) proseSection(parent, "尚不确定的部分", item.uncertainty);
+  if (item.belief) { const section = el("section"); section.append(el("h3", "当前把握与依据"), beliefView(item.belief)); parent.append(section); }
   if (item.attention != null) { const section = el("section"); section.append(el("h3", "为什么仍在关注"), representationView(item.attention)); parent.append(section); }
   if (item.representation && Object.keys(item.representation).length) {
     const section = el("section"); section.append(el("h3", "它如何组织这项认识"), representationView(item.representation)); parent.append(section);
@@ -298,13 +307,14 @@ async function showMemory(kind, id) {
       const row = el("div", null, "source-actions");
       row.append(button(`${link.relation || "关联记忆"} · ${targetMemory?.title || kinds[target.kind] || target.kind}`, () => showMemory(target.kind, target.id)));
       if (link.summary) row.append(el("span", link.summary, "footnote"));
+      if (link.belief) row.append(beliefView(link.belief));
       section.append(row);
     }
     if (item.navigation.more) section.append(el("p", "还有更多连接，可从记忆图继续展开。", "footnote"));
     parent.append(section);
   }
   for (const basis of item.basis || []) if (basis.basis_changed) {
-    parent.append(el("p", `这项认识的依据后来发生了变化：${basis.target.title || basis.target.kind}。目前尚需结合变化重新理解。`, "meta"));
+    parent.append(el("p", `${basis.status === "RETRACTED" ? "已撤回的联系" : "形成依据后来有变化"}：${basis.target.title || basis.target.kind}。${basis.change_reason || ""}`, "meta"));
   }
   const sources = el("section"); sources.append(el("h3", "回到原始消息"));
   const actions = el("div", null, "source-actions");

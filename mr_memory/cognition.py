@@ -38,9 +38,10 @@ def visible_memories(value):
                     and ("content" in part or "summary" in part)):
                 ref = reference(part)
                 found[(ref["kind"], ref["id"], part["revision_no"])] = {
-                    **ref, "revision_no": part["revision_no"], "title": part.get("title", "")}
+                    **ref, "revision_no": part["revision_no"], "title": part.get("title", ""),
+                    "belief": part.get("belief", {"stance": "unconfirmed"})}
             for key, child in part.items():
-                if key in {"representation", "recollection", "attention", "pending_items", "pending_recall_writes", "rejected"}:
+                if key in {"representation", "recollection", "attention", "belief", "pending_items", "pending_recall_writes", "rejected"}:
                     continue
                 if isinstance(child, (list, dict)):
                     visit(child)
@@ -118,6 +119,7 @@ class Cognition:
         rows = self.store._rows("SELECT * FROM mr_cognition_turns WHERE " + " AND ".join(clauses)
                                + " ORDER BY id DESC LIMIT ? OFFSET ?", [*args, limit + 1, offset])
         experiences = []
+        current_refs = {}
         for row in rows[:limit]:
             payload = json.loads(row["payload_json"])
             experience = {key: row[key] for key in ("id", "run_id", "kind", "at", "request_id", "observation_id")}
@@ -126,9 +128,19 @@ class Cognition:
                 events, more = self.store.reflections._events(row["request_id"])
                 experience["actual_response"] = [self.store.reflections._event_summary(event) for event in events]
                 experience["more_response_events"] = more
+                original = self.db.execute("SELECT id FROM messages WHERE umo=? AND message_id=? ORDER BY id LIMIT 1",
+                                           (self.store.umo, row["request_id"])).fetchone()
+                experience["subsequent_context"] = self.store.reflections.following_context(
+                    events, {"id": original[0]} if original else None)
+            for ref in payload.get("available_memories", []):
+                current_refs[(ref["kind"], ref["id"])] = reference(ref)
             experiences.append(experience)
         cursor = self.db.execute("SELECT COALESCE(max(id),0) FROM mr_cognition_turns WHERE umo=? AND kind='foreground'",
                                  (self.store.umo,)).fetchone()[0]
-        return {"items": experiences, "cursor": cursor, "more": len(rows) > limit,
+        graph = self.store.memory_graph
+        return {"items": experiences,
+                "current_memories": [{**graph.brief(ref), "basis": graph.connections(ref, purpose="basis")}
+                                     for ref in current_refs.values()],
+                "cursor": cursor, "more": len(rows) > limit,
                 "next_offset": offset + limit,
-                "meaning": "本次怎样理解、实际提供了哪些记忆以及后来怎样回应。available_memories是可见材料，recollection是模型自己描述的理解，不把两者当作已证明的影响关系。用interaction或context继续体验前后交流，也可由此改变原认识与关注。"}
+                "meaning": "available_memories保留当时可见的版本与把握，current_memories为现在的版本。recollection是模型自述，不能证明某记忆造成回答；actual_response是实际回复，subsequent_context是邻接交流，不自动算赞同或反对。理解其对象与含义后，可改变原认识、连接和把握；用interaction或context继续展开。"}
