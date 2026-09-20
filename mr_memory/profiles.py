@@ -6,6 +6,7 @@ is a view of this directory, not its storage limit. Call under Store's lock.
 from __future__ import annotations
 
 import json
+import shlex
 import time
 
 
@@ -30,6 +31,43 @@ PREFIX_GUIDE = """本群成员资料（按真实 UID 对应）：群名片、平
 
 def encoded(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_profile_changes(arguments: str) -> dict:
+    """Read explicit field/value pairs, keeping quoted field names as text."""
+    fields = {"称呼": "preferred_name", "别名": "aliases", "不用": "avoided_names", "说明": "description"}
+    lexer = shlex.shlex(arguments, posix=False)
+    lexer.whitespace_split = True
+    lexer.whitespace += "\u3000"
+    lexer.commenters = ""
+    changes, values = {}, []
+    field = None
+
+    def finish_field():
+        value = " ".join(values).strip()
+        if not value:
+            raise ValueError(f"{field}后缺少内容；如需清空请填 -。本次资料未修改。")
+        value = "" if value == "-" else value
+        changes[fields[field]] = ([part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+                                  if field in {"别名", "不用"} else value)
+
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise ValueError("引号未闭合，请用成对的英文引号包住内容。本次资料未修改。") from exc
+    for token in tokens:
+        if token in fields:
+            if field is not None:
+                finish_field()
+            field, values = token, []
+        else:
+            if field is None:
+                raise ValueError("用法：/mr uid；修改本人：/mr uid 称呼 小林 别名 林同学；还可用 不用 / 说明，填 - 清空。不能指定他人的 UID。")
+            # posix=False retains quotes, so a value such as "别名" is not a field.
+            values.append(token[1:-1] if len(token) >= 2 and token[0] in "\"'" and token[-1] == token[0] else token)
+    if field is not None:
+        finish_field()
+    return changes
 
 
 class MemberProfiles:

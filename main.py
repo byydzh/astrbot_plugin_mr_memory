@@ -27,6 +27,7 @@ from .mr_memory.schedule import work_window
 from .mr_memory.console import register_console
 from .mr_memory.trace import RunTrace
 from .mr_memory.request_context import RequestContext
+from .mr_memory.profiles import parse_profile_changes
 
 
 def json_value(value: Any) -> Any:
@@ -838,22 +839,16 @@ class MrMemoryPlugin(Star):
         # The account always comes from the adapter, never from command text.
         account = str(event.message_obj.sender.user_id)
         args = event.get_message_str().partition("uid")[2].strip()
-        fields = {"称呼": "preferred_name", "别名": "aliases", "不用": "avoided_names", "说明": "description"}
         try:
-            if args:
-                field, _, value = args.partition(" ")
-                if field not in fields:
-                    raise ValueError("用法：/mr uid；修改本人：/mr uid 称呼 小明；/mr uid 别名 明明,阿明；/mr uid 不用 旧称呼；/mr uid 说明 本人说明。字段后填 - 可清空。不能指定他人的 UID。")
-                value = "" if value.strip() == "-" else value.strip()
-                changes = {fields[field]: [x.strip() for x in value.replace("，", ",").split(",") if x.strip()]
-                           if field in {"别名", "不用"} else value}
+            changes = parse_profile_changes(args)
+            if changes:
                 person = await asyncio.to_thread(store.edit_member, account, changes, actor="self:" + account)
             else:
                 person = (await asyncio.to_thread(store.members, account_ids=[account]))[0]
             text = (f"你的 UID：{account}\n群名片：{person['card'] or '未提供'}\n平台昵称：{person['nickname'] or '未提供'}"
                     f"\n希望称呼：{person['preferred_name'] or '未设置'}\n别名：{', '.join(person['confirmed_aliases']) or '未设置'}"
                     f"\n不用的称呼：{', '.join(person['avoided_names']) or '未设置'}\n说明：{person['description'] or '未设置'}"
-                    "\n修改：/mr uid 称呼 小明（还可用：别名 / 不用 / 说明；填 - 清空）。只修改你在本群的资料。")
+                    "\n修改：/mr uid 称呼 小林 别名 林同学（可连写 称呼 / 别名 / 不用 / 说明；填 - 清空）。只修改你在本群的资料。")
         except (ValueError, IndexError) as exc:
             text = str(exc) or "尚无本人资料"
         yield event.plain_result(text)

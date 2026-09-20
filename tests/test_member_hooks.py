@@ -14,6 +14,31 @@ class MemberHookTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.MainIntegrationTests.asyncSetUp
     asyncTearDown = fixtures.MainIntegrationTests.asyncTearDown
 
+    async def test_multiple_fields_save_together_and_update_prefix(self):
+        current = fixtures.event()
+        current.message_obj.timestamp = int(time.time())
+        current.message_obj.raw_message = {'time': current.message_obj.timestamp}
+        current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
+        store = await self.plugin.store_for(current)
+        store.append_message(self.plugin.message(current))
+        store.member_pool(50)
+        current.message_str = '/mr uid 称呼 小禾 别名 阿禾'
+        current.message_obj.message_str = current.message_str
+        with patch.object(store, 'edit_member', wraps=store.edit_member) as edit:
+            replies = [reply async for reply in self.plugin.member_profile(current)]
+        edit.assert_called_once()
+        self.assertEqual(len(replies), 1)
+        person = store.members([current.get_sender_id()])[0]
+        self.assertEqual(person['preferred_name'], '小禾')
+        self.assertEqual(person['confirmed_aliases'], ['阿禾'])
+        member = next(row for row in store.member_pool(50)['members'] if row['uid'] == current.get_sender_id())
+        self.assertEqual(member['preferred_name'], '小禾')
+        self.assertEqual(member['aliases'], ['阿禾'])
+        current.message_str = '/mr uid 称呼 不应保存 别名'
+        current.message_obj.message_str = current.message_str
+        _ = [reply async for reply in self.plugin.member_profile(current)]
+        self.assertEqual(store.members([current.get_sender_id()])[0]['preferred_name'], '小禾')
+
     async def test_self_command_and_directory_handoff(self):
         current=fixtures.event()
         current.message_obj.timestamp=int(time.time())
