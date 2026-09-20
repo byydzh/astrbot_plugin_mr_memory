@@ -132,10 +132,6 @@ async function loadRuns() {
 
 function renderLearning(data) {
   const plan = $("learning-plan"), window = data.learning_window || state.overview?.runtime?.learning_window;
-  if (!state.overview?.runtime?.advanced) {
-    plan.replaceChildren(el("p", "基础模式：群聊原文持续记录并建立本地检索索引；回答前可主动搜索。自动整理、反馈学习和高级连接已关闭，旧整理队列保留，但不会发起模型调用。", "inset"));
-    return;
-  }
   if (!window) { plan.replaceChildren(); return; }
   const allDay = !window.enabled || window.start === window.end;
   const heading = el("div", null, "learning-window");
@@ -144,6 +140,9 @@ function renderLearning(data) {
   heading.append(el("small", window.open ? "当前处于工作时段；群消息记录和回答前回忆始终即时。" :
     `普通新任务排到 ${window.next_start_local || "下一工作时段"}；已开始的任务继续保存，群消息记录、回答前回忆和明确预约照常进行。`));
   plan.replaceChildren(heading);
+  if (!state.overview?.runtime?.advanced) {
+    plan.append(el("p", "基础整理将新交流保存为带原文来源的事件、语义记忆和关联，持续更新记忆图。实验性反思与高级连接关闭；旧实验任务暂停保存。回答前搜索独立运行。", "inset"));
+  }
   const labels = { deferred: "等待工作时段", budget_exhausted: "等待额度恢复", budget_wait: "等待可用额度", running: "正在学习", partial: "保存进度，待续接", completed: "本批完成", disabled: "已关闭", busy: "群内正在学习", skipped: "等待新材料", waiting: "等待更多交流", idle: "暂无待处理材料" };
   for (const kind of ["background", "feedback"]) {
     const task = (data.learning || []).find((item) => item.kind === kind);
@@ -189,7 +188,7 @@ async function refresh() {
     option.value = s.id; select.append(option);
   }
   if (!overview.scopes.some((s) => s.id === state.scope)) state.scope = overview.scopes[0]?.id || "";
-  select.value = state.scope; select.disabled = !state.scope; $("distill").disabled = !state.scope || !overview.runtime.advanced;
+  select.value = state.scope; select.disabled = !state.scope; $("distill").disabled = !state.scope || !overview.runtime.background_enabled;
   $("experimental-workspace").hidden = !overview.runtime.advanced;
   $("reset-conversation").disabled = !state.scope || state.resetBusy;
   $("connection").textContent = "已连接 AstrBot";
@@ -208,8 +207,9 @@ async function refresh() {
   $("policies").replaceChildren(...[
     `群消息记录：${r.capture ? "启用" : "关闭"}`,
     `回答前回忆：${r.recall ? "启用" : "关闭"}`,
-    `后台学习：${r.learning ? "启用" : "关闭"}`,
+    `自动整理建图：${r.learning ? "启用" : "关闭"}`,
     `反馈学习：${r.feedback ? "启用" : "关闭"}`,
+    `高级反思：${r.advanced ? "启用" : "关闭"}`,
     `成员前缀：最多 ${r.member_prefix_capacity} 人 / 每日更新`,
     `本地语义检索：${r.embedding_enabled === false ? "关闭" : r.embedding_loaded ? "模型已加载" : "模型尚未加载"}`,
     `回忆模型：${r.provider || "尚未配置"}`,
@@ -236,7 +236,7 @@ async function loadTab() {
       ["回忆耗时中位数", duration(median), `最近记录中的 ${latencies.length} 次回答前回忆`],
       ["最近 24 小时后台用量", number(overview.background_tokens_rolling24h), `Token · 额度 ${budget > 0 ? number(budget) : "不限"}；反馈另用 ${number(overview.feedback_tokens_rolling24h)} / ${feedbackBudget > 0 ? number(feedbackBudget) : "不限"}`],
       ["原始消息", number(c.messages), `最近消息：${date(c.last_message_at)}`],
-      [state.overview.runtime.advanced ? "待整理消息" : "未做模型整理的原文", number(c.pending), state.overview.runtime.advanced ? `上次整理：${date(overview.state.consolidated_at)}` : "基础模式保留原文用于检索，不要求自动整理清零"],
+      ["待整理消息", number(c.pending), `上次整理：${date(overview.state.consolidated_at)}；原文可先行检索`],
       ["共同经历", number(c.episodes), "保留的情节记忆"],
       ["人物与事实", number(c.semantics), "当前有效的语义记忆"],
       ["语义连接", number(c.associations), "仍可用于搜索的关联"],
@@ -449,7 +449,7 @@ $("distill").addEventListener("click", () => attempt(async () => {
     const result = await api(path("distill"), {}, true);
     notice(result?.reason || result?.detail || (result?.status === "completed" ? `整理完成，更新 ${result.written_count ?? "未记录数量的"} 项记忆。` : `本次整理状态：${statuses[result?.status] || result?.status || "未记录"}`), ["error", "failed"].includes(result?.status));
     if (scope === state.scope) await loadTab();
-  } finally { $("distill").disabled = !state.scope || !state.overview?.runtime.advanced; $("distill").textContent = "整理新消息"; }
+  } finally { $("distill").disabled = !state.scope || !state.overview?.runtime.background_enabled; $("distill").textContent = "整理新消息"; }
 }));
 $("reset-conversation").addEventListener("click", async () => {
   if (!state.scope || state.resetBusy) return;

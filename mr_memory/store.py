@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS mr_memory_write_receipts (
 CREATE TABLE IF NOT EXISTS mr_learning_tasks (umo TEXT NOT NULL,kind TEXT NOT NULL
  CHECK(kind IN ('background','feedback')),task_json TEXT NOT NULL,updated_at INTEGER NOT NULL,
  PRIMARY KEY(umo,kind));
+CREATE TABLE IF NOT EXISTS mr_learning_paused (umo TEXT NOT NULL,kind TEXT NOT NULL,
+ mode TEXT NOT NULL,task_json TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,kind,mode));
 CREATE TABLE IF NOT EXISTS mr_feedback_processed (umo TEXT NOT NULL,message_id INTEGER NOT NULL REFERENCES messages(id),
  completed_at INTEGER NOT NULL,PRIMARY KEY(umo,message_id));
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
@@ -405,6 +407,7 @@ class Store:
                 self.db.execute("DELETE FROM memory_embeddings WHERE umo=? AND owner_type='participant' AND owner_key=?", (self.umo, str(person["id"])))
             self.db.execute("DELETE FROM mr_working_state WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=?", (self.umo,))
+            self.db.execute("DELETE FROM mr_learning_paused WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_roster_cache WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_member_profiles WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
             self.db.execute("DELETE FROM mr_member_names WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
@@ -847,6 +850,49 @@ class Store:
         row = self.db.execute("SELECT task_json FROM mr_learning_tasks WHERE umo=? AND kind=?",
                               (self.umo, self._usage_kind(kind))).fetchone()
         return json.loads(row[0]) if row else None
+
+    @_serialized
+    def select_learning_mode(self, kind: str, mode: str) -> dict | None:
+        """Keep an inactive mode's unfinished work out of the active queue."""
+        kind = self._usage_kind(kind)
+        if mode not in {"basic", "advanced"}:
+            raise ValueError("Unknown learning mode")
+        state = self.load_working_state()
+        modes = state.setdefault("learning_modes", {})
+        previous = modes.get(kind, "advanced")
+        if previous == mode:
+            return self.learning_task(kind)
+        with self.db:
+            task = self.learning_task(kind)
+            drafts = state.setdefault("pending_learning_drafts", {}).pop(kind, {})
+            if task or drafts:
+                self.db.execute("""INSERT INTO mr_learning_paused VALUES(?,?,?,?,?)
+                    ON CONFLICT(umo,kind,mode) DO UPDATE SET task_json=excluded.task_json,updated_at=excluded.updated_at""",
+                    (self.umo, kind, previous, _encode({"task": task, "drafts": drafts}), int(time.time())))
+            self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=? AND kind=?", (self.umo, kind))
+            saved = self.db.execute("SELECT task_json FROM mr_learning_paused WHERE umo=? AND kind=? AND mode=?",
+                                    (self.umo, kind, mode)).fetchone()
+            restored = json.loads(saved[0]) if saved else {}
+            self.db.execute("DELETE FROM mr_learning_paused WHERE umo=? AND kind=? AND mode=?", (self.umo, kind, mode))
+            task = restored.get("task")
+            if task:
+                # Both modes organize the same original messages. Work really
+                # completed while this task was paused need not be repeated.
+                if kind == "background" and task["material_ids"]:
+                    ids = task["material_ids"]
+                    done = {row[0] for row in self.db.execute(f"""SELECT m.id FROM messages m
+                        JOIN message_processing p ON p.message_id=m.id
+                        WHERE m.umo=? AND m.id IN ({','.join('?' for _ in ids)})
+                        AND p.status='DISTILLED' AND p.content_sha256=m.content_sha256""", (self.umo, *ids))}
+                    task["completed_ids"] = list(dict.fromkeys([*task["completed_ids"], *sorted(done)]))
+                self._write_learning_task(kind, task)
+            if restored.get("drafts"):
+                state["pending_learning_drafts"][kind] = restored["drafts"]
+            modes[kind] = mode
+            self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
+                DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
+                (self.umo, _encode(state), int(time.time())))
+        return task
 
     @_serialized
     def resume_learning_task(self, kind: str) -> dict | None:

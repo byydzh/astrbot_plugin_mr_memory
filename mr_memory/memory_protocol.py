@@ -1,4 +1,5 @@
 """Shared memory capabilities and purpose, independent of call scheduling."""
+from copy import deepcopy
 from .learning_writes import RETRY_SCHEMA
 
 BASIC_RECALL_PROMPT = """你为 AstrBot 提供本群的记忆背景，帮助它接上真实群聊。当前模式只检索，不创建人物画像、学习反馈或发展新的长期连接。
@@ -32,6 +33,17 @@ learning_task记录本批material_ids、实际给到的offered_ids、参考用co
 待修草稿在pending_items，用retry的pending_id补changes，或说明discard_reason放弃该草稿。保存回执里的地址可以直接引用，不重发成功写入。
 remember可以仅保存进度或recollection。finish=true表示本批完成且这轮思考已收束；还想利用回执继续连接或思考就继续。需要稍后继续的关注用reflect保存，不要求现在穷尽。
 若最后直接输出而非工具调用，使用完整JSON对象{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[],"recollection":{}}，只放未保存的内容。
+"""
+
+BASIC_CONSOLIDATION_PROMPT = """你为群聊机器人整理共同经历，建立以后能够主动检索、沿关联继续查阅的基础记忆图。
+根据本批交流保存有用的事件、群友自述、具体事物及它们的联系；已有对应记忆时查阅后补充或修订，避免把同一件事重复建成互不相通的摘要。记什么、怎样组织、需要沿哪些线索查阅，由你根据语义决定，不要求每条消息生成一项记忆。
+每项认识保留 source_ids 原文地址，cues 提供检索线索，connections 或 association 连接有关的事件、人物、事物和依据。新对象可以用 handle 相互引用；修订用查到的 kind/id 和 revision_no，保留纠正来历。基础记忆也可以表达不确定性、明确更正和直接的语义关系，不必为了建图猜测隐藏关系或发展抽象人格理论。
+UID 标明发言账号，不代表一句话里所有经历都属于作者。结合引用作者、谈论对象及前后文理解归属；成员目录提供平台身份和明确称呼，不把自己的简称写成群友公认外号。BOT 回答和 SYSTEM 生成稿、工具记录是交流的一部分，其中的猜测不是被群友确认的事实；generated/sent 也不是两份独立支持。图片路径不等于看过图片。
+本次工作以整理给定材料为目的，不启动独立反馈学习、持续关注或跨经历高级反思。原文中的明确纠正仍应体现在有关记忆中；模糊评价、反讽与身份推断保留语境和把握，不硬凑结论。
+learning_task 列出本批 material_ids、实际提供的 offered_ids、仅供参考的 context_ids、已完成 completed_ids 及保存地址。输入中的 message_columns/message_rows/message_defaults 是完整原文表格，按表头读取作者、时间、正文和引用。
+用 remember 保存 items 和 progress.completed_ids，或最后直接输出完整 JSON：{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[]}。完成处理包括判断某些闲聊无需另存；无需穷尽所有关联才能完成本批。只保存未保存的内容，已保存回执地址可继续引用。finish=true 结束本批；尚未完成时 checkpoint 留下准确进度。
+pending_items 是待修草稿，用 retry 的 pending_id 和 changes 补字段，或用 discard_reason 说明不再保存。草稿与材料进度分别保存。source_ref/memory_ref 指本次前文已给出的同版本字段，需要时可按地址重新打开。
+queue 与 resource_state 表示各批次共享的资源；理解并保存后即可结束，不必用满额度。
 """
 
 def _schema(description: str, properties: dict, required: tuple = ()) -> dict:
@@ -129,12 +141,22 @@ RECALL_REMEMBER_SCHEMA = _schema("保存或修订自己的理解、表示、连�
     if key in {"items", "retry", "recollection"}})
 RECALL_REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
+BASIC_REMEMBER_SCHEMA = deepcopy(REMEMBER_SCHEMA)
+BASIC_REMEMBER_SCHEMA["description"] = "保存本批的事件、语义记忆及有原文依据的关联，并记录处理进度。" + WRITE_SEMANTICS
+BASIC_REMEMBER_SCHEMA["parameters"]["properties"].pop("recollection")
+BASIC_REMEMBER_SCHEMA["parameters"]["properties"]["items"]["items"]["properties"].pop("attention")
+
 
 def tool_definitions(*, learning=False, basic=False):
     if basic:
-        names = ("main_context", "search_messages", "search_memories", "memory", "semantic_search", "context", "member", "activity", "interaction")
-        return {**{name: TOOL_SCHEMAS[name] for name in names},
-                "complete": _schema("交付本次检索背景并结束，不写入长期记忆。", {"background": TEXT}, ("background",))}
+        names = ("search_messages", "search_memories", "memory", "semantic_search", "context", "member", "activity", "interaction", "graph", "navigate")
+        definitions = {name: TOOL_SCHEMAS[name] for name in names}
+        if learning:
+            definitions["remember"] = BASIC_REMEMBER_SCHEMA
+        else:
+            definitions["main_context"] = TOOL_SCHEMAS["main_context"]
+            definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆。", {"background": TEXT}, ("background",))
+        return definitions
     definitions = {**TOOL_SCHEMAS, "remember": REMEMBER_SCHEMA if learning else RECALL_REMEMBER_SCHEMA}
     if learning:
         definitions.pop("main_context")
