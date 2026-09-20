@@ -132,6 +132,10 @@ async function loadRuns() {
 
 function renderLearning(data) {
   const plan = $("learning-plan"), window = data.learning_window || state.overview?.runtime?.learning_window;
+  if (!state.overview?.runtime?.advanced) {
+    plan.replaceChildren(el("p", "基础模式：群聊原文持续记录并建立本地检索索引；回答前可主动搜索。自动整理、反馈学习和高级连接已关闭，旧整理队列保留，但不会发起模型调用。", "inset"));
+    return;
+  }
   if (!window) { plan.replaceChildren(); return; }
   const allDay = !window.enabled || window.start === window.end;
   const heading = el("div", null, "learning-window");
@@ -185,7 +189,8 @@ async function refresh() {
     option.value = s.id; select.append(option);
   }
   if (!overview.scopes.some((s) => s.id === state.scope)) state.scope = overview.scopes[0]?.id || "";
-  select.value = state.scope; select.disabled = !state.scope; $("distill").disabled = !state.scope;
+  select.value = state.scope; select.disabled = !state.scope; $("distill").disabled = !state.scope || !overview.runtime.advanced;
+  $("experimental-workspace").hidden = !overview.runtime.advanced;
   $("reset-conversation").disabled = !state.scope || state.resetBusy;
   $("connection").textContent = "已连接 AstrBot";
   if (overview.errors?.length) notice(overview.errors.join("\n"), true);
@@ -205,6 +210,7 @@ async function refresh() {
     `回答前回忆：${r.recall ? "启用" : "关闭"}`,
     `后台学习：${r.learning ? "启用" : "关闭"}`,
     `反馈学习：${r.feedback ? "启用" : "关闭"}`,
+    `成员前缀：最多 ${r.member_prefix_capacity} 人 / 每日更新`,
     `本地语义检索：${r.embedding_enabled === false ? "关闭" : r.embedding_loaded ? "模型已加载" : "模型尚未加载"}`,
     `回忆模型：${r.provider || "尚未配置"}`,
     ...(r.background_provider && r.background_provider !== r.provider ? [`后台模型：${r.background_provider}`] : []),
@@ -230,7 +236,7 @@ async function loadTab() {
       ["回忆耗时中位数", duration(median), `最近记录中的 ${latencies.length} 次回答前回忆`],
       ["最近 24 小时后台用量", number(overview.background_tokens_rolling24h), `Token · 额度 ${budget > 0 ? number(budget) : "不限"}；反馈另用 ${number(overview.feedback_tokens_rolling24h)} / ${feedbackBudget > 0 ? number(feedbackBudget) : "不限"}`],
       ["原始消息", number(c.messages), `最近消息：${date(c.last_message_at)}`],
-      ["待整理消息", number(c.pending), `上次整理：${date(overview.state.consolidated_at)}`],
+      [state.overview.runtime.advanced ? "待整理消息" : "未做模型整理的原文", number(c.pending), state.overview.runtime.advanced ? `上次整理：${date(overview.state.consolidated_at)}` : "基础模式保留原文用于检索，不要求自动整理清零"],
       ["共同经历", number(c.episodes), "保留的情节记忆"],
       ["人物与事实", number(c.semantics), "当前有效的语义记忆"],
       ["语义连接", number(c.associations), "仍可用于搜索的关联"],
@@ -351,11 +357,21 @@ async function searchPeople() {
   const scope = state.scope; const data = await api(path("participants"), { query: $("people-query").value.trim() });
   if (scope !== state.scope) return;
   const body = $("people"); body.replaceChildren();
+  const pool = data.pool;
+  $("member-pool-summary").textContent = `前缀 ${pool.account_ids.length} / ${pool.capacity} 人 · ${number(pool.characters)} 字符 · 每日刷新 ${pool.day}。${pool.notice}`;
+  $("member-prefix-preview").textContent = pool.prefix || "当前没有成员前缀";
   for (const person of data.participants) {
-    const tr = el("tr"); const account = el("td"); account.append(button(person.account_id, () => { $("alias-account").value = person.account_id; $("alias-value").focus(); }, "account-btn"));
-    tr.append(account, el("td", person.name), el("td", (person.aliases || []).join(" · ") || "未记录别名", "aliases"), el("td", person.membership === "platform_roster" ? `群成员列表 · ${date(person.roster_fetched_at)}` : "历史消息")); body.append(tr);
+    const tr = el("tr"); const account = el("td"); account.append(button(person.account_id, () => {
+      $("profile-account").value = person.account_id; $("profile-name").value = person.preferred_name || "";
+      $("profile-aliases").value = (person.confirmed_aliases || []).join(", "); $("profile-avoided").value = (person.avoided_names || []).join(", ");
+      $("profile-description").value = person.description || ""; $("profile-name").focus();
+    }, "account-btn"), el("small", pool.account_ids.includes(person.account_id) ? " 前缀中" : " 完整资料库"));
+    tr.append(account, el("td", `${person.card || "无群名片"}\n${person.nickname || "未取得平台昵称"}`),
+      el("td", `历史：${(person.observed_names || []).join(" · ") || "无"}\n确认：${(person.confirmed_aliases || []).join(" · ") || "无"}`, "aliases"),
+      el("td", `${person.preferred_name || "未设置"}\n不用：${(person.avoided_names || []).join(" · ") || "无"}`),
+      el("td", `${person.edited_by?.startsWith("self:") ? "本人填写" : person.edited_by?.startsWith("admin") ? "管理员填写" : "平台记录"}${person.edited_at ? " · " + date(person.edited_at) : ""}`)); body.append(tr);
   }
-  if (!data.participants.length) { const tr = el("tr"); const td = el("td", "没有匹配的账户", "empty"); td.colSpan = 4; tr.append(td); body.append(tr); }
+  if (!data.participants.length) { const tr = el("tr"); const td = el("td", "没有匹配的账户", "empty"); td.colSpan = 5; tr.append(td); body.append(tr); }
 }
 function readableContent(content) {
   if (typeof content === "string") return content;
@@ -405,7 +421,7 @@ async function showContext(id) {
 
 $("close-detail").addEventListener("click", () => $("detail").close());
 $("detail").addEventListener("close", () => { state.detailVersion += 1; state.runDetail = null; schedulePoll(); });
-$("scope-select").addEventListener("change", () => { state.detailVersion += 1; state.runDetail = null; if ($("detail").open) $("detail").close(); state.scope = $("scope-select").value; $("context-repair-result").hidden = true; clearTimeout(state.pollTimer); attempt(refresh); });
+$("scope-select").addEventListener("change", () => { state.detailVersion += 1; state.runDetail = null; if ($("detail").open) $("detail").close(); state.scope = $("scope-select").value; $("profile-form").reset(); $("context-repair-result").hidden = true; clearTimeout(state.pollTimer); attempt(refresh); });
 document.addEventListener("visibilitychange", schedulePoll);
 window.addEventListener("pagehide", () => { clearTimeout(state.pollTimer); state.detailVersion += 1; state.runDetail = null; });
 $("refresh").addEventListener("click", () => attempt(refresh));
@@ -417,9 +433,14 @@ document.querySelectorAll("[data-tab]").forEach((tab) => tab.addEventListener("c
 for (const [form, action] of [["memory-search", searchMemory], ["people-search", searchPeople], ["message-search", () => searchMessages()]]) $(form).addEventListener("submit", (event) => { event.preventDefault(); attempt(action); });
 $("graph-reset").addEventListener("click", () => attempt(async () => renderGraph(await api(path("graph"), { query: state.graphQuery }))));
 $("older").addEventListener("click", () => attempt(() => searchMessages(true)));
-$("alias-form").addEventListener("submit", (event) => { event.preventDefault(); attempt(async () => {
-  const data = await api(path("participants/bind_alias"), { account_id: $("alias-account").value.trim(), alias: $("alias-value").value.trim() }, true);
-  notice(data.message); $("alias-value").value = ""; await searchPeople();
+$("profile-form").addEventListener("submit", (event) => { event.preventDefault(); attempt(async () => {
+  if (!$("profile-account").value) throw new Error("请先选择群员");
+  const scope = state.scope;
+  const list = (id) => $(id).value.replaceAll("，", ",").split(",").map(x => x.trim()).filter(Boolean);
+  const data = await api(path("participants/profile"), { account_id: $("profile-account").value, changes: {
+    preferred_name: $("profile-name").value, aliases: list("profile-aliases"), avoided_names: list("profile-avoided"), description: $("profile-description").value
+  } }, true);
+  if (scope === state.scope) { notice(data.message); await searchPeople(); }
 }); });
 $("distill").addEventListener("click", () => attempt(async () => {
   const scope = state.scope; $("distill").disabled = true; $("distill").textContent = "正在整理…";
@@ -428,7 +449,7 @@ $("distill").addEventListener("click", () => attempt(async () => {
     const result = await api(path("distill"), {}, true);
     notice(result?.reason || result?.detail || (result?.status === "completed" ? `整理完成，更新 ${result.written_count ?? "未记录数量的"} 项记忆。` : `本次整理状态：${statuses[result?.status] || result?.status || "未记录"}`), ["error", "failed"].includes(result?.status));
     if (scope === state.scope) await loadTab();
-  } finally { $("distill").disabled = !state.scope; $("distill").textContent = "整理新消息"; }
+  } finally { $("distill").disabled = !state.scope || !state.overview?.runtime.advanced; $("distill").textContent = "整理新消息"; }
 }));
 $("reset-conversation").addEventListener("click", async () => {
   if (!state.scope || state.resetBusy) return;

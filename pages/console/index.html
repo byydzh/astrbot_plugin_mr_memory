@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MR · 群聊记忆</title>
-  <link rel="stylesheet" href="./style.css?v=20260919-cognition" />
+  <link rel="stylesheet" href="./style.css?v=20260920-members" />
   <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20260919-cognition" defer></script>
+  <script src="./script.js?v=20260920-members" defer></script>
 </head>
 <body>
 <main>
@@ -23,7 +23,7 @@
       <p id="context-repair-result" class="context-repair-result" role="status" hidden></p>
     </section>
     <section id="learning-plan" class="learning-plan" aria-label="后台工作安排"></section>
-    <section class="panel"><div class="panel-heading"><div><h2>它正带着怎样的理解参与群聊</h2><p>由模型选择继续关注的认识；点开可看内容、连接、修订与后来的交流。前台与后台读取同一份当前版本。</p></div></div><div id="workspace" class="card-list"></div></section>
+    <section class="panel" id="experimental-workspace"><div class="panel-heading"><div><h2>实验性持续理解</h2><p>开启高级连接后，显示模型选择继续关注的认识。</p></div></div><div id="workspace" class="card-list"></div></section>
     <div id="metrics" class="metrics"></div>
     <section class="panel"><div class="panel-heading"><div><h2>最近调用</h2><p>点开一次活跃，沿着模型输出、搜索、写入和背景交接逐步阅读。</p></div><small id="runs-live-note">最近 30 次 · 时间为北京时间</small></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>任务 / 问题</th><th>状态 / 当前步骤</th><th>耗时</th><th>Token</th><th></th></tr></thead><tbody id="runs"></tbody></table></div></section>
     <p class="footnote">参数调整请使用 AstrBot 插件的配置面板。这里展示实际记录，调用完成或注入背景不代表回答质量合格。</p>
@@ -36,7 +36,10 @@
   </section>
 
   <section data-view="people" hidden>
-    <section class="panel"><div class="panel-heading"><div><h2>账户与别名</h2><p>历史称呼和当前群名片放在同一账户下。点击账户可填入下方的别名表单。</p></div><form id="people-search"><input id="people-query" type="search" placeholder="昵称、别名或账户 ID" aria-label="搜索账户" /><button>搜索</button></form></div><form id="alias-form" class="search-bar inset"><label>账户 ID<input id="alias-account" required /></label><label class="grow">确认属于该账户的别名<input id="alias-value" required /></label><button class="primary">保存别名</button></form><div class="table-wrap"><table><thead><tr><th>账户</th><th>当前名称</th><th>出现过的别名</th><th>资料来源</th></tr></thead><tbody id="people"></tbody></table></div></section>
+    <section class="panel"><div class="panel-heading"><div><h2>群员资料与活跃前缀</h2><p>完整保存全员资料。点击 UID 编辑该群员；群内命令 /mr uid 只能修改本人。</p><p id="member-pool-summary"></p></div><form id="people-search"><input id="people-query" type="search" placeholder="昵称、别名或 UID" aria-label="搜索账户" /><button>搜索</button></form></div>
+    <details class="inset"><summary>查看实际成员前缀</summary><pre id="member-prefix-preview"></pre></details>
+    <form id="profile-form" class="search-bar inset profile-form"><label>UID<input id="profile-account" required readonly placeholder="请在下方选择群员" /></label><label>希望称呼<input id="profile-name" /></label><label>确认的别名（逗号分隔）<input id="profile-aliases" /></label><label>不使用的称呼（逗号分隔）<input id="profile-avoided" /></label><label class="grow">本人 / 管理员说明<textarea id="profile-description" rows="2"></textarea></label><button class="primary">保存此人资料</button><small>留空会清空对应字段。群名片与平台昵称由平台同步，不被手动称呼覆盖。缓存命中仍计费且占上下文；首次或前缀变化可能按普通输入计费。</small></form>
+    <div class="table-wrap"><table><thead><tr><th>UID / 前缀</th><th>群名片 / 平台昵称</th><th>历史与确认称呼</th><th>希望称呼 / 不使用</th><th>资料来源</th></tr></thead><tbody id="people"></tbody></table></div></section>
   </section>
 
   <section data-view="messages" hidden>

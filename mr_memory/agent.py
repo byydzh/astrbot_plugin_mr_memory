@@ -16,7 +16,7 @@ from .content import text_view
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
 from .handoff import format_background as _background_text
-from .memory_protocol import (RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
+from .memory_protocol import (BASIC_RECALL_PROMPT, RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
     CONSOLIDATION_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions)
 from .tool_calls import response_calls, memory_text_arguments
 
@@ -461,12 +461,14 @@ def estimate_learning_input(messages: list, working: dict, *, feedback: bool = F
 
 class MemoryAgent:
     def __init__(self, provider, store, embedder=None, timeout_seconds=20,
-                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled"):
+                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled", advanced=False):
         self.provider, self.store, self.embedder = provider, store, embedder
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.max_turns = None if max_turns is None else max(1, int(max_turns))
         self.max_output_tokens = max(64, int(max_output_tokens))
         self.thinking_mode = thinking_mode
+        self.advanced = bool(advanced)
+        self.member_prefix = ""
         self.trace = None
         self.run_key = uuid4().hex
         self.available_memories = {}
@@ -639,12 +641,17 @@ class MemoryAgent:
         cutoff = int(current.get("sent_at") or time.time())
         messages = []
         seen_messages = {}
-        tools = _tool_set()
+        tools = _tool_set(basic=not self.advanced)
+        allowed_tools = tool_definitions(basic=not self.advanced)
+        prompt = RECONSTRUCTION_PROMPT if self.advanced else BASIC_RECALL_PROMPT
+        if self.member_prefix:
+            prompt += "\n<mr_member_directory>\n" + self.member_prefix + "\n</mr_member_directory>"
         sources = {row["id"]: row["source_key"] for row in [*recent, current] if "id" in row and "source_key" in row}
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 foreground=True)
-        working = {key: value for key, value in working.items() if key != "pending_recall_writes"}
-        working["continuity"] = await asyncio.to_thread(self.store.continuity, cutoff)
+        working = {key: value for key, value in working.items() if key != "pending_recall_writes"} if self.advanced else {}
+        if self.advanced:
+            working["continuity"] = await asyncio.to_thread(self.store.continuity, cutoff)
         async def persist_changes(args, key):
             operation = asyncio.create_task(asyncio.to_thread(writer.apply, args, self.run_key + ":" + key))
             try:
@@ -663,7 +670,8 @@ class MemoryAgent:
                                 "now_unix": cutoff, "service_local_time": datetime.fromtimestamp(cutoff, timezone.utc).astimezone().isoformat()}, seen_messages=seen_messages)})
                 last_round_seconds = 0.0
                 for turn in range(self.max_turns):
-                    await self._workspace_update(messages, seen_messages)
+                    if self.advanced:
+                        await self._workspace_update(messages, seen_messages)
                     round_started = time.monotonic()
                     remaining = self.timeout_seconds - (round_started - started)
                     messages.append({"role": "user", "content": _json({"resource_state": {
@@ -677,9 +685,10 @@ class MemoryAgent:
                         messages.append({"role": "user", "content":
                             "这是本次可用的最后一轮，交付已经形成的理解，不再发起工具调用。"
                             "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 items、retry、recollection。"
-                            "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。"})
+                            "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。" if self.advanced else
+                            "这是本次可用的最后一轮，直接返回 JSON 对象 {\"background\":\"已读材料中的有用背景\"}，不再请求工具。"})
                     response = await self._model_turn(
-                        messages, RECONSTRUCTION_PROMPT, tools, turn + 1,
+                        messages, prompt, tools, turn + 1,
                         tool_choice="none" if forced_finish else None,
                         response_format={"type": "json_object"} if forced_finish else None)
                     _add_usage(result.usage, response)
@@ -706,7 +715,7 @@ class MemoryAgent:
                             result.detail = detail
                         if result.status == "partial":
                             result.detail = result.detail or "Model turn or output budget reached; background may be incomplete"
-                        if final_writes:
+                        if final_writes and self.advanced:
                             await self._emit("write", "保存最终输出中的记忆变化", "running", operation_id="final_memories", items=final_writes)
                             try:
                                 outcome = await persist_changes(final_writes, "final")
@@ -739,10 +748,12 @@ class MemoryAgent:
                         try:
                             if call.error:
                                 raise ValueError(call.error)
+                            if name not in allowed_tools:
+                                raise ValueError("当前模式未提供此工具；基础模式只检索群聊记忆")
                             if name == "complete":
                                 result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff)
                                 changes = {key: value for key, value in args.items() if key != "background"}
-                                outcome = await persist_changes(changes, call_id) if changes else None
+                                outcome = await persist_changes(changes, call_id) if changes and self.advanced else None
                                 value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
                                 result.status = "partial" if outcome and outcome.rejected else "completed"
                                 if outcome and outcome.rejected:
@@ -792,7 +803,8 @@ class MemoryAgent:
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
             result.pending_items = writer.pending_items
-            await self._record_experience("foreground", current, result, writer)
+            if self.advanced:
+                await self._record_experience("foreground", current, result, writer)
             # Debug evidence is private; hidden model reasoning is not persisted.
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"} for message in messages]
             await self._emit("output", "本次记忆背景产出", "cancelled" if cancelled else result.status,

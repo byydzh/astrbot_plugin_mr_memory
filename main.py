@@ -215,13 +215,15 @@ class MrMemoryPlugin(Star):
                                                  else self.config["memory_max_tokens"]),
                            thinking_mode=self.config["feedback_thinking_mode"] if feedback else
                            self.config["distillation_thinking_mode"] if background else
-                           self.config["local_serving_reader_thinking_mode"])
+                           self.config["local_serving_reader_thinking_mode"],
+                           advanced=self.config["advanced_memory_enabled"])
 
     @staticmethod
     def message(event: AstrMessageEvent) -> dict:
         obj = event.message_obj
         content = components(list(obj.message or []))
         raw = getattr(obj, "raw_message", None)
+        platform_sender = raw.get("sender", {}) if isinstance(raw, dict) else {}
         stamp = raw.get("time") if isinstance(raw, dict) else None
         stamp = stamp or obj.timestamp or time.time()
         if hasattr(stamp, "timestamp"):
@@ -231,6 +233,7 @@ class MrMemoryPlugin(Star):
                 "message_id": str(obj.message_id), "sender_id": str(obj.sender.user_id),
                 "sender_name": str(obj.sender.nickname or ""), "sent_at": int(stamp),
                 "plain_text": str(obj.message_str or ""), "content": content, "role": "USER",
+                "platform_nickname": platform_sender.get("nickname"), "group_card": platform_sender.get("card"),
                 "reply_to": next((x["message_id"] for x in content if x["type"] == "reply"), "")}
 
     async def update_state(self, store: Store, changes: dict) -> None:
@@ -379,9 +382,26 @@ class MrMemoryPlugin(Star):
             current["bot_name"] = next((person["name"] for person in current["participants"]
                                         if person["account_id"] == current["bot_id"]), "")
             current["roster_fetched_at"] = cached_roster.get("fetched_at") if cached_roster else None
+            pool = await asyncio.to_thread(store.member_pool, self.config["member_prefix_capacity"])
+            prefix_start, prefix_end = "<mr_member_directory>", "</mr_member_directory>"
+            original_prompt = req.system_prompt or ""
+            if prefix_start in original_prompt and prefix_end in original_prompt:
+                before, _, tail = original_prompt.partition(prefix_start)
+                _, _, after = tail.partition(prefix_end)
+                original_prompt = before.rstrip() + after
+            req.system_prompt = original_prompt + ("\n\n" + prefix_start + "\n" + pool["prefix"] + "\n" + prefix_end if pool["prefix"] else "")
+            await trace.emit("input", "已提供活跃群友资料", prefix_members=len(pool["account_ids"]),
+                             prefix_chars=pool["characters"], refresh_day=pool["day"], account_ids=pool["account_ids"],
+                             notice=pool["notice"])
+            # An out-of-pool speaker or quoted author still reaches the main model.
+            req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
+                if not str(getattr(part, "text", "")).startswith("<mr_current_members>")]
+            req.extra_user_content_parts.append(TextPart(text="<mr_current_members>\n" +
+                json.dumps(current["participants"], ensure_ascii=False, separators=(",", ":")) + "\n</mr_current_members>").mark_as_temp())
             # Continuing understanding is read from the shared graph by the agent.
-            changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0))
-            recent_learning = await asyncio.to_thread(store.memory_directory, working.get("recent_learning_refs", []))
+            advanced = self.config["advanced_memory_enabled"]
+            changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0)) if advanced else {"cursor": 0}
+            recent_learning = await asyncio.to_thread(store.memory_directory, working.get("recent_learning_refs", [])) if advanced else []
             working = {key: working[key] for key in ("question", "request_at") if key in working}
             working["memory_changes"] = changes
             working["recent_learning"] = [item for item in recent_learning if item]
@@ -389,6 +409,7 @@ class MrMemoryPlugin(Star):
                              messages=recent, working=working, message_count=len(recent), operation_id="prepare")
             prepared = True
             agent = self.agent(store)
+            agent.member_prefix = pool["prefix"]
             agent.request_context = main_context
             agent.trace = trace
             agent.timeout_seconds = max(0.01, float(self.config["local_serving_timeout_seconds"]) - (time.perf_counter() - started))
@@ -494,6 +515,8 @@ class MrMemoryPlugin(Star):
         return await self.spawn(self.learn(store, force=force))
 
     async def learn(self, store: Store, *, force: bool = False, feedback: bool = False) -> dict:
+        if not self.config["advanced_memory_enabled"]:
+            return {"status": "disabled", "reason": "基础模式不进行自动整理、反馈学习或连接写入"}
         kind = "feedback" if feedback else "background"
         if self.stopping or not self.config["subconscious_enabled"]:
             return {"status": "disabled", "reason": "后台潜意识已关闭"}
@@ -785,14 +808,49 @@ class MrMemoryPlugin(Star):
                     continue
                 try:
                     await self.index_pending(store)
-                    if self.config["feedback_learning_enabled"]:
+                    if self.config["advanced_memory_enabled"] and self.config["feedback_learning_enabled"]:
                         await self.learn(store, feedback=True)
-                    if self.config["auto_distillation_enabled"]:
+                    if self.config["advanced_memory_enabled"] and self.config["auto_distillation_enabled"]:
                         await self.consolidate(store)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("MR: background update incomplete; remaining work stays pending")
+
+    @filter.command_group("mr")
+    def mr(self):
+        """本群记忆与本人资料。"""
+
+    @mr.command("uid")
+    async def member_profile(self, event: AstrMessageEvent):
+        """查看或修改自己的称呼、别名、不用的称呼和说明。"""
+        if not self.allowed(event):
+            return
+        store = await self.store_for(event)
+        await asyncio.to_thread(store.append_message, self.message(event))
+        await self.refresh_roster(store, event)
+        # The account always comes from the adapter, never from command text.
+        account = str(event.message_obj.sender.user_id)
+        args = event.get_message_str().partition("uid")[2].strip()
+        fields = {"称呼": "preferred_name", "别名": "aliases", "不用": "avoided_names", "说明": "description"}
+        try:
+            if args:
+                field, _, value = args.partition(" ")
+                if field not in fields:
+                    raise ValueError("用法：/mr uid；修改本人：/mr uid 称呼 小明；/mr uid 别名 明明,阿明；/mr uid 不用 旧称呼；/mr uid 说明 本人说明。字段后填 - 可清空。不能指定他人的 UID。")
+                value = "" if value.strip() == "-" else value.strip()
+                changes = {fields[field]: [x.strip() for x in value.replace("，", ",").split(",") if x.strip()]
+                           if field in {"别名", "不用"} else value}
+                person = await asyncio.to_thread(store.edit_member, account, changes, actor="self:" + account)
+            else:
+                person = (await asyncio.to_thread(store.members, account_ids=[account]))[0]
+            text = (f"你的 UID：{account}\n群名片：{person['card'] or '未提供'}\n平台昵称：{person['nickname'] or '未提供'}"
+                    f"\n希望称呼：{person['preferred_name'] or '未设置'}\n别名：{', '.join(person['confirmed_aliases']) or '未设置'}"
+                    f"\n不用的称呼：{', '.join(person['avoided_names']) or '未设置'}\n说明：{person['description'] or '未设置'}"
+                    "\n修改：/mr uid 称呼 小明（还可用：别名 / 不用 / 说明；填 - 清空）。只修改你在本群的资料。")
+        except (ValueError, IndexError) as exc:
+            text = str(exc) or "尚无本人资料"
+        yield event.plain_result(text)
 
     @filter.command("mrmem")
     async def memory_status(self, event: AstrMessageEvent):

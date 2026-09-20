@@ -179,6 +179,8 @@ class Store:
         from .cognition import Cognition
         self.cognition = Cognition(self)
         self.cognition.migrate_notes()
+        from .profiles import MemberProfiles
+        self.profiles = MemberProfiles(self)
 
     @_serialized
     def close(self) -> None:
@@ -252,6 +254,8 @@ class Store:
                 # Preserve the old text before replacing a changed platform message.
                 changed = (old["plain_text"], json.loads(old["content_json"]), old["role"]) != (text, content, role)
                 if changed:
+                    self.db.execute("DELETE FROM memory_embeddings WHERE umo=? AND owner_type='message' AND owner_key=?", (self.umo, str(row_id)))
+                    self.db.execute("DELETE FROM mr_index_pending WHERE umo=? AND owner_type='message' AND owner_key=?", (self.umo, str(row_id)))
                     self._revision(dict(old), "PREVIOUS")
                     revision += 1
                     self.db.execute("""UPDATE messages SET plain_text=?,content_json=?,role=?,content_sha256=?,
@@ -296,6 +300,9 @@ class Store:
                 ON CONFLICT(message_id) DO UPDATE SET status=CASE
                 WHEN message_processing.content_sha256<>excluded.content_sha256 THEN 'PENDING'
                 ELSE message_processing.status END,content_sha256=excluded.content_sha256""", (row_id, current["content_sha256"]))
+        if role == "USER":
+            self.profiles.observe(account, nickname=message.get("platform_nickname"),
+                                  card=message.get("group_card"), at=at)
         return self._message(current)
 
     def _forgotten(self, platform_id: str, account_id: str) -> bool:
@@ -399,6 +406,9 @@ class Store:
             self.db.execute("DELETE FROM mr_working_state WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_learning_tasks WHERE umo=?", (self.umo,))
             self.db.execute("DELETE FROM mr_roster_cache WHERE umo=?", (self.umo,))
+            self.db.execute("DELETE FROM mr_member_profiles WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
+            self.db.execute("DELETE FROM mr_member_names WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
+            self.db.execute("DELETE FROM mr_member_pool WHERE umo=?", (self.umo,))
         return {"forgotten": True, "messages_removed": len(ids)}
 
     def _revision(self, row: dict, kind: str) -> None:
@@ -479,46 +489,15 @@ class Store:
 
     @_serialized
     def members(self, account_ids: Iterable[str] | None = None, name: str | None = None) -> list[dict]:
-        clauses, args = ["p.umo=?"], [self.umo]
-        if account_ids is not None:
-            ids = _terms(account_ids)
-            if not ids:
-                return []
-            clauses.append(f"p.account_id IN ({','.join('?' for _ in ids)})")
-            args.extend(ids)
-        if name:
-            clauses.append("(instr(lower(p.current_display_name),lower(?))>0 OR EXISTS (SELECT 1 FROM participant_aliases a WHERE a.participant_id=p.id AND instr(lower(a.alias),lower(?))>0))")
-            args.extend((str(name), str(name)))
-        people = self._rows(f"SELECT p.* FROM participants p WHERE {' AND '.join(clauses)} ORDER BY p.last_seen_at DESC,p.id", args)
-        people = [p for p in people if not self._forgotten(p["platform_id"], p["account_id"])]
-        result = [dict(id=p["id"], account_id=p["account_id"], canonical_key=p["canonical_key"], name=p["current_display_name"],
-                     aliases=[r["alias"] for r in self._rows("SELECT alias FROM participant_aliases WHERE participant_id=? ORDER BY last_seen_at DESC", (p["id"],))],
-                     account_type=p["account_type"], last_seen_at=p["last_seen_at"], membership="observed_in_history") for p in people]
-        cached = self.roster()
-        by_account = {p["account_id"]: p for p in result}
-        if cached:
-            wanted = set(ids) if account_ids is not None else None
-            for member in cached["members"]:
-                if not isinstance(member, dict):
-                    continue
-                account = str(member.get("user_id") or member.get("account_id") or "")
-                names = [str(member.get(k) or "") for k in ("card", "nickname", "name")]
-                if not account or (wanted is not None and account not in wanted):
-                    continue
-                if self._forgotten(self.umo.split(":")[0], account):
-                    continue
-                person = by_account.get(account)
-                if name and person is None and not any(str(name).casefold() in n.casefold() for n in names):
-                    continue
-                if person is None:
-                    observed = self.db.execute("SELECT id,canonical_key FROM participants WHERE umo=? AND account_id=?", (self.umo, account)).fetchone()
-                    person = dict(id=observed[0] if observed else None, account_id=account,
-                                  canonical_key=observed[1] if observed else None, aliases=[], account_type="USER")
-                    result.append(person)
-                person.update(name=next((n for n in names if n), person.get("name", account)),
-                              role=member.get("role"), membership="platform_roster",
-                              roster_fetched_at=cached["fetched_at"])
-        return result
+        return self.profiles.members(account_ids, name)
+
+    @_serialized
+    def edit_member(self, account_id: str, changes: dict, *, actor: str) -> dict:
+        return self.profiles.edit(account_id, changes, actor=actor)
+
+    @_serialized
+    def member_pool(self, capacity: int = 50, *, now=None) -> dict:
+        return self.profiles.pool(capacity, now=now)
 
     @_serialized
     def search_messages(self, terms: Iterable[str] = (), participant_id: int | None = None,
@@ -1107,6 +1086,7 @@ class Store:
                 self.umo.split(":")[0], str(m.get("user_id") or m.get("account_id") or ""))]
         with self.db:
             self.db.execute("INSERT INTO mr_roster_cache VALUES(?,?,?) ON CONFLICT(umo) DO UPDATE SET payload_json=excluded.payload_json,fetched_at=excluded.fetched_at", (self.umo, _encode(payload), int(fetched_at)))
+        self.profiles.observe_roster(members, fetched_at)
 
     @_serialized
     def roster(self) -> dict | None:
@@ -1163,6 +1143,19 @@ class Store:
                 ORDER BY m.updated_at DESC,m.kind,m.id LIMIT ?""", (self.umo, model_id, _limit(limit)))
             for row in rows:
                 self._queue_embedding(row["kind"], row["id"])
+            # Raw speech remains semantically searchable when LLM learning is off.
+            # Index the original text; no inferred profile or summary is created.
+            originals = self._rows("""SELECT m.id,m.sender_name,m.sender_id,m.plain_text,m.revision_no FROM messages m
+                WHERE m.umo=? AND m.is_deleted=0 AND m.role IN('USER','BOT') AND m.plain_text<>''
+                AND NOT EXISTS(SELECT 1 FROM memory_embeddings v WHERE v.umo=m.umo AND v.owner_type='message'
+                    AND v.owner_key=CAST(m.id AS TEXT) AND v.model=?)
+                AND NOT EXISTS(SELECT 1 FROM mr_index_pending q WHERE q.umo=m.umo AND q.owner_type='message'
+                    AND q.owner_key=CAST(m.id AS TEXT)) ORDER BY m.sent_at DESC,m.id DESC LIMIT ?""",
+                (self.umo, model_id, _limit(limit)))
+            for row in originals:
+                text = f"{row['sender_name']} (UID {row['sender_id']})：" + searchable_text(row["plain_text"])
+                self.db.execute("INSERT OR IGNORE INTO mr_index_pending VALUES(?,'message',?,?,?)",
+                                (self.umo, str(row["id"]), text, int(time.time())))
         return self._rows("SELECT owner_type,owner_key,text,updated_at FROM mr_index_pending WHERE umo=? ORDER BY updated_at DESC,owner_type,owner_key LIMIT ?", (self.umo, _limit(limit)))
 
     @_serialized
@@ -1183,6 +1176,8 @@ class Store:
             FROM memory_embeddings v LEFT JOIN mr_memory_objects m
             ON m.umo=v.umo AND m.kind=v.owner_type AND CAST(m.id AS TEXT)=v.owner_key
             WHERE v.umo=? AND v.model=? AND (m.status='ACTIVE' OR v.owner_type='cue' OR
+                (v.owner_type='message' AND EXISTS(SELECT 1 FROM messages raw WHERE raw.umo=v.umo
+                    AND CAST(raw.id AS TEXT)=v.owner_key AND raw.is_deleted=0)) OR
                 (v.owner_type='participant' AND EXISTS(SELECT 1 FROM participants p WHERE p.umo=v.umo
                     AND CAST(p.id AS TEXT)=v.owner_key AND p.current_display_name!='')))""", (self.umo, model_id))
         for row in rows:

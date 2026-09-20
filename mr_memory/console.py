@@ -32,6 +32,7 @@ class Console:
             ("scopes/<scope_id>/graph", self.graph, "GET"),
             ("scopes/<scope_id>/participants", self.participants, "GET"),
             ("scopes/<scope_id>/participants/bind_alias", self.bind_alias, "POST"),
+            ("scopes/<scope_id>/participants/profile", self.edit_profile, "POST"),
             ("scopes/<scope_id>/messages", self.messages, "GET"),
             ("scopes/<scope_id>/context/<message_id>", self.message_context, "GET"),
             ("scopes/<scope_id>/distill", self.distill, "POST"),
@@ -97,8 +98,10 @@ class Console:
             "background_provider": config["subconscious_provider_id"],
             "capture": config["capture_enabled"],
             "recall": config["local_serving_enabled"],
-            "learning": config["subconscious_enabled"] and config["auto_distillation_enabled"],
-            "feedback": config["subconscious_enabled"] and config["feedback_learning_enabled"],
+            "advanced": config["advanced_memory_enabled"],
+            "member_prefix_capacity": config["member_prefix_capacity"],
+            "learning": config["advanced_memory_enabled"] and config["subconscious_enabled"] and config["auto_distillation_enabled"],
+            "feedback": config["advanced_memory_enabled"] and config["subconscious_enabled"] and config["feedback_learning_enabled"],
             "embedding_enabled": config["embedding_enabled"],
             "embedding_loaded": getattr(self.plugin.embedder, "_model", None) is not None,
             "memory_timeout_seconds": config["local_serving_timeout_seconds"],
@@ -222,22 +225,26 @@ class Console:
             by_id = await asyncio.to_thread(store.members, account_ids=[query])
             existing = {p["account_id"] for p in people}
             people.extend(p for p in by_id if p["account_id"] not in existing)
-        return {"participants": people}
+        pool = await asyncio.to_thread(store.member_pool, self.plugin.config["member_prefix_capacity"])
+        return {"participants": people, "pool": pool}
+
+    async def edit_profile(self, scope_id):
+        store = await self.get_store(scope_id)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("changes"), dict):
+            raise ValueError("请提供账户 UID 和资料字段")
+        person = await asyncio.to_thread(store.edit_member, str(body.get("account_id", "")), body["changes"], actor="admin")
+        return {"participant": person, "message": "已保存该群员资料，后续检索与前缀立即使用新资料"}
 
     @staticmethod
     def save_alias(store, account, alias):
         if not account or not alias:
             raise ValueError("请填写账户 ID 和别名")
-        with store._lock, store.db:
-            person = store.db.execute("SELECT id FROM participants WHERE umo=? AND account_id=?", (store.umo, account)).fetchone()
-            if person is None:
-                raise ValueError("该账户还没有历史消息记录，请先从下方列表选择已记录的账户")
-            now = int(time.time())
-            store.db.execute("""INSERT INTO participant_aliases
-                (participant_id,alias,normalized_alias,first_seen_at,last_seen_at,source_kind)
-                VALUES(?,?,?,?,?,'admin_confirmed') ON CONFLICT(participant_id,normalized_alias)
-                DO UPDATE SET alias=excluded.alias,is_active=1,source_kind='admin_confirmed',updated_at=CURRENT_TIMESTAMP""",
-                (person[0], alias, alias.casefold().strip(), now, now))
+        with store._lock:
+            people = store.members([account])
+            if not people:
+                raise ValueError("找不到该群员")
+            store.edit_member(account, {"aliases": [*people[0]["confirmed_aliases"], alias]}, actor="admin")
         return {"message": "别名已保存到这个账户，后续成员检索可以读到"}
 
     async def bind_alias(self, scope_id):

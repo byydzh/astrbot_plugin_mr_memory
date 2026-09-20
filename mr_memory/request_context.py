@@ -25,7 +25,7 @@ class RequestContext:
     def __init__(self, request):
         tools = getattr(getattr(request, "func_tool", None), "tools", []) or []
         additional = [part for part in (getattr(request, "extra_user_content_parts", []) or [])
-                      if not str(getattr(part, "text", "")).startswith(("<mr_group_context>", "<mr_request_context>"))]
+                      if not str(getattr(part, "text", "")).startswith(("<mr_group_context>", "<mr_request_context>", "<mr_current_members>"))]
         self.sections = copy.deepcopy(_plain({
             "request": [getattr(request, "prompt", "") or ""],
             "conversation": getattr(request, "contexts", []) or [],

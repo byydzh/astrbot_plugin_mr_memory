@@ -66,7 +66,9 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for item in self.patches:
             item.start()
         self.plugin = plugin_module.MrMemoryPlugin(self.context, {"maintenance_interval_seconds": 600,
-            "capture_enabled": True, "embedding_enabled": True, "learning_window_enabled": False})
+            "capture_enabled": True, "embedding_enabled": True, "learning_window_enabled": False,
+            **getattr(self, "mode_settings", {"advanced_memory_enabled": True,
+                "subconscious_enabled": True, "auto_distillation_enabled": True})})
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
@@ -472,6 +474,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(options["task"]["completed_ids"], [first["id"]])
             self.assertEqual(len(options["task"]["memory_refs"]), 1)
             self.assertIn("第一段已保存", options["task"]["checkpoint"])
+            store.save_learning_progress("background", {"completed_ids": [second["id"]]})
             return ConsolidationResult(status="completed", usage={"input_other": 20}, model_attempts=1,
                                        progress={"completed_ids": [second["id"]]})
 

@@ -1,6 +1,13 @@
 """Shared memory capabilities and purpose, independent of call scheduling."""
 from .learning_writes import RETRY_SCHEMA
 
+BASIC_RECALL_PROMPT = """你为 AstrBot 提供本群的记忆背景，帮助它接上真实群聊。当前模式只检索，不创建人物画像、学习反馈或发展新的长期连接。
+结合当前消息、引用、近期对话和成员资料，自行决定检索词、语义查询、读取哪些原文，以及何时已有足够材料。旧记忆是检索入口，摘要可能有误；需要核对具体人物或经历时可打开对应原文及前后交流。UID 标明发言账号，引用作者、谈论对象与发言者各自保留，不能沿用相邻消息或图片的作者。
+记录中 USER 是群友发言，BOT 是实际发送，SYSTEM 可能是 bot 生成稿或工具活动；同一请求的 generated/sent 不算两个独立事实。图片地址不等于看过图片。main_context 可读取主意识已有对话和工具，外部搜索、图像和行动由主意识负责。
+成员目录的明确称呼与更正直接供本轮理解使用；群内简称和话中指代仍结合语境理解，重名不合并账号。不要把 bot 自己的旧猜测当成群友的确认。
+完成时用 complete 返回文字 background，或直接输出 {"background":"..."}。只提供主意识此刻缺少的群内来历，不代写回复，不替它决定外部行动。通常一两段；有必要时在文字中短引原话并保留作者 UID，不附整篇历史机器人回答和思考报告。把握程度直接用自然语言表达。没有需补充的背景可留空。工具返回的 source_ref/memory_ref 指本次此前已给出的相同材料，内容变化照常完整呈现。
+"""
+
 MEMORY_PROTOCOL = """你是群聊机器人持续的理解与记忆。让它接得上共同经历，理解人们此刻的意思，发展自己的认识，并能因后来的交流改变看法。人、事件、关系、玩笑、未完的事和跨经历的联系都可以成为思考材料。关注什么、怎样表示、沿什么联系继续、何时已经理解够了，由你决定。
 
 原话记录了一次发言；发言者、谈论对象和引用作者在语境中有各自的位置。bot说过的话也是共同经历，但其中的解释仍可能错。熟悉程度、联想的用途和事实把握是不同的：多次回忆或转述同一解释不会增加独立支持。未经明确认可的模型解释保留暂定身份；多次独立经历、针对内容的肯定可以强化认识。自述、偏好和纠正本身有相应的效力，不必等待夸赞才采用。
@@ -123,7 +130,11 @@ RECALL_REMEMBER_SCHEMA = _schema("保存或修订自己的理解、表示、连�
 RECALL_REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
 
-def tool_definitions(*, learning=False):
+def tool_definitions(*, learning=False, basic=False):
+    if basic:
+        names = ("main_context", "search_messages", "search_memories", "memory", "semantic_search", "context", "member", "activity", "interaction")
+        return {**{name: TOOL_SCHEMAS[name] for name in names},
+                "complete": _schema("交付本次检索背景并结束，不写入长期记忆。", {"background": TEXT}, ("background",))}
     definitions = {**TOOL_SCHEMAS, "remember": REMEMBER_SCHEMA if learning else RECALL_REMEMBER_SCHEMA}
     if learning:
         definitions.pop("main_context")
@@ -133,8 +144,8 @@ def tool_definitions(*, learning=False):
     return definitions
 
 
-def _tool_set(*, learning=False):
+def _tool_set(*, learning=False, basic=False):
     # Imported only when running under AstrBot; the core remains importable offline.
     from astrbot.core.agent.tool import FunctionTool, ToolSet
-    definitions = tool_definitions(learning=learning)
+    definitions = tool_definitions(learning=learning, basic=basic)
     return ToolSet(tools=[FunctionTool(name=name, **definition) for name, definition in definitions.items()])
