@@ -182,6 +182,7 @@ class MrMemoryPlugin(Star):
                     self.state_locks[umo] = asyncio.Lock()
                 self.active_scopes.add(umo)
         self.spawn(self.maintain())
+        self.spawn(self.maintain(indexing=True))
         logger.info("MR: active memory reconstruction ready")
 
     def allowed(self, event: AstrMessageEvent) -> bool:
@@ -772,7 +773,9 @@ class MrMemoryPlugin(Star):
                     payload["status"] = "partial" if result.status == "completed" else result.status
                     payload["detail"] = result.detail or "本批尚有材料未完成，已保存进度等待续接"
                 payload["written_count"] = len(written)
-                await self.index_pending(store, trace=trace)
+                if written and self.config["embedding_enabled"]:
+                    await trace.emit("index", "新记忆已加入本地语义索引队列", status="queued",
+                        memories=[{"kind": row["kind"], "id": row["id"]} for row in written])
                 return report("completed" if completed else payload["status"], (result.detail or "本批材料已完成") if completed else payload["detail"],
                               written_count=len(written), message_count=len(messages), remaining_message_count=len(unfinished),
                               pending_draft_count=len(result.continuation.get("write_state", {}).get("pending_items", {})))
@@ -786,29 +789,17 @@ class MrMemoryPlugin(Star):
                 payload["elapsed_ms"] = (time.time() - started_at) * 1000
                 await trace.finish(payload)
 
-    async def index_pending(self, store: Store, *, trace=None) -> None:
+    async def index_pending(self, store: Store) -> None:
         if not self.config["embedding_enabled"]:
             return
         docs = await asyncio.to_thread(store.pending_embeddings, self.embedder.model_id, 16)
         if not docs:
             return
-        if trace:
-            await trace.emit("index", "更新本地语义索引", status="running", count=len(docs), model=self.embedder.model_id,
-                             operation_id="index")
-        try:
-            vectors = await self.embedder.texts([d["text"] for d in docs])
-            for doc, vector in zip(docs, vectors, strict=True):
-                await asyncio.to_thread(store.save_embedding, doc, self.embedder.model_id, vector)
-        except BaseException as exc:
-            if trace:
-                await trace.emit("index", "索引更新未完成", status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
-                                 detail=str(exc), count=len(docs), operation_id="index")
-            raise
-        if trace:
-            await trace.emit("index", "已更新本地语义索引", count=len(docs),
-                             memories=[{"kind": d["owner_type"], "id": d["owner_key"]} for d in docs], operation_id="index")
+        vectors = await self.embedder.texts([d["text"] for d in docs])
+        for doc, vector in zip(docs, vectors, strict=True):
+            await asyncio.to_thread(store.save_embedding, doc, self.embedder.model_id, vector)
 
-    async def maintain(self) -> None:
+    async def maintain(self, *, indexing: bool = False) -> None:
         while not self.stopping:
             await asyncio.sleep(float(self.config.get("background_interval_seconds", 60)))
             for store in list(self.stores.values()):
@@ -820,11 +811,13 @@ class MrMemoryPlugin(Star):
                 if allowed and store.umo not in allowed:
                     continue
                 try:
-                    await self.index_pending(store)
-                    if self.config["advanced_memory_enabled"] and self.config["feedback_learning_enabled"]:
-                        await self.learn(store, feedback=True)
-                    if self.config["auto_distillation_enabled"]:
-                        await self.consolidate(store)
+                    if indexing:
+                        await self.index_pending(store)
+                    else:
+                        if self.config["advanced_memory_enabled"] and self.config["feedback_learning_enabled"]:
+                            await self.learn(store, feedback=True)
+                        if self.config["auto_distillation_enabled"]:
+                            await self.consolidate(store)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

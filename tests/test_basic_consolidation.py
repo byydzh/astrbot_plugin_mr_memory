@@ -1,5 +1,6 @@
 """Basic ingestion must build a searchable graph with advanced work paused."""
 import copy
+import asyncio
 import json
 import time
 import unittest
@@ -13,6 +14,31 @@ class BasicConsolidationTests(unittest.IsolatedAsyncioTestCase):
     mode_settings = {}
     asyncSetUp = fixtures.MainIntegrationTests.asyncSetUp
     asyncTearDown = fixtures.MainIntegrationTests.asyncTearDown
+
+    async def test_slow_index_does_not_block_consolidation_schedule(self):
+        store = await self.plugin.store_for(fixtures.event())
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def index(_store):
+            started.set()
+            await release.wait()
+
+        async def consolidate(_store):
+            self.plugin.stopping = True
+
+        with patch.object(fixtures.plugin_module.asyncio, "sleep", new_callable=AsyncMock), \
+                patch.object(self.plugin, "index_pending", side_effect=index), \
+                patch.object(self.plugin, "consolidate", side_effect=consolidate) as learn:
+            indexing = self.plugin.spawn(self.plugin.maintain(indexing=True))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                await asyncio.wait_for(self.plugin.maintain(), 1)
+                learn.assert_awaited_once_with(store)
+                self.assertFalse(indexing.done())
+            finally:
+                release.set()
+                await indexing
+                self.plugin.stopping = False
 
     async def test_basic_graph_write_and_retrieval_without_resuming_reflection(self):
         store = await self.plugin.store_for(fixtures.event())
