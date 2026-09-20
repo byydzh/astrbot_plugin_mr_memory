@@ -398,12 +398,14 @@ def checkpoint_learning_task(task: dict) -> dict:
     }}
 
 
-def _checkpoint_conversation(messages: list, working: dict, task: dict | None) -> list:
+def _checkpoint_conversation(messages: list, working: dict, task: dict | None, *, basic: bool = False) -> list:
     conversation = [{"role": "user", "content": _learning_json(_learning_material(messages, working, task))}]
     tail = _learning_continuation(task).get("checkpoint_tail", [])
     if tail:
         conversation.extend(copy.deepcopy(tail))
-        conversation.append({"role": "user", "content": "以上工具记录已实际执行；从当前checkpoint、实际写入回执与尚未完成的关注继续。材料已处理不等于反思必须立即结束，也不需要重做已经保存的部分。此处从checkpoint续接，部分source_ref引用的正文位于已省去的旧输入；地址仍有效，需要核对时用context(message_id)重新打开原文。"})
+        purpose = ("从当前checkpoint、实际写入回执与未完成材料继续整理；材料处理完即可结束。" if basic else
+                   "从当前checkpoint、实际写入回执与尚未完成的关注继续；材料已处理不等于反思必须立即结束。")
+        conversation.append({"role": "user", "content": "以上工具记录已实际执行；" + purpose + "不需要重做已经保存的部分。此处从checkpoint续接，部分source_ref引用的正文位于已省去的旧输入；地址仍有效，需要核对时用context(message_id)重新打开原文。"})
     return conversation
 
 
@@ -456,7 +458,7 @@ def estimate_learning_input(messages: list, working: dict, *, feedback: bool = F
         update = _learning_resume_update(messages, working, task, previous)
         conversation.append({"role": "user", "content": _learning_json(update, seen_messages=seen)})
     else:
-        conversation = _checkpoint_conversation(messages, working, task)
+        conversation = _checkpoint_conversation(messages, working, task, basic=basic)
         seen = {}
     if workspace is not None and workspace != previous.get("workspace"):
         conversation.append({"role": "user", "content": _json({"workspace": workspace}, seen_messages=seen)})
@@ -898,7 +900,7 @@ class MemoryAgent:
                 if writer.pending_items:
                     material["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
                 if not conversation:
-                    conversation = _checkpoint_conversation(messages, working, task)
+                    conversation = _checkpoint_conversation(messages, working, task, basic=not self.advanced)
                     conversation[0]["content"] = _learning_json(material, seen_messages=seen_messages)
                 else:
                     # Previous messages remain byte-for-byte intact for prefix reuse.
