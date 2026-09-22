@@ -1,6 +1,8 @@
 {
   "capture_enabled": {"description": "记录群聊经历", "type": "bool", "default": false, "hint": "记录收到的群消息、机器人实际回复和工具活动，供本群后续理解使用。"},
   "allowed_umos": {"description": "启用的群会话（空为全部群）", "type": "list", "items": {"type": "string"}, "default": []},
+  "history_recovery_enabled": {"description": "断线后自动补回群聊历史", "type": "bool", "default": true, "hint": "OneBot 重连、插件启动时补查遗漏，每五分钟继续核对。按群和消息 ID 去重入库，不触发旧命令或回复；不额外调用 LLM。可补范围取决于 NapCat 返回的 QQ 历史。"},
+  "history_recovery_initial_hours": {"description": "首次补查历史时长（小时）", "type": "float", "default": 24, "hint": "首次启用和前端手动补查使用此范围；后续自动回补从独立保存的核对进度继续，不受此时长限制。"},
   "local_serving_enabled": {"description": "回答前提供群聊语义背景", "type": "bool", "default": true, "hint": "由记忆模型主动检索并理解群聊经历，向 AstrBot 主模型提供背景；与后台整理开关独立。"},
   "local_serving_timeout_seconds": {"description": "回答前记忆工作的异常超时（秒）", "type": "float", "default": 180, "hint": "用于结束异常卡住的调用，不是目标延迟，也不要求每次用满。模型读够材料即可结束。"},
   "local_serving_max_chars": {"description": "提供给主模型的语义背景字符上限", "type": "int", "default": 12000, "hint": "限制本次背景的长度；不限制记忆模型查询原文的次数。"},

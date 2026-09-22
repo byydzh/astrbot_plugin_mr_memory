@@ -244,11 +244,36 @@ async function loadTab() {
     ].map(([label, value, caption]) => { const card = el("article", null, "metric"); card.append(el("span", label), el("strong", value), el("small", caption)); return card; }));
     renderRuns(rows);
     renderLearning(overview);
+    renderHistory(overview.history || {});
     renderWorkspace(overview);
   } else if (state.tab === "memory") { await searchMemory(); }
   else if (state.tab === "people") { await searchPeople(); }
   else { await searchMessages(); }
 }
+
+function renderHistory(history) {
+  const active = history.status === "running";
+  $("recover-history").disabled = !state.scope || !state.overview?.runtime.history_recovery || active;
+  const progress = history.pending || history.last_result || {};
+  const status = !state.overview?.runtime.history_recovery ? "已关闭" : statuses[history.status] || "等待核对";
+  $("history-status").textContent = `${status} · 累计补入 ${number(history.total_inserted || 0)} 条遗漏消息${active ? `；本次已读取 ${progress.pages || 0} 页` : ""}`;
+  const details = [`最近核对：${date(history.checked_at || history.updated_at)}`, "重连时补查，每五分钟核对；只补入记忆库，不重新回复。"];
+  if (history.error) details.push(`本次未完成：${history.error}，后续从已保存进度重试。`);
+  if (history.unavailable) details.push(`${date(history.unavailable.since)} 至 ${date(history.unavailable.until)}：平台没有返回更早记录，无法确认补齐。`);
+  $("history-detail").textContent = details.join(" ");
+}
+
+$("recover-history").addEventListener("click", () => attempt(async () => {
+  $("recover-history").disabled = true;
+  try {
+    const result = await api(path("history/recover"), {}, true);
+    notice(result.message);
+    await loadTab();
+  } catch (error) {
+    $("recover-history").disabled = !state.scope || !state.overview?.runtime.history_recovery;
+    throw error;
+  }
+}));
 
 async function showRun(id) {
   const ticket = openDetail("运行轨迹");

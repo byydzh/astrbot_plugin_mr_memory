@@ -28,6 +28,7 @@ from .mr_memory.console import register_console
 from .mr_memory.trace import RunTrace
 from .mr_memory.request_context import RequestContext
 from .mr_memory.profiles import parse_profile_changes
+from .mr_memory.history import HistoryRecovery
 
 
 def json_value(value: Any) -> Any:
@@ -141,6 +142,7 @@ class MrMemoryPlugin(Star):
         self.last_result: dict[str, dict] = {}
         self.learning_status: dict[str, dict] = {}
         self.stopping = False
+        self.history = HistoryRecovery(self)
         self.embedder = Embedder(
             str(config.get("embedding_model_name", "microsoft/harrier-oss-v1-270m")),
             self.data_dir / "models" / "sentence_transformers",
@@ -184,6 +186,7 @@ class MrMemoryPlugin(Star):
                 self.active_scopes.add(umo)
         self.spawn(self.maintain())
         self.spawn(self.maintain(indexing=True))
+        self.history.start()
         logger.info("MR: active memory reconstruction ready")
 
     def allowed(self, event: AstrMessageEvent) -> bool:
@@ -300,6 +303,8 @@ class MrMemoryPlugin(Star):
                 await asyncio.to_thread(store.delete_message, str(raw["message_id"]))
             else:
                 await asyncio.to_thread(store.append_message, self.message(event))
+                if event.get_platform_id() not in self.history.clients:
+                    self.history.request(store)
         except Exception:
             logger.exception("MR: could not record group message")
 
@@ -874,6 +879,7 @@ class MrMemoryPlugin(Star):
 
     async def terminate(self) -> None:
         self.stopping = True
+        self.history.close()
         self.console.close()
         for event in self.observed_events:
             if getattr(event, "_mr_memory_send_observed", None) is self:

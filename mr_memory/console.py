@@ -37,6 +37,7 @@ class Console:
             ("scopes/<scope_id>/context/<message_id>", self.message_context, "GET"),
             ("scopes/<scope_id>/distill", self.distill, "POST"),
             ("scopes/<scope_id>/conversation/reset", self.reset_conversation, "POST"),
+            ("scopes/<scope_id>/history/recover", self.recover_history, "POST"),
         )
         for path, handler, method in routes:
             wrapped = partial(self.dispatch, handler)
@@ -97,6 +98,7 @@ class Console:
             "provider": config["local_serving_reader_provider_id"] or config["subconscious_provider_id"],
             "background_provider": config["subconscious_provider_id"],
             "capture": config["capture_enabled"],
+            "history_recovery": config["capture_enabled"] and config["history_recovery_enabled"],
             "recall": config["local_serving_enabled"],
             "advanced": config["advanced_memory_enabled"],
             "member_prefix_capacity": config["member_prefix_capacity"],
@@ -170,7 +172,8 @@ class Console:
         store = await self.get_store(scope_id)
         counts = await asyncio.to_thread(self.inventory, store)
         state = await asyncio.to_thread(store.load_working_state)
-        return {"counts": counts, "state": state, "workspace": await asyncio.to_thread(store.workspace), **await self.learning_overview(store),
+        return {"counts": counts, "state": state, "history": await asyncio.to_thread(store.history_state),
+                "workspace": await asyncio.to_thread(store.workspace), **await self.learning_overview(store),
                 "background_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "background"),
                 "feedback_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "feedback")}
 
@@ -178,6 +181,15 @@ class Console:
         store = await self.get_store(scope_id)
         return {"runs": await asyncio.to_thread(store.recent_runs, limit=30), "workspace": await asyncio.to_thread(store.workspace),
                 **await self.learning_overview(store)}
+
+    async def recover_history(self, scope_id):
+        store = await self.get_store(scope_id)
+        hours = float(self.plugin.config["history_recovery_initial_hours"])
+        if hours <= 0:
+            raise ValueError("补查历史时长必须大于零")
+        if not self.plugin.history.request(store, since=time.time() - hours * 3600):
+            raise ValueError("请启用消息记录和历史回补，并使用已配置的 OneBot 群会话")
+        return {"queued": True, "message": f"已安排补查近 {hours:g} 小时历史；结果会显示在历史回补进度中"}
 
     async def run(self, scope_id, run_id):
         store = await self.get_store(scope_id)

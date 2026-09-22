@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS mr_learning_paused (umo TEXT NOT NULL,kind TEXT NOT N
 CREATE TABLE IF NOT EXISTS mr_feedback_processed (umo TEXT NOT NULL,message_id INTEGER NOT NULL REFERENCES messages(id),
  completed_at INTEGER NOT NULL,PRIMARY KEY(umo,message_id));
 CREATE TABLE IF NOT EXISTS mr_roster_cache (umo TEXT PRIMARY KEY,payload_json TEXT NOT NULL,fetched_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_history_sync (umo TEXT PRIMARY KEY,state_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mr_index_pending (umo TEXT NOT NULL,owner_type TEXT NOT NULL,owner_key TEXT NOT NULL,
  text TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(umo,owner_type,owner_key));
 CREATE TABLE IF NOT EXISTS mr_memory_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,umo TEXT NOT NULL,
@@ -311,6 +312,33 @@ class Store:
         digest = hashlib.sha256("\x1f".join((self.umo, platform_id, str(account_id))).encode()).hexdigest()
         return self.db.execute("SELECT 1 FROM forgotten_accounts WHERE umo=? AND platform_id=? AND account_hash=?",
                                (self.umo, platform_id, digest)).fetchone() is not None
+
+    @_serialized
+    def history_state(self) -> dict:
+        row = self.db.execute("SELECT state_json FROM mr_history_sync WHERE umo=?", (self.umo,)).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    @_serialized
+    def save_history_state(self, state: dict) -> None:
+        with self.db:
+            self.db.execute("INSERT INTO mr_history_sync VALUES(?,?) ON CONFLICT(umo) DO UPDATE SET state_json=excluded.state_json",
+                            (self.umo, _encode(state)))
+
+    @_serialized
+    def append_history(self, messages: list[dict]) -> dict:
+        counts = {"inserted": 0, "existing": 0, "ignored": 0}
+        for message in messages:
+            if message["umo"] != self.umo:
+                raise ValueError("History belongs to another group")
+            source = f"{message['platform_id']}|{self.umo}|{message['message_id']}"
+            # History fills gaps without replacing richer live content or
+            # resurrecting a recalled message that is already in the archive.
+            if self.db.execute("SELECT 1 FROM messages WHERE source_key=?", (source,)).fetchone():
+                counts["existing"] += 1
+                continue
+            result = self.append_message(message)
+            counts["inserted" if "id" in result else "ignored"] += 1
+        return counts
 
     def _invalidate_sources(self, ids):
         if not ids:
