@@ -1218,14 +1218,16 @@ class Store:
 
     @_serialized
     def vector_rows(self, model_id):
+        # Match the integer keys first so SQLite can use their indexes. Keep the
+        # text equality too: noncanonical owner keys must not gain a match.
         rows = self._rows("""SELECT v.model,v.owner_type,v.owner_key,v.dimensions,v.vector
             FROM memory_embeddings v LEFT JOIN mr_memory_objects m
-            ON m.umo=v.umo AND m.kind=v.owner_type AND CAST(m.id AS TEXT)=v.owner_key
+            ON m.umo=v.umo AND m.kind=v.owner_type AND m.id=v.owner_key AND CAST(m.id AS TEXT)=v.owner_key
             WHERE v.umo=? AND v.model=? AND (m.status='ACTIVE' OR v.owner_type='cue' OR
                 (v.owner_type='message' AND EXISTS(SELECT 1 FROM messages raw WHERE raw.umo=v.umo
-                    AND CAST(raw.id AS TEXT)=v.owner_key AND raw.is_deleted=0)) OR
+                    AND raw.id=v.owner_key AND CAST(raw.id AS TEXT)=v.owner_key AND raw.is_deleted=0)) OR
                 (v.owner_type='participant' AND EXISTS(SELECT 1 FROM participants p WHERE p.umo=v.umo
-                    AND CAST(p.id AS TEXT)=v.owner_key AND p.current_display_name!='')))""", (self.umo, model_id))
+                    AND p.id=v.owner_key AND CAST(p.id AS TEXT)=v.owner_key AND p.current_display_name!='')))""", (self.umo, model_id))
         for row in rows:
             row["embedding_blob"] = row["vector"]
         return rows

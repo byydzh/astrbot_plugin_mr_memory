@@ -185,20 +185,47 @@ class StoreContractTests(unittest.TestCase):
         self.store.db.commit()
         self.assertEqual(self.store.pending_messages(20)[0]["id"], first["id"])
         docs = self.store.pending_embeddings("fixture-model", 10)
-        self.assertEqual(len(docs), 5)  # The two graph endpoints are independently searchable.
+        self.assertEqual(len(docs), 7)  # Three memories, two graph endpoints, and two original messages.
         self.store.close()
         self.store = Store(self.path, self.scope)
-        self.assertEqual(len(self.store.pending_embeddings("fixture-model", 10)), 5)
+        self.assertEqual(len(self.store.pending_embeddings("fixture-model", 10)), 7)
         for doc in docs:
             self.assertTrue(self.store.save_embedding(doc, "fixture-model", [1.0, 0.0]))
         self.assertEqual(self.store.pending_embeddings("fixture-model", 10), [])
         vectors = self.store.vector_rows("fixture-model")
-        self.assertEqual(len(vectors), 5)
+        self.assertEqual(len(vectors), 7)
         self.assertEqual(struct.unpack("<2f", vectors[0]["vector"]), (1.0, 0.0))
         self.assertEqual(self.store.vector_rows("another-model"), [])
         self.store.delete_message("1")
         self.assertEqual(self.store.graph(), [])
-        self.assertEqual(self.store.vector_rows("fixture-model"), [])
+        self.assertEqual([(row["owner_type"], row["owner_key"]) for row in self.store.vector_rows("fixture-model")],
+                         [("message", str(second["id"]))])
+
+    def test_raw_vector_lookup_does_not_rescan_messages_for_every_vector(self):
+        messages = [self.message(number, "index lookup") for number in range(1, 401)]
+        keys = [str(row["id"]) for row in messages]
+        vector = struct.pack("<2f", 1.0, 0.0)
+        with self.store.db:
+            self.store.db.executemany("""INSERT INTO memory_embeddings
+                (umo,owner_type,owner_key,model,dimensions,vector) VALUES(?,'message',?,'lookup-test',2,?)""",
+                [(self.scope, key, vector) for key in keys + ["0" + keys[0], keys[0] + "x"]])
+            self.store.db.execute("UPDATE messages SET is_deleted=1 WHERE id=?", (messages[-1]["id"],))
+
+        # Bound SQLite work instead of machine-dependent seconds. A table scan
+        # for each vector exhausts this budget even with just 400 messages.
+        progress_calls = 0
+
+        def query_budget():
+            nonlocal progress_calls
+            progress_calls += 1
+            return progress_calls > 200
+
+        self.store.db.set_progress_handler(query_budget, 1000)
+        try:
+            rows = self.store.vector_rows("lookup-test")
+        finally:
+            self.store.db.set_progress_handler(None, 0)
+        self.assertEqual({row["owner_key"] for row in rows}, set(keys[:-1]))
 
     def test_author_filter_and_memory_sources_keep_quote_authors(self):
         first = self.message(1, "我以前住五人寝", sender_name="小桥")
