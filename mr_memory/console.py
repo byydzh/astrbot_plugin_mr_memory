@@ -133,7 +133,8 @@ class Console:
                 json_array_length(task_json,'$.completed_ids') completed_count,
                 json_extract(task_json,'$.checkpoint') checkpoint,
                 json_extract(task_json,'$.memory_refs') memory_refs,
-                json_extract(task_json,'$.run_id') run_id
+                json_extract(task_json,'$.run_id') run_id,
+                (SELECT count(*) FROM json_each(task_json,'$.continuation.write_state.pending_items')) pending_draft_count
                 FROM mr_learning_tasks WHERE umo=? ORDER BY kind""", (store.umo,))
         for row in rows:
             row["memory_refs"] = json.loads(row["memory_refs"] or "[]")
@@ -145,7 +146,9 @@ class Console:
             statuses[kind] = {key: value[key] for key in ("status", "reason", "next_start", "local_now", "timezone",
                              "remaining_message_count", "used_tokens") if key in value}
             statuses[kind]["next_start_local"] = self.local_date(value.get("next_start"))
+        working = await asyncio.to_thread(store.load_working_state)
         return {"learning": await asyncio.to_thread(self.learning_tasks, store),
+                "pending_learning_drafts": {kind: len(rows) for kind, rows in working.get("pending_learning_drafts", {}).items()},
                 "learning_status": statuses, "learning_window": self.learning_window()}
 
     @staticmethod

@@ -162,6 +162,8 @@ function renderLearning(data) {
       }
     }
     if (runtime.reason) row.append(el("small", runtime.reason));
+    const pendingDrafts = (task?.pending_draft_count || 0) + (data.pending_learning_drafts?.[kind] || 0);
+    if (pendingDrafts) row.append(el("p", `${number(pendingDrafts)} 项记忆草稿尚未保存，已保留供后续修复。材料已处理不等于这些记忆已写入。`, "inset"));
     if (runtime.next_start_local && runtime.next_start !== window.next_start) row.append(el("small", `下次可继续：${runtime.next_start_local}`));
     plan.append(row);
   }
@@ -257,8 +259,9 @@ function renderHistory(history) {
   const progress = history.pending || history.last_result || {};
   const status = !state.overview?.runtime.history_recovery ? "已关闭" : statuses[history.status] || "等待核对";
   $("history-status").textContent = `${status} · 累计补入 ${number(history.total_inserted || 0)} 条遗漏消息${active ? `；本次已读取 ${progress.pages || 0} 页` : ""}`;
-  const details = [`最近核对：${date(history.checked_at || history.updated_at)}`, "重连时补查，每五分钟核对；只补入记忆库，不重新回复。"];
+  const details = [`最近核对：${date(history.checked_at || history.updated_at)}`, "重连时补查，正常每五分钟核对；连续失败时逐步延后到每小时，手动补查立即执行。只补入记忆库，不重新回复。"];
   if (history.error) details.push(`本次未完成：${history.error}，后续从已保存进度重试。`);
+  if (history.retry_at) details.push(`下次自动重试：${date(history.retry_at)}。`);
   if (history.unavailable) details.push(`${date(history.unavailable.since)} 至 ${date(history.unavailable.until)}：平台没有返回更早记录，无法确认补齐。`);
   $("history-detail").textContent = details.join(" ");
 }

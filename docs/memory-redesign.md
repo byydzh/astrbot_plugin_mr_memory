@@ -46,7 +46,8 @@ UID 负责账号身份，语言模型负责语义指代。不能把昵称相同�
 | `agent.py` / `memory_protocol.py` | 回答前检索、基础整理建图与实验模式的任务/工具边界 |
 | `embedding.py` | 本地语义向量，独立于付费模型整理 |
 | `handoff.py` / `request_context.py` | 主意识输入访问及背景交付 |
-| `learning_writes.py` | 基础及高级模式共用的记忆写入与独立材料进度 |
+| `learning_writes.py` | 基础及高级模式共用的记忆写入、相互依赖草稿的事务分组与独立材料进度 |
+| `model_json.py` / `tool_calls.py` | 保留模型原始输出，解析完整字段及工具参数，不改写含义或补造字段值 |
 | `cognition.py` | 高级实验的关注及理解经验回流 |
 | `main.py` | 生命周期、事件接入、自助命令、资源调度 |
 | `console.py` / `pages/console/` | 管理资料、检索和真实运行过程 |

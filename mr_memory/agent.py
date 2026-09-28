@@ -19,6 +19,7 @@ from .handoff import format_background as _background_text
 from .memory_protocol import (BASIC_RECALL_PROMPT, BASIC_CONSOLIDATION_PROMPT, RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
     CONSOLIDATION_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions)
 from .tool_calls import response_calls, memory_text_arguments
+from .model_json import decode_envelope
 
 
 
@@ -233,26 +234,9 @@ def _memory_output(text: str) -> dict:
         text = text[3:].lstrip()
     starts = [0, *(match.end() for match in re.finditer(r"(?m)^[ \t]*(?=[{\[])", text))]
     for start in dict.fromkeys(starts):
-        repair = ""
         try:
-            payload, end = json.JSONDecoder().raw_decode(text, start)
-        except json.JSONDecodeError as exc:
-            # A finished response can omit only its outer closing brace. Accept
-            # that one syntactic repair if the entire rest parses unchanged;
-            # do not fill strings, arrays, fields or values. Length-truncated
-            # responses are handled before this parser is called.
-            if start or exc.pos != len(text) or not text.startswith("{") or text[-1:] not in {"}", "]"}:
-                continue
-            try:
-                payload = json.loads(text + "}")
-            except json.JSONDecodeError:
-                continue
-            end = len(text)
-            repair = "补齐缺失的最外层闭合括号；原字段、值和原始输出保留。"
-        tail = text[end:].strip()
-        if tail.startswith("```"):
-            tail = tail[3:].strip()
-        if tail and not re.fullmatch(r"(?:\s*</[｜|]+DSML[｜|]+(?:parameter|invoke|tool_calls|function_calls)>\s*)+", tail):
+            payload, repair = decode_envelope(text[start:])
+        except ValueError:
             continue
         items = payload.get("items") if isinstance(payload, dict) else payload
         if isinstance(items, list):
@@ -273,16 +257,18 @@ def _reconstruction_output(text: str, store=None, before=None) -> tuple[str, Any
     if not value.startswith("{"):
         return text, {}, "本次仅返回文本背景", {}
     try:
-        result = json.loads(value, strict=False)
+        result, repair = decode_envelope(value)
     except ValueError:
         return "", {}, "本次结构化输出未完整返回", {}
+    if not isinstance(result, dict) or "background" not in result:
+        return "", {}, "本次结构化输出缺少 background 字段", {}
     writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
     try:
         background = _background_text(result.get("background"), store, before)
     except ValueError as exc:
         return "", {}, str(exc), writes
     recollection = result.get("recollection", {})
-    return background.strip(), recollection, "", writes
+    return background.strip(), recollection, repair if background else "", writes
 
 
 def _memory_items(text: str) -> list:
@@ -485,7 +471,7 @@ class MemoryAgent:
         self.last_workspace = None
 
     async def _workspace_update(self, messages, seen_messages):
-        workspace = await asyncio.to_thread(self.store.workspace)
+        workspace = await self.store.read_async(self.store.workspace)
         if workspace != self.last_workspace:
             messages.append({"role": "user", "content": _json({"workspace": workspace}, seen_messages=seen_messages)})
             self.last_workspace = workspace
@@ -614,16 +600,16 @@ class MemoryAgent:
                 return {"status": "unavailable", "detail": "This recorded run has no main-model request snapshot; its capabilities cannot be inferred from that absence."}
             return context.read(**args)
         if name == "interaction":
-            return await asyncio.to_thread(self.store.reflections.interaction, **args)
+            return await self.store.read_async(self.store.reflections.interaction, **args)
         if name == "reflect":
             if set(args) == {"id"}:
-                return await asyncio.to_thread(self.store.reflections.get, args["id"])
+                return await self.store.read_async(self.store.reflections.get, args["id"])
             return await asyncio.to_thread(self.store.reflections.save, args)
         if name == "semantic_search":
             if self.embedder is None:
                 return {"status": "unavailable", "detail": "Semantic index is not configured; literal search remains available."}
             hits = await self.embedder.search(self.store, args["query"], limit=args.get("limit", 8))
-            rows = await asyncio.gather(*(asyncio.to_thread(self.store.memory, hit["owner_type"], hit["owner_key"],
+            rows = await asyncio.gather(*(self.store.read_async(self.store.memory, hit["owner_type"], hit["owner_key"],
                                                           include_sources=False) for hit in hits))
             return [{"score": hit["score"], "memory": {key: value for key, value in row.items() if key != "sources"}}
                     for hit, row in zip(hits, rows) if row is not None]
@@ -632,11 +618,11 @@ class MemoryAgent:
             if args.get("start_at", 0) > args["end_at"]:
                 raise ValueError("start_at is later than the allowed end_at")
         if name == "search_messages":
-            return await asyncio.to_thread(self.store.search_message_context, **args)
+            return await self.store.read_async(self.store.search_message_context, **args)
         if name == "context":
             args["before_time"] = cutoff
         method = "members" if name == "member" else name
-        value = await asyncio.to_thread(getattr(self.store, method), **args)
+        value = await self.store.read_async(getattr(self.store, method), **args)
         if name == "context" and not value:
             raise ValueError("Context anchor not found in this group at or before the request time. "
                              "message_id is the MR internal message id (source_ids), not a platform message number. "
@@ -661,7 +647,7 @@ class MemoryAgent:
                                 foreground=True)
         working = {key: value for key, value in working.items() if key != "pending_recall_writes"} if self.advanced else {}
         if self.advanced:
-            working["continuity"] = await asyncio.to_thread(self.store.continuity, cutoff)
+            working["continuity"] = await self.store.read_async(self.store.continuity, cutoff)
         async def persist_changes(args, key):
             operation = asyncio.create_task(asyncio.to_thread(writer.apply, args, self.run_key + ":" + key))
             try:
@@ -696,11 +682,11 @@ class MemoryAgent:
                             "这是本次可用的最后一轮，交付已经形成的理解，不再发起工具调用。"
                             "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 items、retry、recollection。"
                             "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。" if self.advanced else
-                            "这是本次可用的最后一轮，直接返回 JSON 对象 {\"background\":\"已读材料中的有用背景\"}，不再请求工具。"})
+                            "这是本次可用的最后一轮，直接用纯文本交付已读材料中的有用背景，不加 JSON 或工具标签，不再请求工具。没有需要补充的背景时返回 {\"background\":\"\"}。"})
                     response = await self._model_turn(
                         messages, prompt, tools, turn + 1,
                         tool_choice="none" if forced_finish else None,
-                        response_format={"type": "json_object"} if forced_finish else None)
+                        response_format={"type": "json_object"} if forced_finish and self.advanced else None)
                     _add_usage(result.usage, response)
                     native_calls = response_calls(response)
                     names = [call.name for call in native_calls]
@@ -709,7 +695,7 @@ class MemoryAgent:
                         # Tool-planning prose is part of this agent's conversation,
                         # not a completed background for the main model.
                         background, recollection, detail, _ = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
-                        if not detail:
+                        if background and detail != "本次仅返回文本背景":
                             result.background = background
                         result.status = "partial"
                     if not names:
@@ -719,10 +705,18 @@ class MemoryAgent:
                         messages.append({"role": "assistant", "content": text})
                         background, recollection, detail, final_writes = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
                         result.background = background
+                        result.detail = ""
                         result.status = "partial" if _finish_reason(response) == "length" else "completed"
                         if not background and detail:
                             result.status = "partial"
                             result.detail = detail
+                            if turn + 1 < self.max_turns and _finish_reason(response) != "length":
+                                messages.append({"role": "user", "content":
+                                    "刚才的交付格式无法读取：" + detail + "。保留已经形成的含义和不确定性，修正输出格式；不要重新检索或添加新解释。"
+                                    + ("返回完整 JSON。" if self.advanced else "仅交付纯文本背景即可。")})
+                                continue
+                        if detail and background:
+                            await self._emit("output", "已读取背景正文", detail=detail)
                         if result.status == "partial":
                             result.detail = result.detail or "Model turn or output budget reached; background may be incomplete"
                         if final_writes and self.advanced:
@@ -750,6 +744,8 @@ class MemoryAgent:
                         record = {"name": name, "arguments": args, "id": call_id, "status": "running"}
                         if call.error:
                             record["raw_arguments"] = call.raw_arguments
+                        if call.format_note:
+                            record.update(raw_arguments=call.raw_arguments, format_note=call.format_note)
                         result.tool_calls.append(record)
                         value = None
                         phase = "write" if name in {"remember", "complete"} or (name == "reflect" and set(args or {}) != {"id"}) else "read"
@@ -1061,6 +1057,8 @@ class MemoryAgent:
                         record = {"name": name, "arguments": args, "id": call_id, "status": "running"}
                         if call.error:
                             record["raw_arguments"] = call.raw_arguments
+                        if call.format_note:
+                            record.update(raw_arguments=call.raw_arguments, format_note=call.format_note)
                         result.tool_calls.append(record)
                         value = None
                         phase = "write" if name == "remember" or (name == "reflect" and set(args or {}) != {"id"}) else "read"

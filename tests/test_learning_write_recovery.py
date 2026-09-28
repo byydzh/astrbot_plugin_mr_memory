@@ -37,6 +37,71 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                           {"kind": "semantic", "content": "群友2会带桌游", "source_ids": [self.ids[1]]}],
                 "progress": {"completed_ids": self.ids, "checkpoint": "已读完，原文编号可继续查阅"}, "finish": True}
 
+    def test_mutual_drafts_and_self_link_commit_once_with_receipts(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        args = {"items": [
+            {"kind": "episode", "handle": "trip", "content": "周末桌游", "source_ids": self.ids,
+             "connections": [{"handle": "plan", "relation": "安排"}]},
+            {"kind": "semantic", "handle": "plan", "content": "西门集合", "source_ids": self.ids,
+             "connections": [{"handle": "trip", "relation": "出自", "purpose": "basis"},
+                             {"handle": "plan", "relation": "自我说明"}]}]}
+        first = writer.apply(args, "cycle")
+        self.assertFalse(first.rejected)
+        self.assertFalse(writer.pending_items)
+        self.assertEqual(len(first.written), 2)
+        refs = {row["handle"]: row for row in first.written}
+        basis = self.store.memory("semantic", refs["plan"]["id"])["basis"]
+        self.assertEqual(basis[0]["target"]["id"], refs["trip"]["id"])
+        state = self.store.learning_task("background")["continuation"]["write_state"]
+        self.assertEqual(set(state["receipts"]), {"cycle:0", "cycle:1"})
+        again = LearningWriter(self.store, self.sources, learning_kind="background", **state)
+        self.assertEqual(len(again.apply(args, "cycle").written), 2)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0], 5)
+
+    def test_cycle_failure_rolls_back_objects_edges_and_receipts_but_not_other_draft(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        result = writer.apply({"items": [
+            {"kind": "episode", "handle": "a", "content": "约定", "connections": [{"handle": "b", "relation": "相关"}]},
+            {"kind": "semantic", "handle": "b", "content": "地点", "connections": [{"handle": "a"}]},
+            {"kind": "episode", "content": "独立的另一项记忆"}]}, "broken-cycle")
+        self.assertEqual(len(result.written), 1)
+        self.assertEqual(len(writer.pending_items), 2)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0], 1)
+        self.assertEqual(set(self.store.learning_task("background")["continuation"]["write_state"]["receipts"]), {"broken-cycle:2"})
+        repaired = writer.apply({"retry": [{"pending_id": "broken-cycle:0"},
+            {"pending_id": "broken-cycle:1", "changes": {"connections": [{"handle": "a", "relation": "出自"}]}}]}, "retry")
+        self.assertEqual(len(repaired.written), 2)
+        self.assertFalse(writer.pending_items)
+
+    def test_association_cycle_reserves_endpoints_without_committing_placeholders(self):
+        writer = LearningWriter(self.store, self.sources, foreground=True)
+        args = {"items": [
+            {"kind": "association", "handle": "a", "content": "联系一", "source": {"handle": "b"},
+             "target": {"handle": "a"}, "relation": "联系", "purpose": "basis"},
+            {"kind": "association", "handle": "b", "content": "联系二", "source": {"handle": "a"},
+             "target": {"handle": "b"}, "relation": "联系"}]}
+        result = writer.apply(args, "edges")
+        self.assertFalse(result.rejected)
+        self.assertEqual(len(result.written), 2)
+        self.assertEqual(len(writer.apply(args, "edges").written), 2)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0], 2)
+
+    def test_surviving_draft_keeps_saved_handle_after_batch_finishes(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        saved = writer.apply({"items": [
+            {"kind": "episode", "handle": "basis", "content": "见面安排", "source_ids": self.ids},
+            {"kind": "semantic", "content": "地点", "source_ids": [999],
+             "connections": [{"handle": "basis", "relation": "依据", "purpose": "basis"}]}]}, "prior")
+        self.store.finish_learning_task("background")
+        state = self.store.start_learning_task("background", [])["continuation"]["write_state"]
+        ref = state["pending_items"]["prior:1"]["bindings"]["basis"]
+        self.assertEqual(ref, {"kind": saved.written[0]["kind"], "id": saved.written[0]["id"]})
+        self.assertIsNotNone(self.store.write_receipt("prior:0"))
+        resumed = LearningWriter(self.store, {}, learning_kind="background", **state)
+        result = resumed.apply({"retry": [{"pending_id": "prior:1", "changes": {"source_ids": self.ids}}]}, "repair")
+        self.assertFalse(result.rejected)
+        self.assertEqual(len(result.written), 1)
+
     async def test_native_malformed_save_survives_sdk_empty_args_and_is_repaired(self):
         good = {"items": [{"kind": "episode", "summary": "周末在西门玩桌游", "source_ids": self.ids}],
                 "progress": {"completed_ids": self.ids, "checkpoint": "见面地点与携带物已保存"}, "finish": True}
@@ -93,13 +158,13 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     raw_completion={"choices": [{"finish_reason": "stop"}]})
 
         with patch("mr_memory.agent._tool_set", return_value=schema) as tool_set:
-            result = await ClosingAgent(None, self.store, max_output_tokens=12000).consolidate(self.rows, {}, task=task,
+            result = await ClosingAgent(None, self.store, max_output_tokens=12000, advanced=True).consolidate(self.rows, {}, task=task,
                 token_budget=estimate * 2 + 10000)
         self.assertEqual(result.status, "completed", result.detail)
         self.assertEqual(self.store.pending_status()["count"], 0)
         self.assertEqual(result.model_attempts, 1)
         self.assertEqual(result.continuation["output_token_reserve"], 6000)
-        tool_set.assert_called_once_with(learning=True)
+        tool_set.assert_called_once_with(learning=True, basic=False)
 
     async def test_final_native_dsml_preserves_complete_draft_and_progress(self):
         args = {"items": [{"kind": "episode", "summary": "小桥说 <北门> & 西门有别", "source_ids": self.ids}],

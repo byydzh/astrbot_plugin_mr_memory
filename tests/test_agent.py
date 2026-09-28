@@ -41,6 +41,9 @@ class Provider:
 
 
 class Store:
+    async def read_async(self, method, /, *args, **kwargs):
+        return await asyncio.to_thread(method, *args, **kwargs)
+
     def workspace(self):
         return {"active": []}
 

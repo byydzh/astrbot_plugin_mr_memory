@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import json
 import re
 
+from .model_json import decode_envelope
+
 
 def field(value, name, default=None):
     return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
@@ -40,6 +42,7 @@ class ToolCall:
     arguments: dict | None
     error: str = ""
     extra_content: object = None
+    format_note: str = ""
 
     def message(self):
         value = {"id": self.id, "type": "function", "function": {
@@ -69,16 +72,16 @@ def response_calls(response) -> list[ToolCall]:
         function = field(value, "function")
         arguments = field(function, "arguments")
         wire = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
-        error = ""
+        error, format_note = "", ""
         try:
-            parsed = json.loads(wire)
+            parsed, format_note = decode_envelope(wire)
             if not isinstance(parsed, dict):
                 raise ValueError("Tool arguments must be a JSON object")
         except (ValueError, TypeError) as exc:
             parsed = None
             error = f"工具参数未执行：{exc}。上一条调用保留了完整原始参数；请修正 JSON 后重发此调用，已成功的其他调用不用重做。"
         calls.append(ToolCall(str(field(value, "id", "")), str(field(function, "name", "")),
-                              wire, parsed, error, field(value, "extra_content")))
+                              wire, parsed, error, field(value, "extra_content"), format_note))
     if any(not call.id or not call.name for call in calls) or len({call.id for call in calls}) != len(calls):
         raise ValueError("Provider returned missing or repeated tool call IDs/names")
     return calls

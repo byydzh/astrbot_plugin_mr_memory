@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import time
 
 
@@ -129,12 +130,14 @@ class HistoryRecovery:
                     try:
                         rewind = umo in self.rewind
                         self.rewind.discard(umo)
-                        await self.recover(store, client[0], since=since, rewind=rewind)
+                        await self.recover(store, client[0], since=since, rewind=rewind, force=rewind or since is not None)
                     except Exception:
                         logger.exception("MR history recovery %s could not read or save progress", umo)
 
-    async def recover(self, store, bot, *, since=None, rewind=False):
+    async def recover(self, store, bot, *, since=None, rewind=False, force=True):
         state = await asyncio.to_thread(store.history_state)
+        if not force and state.get("retry_at", 0) > time.time():
+            return state
         pending = state.get("pending")
         watermark = max(state.get("watermark", 0), (state.get("last_result") or {}).get("since", 0))
         floor = float(since) if since is not None else float(watermark or
@@ -170,6 +173,7 @@ class HistoryRecovery:
                 rows = sorted((history_message(item, store.umo, self_id) for item in raw), key=lambda row: row["sent_at"])
                 pending["head_at"] = max(pending["head_at"], max(row["sent_at"] for row in rows))
                 counts = await asyncio.to_thread(store.append_history, [row for row in rows if row["sent_at"] >= pending["since"]])
+                state.update(retry_at=0, failures=0, error_key="")
                 for key in counts:
                     pending[key] += counts[key]
                 state["total_inserted"] = state.get("total_inserted", 0) + counts["inserted"]
@@ -199,7 +203,16 @@ class HistoryRecovery:
             await save()
             raise
         except Exception as exc:
-            state.update(status="error", error=f"{type(exc).__name__}: {exc}")
+            response = getattr(exc, "result", None)
+            identity = ({key: response.get(key) for key in ("retcode", "message", "wording")}
+                        if isinstance(response, dict) else str(exc))
+            key = type(exc).__name__ + ":" + json.dumps(identity, ensure_ascii=False, sort_keys=True)
+            repeated = state.get("error_key") == key
+            failures = state.get("failures", 0) + 1 if repeated else 1
+            delay = min(3600, 300 * 2 ** min(failures - 1, 4))
+            state.update(status="error", error=f"{type(exc).__name__}: {exc}", error_key=key,
+                         failures=failures, retry_at=time.time() + delay)
             await save()
-            logger.warning("MR history recovery %s incomplete: %s", store.umo, state["error"])
+            if not repeated:
+                logger.warning("MR history recovery %s incomplete (retry in %ss): %s", store.umo, delay, state["error"])
         return state

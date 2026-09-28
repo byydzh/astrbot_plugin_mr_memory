@@ -188,13 +188,16 @@ class MemoryGraph:
             from .store import RELATED_ACCOUNT_SQL
             # Follow explicit formation references as candidate provenance.
             # Being related through an experience does not assign its facts to a person.
+            # SQLite must expand each small source-id list before PK lookup, and
+            # each recursive frontier before target-index lookup. Ordinary JOIN
+            # let the planner rescan all group messages/edges for every object.
             prefix = """WITH RECURSIVE related(kind,id) AS (
                 SELECT o.kind,o.id FROM mr_memory_objects o WHERE o.umo=? AND o.status='ACTIVE' AND
                 (CAST(json_extract(o.attributes_json,'$.subject.account_id') AS TEXT)=? OR EXISTS(
-                    SELECT 1 FROM json_each(o.attributes_json,'$.source_ids') s JOIN messages m ON m.id=s.value
+                    SELECT 1 FROM json_each(o.attributes_json,'$.source_ids') s CROSS JOIN messages m ON m.id=s.value
                     WHERE m.umo=o.umo AND m.is_deleted=0 AND """ + RELATED_ACCOUNT_SQL + """))
                 UNION SELECT json_extract(e.attributes_json,'$.source_ref.kind'),json_extract(e.attributes_json,'$.source_ref.id')
-                FROM related r JOIN mr_memory_objects e ON e.umo=? AND e.kind='association' AND e.status='ACTIVE'
+                FROM related r CROSS JOIN mr_memory_objects e ON e.umo=? AND e.kind='association' AND e.status='ACTIVE'
                 AND json_extract(e.attributes_json,'$.purpose')='basis'
                 AND json_extract(e.attributes_json,'$.target_ref.kind')=r.kind
                 AND json_extract(e.attributes_json,'$.target_ref.id')=r.id) """
@@ -250,10 +253,10 @@ class MemoryGraph:
             rows = self.store._rows("SELECT c.cue,c.aspect,count(*) memories" + base + " GROUP BY c.cue,c.aspect ORDER BY c.cue,c.aspect LIMIT ? OFFSET ?", [*args, limit + 1, offset])
         return {"items": rows[:limit], "more": len(rows) > limit, "next_offset": offset + limit}
 
-    def _endpoint(self, value, sources, run_id):
+    def _endpoint(self, value, sources, run_id, pending_refs=None):
         if isinstance(value, dict) and "kind" in value and "id" in value:
             ref = reference(value)
-            if not self.raw(ref["kind"], ref["id"]):
+            if not self.raw(ref["kind"], ref["id"]) and (ref["kind"], ref["id"]) not in (pending_refs or {}):
                 raise ValueError(f"Unknown memory endpoint {ref}")
             return ref
         value = {"label": value} if isinstance(value, str) else dict(value or {})
@@ -265,7 +268,7 @@ class MemoryGraph:
             if not self.raw(ref["kind"], ref["id"]):
                 raise ValueError(f"Unknown memory endpoint {ref}")
             return ref
-        saved = self.write(value, run_id=run_id)
+        saved = self.write(value, run_id=run_id, pending_refs=pending_refs)
         return reference(saved)
 
     def focus_connections(self, owner, refs):
@@ -285,7 +288,7 @@ class MemoryGraph:
                     "target": {"kind": kind, "id": target}, "relation": "继续思考", "purpose": "focus",
                     "statement": "这项思路所关注的记忆"})
 
-    def write(self, item, *, run_id=None):
+    def write(self, item, *, run_id=None, allocated_id=None, pending_refs=None):
         kind = canonical(str(item.get("kind") or ""))
         if not kind or kind in {"all", "cue", "participant"}:
             raise ValueError("Choose a stored memory kind (episode, semantic, topic, pattern, node, association, or another descriptive kind)")
@@ -334,13 +337,15 @@ class MemoryGraph:
         if kind == "association":
             for side in ("source", "target"):
                 if side in item:
-                    attrs[side + "_ref"] = self._endpoint(item[side], sources, run_id)
+                    attrs[side + "_ref"] = self._endpoint(item[side], sources, run_id, pending_refs)
                 if side + "_ref" not in attrs:
                     raise ValueError("A connection needs source and target memory addresses")
             if not attrs.get("relation"):
                 raise ValueError("A connection needs a meaningful relation")
             if attrs.get("purpose") == "basis" and ("target" in item or "target_revision" not in attrs):
-                attrs["target_revision"] = self.raw(**{"kind": attrs["target_ref"]["kind"], "owner": attrs["target_ref"]["id"]})["revision"]
+                target = attrs["target_ref"]
+                planned = (pending_refs or {}).get((target["kind"], target["id"]))
+                attrs["target_revision"] = planned if planned is not None else self.raw(target["kind"], target["id"])["revision"]
         if isinstance(attrs.get("subject"), dict) and attrs["subject"].get("account_id") is not None:
             account = str(attrs["subject"]["account_id"])
             who = self.db.execute("SELECT id FROM participants WHERE umo=? AND account_id=?", (self.umo, account)).fetchone()
@@ -353,14 +358,18 @@ class MemoryGraph:
             attrs["participant_id"] = None
         # Exact repeated assertions with the same provenance are one write;
         # this does not infer identity or merge similarly named people/nodes.
-        if not stored and kind not in {"node", "association"} and not item.get("connections") and not item.get("cues"):
+        if not stored and allocated_id is None and kind not in {"node", "association"} and not item.get("connections") and not item.get("cues"):
             identical = self.db.execute("SELECT id FROM mr_memory_objects WHERE umo=? AND kind=? AND title=? AND content=? AND attributes_json=? AND status='ACTIVE'",
                                         (self.umo, kind, title, content, encode(attrs))).fetchone()
             if identical:
                 if "attention" in item:
                     self.store.cognition.select({"kind": kind, "id": identical[0]}, item["attention"])
                 return self.get(kind, identical[0], include_sources=False)
-        owner = stored["id"] if stored else self.db.execute("SELECT COALESCE(max(id),0)+1 FROM mr_memory_objects WHERE umo=? AND kind=?", (self.umo, kind)).fetchone()[0]
+        owner = stored["id"] if stored else allocated_id
+        if owner is None:
+            owner = self.db.execute("SELECT COALESCE(max(id),0)+1 FROM mr_memory_objects WHERE umo=? AND kind=?", (self.umo, kind)).fetchone()[0]
+            while (kind, owner) in (pending_refs or {}):
+                owner += 1
         now, reason = time.time(), str(item.get("reason", ""))
         revision = stored["revision"] + 1 if stored else 1
         if stored:
@@ -387,14 +396,7 @@ class MemoryGraph:
             self.store.cognition.select({"kind": kind, "id": owner}, item["attention"])
         if kind == "reflection" and "memory_refs" in item:
             self.focus_connections(owner, attrs["memory_refs"])
-        # The model supplies connection meaning; the write merely connects addresses.
-        for link in item.get("connections", []):
-            target = reference(link)
-            self.write({"kind": "association", "source": {"kind": kind, "id": owner}, "target": target,
-                        "relation": link["relation"], "purpose": link.get("purpose", "association"),
-                        "statement": link.get("context") or link["relation"], "source_ids": [],
-                        **{key: link[key] for key in ("belief", "reason", "revision_no") if key in link},
-                        **({"id": link["connection_id"]} if link.get("connection_id") is not None else {})}, run_id=run_id)
+        self.connect({"kind": kind, "id": owner}, item.get("connections", []), run_id=run_id, pending_refs=pending_refs)
         # A relabelled endpoint changes the searchable description of its incident edges.
         if stored and (title != stored["title"] or content != stored["content"] or attrs.get("aliases") != old.get("aliases")):
             edges = self.store._rows("""SELECT id FROM mr_memory_objects WHERE umo=? AND kind='association'
@@ -405,6 +407,17 @@ class MemoryGraph:
                 self.store._clear_memory_derivatives("association", edge["id"])
                 self.store._queue_embedding("association", edge["id"])
         return self.get(kind, owner, include_sources=False, include_history=action == "withdraw")
+
+    def connect(self, source, links, *, run_id=None, pending_refs=None):
+        # The model supplies meaning; storage only connects the chosen addresses.
+        for link in links:
+            target = reference(link)
+            self.write({"kind": "association", "source": source, "target": target,
+                        "relation": link["relation"], "purpose": link.get("purpose", "association"),
+                        "statement": link.get("context") or link["relation"], "source_ids": [],
+                        **{key: link[key] for key in ("belief", "reason", "revision_no") if key in link},
+                        **({"id": link["connection_id"]} if link.get("connection_id") is not None else {})},
+                       run_id=run_id, pending_refs=pending_refs)
 
     def changes(self, after=0, limit=20):
         rows = self.store._rows("SELECT kind,id,change_seq FROM mr_memory_objects WHERE umo=? AND change_seq>? ORDER BY change_seq LIMIT ?",

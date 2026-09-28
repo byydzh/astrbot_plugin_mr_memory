@@ -178,7 +178,13 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 parts = [p for p in request.extra_user_content_parts
                          if getattr(p, "text", "").startswith("<mr_request_context>")]
                 self.assertEqual(len(parts), 1)
-                self.assertEqual(json.loads(parts[0].text.splitlines()[2]), expected)
+                runtime = json.loads(parts[0].text.splitlines()[2])
+                clock = runtime.pop("clock")
+                self.assertEqual(runtime, expected)
+                from datetime import datetime
+                self.assertEqual(datetime.fromisoformat(clock["message"]["local"]),
+                                 datetime.fromisoformat(clock["message"]["utc"]))
+                self.assertEqual(datetime.fromisoformat(clock["message"]["utc"]).timestamp(), model_current["sent_at"])
 
     async def test_user_generation_tools_and_sent_output_survive_store_reopen(self):
         current = event()

@@ -39,6 +39,36 @@ class MemoryGraphTests(unittest.TestCase):
     def save(self, **item):
         return self.store.save_memories([item], mark_processed=False)[0]
 
+    def test_related_account_search_preserves_results_and_uses_key_lookups(self):
+        episode = self.save(kind="episode", content="共同经历", source_ids=[self.message["id"]])
+        pattern = self.save(kind="pattern", content="由经历形成", connections=[{
+            "kind": "episode", "id": episode["id"], "relation": "依据", "purpose": "basis"}])
+        higher = self.save(kind="perspective", content="继续形成", connections=[{
+            "kind": "pattern", "id": pattern["id"], "relation": "依据", "purpose": "basis"}])
+        unrelated = self.save(kind="pattern", content="无关事项")
+        original_rows = self.store._rows
+        checked = []
+
+        def inspect(sql, params=()):
+            if sql.startswith("WITH RECURSIVE related"):
+                # Compare the complete candidate result on a small fixture;
+                # never benchmark the pathological old plan on production.
+                self.assertEqual(original_rows(sql, params), original_rows(sql.replace("CROSS JOIN", "JOIN"), params))
+                plan = original_rows("EXPLAIN QUERY PLAN " + sql, params)
+                self.assertTrue(any("SEARCH m USING INTEGER PRIMARY KEY" in r["detail"] for r in plan), plan)
+                self.assertTrue(any("SEARCH e USING INDEX mr_memory_target" in r["detail"]
+                                    and r["detail"].count("<expr>=?") == 2 for r in plan), plan)
+                checked.append(True)
+            return original_rows(sql, params)
+
+        with patch.object(self.store, "_rows", side_effect=inspect):
+            found = self.store.search_memories(related_account_id="10", limit=100)
+        refs = {(m["kind"], m["id"]) for m in found}
+        for memory in (episode, pattern, higher):
+            self.assertIn((memory["kind"], memory["id"]), refs)
+        self.assertNotIn((unrelated["kind"], unrelated["id"]), refs)
+        self.assertEqual(checked, [True])
+
     def test_recursive_abstractions_navigate_both_ways_and_revise_basis(self):
         episode = self.save(kind="episode", title="一次协作", content="共同修改方案", source_ids=[self.message["id"]],
                             cues=[{"cue": "协作", "aspect": "具体经历"}])
@@ -125,7 +155,7 @@ class MemoryGraphTests(unittest.TestCase):
             response('{"background":"本轮背景","recollection":{"发现":"新的联系"}}')])
         async def run():
             with patch("mr_memory.agent._tool_set", return_value=object()):
-                return await MemoryAgent(provider, self.store, max_turns=4).reconstruct(self.message, [self.message], {})
+                return await MemoryAgent(provider, self.store, max_turns=4, advanced=True).reconstruct(self.message, [self.message], {})
         result = asyncio.run(run())
         self.assertEqual(result.status, "completed", result.detail)
         self.assertEqual(len(result.written), 1)

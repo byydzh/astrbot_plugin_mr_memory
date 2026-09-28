@@ -29,6 +29,7 @@ from .mr_memory.trace import RunTrace
 from .mr_memory.request_context import RequestContext
 from .mr_memory.profiles import parse_profile_changes
 from .mr_memory.history import HistoryRecovery
+from .mr_memory.handoff import request_clock
 
 
 def json_value(value: Any) -> Any:
@@ -354,12 +355,13 @@ class MrMemoryPlugin(Star):
         # Give both models the live value rather than asking memory to infer it.
         # This role is not a claim that every tool is available or authorized.
         current["astrbot_runtime"] = {"requester_id": current["sender_id"], "is_admin": event.is_admin()}
+        current["clock"] = request_clock(started_at, current["sent_at"])
         runtime_prefix = "<mr_request_context>"
         req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
                                            if not str(getattr(part, "text", "")).startswith(runtime_prefix)]
         req.extra_user_content_parts.append(TextPart(text=(
-            f"{runtime_prefix}\n当前 AstrBot 请求事件提供的运行身份（与平台群角色不同）：\n"
-            + json.dumps(current["astrbot_runtime"], ensure_ascii=False, separators=(",", ":"))
+            f"{runtime_prefix}\n当前 AstrBot 请求的运行身份与时间（运行身份与平台群角色不同）：\n"
+            + json.dumps({**current["astrbot_runtime"], "clock": current["clock"]}, ensure_ascii=False, separators=(",", ":"))
             + "\n</mr_request_context>"
         )).mark_as_temp())
         payload = {"status": "cancelled", "question": current["question"], "request_id": current["message_id"]}

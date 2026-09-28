@@ -3,7 +3,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from mr_memory.history import CONNECT_EVENT, HistoryRecovery, history_message
 from mr_memory.store import Store
@@ -37,6 +37,26 @@ class HistoryRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def archive(self, raw):
         return self.store.append_message(history_message(raw, self.store.umo, "9000"))
+
+    async def test_repeated_failure_backs_off_without_losing_gap_and_manual_retries_now(self):
+        class Failed(Exception):
+            def __init__(self, seq):
+                self.result = {"retcode": 1200, "message": "message unavailable", "echo": {"seq": seq}}
+        self.bot.get_group_msg_history.side_effect = [Failed(1), Failed(2),
+            {"messages": [self.raw(30, 300), self.raw(10, 100)]}]
+        with patch("mr_memory.history.time.time", return_value=1000), patch("mr_memory.history.logger.warning") as warning:
+            first = await self.recovery.recover(self.store, self.bot)
+            self.assertEqual(first["retry_at"], 1300)
+            skipped = await self.recovery.recover(self.store, self.bot, force=False)
+            self.assertEqual(self.bot.get_group_msg_history.await_count, 1)
+            self.assertEqual(skipped["pending"], first["pending"])
+            second = await self.recovery.recover(self.store, self.bot)
+            self.assertEqual(second["retry_at"], 1600)
+            warning.assert_called_once()
+            finished = await self.recovery.recover(self.store, self.bot, rewind=True)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["retry_at"], 0)
+        self.assertEqual(finished["failures"], 0)
 
     async def test_pages_fill_gap_without_replacing_live_messages_or_replaying_commands(self):
         original = self.archive(self.raw(30, 300))

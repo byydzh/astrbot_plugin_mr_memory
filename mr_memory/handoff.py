@@ -7,6 +7,14 @@ from datetime import datetime, timezone
 from .content import text_view
 
 
+def request_clock(now, sent_at):
+    def times(timestamp):
+        utc = datetime.fromtimestamp(timestamp, timezone.utc)
+        return {"local": utc.astimezone().isoformat(), "utc": utc.isoformat()}
+    return {"now": times(now), "message": times(sent_at),
+            "meaning": "local 是服务环境当地时间，含 UTC 偏移；utc 是同一时刻的 UTC 时间。"}
+
+
 def context_ref(ref):
     if not isinstance(ref, dict):
         raise ValueError("A selected context address must be an object")

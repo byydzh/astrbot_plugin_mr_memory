@@ -2,11 +2,13 @@
 
 Stored prose is evidence for the model, never an identity decision made here.
 Legacy memory tables are imported once; live access uses MemoryGraph.
-All methods are synchronous; one reentrant lock serializes this connection's
-transactions and reads. No model or network calls happen while holding it.
+One reentrant lock serializes this connection's transactions and reads.
+read_async owns cancellable SQL reads; synchronous writes retain their existing
+transaction/receipt semantics. No model or network calls happen under the lock.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -14,7 +16,7 @@ import struct
 import time
 from functools import wraps
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -147,6 +149,7 @@ def _serialized(method):
 class Store:
     def __init__(self, path: str | Path, umo: str):
         self._lock = RLock()
+        self._read_gate = asyncio.Lock()
         self.umo = str(umo).strip()
         if not self.umo:
             raise ValueError("Store requires an explicit group scope")
@@ -188,6 +191,49 @@ class Store:
     @_serialized
     def close(self) -> None:
         self.db.close()
+
+    async def read_async(self, method, /, *args, **kwargs):
+        """Run a read, cancelling its SQLite VM before releasing the caller.
+
+        The progress handler belongs to this operation under the connection
+        lock, never to an unrelated write or the next query. Queue parallel
+        reads in asyncio instead of filling the host executor with lock waiters.
+        This is for local reads only, not writes or arbitrary blocking I/O.
+        """
+        async with self._read_gate:
+            stop = Event()
+            worker = asyncio.create_task(asyncio.to_thread(self._read_worker, stop, method, args, kwargs))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                stop.set()
+                # to_thread cancellation alone leaves SQL running. Drain the
+                # actual worker, even if unload also cancels the caller again.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()  # consume the expected SQLite interrupt
+                raise
+
+    def _read_worker(self, stop, method, args, kwargs):
+        while not self._lock.acquire(timeout=0.05):
+            if stop.is_set():
+                return None
+        try:
+            if stop.is_set():
+                return None
+            self.db.set_progress_handler(stop.is_set, 1000)
+            try:
+                return method(*args, **kwargs)
+            finally:
+                self.db.set_progress_handler(None, 0)
+        finally:
+            self._lock.release()
 
     def _rows(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
         return [dict(r) for r in self.db.execute(sql, tuple(params))]
@@ -1021,7 +1067,13 @@ class Store:
             task = self.learning_task(kind)
             state = self.load_working_state()
             drafts = (task or {}).get("continuation", {}).get("write_state", {}).get("pending_items", {})
+            # Keep concrete addresses in surviving drafts. A completed task's
+            # transcript/receipt map is no longer their address book.
+            receipts = (task or {}).get("continuation", {}).get("write_state", {}).get("receipts", {})
             for row in drafts.values():
+                row["bindings"] = {name: receipts[ref["receipt_key"]][0]
+                    if ref.get("receipt_key") in receipts and receipts[ref["receipt_key"]] else ref
+                    for name, ref in row.get("bindings", {}).items()}
                 row.setdefault("origin_run_id", task.get("run_id"))
                 row.setdefault("saved_memory_refs", task.get("memory_refs", []))
             if drafts:
@@ -1275,8 +1327,74 @@ class Store:
                 dimensions=excluded.dimensions,vector=excluded.vector,updated_at=CURRENT_TIMESTAMP""", (self.umo, owner_type, str(owner_key), model_id, int(dimensions), vector))
 
     @_serialized
+    def save_memory_component(self, items, *, state, run_id=None, learning_kind=None, foreground=False):
+        """Commit one mutually dependent set of drafts, including its receipts.
+
+        Addresses are reserved inside this transaction. All objects exist before
+        their inline connections are written; no provisional row is committed.
+        """
+        addresses, planned, values, next_ids = {}, {}, {}, {}
+        with self.db:
+            existing = {key: self.write_receipt(key) for key in items}
+            if all(refs is not None for refs in existing.values()):
+                return existing
+            if any(refs is not None for refs in existing.values()):
+                raise ValueError("Some component drafts were already saved; reopen their receipts before retrying")
+            for key, item in items.items():
+                value = dict(item)
+                kind = canonical(str(value.get("kind") or ""))
+                old = self.memory_graph.raw(kind, value["id"]) if value.get("id") is not None else None
+                if value.get("id") is not None and old is None:
+                    raise ValueError(f"No {kind} memory with id {value['id']}")
+                if old:
+                    owner, revision = old["id"], old["revision"] + 1
+                else:
+                    if kind not in next_ids:
+                        next_ids[kind] = self.db.execute("SELECT COALESCE(max(id),0)+1 FROM mr_memory_objects WHERE umo=? AND kind=?", (self.umo, kind)).fetchone()[0]
+                    owner, revision = next_ids[kind], 1
+                    next_ids[kind] += 1
+                addresses[key] = {"kind": kind, "id": owner}
+                planned[kind, owner] = revision
+                if "source_keys" in value:
+                    keys = list(dict.fromkeys(value.pop("source_keys")))
+                    sources = {row["source_key"]: row["id"] for row in self._messages_for_sources(keys)}
+                    if set(keys) != set(sources):
+                        raise ValueError("Memory sources must be retained messages in this group")
+                    value["source_ids"] = [sources[key] for key in keys]
+                values[key] = value
+
+            def resolve(ref):
+                if not isinstance(ref, dict) or "draft_key" not in ref:
+                    return ref
+                return {**{k: v for k, v in ref.items() if k != "draft_key"}, **addresses[ref["draft_key"]]}
+
+            links = {}
+            for key, value in values.items():
+                for side in ("source", "target"):
+                    if side in value:
+                        value[side] = resolve(value[side])
+                links[key] = [resolve(ref) for ref in value.pop("connections", [])]
+                self.memory_graph.write(value, run_id=run_id, pending_refs=planned,
+                    allocated_id=addresses[key]["id"] if value.get("id") is None else None)
+            for key, connections in links.items():
+                self.memory_graph.connect(addresses[key], connections, run_id=run_id)
+            receipts = {key: [ref] for key, ref in addresses.items()}
+            for key, receipt in receipts.items():
+                self.db.execute("INSERT INTO mr_memory_write_receipts VALUES(?,?,?)", (self.umo, key, _encode(receipt)))
+            if learning_kind is not None:
+                self._save_learning_progress(learning_kind, None, [(r["kind"], r["id"]) for r in addresses.values()], run_id)
+                task = self.learning_task(learning_kind)
+                state = {**state, "receipts": {**state.get("receipts", {}), **receipts},
+                         "pending_items": {key: row for key, row in state.get("pending_items", {}).items() if key not in receipts}}
+                task["continuation"] = {**task.get("continuation", {}), "write_state": state}
+                self._write_learning_task(learning_kind, task)
+        return {key: [self.memory(ref["kind"], ref["id"]) or ref] for key, ref in addresses.items()}
+
+    @_serialized
     def save_memories(self, items, sources=(), mark_processed=True, *, run_id=None,
                       learning_kind=None, progress=None, learning_write=None, receipt_key=None):
+        if receipt_key is None and learning_write is not None:
+            receipt_key = learning_write["pending_id"]
         if receipt_key is not None:
             receipt = self.write_receipt(receipt_key)
             if receipt is not None:

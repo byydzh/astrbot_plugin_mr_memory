@@ -6,7 +6,8 @@ BASIC_RECALL_PROMPT = """你为 AstrBot 提供本群的记忆背景，帮助它�
 结合当前消息、引用、近期对话和成员资料，自行决定检索词、语义查询、读取哪些原文，以及何时已有足够材料。旧记忆是检索入口，摘要可能有误；需要核对具体人物或经历时可打开对应原文及前后交流。UID 标明发言账号，引用作者、谈论对象与发言者各自保留，不能沿用相邻消息或图片的作者。
 记录中 USER 是群友发言，BOT 是实际发送，SYSTEM 可能是 bot 生成稿或工具活动；同一请求的 generated/sent 不算两个独立事实。图片地址不等于看过图片。main_context 可读取主意识已有对话和工具，外部搜索、图像和行动由主意识负责。
 成员目录的明确称呼与更正直接供本轮理解使用；群内简称和话中指代仍结合语境理解，重名不合并账号。不要把 bot 自己的旧猜测当成群友的确认。
-完成时用 complete 返回文字 background，或直接输出 {"background":"..."}。只提供主意识此刻缺少的群内来历，不代写回复，不替它决定外部行动。通常一两段；有必要时在文字中短引原话并保留作者 UID，不附整篇历史机器人回答和思考报告。把握程度直接用自然语言表达。没有需补充的背景可留空。工具返回的 source_ref/memory_ref 指本次此前已给出的相同材料，内容变化照常完整呈现。
+完成时用 complete 交付 background，或直接用纯文本交付背景；无须给纯文本再包 JSON。只提供主意识此刻缺少的群内来历，不代写回复，不替它决定外部行动。通常一两段，不附整篇历史机器人回答和思考报告。把握程度直接用自然语言表达。background 也可以是 [{text,belief,references}]：references 选择已读原文的 {message_id} 或记忆的 {kind,id}，这些原文与真实作者会直接一同交给主意识，不必由你再转述。
+没有需补充的背景可交付空字符串。工具返回的 source_ref/memory_ref 指本次此前已给出的相同材料，内容变化照常完整呈现。
 """
 
 MEMORY_PROTOCOL = """你是群聊机器人持续的理解与记忆。让它接得上共同经历，理解人们此刻的意思，发展自己的认识，并能因后来的交流改变看法。人、事件、关系、玩笑、未完的事和跨经历的联系都可以成为思考材料。关注什么、怎样表示、沿什么联系继续、何时已经理解够了，由你决定。
@@ -133,7 +134,7 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
     "progress": PROGRESS_SCHEMA, "finish": {"type": "boolean"}, "retry": RETRY_SCHEMA,
     "recollection": {"description": "自己对这次理解过程的记录，内容与表示由你决定；可复用的认识用items保存。"}})
 REMEMBER_SCHEMA["description"] += " 每项分别保存；失败回执给出pending_id及原草稿，用retry:[{pending_id,changes:{source_ids:[...]}}]只补字段，不必重发已保存项。重新考虑后不保存某草稿可给discard_reason；其他草稿成功不会自动取消失败项。"
-WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connections引用；循环新引用先建对象再连接。修订用kind/id和revision_no，省略字段保留；withdraw撤回且保留历史。content写认识或关系语境，representation自定结构。connections从本项指向另一项，purpose=basis表示依据；connection_id可改已有边，新增不删除旧边。cues的cue/aspect说明自然线索及从它进入的方面。"
+WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connections引用；相互引用和自引用会连同对象一起保存，无须拆成多轮。修订用kind/id和revision_no，省略字段保留；withdraw撤回且保留历史。content写认识或关系语境，representation自定结构。connections从本项指向另一项，purpose=basis表示依据；connection_id可改已有边，新增不删除旧边。cues的cue/aspect说明自然线索及从它进入的方面。"
 REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
 RECALL_REMEMBER_SCHEMA = _schema("保存或修订自己的理解、表示、连接与注意，返回当前记忆地址。失败草稿可用retry修正。当前任务是为正在发生的交流提供背景，没有待完成的后台消息批次。", {
@@ -155,7 +156,7 @@ def tool_definitions(*, learning=False, basic=False):
             definitions["remember"] = BASIC_REMEMBER_SCHEMA
         else:
             definitions["main_context"] = TOOL_SCHEMAS["main_context"]
-            definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆。", {"background": TEXT}, ("background",))
+            definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆；可以同时选择关键原话交给主意识。", {"background": BACKGROUND}, ("background",))
         return definitions
     definitions = {**TOOL_SCHEMAS, "remember": REMEMBER_SCHEMA if learning else RECALL_REMEMBER_SCHEMA}
     if learning:

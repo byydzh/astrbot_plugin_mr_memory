@@ -12,6 +12,39 @@ RETRY_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "required": ["pending_id"], "additionalProperties": False}}
 
 
+def dependency_groups(work, pending):
+    """Strongly connected drafts, with dependencies before their dependants."""
+    rows = {row[0]: row for row in work}
+    edges = {key: {ref["receipt_key"] for ref in pending[key].get("bindings", {}).values()
+                   if ref.get("receipt_key") in rows} for key in rows}
+    indices, low, stack, active, groups = {}, {}, [], set(), []
+
+    def visit(key):
+        indices[key] = low[key] = len(indices)
+        stack.append(key)
+        active.add(key)
+        for other in sorted(edges[key]):
+            if other not in indices:
+                visit(other)
+                low[key] = min(low[key], low[other])
+            elif other in active:
+                low[key] = min(low[key], indices[other])
+        if low[key] == indices[key]:
+            group = []
+            while True:
+                other = stack.pop()
+                active.remove(other)
+                group.append(rows[other])
+                if other == key:
+                    break
+            groups.append((group, len(group) > 1 or key in edges[key]))
+
+    for key in rows:
+        if key not in indices:
+            visit(key)
+    return groups
+
+
 @dataclass
 class WriteOutcome:
     written: list = field(default_factory=list)
@@ -74,16 +107,16 @@ class LearningWriter:
             self.store.update_learning_task(self.learning_kind, {
                 "continuation": {**task.get("continuation", {}), "write_state": self.state()}})
 
-    def clean_item(self, item, bindings=None) -> dict:
+    def clean_item(self, item, bindings=None, component=()) -> dict:
         if not isinstance(item, dict):
             raise ValueError("Memory item must be an object")
         item = copy.deepcopy(item)
         item.pop("handle", None)
         for side in ("source", "target"):
             if side in item:
-                item[side] = self.resolve(item[side], bindings)
+                item[side] = self.resolve(item[side], bindings, component)
         if "connections" in item:
-            item["connections"] = [self.resolve(link, bindings) for link in item["connections"]]
+            item["connections"] = [self.resolve(link, bindings, component) for link in item["connections"]]
         if "source_ids" not in item:
             # Derived thoughts may cite other memories through connections;
             # updating an object without changing its sources keeps those sources.
@@ -103,14 +136,16 @@ class LearningWriter:
         row.pop("source_ids")
         return row
 
-    def resolve(self, ref, bindings=None):
+    def resolve(self, ref, bindings=None, component=()):
         if not isinstance(ref, dict) or "handle" not in ref:
             return ref
         handle = str(ref["handle"])
         target = (bindings or {}).get(handle, self.handles.get(handle))
         if target and "receipt_key" in target:
             key = target["receipt_key"]
-            saved = self.store.write_receipt(key) if self.foreground else self.receipts.get(key)
+            if key in component:
+                return {**{k: v for k, v in ref.items() if k != "handle"}, "draft_key": key}
+            saved = self.store.write_receipt(key) or self.receipts.get(key)
             if not saved and self.learning_kind is not None:
                 saved = self.store.learning_task(self.learning_kind).get("continuation", {}).get("write_state", {}).get("receipts", {}).get(key)
             target = saved[0] if saved else None
@@ -121,6 +156,32 @@ class LearningWriter:
     def remember_handle(self, item, saved):
         if isinstance(item, dict) and item.get("handle") and saved:
             self.handles[str(item["handle"])] = {key: saved[0][key] for key in ("kind", "id")}
+
+    def apply_component(self, group, outcome):
+        keys = {row[0] for row in group}
+        try:
+            items = {key: self.clean_item(item, self.pending_items[key].get("bindings"), keys)
+                     for key, _, item in group}
+            saved = self.store.save_memory_component(items, state=self.state(), run_id=self.run_id,
+                learning_kind=self.learning_kind, foreground=self.foreground)
+        except Exception as exc:
+            # Detailed reads may fail after the transaction committed. Recover
+            # its receipts exactly as for an independent write.
+            durable = (self.store.learning_task(self.learning_kind).get("continuation", {}).get("write_state", {}).get("receipts", {})
+                       if self.learning_kind is not None else {})
+            saved = {key: self.store.write_receipt(key) or durable.get(key) for key in keys}
+            if not all(value is not None for value in saved.values()):
+                for key, _, _ in group:
+                    self.pending_items[key]["detail"] = f"{type(exc).__name__}: {exc}"
+                    outcome.rejected.append({"pending_id": key, **self.pending_items[key]})
+                self.persist()
+                return
+        for key, _, item in group:
+            rows = saved[key]
+            outcome.written.extend([{**row, "handle": item["handle"]} if item.get("handle") else row for row in rows])
+            self.receipts[key] = [{"kind": row["kind"], "id": row["id"]} for row in rows]
+            self.remember_handle(item, rows)
+            self.pending_items.pop(key, None)
 
     def apply(self, args: dict, call_id: str) -> WriteOutcome:
         if not isinstance(args, dict) or set(args) - {"items", "progress", "finish", "retry", "recollection"}:
@@ -189,24 +250,13 @@ class LearningWriter:
                                        "origin_run_id": self.pending_items.get(key, {}).get("origin_run_id", self.run_id),
                                        "detail": "This draft has not been saved yet"}
         self.persist()
-        # Resolve acyclic batch references before saving their owners. List order
-        # should not strand a revision merely because its new basis follows it.
-        waiting = list(work)
-        work = []
-        while waiting:
-            pending_keys = {key for key, _, _ in waiting}
-            ready = [row for row in waiting if not any(
-                address.get("receipt_key") in pending_keys
-                for address in self.pending_items[row[0]].get("bindings", {}).values())]
-            if not ready:
-                # Missing/cyclic drafts keep the existing explicit error and
-                # recovery path; no incomplete memory is reported as saved.
-                work.extend(waiting)
-                break
-            work.extend(ready)
-            chosen = {row[0] for row in ready}
-            waiting = [row for row in waiting if row[0] not in chosen]
+        groups = dependency_groups(work, self.pending_items)
+        cycles = {group[0][0]: group for group, cyclic in groups if cyclic}
+        work = [group[0] for group, _ in groups]
         for key, index, item in work:
+            if key in cycles:
+                self.apply_component(cycles[key], outcome)
+                continue
             if key in self.receipts:
                 self.remember_handle(item, self.receipts[key])
                 outcome.written.extend(self.receipts[key])
