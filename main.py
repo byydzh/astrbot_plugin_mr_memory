@@ -8,6 +8,7 @@ import time
 import weakref
 from contextlib import closing
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -231,6 +232,16 @@ class MrMemoryPlugin(Star):
         raw = getattr(obj, "raw_message", None)
         platform_sender = raw.get("sender", {}) if isinstance(raw, dict) else {}
         stamp = raw.get("time") if isinstance(raw, dict) else None
+        if event.get_platform_name() in ("qq_official", "qq_official_webhook"):
+            payload = raw if isinstance(raw, dict) else getattr(raw, "raw_data", {})
+            author = payload.get("author", {}) if isinstance(payload, dict) else {}
+            platform_sender = {"nickname": author.get("username")} if isinstance(author, dict) else {}
+            official_stamp = payload.get("timestamp") if isinstance(payload, dict) else None
+            if official_stamp:
+                try:
+                    stamp = datetime.fromisoformat(str(official_stamp).replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    logger.warning("MR: invalid QQ official timestamp; using adapter receive time")
         stamp = stamp or obj.timestamp or time.time()
         if hasattr(stamp, "timestamp"):
             stamp = stamp.timestamp()
@@ -245,6 +256,16 @@ class MrMemoryPlugin(Star):
     async def update_state(self, store: Store, changes: dict) -> None:
         async with self.state_locks[store.umo]:
             await asyncio.to_thread(store.update_working_state, changes)
+
+    async def record_external_send(self, event: AstrMessageEvent, message) -> None:
+        """Record a confirmed send made through Context rather than event.send."""
+        if self.stopping:
+            return
+        try:
+            chain = components(list(getattr(message, "chain", []) or []))
+            await self.record_bot_event(event, "sent", readable(chain), chain)
+        except Exception:
+            logger.exception("MR: could not record sent response")
 
     def observe_sends(self, event: AstrMessageEvent) -> None:
         """Record successful sends on this event, including streamed segments."""
@@ -310,6 +331,10 @@ class MrMemoryPlugin(Star):
             logger.exception("MR: could not record group message")
 
     async def refresh_roster(self, store: Store, event: AstrMessageEvent) -> None:
+        # This is the OneBot member-list API, not a generic QQ capability.
+        # Official events still populate observed participants via append_message.
+        if event.get_platform_name() != "aiocqhttp":
+            return
         bot = getattr(event, "bot", None)
         if bot is None:
             return
@@ -355,6 +380,13 @@ class MrMemoryPlugin(Star):
         # Give both models the live value rather than asking memory to infer it.
         # This role is not a claim that every tool is available or authorized.
         current["astrbot_runtime"] = {"requester_id": current["sender_id"], "is_admin": event.is_admin()}
+        if event.get_platform_name() in ("qq_official", "qq_official_webhook"):
+            current["astrbot_runtime"]["platform_context"] = {
+                "identity_namespace": "QQ official OpenID; not a QQ account number",
+                "member_directory": "observed senders only; full roster unavailable",
+                "history_recovery": "unavailable on this adapter; missing messages are not recovered",
+                "identity_binding_policy": "use explicit mappings only; do not equate names with old QQ accounts",
+            }
         current["clock"] = request_clock(started_at, current["sent_at"])
         runtime_prefix = "<mr_request_context>"
         req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
@@ -488,6 +520,7 @@ class MrMemoryPlugin(Star):
         bot = await asyncio.to_thread(store.members, account_ids=[bot_id])
         row.update(message_id=str(message_id) if message_id is not None else f"astrbot:{request_id}:{kind}:{time.time_ns()}",
                    sender_id=bot_id, sender_name=bot[0]["name"] if bot else "",
+                   platform_nickname=None, group_card=None,
                    sent_at=int(time.time()), plain_text=text, role="BOT" if kind == "sent" else "SYSTEM",
                    content=[{"type": "response_to", "message_id": request_id},
                             {"type": "bot_event", "event": kind}, *content], reply_to=request_id)
