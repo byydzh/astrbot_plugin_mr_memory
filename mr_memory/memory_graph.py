@@ -185,7 +185,8 @@ class MemoryGraph:
             clauses.append("(json_extract(m.attributes_json,'$.participant_id')=? OR EXISTS(SELECT 1 FROM json_each(m.attributes_json,'$.source_ids') s JOIN messages raw ON raw.id=s.value WHERE raw.umo=m.umo AND raw.sender_participant_id=?))")
             args.extend([int(participant_id)] * 2)
         if related_account_id is not None:
-            from .store import RELATED_ACCOUNT_SQL
+            accounts = self.store.linked_accounts(related_account_id)
+            related_sql, related_args = self.store.related_account_sql(related_account_id)
             # Follow explicit formation references as candidate provenance.
             # Being related through an experience does not assign its facts to a person.
             # SQLite must expand each small source-id list before PK lookup, and
@@ -193,15 +194,15 @@ class MemoryGraph:
             # let the planner rescan all group messages/edges for every object.
             prefix = """WITH RECURSIVE related(kind,id) AS (
                 SELECT o.kind,o.id FROM mr_memory_objects o WHERE o.umo=? AND o.status='ACTIVE' AND
-                (CAST(json_extract(o.attributes_json,'$.subject.account_id') AS TEXT)=? OR EXISTS(
+                (CAST(json_extract(o.attributes_json,'$.subject.account_id') AS TEXT) IN (""" + ",".join("?" for _ in accounts) + """) OR EXISTS(
                     SELECT 1 FROM json_each(o.attributes_json,'$.source_ids') s CROSS JOIN messages m ON m.id=s.value
-                    WHERE m.umo=o.umo AND m.is_deleted=0 AND """ + RELATED_ACCOUNT_SQL + """))
+                    WHERE m.umo=o.umo AND m.is_deleted=0 AND """ + related_sql + """))
                 UNION SELECT json_extract(e.attributes_json,'$.source_ref.kind'),json_extract(e.attributes_json,'$.source_ref.id')
                 FROM related r CROSS JOIN mr_memory_objects e ON e.umo=? AND e.kind='association' AND e.status='ACTIVE'
                 AND json_extract(e.attributes_json,'$.purpose')='basis'
                 AND json_extract(e.attributes_json,'$.target_ref.kind')=r.kind
                 AND json_extract(e.attributes_json,'$.target_ref.id')=r.id) """
-            prefix_args = [self.umo, *([str(related_account_id)] * 5), self.umo]
+            prefix_args = [self.umo, *accounts, *related_args, self.umo]
             clauses.append("(m.kind,m.id) IN (SELECT kind,id FROM related)")
         rows = self.store._rows(prefix + "SELECT m.kind,m.id FROM mr_memory_objects m WHERE " + " AND ".join(clauses) + " ORDER BY m.updated_at DESC,m.kind,m.id DESC LIMIT ?", [*prefix_args, *args, max(1, min(500, int(limit)))])
         return [self.get(r["kind"], r["id"], include_sources=include_sources) for r in rows]
@@ -219,7 +220,7 @@ class MemoryGraph:
             value = self.get("association", row["id"], include_sources=include_sources)
             if words and not any(str(word).lower() in encode(value).lower() for word in words):
                 continue
-            if related_account_id is not None and not any(r["sender_id"] == str(related_account_id) for r in self.store.messages(value["source_ids"])):
+            if related_account_id is not None and not any(r["sender_id"] in self.store.linked_accounts(related_account_id) for r in self.store.messages(value["source_ids"])):
                 continue
             values.append(value)
             if len(values) >= max(0, int(offset)) + max(1, min(500, int(limit))):

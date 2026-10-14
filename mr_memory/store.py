@@ -461,6 +461,10 @@ class Store:
 
     @_serialized
     def forget(self, account_id: str) -> dict:
+        results = [self._forget_account(account) for account in self.linked_accounts(account_id, confirmed=True)]
+        return {"forgotten": True, "messages_removed": sum(r["messages_removed"] for r in results)}
+
+    def _forget_account(self, account_id: str) -> dict:
         people = self._rows("SELECT * FROM participants WHERE umo=? AND account_id=?", (self.umo, str(account_id)))
         platform_ids = {p["platform_id"] for p in people} or {self.umo.split(":")[0]}
         rows = self._rows("SELECT id,message_id FROM messages WHERE umo=? AND sender_id=?", (self.umo, str(account_id)))
@@ -566,10 +570,38 @@ class Store:
 
     @_serialized
     def members(self, account_ids: Iterable[str] | None = None, name: str | None = None) -> list[dict]:
-        return self.profiles.members(account_ids, name)
+        wanted = None if account_ids is None else list(dict.fromkeys(
+            account for uid in account_ids for account in self.linked_accounts(uid)))
+        result = self.profiles.members(wanted, name)
+        if not getattr(self, "identity_links", {}) and not getattr(self, "platform_migrated", False):
+            return result
+        by_id = {row["account_id"]: row for row in self.profiles.members(wanted)}
+        for person in result:
+            links = self.linked_accounts(person["account_id"])
+            person["linked_account_ids"] = [uid for uid in links if uid != person["account_id"]]
+            legacy = getattr(self, "identity_links", {}).get(person["account_id"])
+            if legacy and legacy in by_id and not person.get("edited_at"):
+                for key in ("preferred_name", "description", "confirmed_aliases", "avoided_names"):
+                    person[key] = by_id[legacy][key]
+                person["name"] = person["preferred_name"] or person["name"]
+            if getattr(self, "platform_migrated", False) and person["membership"] == "platform_roster":
+                person.update(membership="historical_roster", role=None)
+        return result
+
+    def linked_accounts(self, account, *, confirmed=False):
+        account = str(account)
+        links = getattr(self, "identity_confirmed" if confirmed else "identity_links", {})
+        legacy = links.get(account, account)
+        return list(dict.fromkeys([account, legacy, *(uid for uid, old in links.items() if old == legacy)]))
+
+    def related_account_sql(self, account):
+        accounts = self.linked_accounts(account)
+        return "(" + " OR ".join(RELATED_ACCOUNT_SQL for _ in accounts) + ")", [uid for uid in accounts for _ in range(4)]
 
     @_serialized
     def edit_member(self, account_id: str, changes: dict, *, actor: str) -> dict:
+        links = getattr(self, "identity_confirmed" if actor.startswith("self:") else "identity_links", {})
+        account_id = links.get(str(account_id), account_id)
         return self.profiles.edit(account_id, changes, actor=actor)
 
     @_serialized
@@ -597,13 +629,15 @@ class Store:
             clauses.append("(m.sender_participant_id=? OR EXISTS(SELECT 1 FROM message_participants mp WHERE mp.message_id=m.id AND mp.participant_id=?))")
             args.extend((int(participant_id), int(participant_id)))
         if sender_id is not None:
-            clauses.append("m.sender_id=?")
-            args.append(str(sender_id))
+            accounts = self.linked_accounts(sender_id)
+            clauses.append(f"m.sender_id IN ({','.join('?' for _ in accounts)})")
+            args.extend(accounts)
         if related_account_id is not None:
             # Involvement includes sending, mentions, and replies. It is a
             # separate query from the actual-author filter above.
-            clauses.append(RELATED_ACCOUNT_SQL)
-            args.extend([str(related_account_id)] * 4)
+            predicate, parameters = self.related_account_sql(related_account_id)
+            clauses.append(predicate)
+            args.extend(parameters)
         for field, op, value in (("sent_at", ">=", start_at), ("sent_at", "<", end_at)):
             if value is not None:
                 clauses.append(f"m.{field}{op}?")
@@ -654,8 +688,9 @@ class Store:
         if start_at is None or end_at is None or (participant_id is None and account_id is None):
             raise ValueError("Activity requires an account and time range")
         author = "sender_id" if account_id is not None else "sender_participant_id"
-        args = (self.umo, str(account_id) if account_id is not None else int(participant_id), int(start_at), int(end_at))
-        where = f"umo=? AND {author}=? AND sent_at>=? AND sent_at<? AND is_deleted=0"
+        accounts = self.linked_accounts(account_id) if account_id is not None else [int(participant_id)]
+        args = (self.umo, *accounts, int(start_at), int(end_at))
+        where = f"umo=? AND {author} IN ({','.join('?' for _ in accounts)}) AND sent_at>=? AND sent_at<? AND is_deleted=0"
         total = dict(self.db.execute(f"SELECT count(*) message_count,min(sent_at) first_at,max(sent_at) last_at FROM messages WHERE {where}", args).fetchone())
         days = self._rows(f"SELECT date(sent_at,'unixepoch','+8 hours') date,count(*) message_count,min(sent_at) first_at,max(sent_at) last_at FROM messages WHERE {where} GROUP BY date ORDER BY date", args)
         hours = {int(r["hour"]): r["message_count"] for r in self._rows(f"SELECT strftime('%H',sent_at,'unixepoch','+8 hours') hour,count(*) message_count FROM messages WHERE {where} GROUP BY hour", args)}
@@ -1216,6 +1251,8 @@ class Store:
 
     @_serialized
     def roster(self) -> dict | None:
+        if getattr(self, "platform_migrated", False):
+            return None
         row = self.db.execute("SELECT payload_json,fetched_at FROM mr_roster_cache WHERE umo=?", (self.umo,)).fetchone()
         if not row:
             return None

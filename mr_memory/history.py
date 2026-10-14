@@ -63,6 +63,9 @@ class HistoryRecovery:
 
     def enabled(self, umo):
         config = self.plugin.config
+        identities = getattr(self.plugin, "identities", None)
+        if identities and identities.aliases(umo):
+            return False
         return (config["capture_enabled"] and config.get("history_recovery_enabled", True)
                 and (not config["allowed_umos"] or umo in config["allowed_umos"]))
 

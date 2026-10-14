@@ -249,11 +249,17 @@ async function loadTab() {
     renderHistory(overview.history || {});
     renderWorkspace(overview);
   } else if (state.tab === "memory") { await searchMemory(); }
-  else if (state.tab === "people") { await searchPeople(); }
+  else if (state.tab === "people") { await searchPeople(); if ($("platform-migration").open) await loadMigration(); }
   else { await searchMessages(); }
 }
 
 function renderHistory(history) {
+  if (history.status === "unsupported") {
+    $("recover-history").disabled = true;
+    $("history-status").textContent = "官方 QQ：在线消息持续记录";
+    $("history-detail").textContent = history.last_error;
+    return;
+  }
   const active = history.status === "running";
   $("recover-history").disabled = !state.scope || !state.overview?.runtime.history_recovery || active;
   const progress = history.pending || history.last_result || {};
@@ -502,6 +508,55 @@ $("reset-conversation").addEventListener("click", async () => {
     state.resetBusy = false; control.disabled = !state.scope; control.textContent = "清理主会话上下文";
   }
 });
+let migrationPreview = null;
+async function loadMigration(preview = false) {
+  if (!state.scope) return;
+  const scope = state.scope;
+  const selected = preview ? $("migration-legacy").value : "";
+  const data = await api(path("migration"), selected ? { legacy_scope: selected } : {});
+  if (scope !== state.scope) return;
+  migrationPreview = { ...data, scope, selected: data.legacy_scope || selected };
+  const picker = $("migration-legacy"); picker.replaceChildren(el("option", "选择旧群记忆库"));
+  picker.firstChild.value = "";
+  for (const group of data.choices) { const option = el("option", `群 ${group.group_id} · ${group.platform_id}`); option.value = group.id; picker.append(option); }
+  picker.value = migrationPreview.selected;
+  picker.disabled = data.bound || !data.official;
+  $("migration-bind").disabled = !data.official || data.bound || !data.old_counts;
+  $("migration-preview").disabled = !data.official;
+  const matched = Object.values(data.matches).filter(v => v.legacy_id).length;
+  $("migration-status").textContent = !data.official ? "请在上方群选择器切换到新官方机器人已开始记录的群。" :
+    `${data.message} 已观察 ${data.observed_people.length} 位成员，${matched} 位已找到对应。` +
+    (data.old_counts ? ` 旧库有 ${number(data.old_counts.messages)} 条原文、${number(data.old_counts.episodes + data.old_counts.semantics + data.old_counts.associations + data.old_counts.patterns)} 项有效记忆。` : "");
+  const body = $("migration-members"); body.replaceChildren();
+  for (const person of data.observed_people) {
+    const match = data.matches[person.account_id];
+    const row = el("tr"), select = el("select"), choice = el("option", "暂不关联（新成员 / 尚未确认）");
+    choice.value = ""; select.append(choice);
+    for (const old of data.old_people.filter(p => p.account_type === "USER")) {
+      const option = el("option", `${old.card || old.nickname || old.name} · ${old.account_id}`); option.value = old.account_id; select.append(option);
+    }
+    select.value = match?.legacy_id || ""; select.disabled = !data.bound;
+    select.setAttribute("aria-label", `为 ${person.name} 选择旧账号`);
+    const cell = el("td"); cell.append(select);
+    const action = el("td"), save = button("保存关联", async () => {
+      const result = await api(`scopes/${encodeURIComponent(scope)}/migration/member`, {account_id: person.account_id, legacy_id: select.value}, true);
+      if (state.scope === scope) { notice(result.message); await loadMigration(); }
+    }); save.disabled = !data.bound; action.append(save);
+    row.append(el("td", `${person.card || person.nickname || person.name}\n${person.account_id}`), cell,
+      el("td", match?.method === "manual" ? "手动确认" : match?.method === "unchanged_name" ? "唯一名称一致" : match?.method === "ignored" ? "已设为不关联" : "待对照 / 名称有冲突"), action);
+    body.append(row);
+  }
+}
+$("platform-migration").addEventListener("toggle", () => { if ($("platform-migration").open) attempt(() => loadMigration()); });
+$("migration-preview").addEventListener("click", () => attempt(() => loadMigration(true)));
+$("migration-legacy").addEventListener("change", () => { $("migration-bind").disabled = true; migrationPreview = null; });
+$("migration-bind").addEventListener("click", () => attempt(async () => {
+  if (!migrationPreview || migrationPreview.scope !== state.scope || !migrationPreview.selected) throw new Error("请先预览当前两个群的对照结果");
+  $("migration-bind").disabled = true;
+  const result = await api(path("migration/bind"), {legacy_scope: migrationPreview.selected}, true);
+  notice(result.message); await loadMigration();
+}));
+
 attempt(async () => {
   const deadline = performance.now() + 5000;
   while (!window.AstrBotPluginPage) {

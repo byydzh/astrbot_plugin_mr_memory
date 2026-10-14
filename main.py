@@ -31,6 +31,7 @@ from .mr_memory.request_context import RequestContext
 from .mr_memory.profiles import parse_profile_changes
 from .mr_memory.history import HistoryRecovery
 from .mr_memory.handoff import request_clock
+from .mr_memory.identity import IdentityBindings, import_unlearned_messages
 
 
 def json_value(value: Any) -> Any:
@@ -133,6 +134,8 @@ class MrMemoryPlugin(Star):
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_mr_memory"
         self.scope_dir = self.data_dir / "scopes"
         self.scope_dir.mkdir(parents=True, exist_ok=True)
+        self.identities = IdentityBindings(self.data_dir / "platform_bindings.json")
+        self.identity_lock = asyncio.Lock()
         self.stores: dict[str, Store] = {}
         self.active_scopes: set[str] = set()
         self.open_lock = asyncio.Lock()
@@ -168,12 +171,12 @@ class MrMemoryPlugin(Star):
         # quiet after reload. Opening a scope does not start a model call.
         def reflection_scopes():
             scopes = []
-            allowed = self.config["allowed_umos"]
+            allowed = {self.identities.canonical(umo) for umo in self.config["allowed_umos"]}
             for path in self.scope_dir.glob("*.db"):
                 try:
                     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
                         row = db.execute("SELECT umo FROM scope_meta WHERE singleton=1").fetchone()
-                        if not row or (allowed and row[0] not in allowed):
+                        if not row or self.identities.canonical(row[0]) != row[0] or (allowed and row[0] not in allowed):
                             continue
                         scopes.append((path, row[0]))
                 except sqlite3.Error:
@@ -184,6 +187,7 @@ class MrMemoryPlugin(Star):
             async with self.open_lock:
                 if umo not in self.stores:
                     self.stores[umo] = await asyncio.to_thread(Store, path, umo)
+                    self.identities.configure(self.stores[umo])
                     self.state_locks[umo] = asyncio.Lock()
                 self.active_scopes.add(umo)
         self.spawn(self.maintain())
@@ -193,19 +197,64 @@ class MrMemoryPlugin(Star):
 
     def allowed(self, event: AstrMessageEvent) -> bool:
         scopes = self.config.get("allowed_umos", [])
-        return bool(event.get_group_id()) and (not scopes or event.unified_msg_origin in scopes)
+        umo = event.unified_msg_origin
+        canonical = self.identities.canonical(umo) if hasattr(self, "identities") else umo
+        return bool(event.get_group_id()) and (not scopes or umo in scopes or canonical in scopes)
 
     async def store_for(self, event: AstrMessageEvent) -> Store:
-        umo = event.unified_msg_origin
-        self.active_scopes.add(umo)
-        if umo not in self.stores:
-            async with self.open_lock:
-                if umo not in self.stores:
-                    # Keep the existing on-disk group filename; this is not a semantic check.
-                    path = self.scope_dir / (hashlib.sha256(umo.encode()).hexdigest() + ".db")
-                    self.stores[umo] = await asyncio.to_thread(Store, path, umo)
-                    self.state_locks[umo] = asyncio.Lock()
+        async with self.open_lock:
+            umo = self.identities.canonical(event.unified_msg_origin)
+            self.active_scopes.add(umo)
+            if umo not in self.stores:
+                path = self.scope_dir / (hashlib.sha256(umo.encode()).hexdigest() + ".db")
+                self.stores[umo] = await asyncio.to_thread(Store, path, umo)
+                self.identities.configure(self.stores[umo])
+                self.state_locks[umo] = asyncio.Lock()
         return self.stores[umo]
+
+    @staticmethod
+    def for_store(row, store):
+        row = dict(row)
+        if row["umo"] != store.umo:
+            prefix = f"{row['platform_id']}|{row['umo']}|"
+            row["source_key"] = row.get("source_key") or prefix + row["message_id"]
+            if row.get("reply_to") and "|" not in str(row["reply_to"]):
+                row["reply_to"] = prefix + str(row["reply_to"])
+            row["umo"] = store.umo
+        return row
+
+    async def refresh_identities(self, current_umo, store):
+        if current_umo not in self.identities.groups:
+            return
+        async with self.identity_lock:
+            platform = current_umo.split(":", 1)[0]
+            def current_people():
+                with store._lock:
+                    ids = [r[0] for r in store.db.execute(
+                        "SELECT account_id FROM participants WHERE umo=? AND platform_id=? AND account_type='USER'",
+                        (store.umo, platform))]
+                    return store.profiles.members(ids)
+            people = await asyncio.to_thread(current_people)
+            if self.identities.refresh(current_umo, people):
+                self.identities.configure(store)
+
+    async def bind_scope(self, current, legacy):
+        async with self.identity_lock, self.open_lock:
+            if self.requests or any(lock.locked() for key, lock in self.learning_locks.items()
+                                    if key in {current.umo, legacy.umo}):
+                raise ValueError("这两个群有记忆任务正在运行，请在任务结束后再执行接续")
+            if not legacy.umo.rsplit(":", 1)[-1].isdigit():
+                raise ValueError("请选择旧 QQ 群号对应的记忆库")
+            if current.umo in self.identities.groups or self.identities.aliases(legacy.umo):
+                raise ValueError("所选群已有绑定，请先查看已有关系")
+            old_people = await asyncio.to_thread(legacy.profiles.members)
+            copied = await asyncio.to_thread(import_unlearned_messages, current, legacy)
+            self.identities.bind(current.umo, legacy.umo, old_people)
+            self.identities.configure(legacy)
+            self.active_scopes.discard(current.umo)
+            self.active_scopes.add(legacy.umo)
+        await self.refresh_identities(current.umo, legacy)
+        return {"imported_messages": copied, "message": "已接续旧群记忆。后续消息静默进入同一记忆库，成员名称对照已启用。"}
 
     def agent(self, store: Store, *, background: bool = False, feedback: bool = False) -> MemoryAgent:
         provider_id = str(self.config["subconscious_provider_id"])
@@ -273,8 +322,30 @@ class MrMemoryPlugin(Star):
             return
         original_send = getattr(event, "_mr_memory_original_send", event.send)
         observes_receipts = isinstance(event, AiocqhttpMessageEvent)
+        official = event.get_platform_name() in {"qq_official", "qq_official_webhook"}
+        if official and hasattr(event, "_post_send_one"):
+            observes_receipts = True
+            original_post = getattr(event, "_mr_memory_original_post", event._post_send_one)
 
-        if observes_receipts:
+            async def record_official(receipt, chain):
+                message_id = receipt.get("id") if isinstance(receipt, dict) else getattr(receipt, "id", None)
+                if message_id and not self.stopping:
+                    try:
+                        await self.record_bot_event(event, "sent", readable(chain), chain, message_id=message_id)
+                    except Exception:
+                        logger.exception("MR: could not record confirmed QQ official response")
+
+            async def post_and_record(message, *args, **kwargs):
+                receipt = await original_post(message, *args, **kwargs)
+                await record_official(receipt, components(list(message.chain)))
+                return receipt
+
+            event._post_send_one = post_and_record
+            event._mr_memory_original_post = original_post
+            event._mr_memory_post_wrapper = post_and_record
+            event._mr_memory_record_official_receipt = record_official
+
+        if isinstance(event, AiocqhttpMessageEvent):
             original_transport = getattr(event, "_mr_memory_original_send_message", event.send_message)
 
             async def record_receipt(receipt, chain):
@@ -319,14 +390,16 @@ class MrMemoryPlugin(Star):
             return
         self.observe_sends(event)
         try:
-            store = await self.store_for(event)
-            raw = getattr(event.message_obj, "raw_message", {})
-            if isinstance(raw, dict) and raw.get("notice_type") == "group_recall":
-                await asyncio.to_thread(store.delete_message, str(raw["message_id"]))
-            else:
-                await asyncio.to_thread(store.append_message, self.message(event))
-                if event.get_platform_id() not in self.history.clients:
-                    self.history.request(store)
+            async with self.identity_lock:
+                store = await self.store_for(event)
+                raw = getattr(event.message_obj, "raw_message", {})
+                if isinstance(raw, dict) and raw.get("notice_type") == "group_recall":
+                    await asyncio.to_thread(store.delete_message, str(raw["message_id"]))
+                else:
+                    await asyncio.to_thread(store.append_message, self.for_store(self.message(event), store))
+            await self.refresh_identities(event.unified_msg_origin, store)
+            if event.get_platform_id() not in self.history.clients:
+                self.history.request(store)
         except Exception:
             logger.exception("MR: could not record group message")
 
@@ -372,7 +445,7 @@ class MrMemoryPlugin(Star):
         started = time.perf_counter()
         started_at = time.time()
         store = await self.store_for(event)
-        current = self.message(event)
+        current = self.for_store(self.message(event), store)
         current["question"] = req.prompt or current["plain_text"]
         main_context = RequestContext(req)
         current["main_context"] = main_context.directory()
@@ -385,7 +458,9 @@ class MrMemoryPlugin(Star):
                 "identity_namespace": "QQ official OpenID; not a QQ account number",
                 "member_directory": "observed senders only; full roster unavailable",
                 "history_recovery": "unavailable on this adapter; missing messages are not recovered",
-                "identity_binding_policy": "use explicit mappings only; do not equate names with old QQ accounts",
+                "identity_binding_policy": "use linked_accounts maintained by the migration panel; raw source authors remain unchanged",
+                "linked_accounts": getattr(store, "identity_links", {}),
+                "memory_scope": store.umo,
             }
         current["clock"] = request_clock(started_at, current["sent_at"])
         runtime_prefix = "<mr_request_context>"
@@ -524,7 +599,7 @@ class MrMemoryPlugin(Star):
                    sent_at=int(time.time()), plain_text=text, role="BOT" if kind == "sent" else "SYSTEM",
                    content=[{"type": "response_to", "message_id": request_id},
                             {"type": "bot_event", "event": kind}, *content], reply_to=request_id)
-        await asyncio.to_thread(store.append_message, row)
+        await asyncio.to_thread(store.append_message, self.for_store(row, store))
 
     @filter.on_llm_response()
     async def capture_response(self, event: AstrMessageEvent, response: Any) -> None:
@@ -563,7 +638,7 @@ class MrMemoryPlugin(Star):
         kind = "feedback" if feedback else "background"
         if self.stopping or not self.config["subconscious_enabled"]:
             return {"status": "disabled", "reason": "后台潜意识已关闭"}
-        allowed = self.config["allowed_umos"]
+        allowed = {self.identities.canonical(umo) for umo in self.config["allowed_umos"]}
         if allowed and store.umo not in allowed:
             return {"status": "disabled", "reason": "此群未启用"}
         lock = self.learning_locks.setdefault(store.umo, asyncio.Lock())
@@ -848,7 +923,7 @@ class MrMemoryPlugin(Star):
                     return
                 if store.umo not in self.active_scopes:
                     continue
-                allowed = self.config["allowed_umos"]
+                allowed = {self.identities.canonical(umo) for umo in self.config["allowed_umos"]}
                 if allowed and store.umo not in allowed:
                     continue
                 try:
@@ -874,7 +949,7 @@ class MrMemoryPlugin(Star):
         if not self.allowed(event):
             return
         store = await self.store_for(event)
-        await asyncio.to_thread(store.append_message, self.message(event))
+        await asyncio.to_thread(store.append_message, self.for_store(self.message(event), store))
         await self.refresh_roster(store, event)
         # The account always comes from the adapter, never from command text.
         account = str(event.message_obj.sender.user_id)
@@ -884,7 +959,8 @@ class MrMemoryPlugin(Star):
             if changes:
                 person = await asyncio.to_thread(store.edit_member, account, changes, actor="self:" + account)
             else:
-                person = (await asyncio.to_thread(store.members, account_ids=[account]))[0]
+                people = await asyncio.to_thread(store.members, account_ids=[account])
+                person = next((p for p in people if p["account_id"] == account), people[0])
             text = (f"你的 UID：{account}\n群名片：{person['card'] or '未提供'}\n平台昵称：{person['nickname'] or '未提供'}"
                     f"\n希望称呼：{person['preferred_name'] or '未设置'}\n别名：{', '.join(person['confirmed_aliases']) or '未设置'}"
                     f"\n不用的称呼：{', '.join(person['avoided_names']) or '未设置'}\n说明：{person['description'] or '未设置'}"
@@ -925,6 +1001,11 @@ class MrMemoryPlugin(Star):
                         event.send_message = event._mr_memory_original_send_message
                     del event._mr_memory_original_send_message
                     del event._mr_memory_send_message_wrapper
+                if hasattr(event, "_mr_memory_post_wrapper"):
+                    if event._post_send_one is event._mr_memory_post_wrapper:
+                        event._post_send_one = event._mr_memory_original_post
+                    for name in ("_mr_memory_original_post", "_mr_memory_post_wrapper", "_mr_memory_record_official_receipt"):
+                        delattr(event, name)
                 for name in ("_mr_memory_send_observed", "_mr_memory_original_send", "_mr_memory_send_wrapper"):
                     delattr(event, name)
         self.observed_events.clear()

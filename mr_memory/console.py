@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import time
@@ -15,6 +16,7 @@ from .store import Store
 from .settings import DEFAULTS
 from .schedule import work_window
 from .conversation import ConversationRepair
+from .identity import match_members
 
 
 class Console:
@@ -38,6 +40,9 @@ class Console:
             ("scopes/<scope_id>/distill", self.distill, "POST"),
             ("scopes/<scope_id>/conversation/reset", self.reset_conversation, "POST"),
             ("scopes/<scope_id>/history/recover", self.recover_history, "POST"),
+            ("scopes/<scope_id>/migration", self.migration, "GET"),
+            ("scopes/<scope_id>/migration/bind", self.migration_bind, "POST"),
+            ("scopes/<scope_id>/migration/member", self.migration_member, "POST"),
         )
         for path, handler, method in routes:
             wrapped = partial(self.dispatch, handler)
@@ -75,25 +80,26 @@ class Console:
                 errors.append(f"{path.name}：{exc}")
         return scopes, errors
 
-    async def get_store(self, scope_id):
+    async def get_store(self, scope_id, *, raw=False):
         scopes, _ = await asyncio.to_thread(self.discover)
         scope = next((s for s in scopes if s["id"] == scope_id), None)
         if scope is None:
             raise FileNotFoundError("找不到这个群的记忆库，请刷新群列表")
-        umo = scope["umo"]
+        umo = scope["umo"] if raw else self.plugin.identities.canonical(scope["umo"])
         async with self.plugin.open_lock:
             if umo not in self.plugin.stores:
                 self.plugin.stores[umo] = await asyncio.to_thread(
-                    Store, self.plugin.scope_dir / f"{scope_id}.db", umo)
+                    Store, self.plugin.scope_dir / (hashlib.sha256(umo.encode()).hexdigest() + ".db"), umo)
+                self.plugin.identities.configure(self.plugin.stores[umo])
                 self.plugin.state_locks[umo] = asyncio.Lock()
         return self.plugin.stores[umo]
 
     async def overview(self):
         scopes, errors = await asyncio.to_thread(self.discover)
         config = {**DEFAULTS, **self.plugin.config}
-        allowed = config["allowed_umos"]
+        allowed = {self.plugin.identities.canonical(umo) for umo in config["allowed_umos"]}
         for scope in scopes:
-            scope["enabled"] = not allowed or scope["umo"] in allowed
+            scope["enabled"] = not allowed or scope["umo"] in allowed or self.plugin.identities.canonical(scope["umo"]) in allowed
         return {"scopes": scopes, "errors": errors, "runtime": {
             "provider": config["local_serving_reader_provider_id"] or config["subconscious_provider_id"],
             "background_provider": config["subconscious_provider_id"],
@@ -175,7 +181,11 @@ class Console:
         store = await self.get_store(scope_id)
         counts = await asyncio.to_thread(self.inventory, store)
         state = await asyncio.to_thread(store.load_working_state)
-        return {"counts": counts, "state": state, "history": await asyncio.to_thread(store.history_state),
+        history = await asyncio.to_thread(store.history_state)
+        adapter = self.plugin.context.get_platform_inst(store.umo.split(":", 1)[0])
+        if getattr(store, "platform_migrated", False) or (adapter and adapter.meta().name in {"qq_official", "qq_official_webhook"}):
+            history = {**history, "status": "unsupported", "last_error": "官方 QQ 没有历史补拉接口；在线普通消息持续记录，旧库已接续的历史仍可检索。"}
+        return {"counts": counts, "state": state, "history": history,
                 "workspace": await asyncio.to_thread(store.workspace), **await self.learning_overview(store),
                 "background_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "background"),
                 "feedback_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "feedback")}
@@ -301,7 +311,64 @@ class Console:
 
     async def reset_conversation(self, scope_id):
         store = await self.get_store(scope_id)
-        return await self.conversation_repair.reset_main_conversation(store.umo)
+        aliases = self.plugin.identities.aliases(store.umo)
+        return await self.conversation_repair.reset_main_conversation(aliases[0] if aliases else store.umo)
+
+    async def migration(self, scope_id):
+        current = await self.get_store(scope_id, raw=True)
+        scopes, _ = await asyncio.to_thread(self.discover)
+        bindings = self.plugin.identities
+        binding = bindings.groups.get(current.umo)
+        old_scope = next((s for s in scopes if s["umo"] == binding["legacy_umo"]), None) if binding else None
+        selected = request.query.get("legacy_scope") or (old_scope or {}).get("id")
+        old = await self.get_store(selected) if selected else None
+        view = old if binding else current
+        def people():
+            with view._lock:
+                platform = current.umo.split(":", 1)[0]
+                ids = [r[0] for r in view.db.execute("SELECT account_id FROM participants WHERE platform_id=? AND account_type='USER'", (platform,))]
+                return view.profiles.members(ids)
+        observed = await asyncio.to_thread(people)
+        old_people = binding["old_people"] if binding else (await asyncio.to_thread(old.profiles.members) if old else [])
+        matches = binding["members"] if binding else match_members(old_people, observed)
+        with current._lock:
+            official = bool(current.db.execute("SELECT 1 FROM messages WHERE platform IN ('qq_official','qq_official_webhook') LIMIT 1").fetchone())
+        return {"official": official, "current_umo": current.umo, "bound": bool(binding),
+                "legacy_scope": (old_scope or {}).get("id"),
+                "choices": [s for s in scopes if s["group_id"].isdigit() and s["umo"] != current.umo],
+                "old_people": old_people, "observed_people": observed, "matches": matches,
+                "old_counts": await asyncio.to_thread(self.inventory, old) if old else None,
+                "receiving_messages": len(observed) > 0,
+                "message": "已接续旧库，后续成员发言会继续静默对照昵称。" if binding else "选择对应旧群，预览名称对照后接续。"}
+
+    async def migration_bind(self, scope_id):
+        data = await request.json()
+        current = await self.get_store(scope_id, raw=True)
+        legacy = await self.get_store(str(data.get("legacy_scope") or ""))
+        with current._lock:
+            official = current.db.execute("SELECT 1 FROM messages WHERE platform IN ('qq_official','qq_official_webhook') LIMIT 1").fetchone()
+        if not official:
+            raise ValueError("请在群选择器中选择新官方机器人已开始记录的群")
+        result = await self.plugin.bind_scope(current, legacy)
+        return {**result, "legacy_scope": str(data["legacy_scope"])}
+
+    async def migration_member(self, scope_id):
+        data = await request.json()
+        current = await self.get_store(scope_id, raw=True)
+        bindings = self.plugin.identities
+        binding = bindings.groups.get(current.umo)
+        if not binding:
+            raise ValueError("请先绑定群，再处理个别成员")
+        canonical = await self.get_store(hashlib.sha256(binding["legacy_umo"].encode()).hexdigest())
+        account, legacy = str(data.get("account_id") or ""), str(data.get("legacy_id") or "")
+        async with self.plugin.identity_lock:
+            with canonical._lock:
+                if not canonical.db.execute("SELECT 1 FROM participants WHERE platform_id=? AND account_id=?",
+                        (current.umo.split(":", 1)[0], account)).fetchone():
+                    raise ValueError("此 OpenID 尚未在当前群被观察到")
+            bindings.member(current.umo, account, legacy)
+            bindings.configure(canonical)
+        return {"message": "成员关联已更新；原文作者及管理员权限保持原样。"}
 
 
 def register_console(plugin):
