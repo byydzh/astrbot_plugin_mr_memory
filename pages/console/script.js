@@ -527,6 +527,10 @@ async function loadMigration(preview = false) {
   $("migration-status").textContent = !data.official ? "请在上方群选择器切换到新官方机器人已开始记录的群。" :
     `${data.message} 已观察 ${data.observed_people.length} 位成员，${matched} 位已找到对应。` +
     (data.old_counts ? ` 旧库有 ${number(data.old_counts.messages)} 条原文、${number(data.old_counts.episodes + data.old_counts.semantics + data.old_counts.associations + data.old_counts.patterns)} 项有效记忆。` : "");
+  const botLinks = Object.entries(data.bot_matches || {}).filter(([, match]) => match.legacy_id);
+  $("migration-bot-status").textContent = botLinks.length ?
+    `机器人自身${data.bound ? "已自动接续" : "将在接续旧群时自动关联"}：` + botLinks.map(([account, match]) => `${account} → ${match.legacy_id}`).join("；") :
+    "机器人自身随旧群接续自动关联，无需手动选择；自身标识会从适配器和回复记录中读取。";
   const body = $("migration-members"); body.replaceChildren();
   for (const person of data.observed_people) {
     const match = data.matches[person.account_id];
@@ -543,7 +547,7 @@ async function loadMigration(preview = false) {
       if (state.scope === scope) { notice(result.message); await loadMigration(); }
     }); save.disabled = !data.bound; action.append(save);
     row.append(el("td", `${person.card || person.nickname || person.name}\n${person.account_id}`), cell,
-      el("td", match?.method === "manual" ? "手动确认" : match?.method === "unchanged_name" ? "唯一名称一致" : match?.method === "ignored" ? "已设为不关联" : "待对照 / 名称有冲突"), action);
+      el("td", {manual: match?.legacy_id ? "管理员设置" : "管理员设置为不关联", unchanged_name: "唯一名称一致", self_reported: "群员自填", self_ignored: "本人已取消", ignored: "管理员设置为不关联"}[match?.method] || "待对照 / 名称有冲突"), action);
     body.append(row);
   }
 }

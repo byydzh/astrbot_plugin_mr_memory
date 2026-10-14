@@ -11,6 +11,16 @@ def names(person):
             ("card", "nickname", "name") if str(person.get(key) or "").strip()}
 
 
+def match_bots(old, current):
+    """BOT marks our own recorded replies, not other bots mentioned in the group."""
+    old_ids = {str(p["account_id"]) for p in old if p.get("account_type") == "BOT"}
+    if len(old_ids) != 1:
+        return {}
+    legacy = next(iter(old_ids))
+    return {str(p["account_id"]): {"legacy_id": legacy, "method": "bot_self", "names": []}
+            for p in current if p.get("account_type") == "BOT"}
+
+
 def match_members(old, current, confirmed=None):
     """Only unique unchanged platform names qualify; collisions remain unresolved."""
     confirmed = confirmed or {}
@@ -24,10 +34,7 @@ def match_members(old, current, confirmed=None):
     result = {}
     for person in current:
         account = str(person["account_id"])
-        if confirmed.get(account, {}).get("method") == "manual":
-            result[account] = confirmed[account]
-            continue
-        if confirmed.get(account, {}).get("method") == "ignored":
+        if confirmed.get(account, {}).get("method") in {"manual", "ignored", "self_reported", "self_ignored"}:
             result[account] = confirmed[account]
             continue
         if confirmed.get(account, {}).get("method") == "unchanged_name":
@@ -48,7 +55,7 @@ def match_members(old, current, confirmed=None):
     for accounts in owners.values():
         if len(accounts) > 1:
             for account in accounts:
-                if result[account]["method"] != "manual":
+                if result[account]["method"] not in {"manual", "self_reported"}:
                     result.pop(account)
     return result
 
@@ -82,30 +89,38 @@ class IdentityBindings:
         if not binding:
             return False
         members = match_members(binding["old_people"], people, binding["members"])
-        if members == binding["members"]:
+        bots = {**binding.get("bots", {}), **match_bots(binding["old_people"], people)}
+        if members == binding["members"] and bots == binding.get("bots", {}):
             return False
         binding["members"] = members
+        binding["bots"] = bots
         self.save()
         return True
 
-    def member(self, current, account, legacy):
+    def member(self, current, account, legacy, *, self_reported=False):
         binding = self.groups.get(current)
         if not binding:
             raise ValueError("请先接续这个群的旧记忆库")
+        existing = binding["members"].get(account, {})
+        if self_reported and existing.get("method") in {"manual", "ignored"}:
+            raise ValueError("你的关联已由管理员设置；如需更改，请联系管理员在迁移后台修改。")
         if not legacy:
-            binding["members"][account] = {"legacy_id": "", "method": "ignored", "names": []}
+            binding["members"][account] = {"legacy_id": "", "method": "self_ignored" if self_reported else "ignored", "names": []}
             self.save()
             return
         old_ids = {str(p["account_id"]) for p in binding["old_people"] if p.get("account_type", "USER") == "USER"}
         if legacy not in old_ids:
             raise ValueError("旧账号不属于所选群的历史成员")
-        if any(k != account and v["legacy_id"] == legacy and v["method"] == "manual"
+        if any(k != account and v["legacy_id"] == legacy and v["method"] in ({"manual", "self_reported"} if self_reported else {"manual"})
                for k, v in binding["members"].items()):
-            raise ValueError("该旧账号已有其他手动绑定，请先核对")
-        binding["members"][account] = {"legacy_id": legacy, "method": "manual", "names": []}
+            raise ValueError("该 QQ 号已被其他成员绑定，请联系管理员核对。")
+        binding["members"][account] = {"legacy_id": legacy, "method": "self_reported" if self_reported else "manual", "names": []}
         for key, value in list(binding["members"].items()):
             if key != account and value["legacy_id"] == legacy:
-                del binding["members"][key]
+                if not self_reported and value["method"] == "self_reported":
+                    binding["members"][key] = {"legacy_id": "", "method": "ignored", "names": []}
+                else:
+                    del binding["members"][key]
         self.save()
 
     def configure(self, store):
@@ -115,6 +130,9 @@ class IdentityBindings:
         store.identity_confirmed = {account: value["legacy_id"] for alias in aliases
                                     for account, value in self.groups[alias]["members"].items()
                                     if value["legacy_id"] and value["method"] == "manual"}
+        for alias in aliases:
+            store.identity_links.update({account: value["legacy_id"]
+                                         for account, value in self.groups[alias].get("bots", {}).items() if value["legacy_id"]})
         store.platform_migrated = bool(aliases)
 
 

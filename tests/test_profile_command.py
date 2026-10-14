@@ -24,6 +24,13 @@ class ProfileCommandTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 parse_profile_changes(command)
 
+    def test_optional_qqid_can_accompany_profile_fields(self):
+        self.assertEqual(parse_profile_changes("qqid 123456 称呼 小禾"), {"qqid": "123456", "preferred_name": "小禾"})
+        self.assertEqual(parse_profile_changes("qqid -"), {"qqid": ""})
+        for command in ["qqid", "称呼 小禾 qqid OPENID", "qqid １２３４５６"]:
+            with self.assertRaises(ValueError):
+                parse_profile_changes(command)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -22,6 +22,35 @@ def message(umo, uid, name, mid, stamp=100):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_self_report_and_admin_correction_with_separate_bot_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = IdentityBindings(Path(tmp) / "bindings.json")
+            old = [person("100", "小林"), person("200", "阿禾"), dict(person("999", "旧机器人"), account_type="BOT")]
+            binding.bind("new:GroupMessage:G", "old:GroupMessage:123", old)
+            binding.member("new:GroupMessage:G", "OPEN1", "100", self_reported=True)
+            binding.refresh("new:GroupMessage:G", [person("OPEN1", "改名了"), person("OPEN2", "阿禾")])
+            self.assertEqual(binding.groups["new:GroupMessage:G"]["members"]["OPEN1"]["method"], "self_reported")
+            with self.assertRaises(ValueError):
+                binding.member("new:GroupMessage:G", "OPEN2", "100", self_reported=True)
+            with self.assertRaises(ValueError):
+                binding.member("new:GroupMessage:G", "OPEN1", "999", self_reported=True)
+            # An administrator can correct either the owner or the destination.
+            binding.member("new:GroupMessage:G", "OPEN2", "100")
+            self.assertEqual(binding.groups["new:GroupMessage:G"]["members"]["OPEN1"]["method"], "ignored")
+            with self.assertRaisesRegex(ValueError, "管理员设置"):
+                binding.member("new:GroupMessage:G", "OPEN2", "200", self_reported=True)
+            binding.refresh("new:GroupMessage:G", [person("OPEN1", "改名了"), person("OPEN2", "阿禾"),
+                                                       dict(person("CURRENT_BOT", "新机器人"), account_type="BOT")])
+            binding = IdentityBindings(binding.path)
+            store = Store(":memory:", "old:GroupMessage:123")
+            try:
+                binding.configure(store)
+                self.assertEqual(set(store.linked_accounts("CURRENT_BOT")), {"CURRENT_BOT", "999"})
+                self.assertEqual(store.linked_accounts("OPEN1"), ["OPEN1"])
+                self.assertEqual(set(store.linked_accounts("OPEN2")), {"OPEN2", "100"})
+            finally:
+                store.close()
+
     def test_names_are_unique_and_later_collision_withdraws_only_automatic_link(self):
         old = [person("100", "小林"), person("200", "重名"), person("300", "重名")]
         now = [person("OPEN1", "小林"), person("OPEN2", "重名"), person("OPEN3", "新朋友")]

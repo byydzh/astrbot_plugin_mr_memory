@@ -6,7 +6,7 @@
   <title>MR · 群聊记忆</title>
   <link rel="stylesheet" href="./style.css?v=20260920-members" />
   <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20261014-migration" defer></script>
+  <script src="./script.js?v=20261014-identity3" defer></script>
 </head>
 <body>
 <main>
@@ -46,7 +46,9 @@
         <div class="search-bar"><label class="grow">对应的旧群<select id="migration-legacy"><option value="">选择旧群记忆库</option></select></label>
           <button type="button" id="migration-preview">预览对照</button><button type="button" class="primary" id="migration-bind" disabled>接续这个旧群</button></div>
         <p id="migration-status" role="status">展开后读取迁移状态。</p>
-        <small>唯一同名成员自动关联；同名冲突与改名成员可在下表选择。关联只用于 MR 记忆，不授予机器人管理权限。</small>
+        <p id="migration-bot-status" class="meta">机器人自身随旧群接续自动关联，无需手动选择。</p>
+        <h3>群员关联</h3>
+        <small>唯一同名成员自动关联；群员可自愿发送 /uid qqid 自己的QQ号。管理员可在下表修正，之后以管理员设置为准。关联只用于 MR 记忆，不授予机器人管理权限。</small>
         <div class="table-wrap"><table><thead><tr><th>新成员 / OpenID</th><th>旧群成员 / QQ 号</th><th>对照结果</th><th></th></tr></thead><tbody id="migration-members"></tbody></table></div>
       </details>
     </details>

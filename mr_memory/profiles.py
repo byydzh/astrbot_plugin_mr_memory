@@ -35,7 +35,7 @@ def encoded(value):
 
 def parse_profile_changes(arguments: str) -> dict:
     """Read explicit field/value pairs, keeping quoted field names as text."""
-    fields = {"称呼": "preferred_name", "别名": "aliases", "不用": "avoided_names", "说明": "description"}
+    fields = {"称呼": "preferred_name", "别名": "aliases", "不用": "avoided_names", "说明": "description", "qqid": "qqid"}
     lexer = shlex.shlex(arguments, posix=False)
     lexer.whitespace_split = True
     lexer.whitespace += "\u3000"
@@ -48,6 +48,8 @@ def parse_profile_changes(arguments: str) -> dict:
         if not value:
             raise ValueError(f"{field}后缺少内容；如需清空请填 -。本次资料未修改。")
         value = "" if value == "-" else value
+        if field == "qqid" and value and (not value.isascii() or not value.isdecimal()):
+            raise ValueError("qqid 请填写自己的数字 QQ 号，或填 - 取消本人自填的关联。本次资料未修改。")
         changes[fields[field]] = ([part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
                                   if field in {"别名", "不用"} else value)
 
@@ -62,7 +64,7 @@ def parse_profile_changes(arguments: str) -> dict:
             field, values = token, []
         else:
             if field is None:
-                raise ValueError("用法：/mr uid；修改本人：/mr uid 称呼 小林 别名 林同学；还可用 不用 / 说明，填 - 清空。不能指定他人的 UID。")
+                raise ValueError("用法：/uid；修改本人：/uid 称呼 小林 别名 林同学；还可用 不用 / 说明；可选 qqid 你的QQ号 关联旧记忆，填 - 清空。不能指定他人的 UID。")
             # posix=False retains quotes, so a value such as "别名" is not a field.
             values.append(token[1:-1] if len(token) >= 2 and token[0] in "\"'" and token[-1] == token[0] else token)
     if field is not None:

@@ -190,6 +190,9 @@ class MrMemoryPlugin(Star):
                     self.identities.configure(self.stores[umo])
                     self.state_locks[umo] = asyncio.Lock()
                 self.active_scopes.add(umo)
+        for umo in list(self.active_scopes):
+            for alias in self.identities.aliases(umo):
+                await self.refresh_identities(alias, self.stores[umo])
         self.spawn(self.maintain())
         self.spawn(self.maintain(indexing=True))
         self.history.start()
@@ -223,7 +226,7 @@ class MrMemoryPlugin(Star):
             row["umo"] = store.umo
         return row
 
-    async def refresh_identities(self, current_umo, store):
+    async def refresh_identities(self, current_umo, store, *, bot_id=""):
         if current_umo not in self.identities.groups:
             return
         async with self.identity_lock:
@@ -231,10 +234,12 @@ class MrMemoryPlugin(Star):
             def current_people():
                 with store._lock:
                     ids = [r[0] for r in store.db.execute(
-                        "SELECT account_id FROM participants WHERE umo=? AND platform_id=? AND account_type='USER'",
+                        "SELECT account_id FROM participants WHERE umo=? AND platform_id=?",
                         (store.umo, platform))]
                     return store.profiles.members(ids)
             people = await asyncio.to_thread(current_people)
+            if bot_id and not any(p["account_id"] == str(bot_id) and p["account_type"] == "BOT" for p in people):
+                people.append({"account_id": str(bot_id), "account_type": "BOT"})
             if self.identities.refresh(current_umo, people):
                 self.identities.configure(store)
 
@@ -397,7 +402,7 @@ class MrMemoryPlugin(Star):
                     await asyncio.to_thread(store.delete_message, str(raw["message_id"]))
                 else:
                     await asyncio.to_thread(store.append_message, self.for_store(self.message(event), store))
-            await self.refresh_identities(event.unified_msg_origin, store)
+            await self.refresh_identities(event.unified_msg_origin, store, bot_id=event.get_self_id())
             if event.get_platform_id() not in self.history.clients:
                 self.history.request(store)
         except Exception:
@@ -600,6 +605,7 @@ class MrMemoryPlugin(Star):
                    content=[{"type": "response_to", "message_id": request_id},
                             {"type": "bot_event", "event": kind}, *content], reply_to=request_id)
         await asyncio.to_thread(store.append_message, self.for_store(row, store))
+        await self.refresh_identities(event.unified_msg_origin, store, bot_id=bot_id)
 
     @filter.on_llm_response()
     async def capture_response(self, event: AstrMessageEvent, response: Any) -> None:
@@ -945,7 +951,7 @@ class MrMemoryPlugin(Star):
 
     @mr.command("uid")
     async def member_profile(self, event: AstrMessageEvent):
-        """查看或修改自己的称呼、别名、不用的称呼和说明。"""
+        """查看本人资料，可选填 QQ 号接续旧记忆。"""
         if not self.allowed(event):
             return
         store = await self.store_for(event)
@@ -956,18 +962,35 @@ class MrMemoryPlugin(Star):
         args = event.get_message_str().partition("uid")[2].strip()
         try:
             changes = parse_profile_changes(args)
+            if "qqid" in changes:
+                qqid = changes.pop("qqid")
+                if event.get_platform_name() not in {"qq_official", "qq_official_webhook"}:
+                    raise ValueError("QQ 号关联用于官方 QQ 迁移；此平台不需要填写。")
+                async with self.identity_lock:
+                    self.identities.member(event.unified_msg_origin, account, qqid, self_reported=True)
+                    self.identities.configure(store)
             if changes:
                 person = await asyncio.to_thread(store.edit_member, account, changes, actor="self:" + account)
             else:
                 people = await asyncio.to_thread(store.members, account_ids=[account])
                 person = next((p for p in people if p["account_id"] == account), people[0])
-            text = (f"你的 UID：{account}\n群名片：{person['card'] or '未提供'}\n平台昵称：{person['nickname'] or '未提供'}"
+            binding = self.identities.groups.get(event.unified_msg_origin, {}).get("members", {}).get(account, {})
+            method = {"manual": "管理员设置", "unchanged_name": "昵称自动关联", "self_reported": "群员自填", "ignored": "管理员设置为不关联", "self_ignored": "本人已取消"}.get(binding.get("method"), "未关联")
+            text = (f"你的 UID：{account}\n关联 QQ 号：{binding.get('legacy_id') or '未填写'}（{method}）"
+                    f"\n群名片：{person['card'] or '未提供'}\n平台昵称：{person['nickname'] or '未提供'}"
                     f"\n希望称呼：{person['preferred_name'] or '未设置'}\n别名：{', '.join(person['confirmed_aliases']) or '未设置'}"
                     f"\n不用的称呼：{', '.join(person['avoided_names']) or '未设置'}\n说明：{person['description'] or '未设置'}"
-                    "\n修改：/mr uid 称呼 小林 别名 林同学（可连写 称呼 / 别名 / 不用 / 说明；填 - 清空）。只修改你在本群的资料。")
+                    "\n修改：/uid 称呼 小林 别名 林同学（可连写 称呼 / 别名 / 不用 / 说明；填 - 清空）。只修改你在本群的资料。"
+                    "\n可选关联旧记忆：/uid qqid 你的QQ号；/uid qqid - 取消本人关联。不填也能使用，管理员可在后台修正。/mr uid 同样可用。")
         except (ValueError, IndexError) as exc:
             text = str(exc) or "尚无本人资料"
         yield event.plain_result(text)
+
+    @filter.command("uid")
+    async def uid(self, event: AstrMessageEvent):
+        """本人资料；可选 qqid 关联旧 QQ 记忆。"""
+        async for result in self.member_profile(event):
+            yield result
 
     @filter.command("mrmem")
     async def memory_status(self, event: AstrMessageEvent):

@@ -16,7 +16,7 @@ from .store import Store
 from .settings import DEFAULTS
 from .schedule import work_window
 from .conversation import ConversationRepair
-from .identity import match_members
+from .identity import match_members, match_bots
 
 
 class Console:
@@ -326,9 +326,13 @@ class Console:
         def people():
             with view._lock:
                 platform = current.umo.split(":", 1)[0]
-                ids = [r[0] for r in view.db.execute("SELECT account_id FROM participants WHERE platform_id=? AND account_type='USER'", (platform,))]
+                ids = [r[0] for r in view.db.execute("SELECT account_id FROM participants WHERE platform_id=?", (platform,))]
                 return view.profiles.members(ids)
-        observed = await asyncio.to_thread(people)
+        all_observed = await asyncio.to_thread(people)
+        if binding:
+            await self.plugin.refresh_identities(current.umo, view)
+        observed = [p for p in all_observed if p["account_type"] == "USER"]
+        bots = [p for p in all_observed if p["account_type"] == "BOT"]
         old_people = binding["old_people"] if binding else (await asyncio.to_thread(old.profiles.members) if old else [])
         matches = binding["members"] if binding else match_members(old_people, observed)
         with current._lock:
@@ -337,6 +341,7 @@ class Console:
                 "legacy_scope": (old_scope or {}).get("id"),
                 "choices": [s for s in scopes if s["group_id"].isdigit() and s["umo"] != current.umo],
                 "old_people": old_people, "observed_people": observed, "matches": matches,
+                "observed_bots": bots, "bot_matches": binding.get("bots", {}) if binding else match_bots(old_people, bots),
                 "old_counts": await asyncio.to_thread(self.inventory, old) if old else None,
                 "receiving_messages": len(observed) > 0,
                 "message": "已接续旧库，后续成员发言会继续静默对照昵称。" if binding else "选择对应旧群，预览名称对照后接续。"}
@@ -363,12 +368,12 @@ class Console:
         account, legacy = str(data.get("account_id") or ""), str(data.get("legacy_id") or "")
         async with self.plugin.identity_lock:
             with canonical._lock:
-                if not canonical.db.execute("SELECT 1 FROM participants WHERE platform_id=? AND account_id=?",
-                        (current.umo.split(":", 1)[0], account)).fetchone():
-                    raise ValueError("此 OpenID 尚未在当前群被观察到")
+                if not canonical.db.execute("SELECT 1 FROM participants WHERE platform_id=? AND account_id=? AND account_type=?",
+                        (current.umo.split(":", 1)[0], account, "USER")).fetchone():
+                    raise ValueError("该类型的账号尚未在当前群被观察到")
             bindings.member(current.umo, account, legacy)
             bindings.configure(canonical)
-        return {"message": "成员关联已更新；原文作者及管理员权限保持原样。"}
+        return {"message": "成员关联已由管理员更新。"}
 
 
 def register_console(plugin):
