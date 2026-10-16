@@ -47,7 +47,7 @@ def selected_context(store, ref, before=None):
             "meaning": "记忆网络中当前的理解，包含模型形成的解释，并非另一份独立观察。"}
 
 
-def format_background(value, store=None, before=None):
+def format_background(value, store=None, before=None, *, references=None, belief=None):
     if isinstance(value, str):
         text = value.strip()
         # Native output may serialize this optional structured value once more.
@@ -55,23 +55,29 @@ def format_background(value, store=None, before=None):
         try:
             decoded = json.loads(text)
         except ValueError:
-            return text
+            decoded = None
         parts = decoded if isinstance(decoded, list) else [decoded]
-        if not parts or not all(isinstance(part, dict) and isinstance(part.get("text"), str)
-                                and ("belief" in part or "references" in part) for part in parts):
-            return text
-        value = parts
+        value = (parts if parts and all(isinstance(part, str) or isinstance(part, dict)
+                 and isinstance(part.get("text"), str) for part in parts) else [text])
     if isinstance(value, dict):
         value = [value]
     if not isinstance(value, list):
         raise ValueError("background needs text or text/belief/references interpretations")
+    if references is not None:
+        value = [*value, {"text": "", "references": references}]
     parts, selected, unavailable = [], {}, []
+    if belief is not None:
+        parts.append("当前理解与把握：" + json.dumps(belief, ensure_ascii=False, separators=(",", ":")))
     for part in value:
+        if isinstance(part, str):
+            part = {"text": part}
         if not isinstance(part, dict) or not isinstance(part.get("text", ""), str):
             raise ValueError("Each background interpretation needs text")
         refs = part.get("references", [])
-        if not isinstance(refs, list):
-            raise ValueError("background.references must be a list")
+        if refs is None:
+            refs = []
+        elif not isinstance(refs, list):
+            refs = [refs]
         addresses = []
         for ref in refs:
             try:
@@ -85,9 +91,10 @@ def format_background(value, store=None, before=None):
         refs = addresses
         body = part.get("text", "").strip()
         if body:
-            belief = part.get("belief") or {"stance": "unconfirmed"}
-            parts.append("当前理解与把握：" + json.dumps(belief, ensure_ascii=False, separators=(",", ":"))
-                         + "\n" + body + ("\n对应交流与记忆：" + json.dumps(refs, ensure_ascii=False, separators=(",", ":")) if refs else ""))
+            belief = part.get("belief")
+            prefix = ("当前理解与把握：" + json.dumps(belief, ensure_ascii=False, separators=(",", ":"))
+                      + "\n") if belief is not None else ""
+            parts.append(prefix + body + ("\n对应交流与记忆：" + json.dumps(refs, ensure_ascii=False, separators=(",", ":")) if refs else ""))
         for ref in refs:
             if ref.get("status") == "invalid_address":
                 continue

@@ -116,7 +116,20 @@ class LearningWriter:
             if side in item:
                 item[side] = self.resolve(item[side], bindings, component)
         if "connections" in item:
-            item["connections"] = [self.resolve(link, bindings, component) for link in item["connections"]]
+            links = []
+            for link in item["connections"]:
+                # Read results expose target_ref. Accept that same explicit
+                # address on write without interpreting names or edge meaning.
+                if isinstance(link, dict) and "target_ref" in link:
+                    target = link["target_ref"]
+                    if not isinstance(target, dict) or not {"kind", "id"} <= target.keys():
+                        raise ValueError("connection.target_ref needs kind and id")
+                    address = {"kind": str(target["kind"]), "id": int(target["id"])}
+                    if any(key in link and str(link[key]) != str(value) for key, value in address.items()):
+                        raise ValueError("Connection supplies conflicting target addresses")
+                    link = {**link, **address}
+                links.append(self.resolve(link, bindings, component))
+            item["connections"] = links
         if "source_ids" not in item:
             # Derived thoughts may cite other memories through connections;
             # updating an object without changing its sources keeps those sources.

@@ -18,8 +18,8 @@ from .cognition import visible_memories
 from .handoff import format_background as _background_text
 from .memory_protocol import (BASIC_RECALL_PROMPT, BASIC_CONSOLIDATION_PROMPT, RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
     CONSOLIDATION_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions)
-from .tool_calls import response_calls, memory_text_arguments
-from .model_json import decode_envelope
+from .tool_calls import response_calls, memory_text_arguments, parse_completion
+from .model_json import decode_background, decode_envelope
 
 
 
@@ -254,17 +254,18 @@ def _reconstruction_output(text: str, store=None, before=None) -> tuple[str, Any
         value = value[7:].strip()
         if value.endswith("```"):
             value = value[:-3].strip()
-    if not value.startswith("{"):
+    if not value.startswith(("{", "[")):
         return text, {}, "本次仅返回文本背景", {}
     try:
-        result, repair = decode_envelope(value)
+        result, repair = decode_background(value)
     except ValueError:
         return "", {}, "本次结构化输出未完整返回", {}
     if not isinstance(result, dict) or "background" not in result:
         return "", {}, "本次结构化输出缺少 background 字段", {}
     writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
     try:
-        background = _background_text(result.get("background"), store, before)
+        background = _background_text(result.get("background"), store, before,
+                                      references=result.get("references"), belief=result.get("belief"))
     except ValueError as exc:
         return "", {}, str(exc), writes
     recollection = result.get("recollection", {})
@@ -541,6 +542,10 @@ class MemoryAgent:
         # Keep the configured client/model; isolate per-call thinking options from
         # other users of the same AstrBot provider instance.
         provider = copy.copy(self.provider)
+        if parser := getattr(provider, "_parse_openai_completion", None):
+            async def parse_mr_response(completion, tools):
+                return await parse_completion(parser, completion, tools)
+            provider._parse_openai_completion = parse_mr_response
         config = getattr(provider, "provider_config", {})
         provider.provider_config = {**config, "custom_extra_body": {
             **config.get("custom_extra_body", {}), "thinking": {"type": self.thinking_mode}}}
@@ -680,7 +685,7 @@ class MemoryAgent:
                     if forced_finish:
                         messages.append({"role": "user", "content":
                             "这是本次可用的最后一轮，交付已经形成的理解，不再发起工具调用。"
-                            "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 items、retry、recollection。"
+                            "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 references、items、retry、recollection。"
                             "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。" if self.advanced else
                             "这是本次可用的最后一轮，直接用纯文本交付已读材料中的有用背景，不加 JSON 或工具标签，不再请求工具。没有需要补充的背景时返回 {\"background\":\"\"}。"})
                     response = await self._model_turn(
@@ -757,11 +762,14 @@ class MemoryAgent:
                             if name not in allowed_tools:
                                 raise ValueError("当前模式未提供此工具；基础模式只检索群聊记忆")
                             if name == "complete":
-                                result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff)
-                                changes = {key: value for key, value in args.items() if key != "background"}
+                                result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff,
+                                                                            references=args.get("references"), belief=args.get("belief"))
+                                changes = {key: args[key] for key in ("items", "retry", "recollection") if key in args}
                                 outcome = await persist_changes(changes, call_id) if changes and self.advanced else None
                                 value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
-                                result.status = "partial" if outcome and outcome.rejected else "completed"
+                                result.status = "partial" if _finish_reason(response) == "length" or outcome and outcome.rejected else "completed"
+                                if _finish_reason(response) == "length":
+                                    result.detail = "Model output reached its token limit; background may be incomplete"
                                 if outcome and outcome.rejected:
                                     result.detail = "Background produced; some memory changes remain unsaved"
                                 completed_response = True
@@ -958,9 +966,14 @@ class MemoryAgent:
                     output_room = min(self.max_output_tokens, max(2048, output_token_reserve))
                     next_input = estimated_input + max(0, estimated_input - previous_input_tokens) if previous_input_tokens else estimated_input
                     save_this_turn = remaining is not None and remaining < estimated_input + next_input + 2 * output_room
+                    save_this_turn = save_this_turn or self.max_turns is not None and turn == self.max_turns - 1
                     resource_state["save_this_turn"] = save_this_turn
                     if save_this_turn:
-                        resource_state["action"] = "剩余额度可能只够本次调用，请收拢已形成的理解并保存实际进度。工具保持可用；若继续读取，下一次携带上下文可能需要等额度释放。未完线索写入checkpoint，已经完整处理的材料可完成，无须穷尽所有关联。"
+                        resource_state["action"] = (
+                            "这是本次可用的最后一轮，暂停继续读取，直接输出完整 JSON 保存已形成的认识和实际进度："
+                            '{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[],"recollection":{}}。'
+                            "只写尚未保存的内容；只完成确已理解的材料，不为收尾编造结论。"
+                            "未完线索、未读结果地址及尚待核对的问题写入 checkpoint，之后继续。")
                     resource_state["estimated_input_tokens"] = estimated_input
                     resource_state["remaining_after_current_input_tokens"] = max(0, remaining - estimated_input) if remaining is not None else None
                     resource_message["content"] = _json({"resource_state": resource_state})
@@ -977,7 +990,9 @@ class MemoryAgent:
                     try:
                         response = await self._model_turn(conversation, prompt,
                                                          tools,
-                                                         turn + 1, max_output_tokens=output_limit)
+                                                         turn + 1, max_output_tokens=output_limit,
+                                                         tool_choice="none" if save_this_turn else None,
+                                                         response_format={"type": "json_object"} if save_this_turn else None)
                     except (Exception, asyncio.CancelledError):
                         result.unknown_usage_calls += 1
                         raise
@@ -1035,7 +1050,11 @@ class MemoryAgent:
                                     "unfinished_writes": pending_write_errors}, seen_messages=seen_messages)})
                                 result.status, result.detail = "partial", "; ".join(pending_write_errors.values())
                                 continue
-                            result.status = "completed"
+                            progress = await asyncio.to_thread(self.store.learning_task, learning_kind)
+                            unfinished = set(progress["material_ids"]) - set(progress["completed_ids"]) if progress else set()
+                            result.status = "partial" if unfinished else "completed"
+                            if unfinished:
+                                result.detail = f"已保存本轮成果与进度；还有 {len(unfinished)} 条材料待继续"
                             break
                         result.items = await clean_items(envelope["items"])
                         writer.recollection = envelope.get("recollection", {})

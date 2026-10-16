@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from mr_memory.agent import _reconstruction_output, _memory_output
 from mr_memory.model_json import decode_envelope
+from mr_memory.handoff import format_background
 from mr_memory.tool_calls import response_calls
 from mr_memory.agent import MemoryAgent
 from unittest.mock import patch
@@ -33,7 +34,63 @@ class ModelEnvelopeTests(unittest.TestCase):
         call = response_calls(response)[0]
         self.assertEqual(call.arguments, {"items": [], "finish": True})
         self.assertTrue(call.format_note)
-        self.assertEqual(call.message()["function"]["arguments"], wire)
+        self.assertEqual(call.raw_arguments, wire)
+        self.assertEqual(json.loads(call.message()["function"]["arguments"]), call.arguments)
+
+    def test_prose_delivery_is_lossless_and_does_not_absorb_memory_writes(self):
+        body = '甲说“可能是朋友的画”，不是确认。\n乙（2002）还没回应。'
+        for wire in ('{"background": ' + body + '}', body, json.dumps([body], ensure_ascii=False)):
+            with self.subTest(wire=wire):
+                call = response_calls(SimpleNamespace(tools_call_name=["complete"], tools_call_ids=["done"],
+                    tools_call_args=[wire]))[0]
+                self.assertFalse(call.error)
+                self.assertEqual(format_background(call.arguments["background"]), body)
+                self.assertEqual(call.raw_arguments, wire)
+        wire = '{"background": 正文, "belief":{"把握":"可能"}, "references":[{"message_id":3}], "items":[{"content":"不能丢掉的写入"}]}'
+        call = response_calls(SimpleNamespace(tools_call_name=["complete"], tools_call_ids=["done"],
+            tools_call_args=[wire]))[0]
+        self.assertEqual(call.arguments, {"background": "正文", "belief": {"把握": "可能"},
+            "references": [{"message_id": 3}], "items": [{"content": "不能丢掉的写入"}]})
+        for wire in ('{"background": 正文, "items":[{"content":"没有说完',
+                     '{"background": "没有说完}', '{"background": 正文} {"items":[]}',
+                     '{"background": [{"text":"内容", "belief": "猜测".to_string()}]}'):
+            with self.subTest(wire=wire):
+                call = response_calls(SimpleNamespace(tools_call_name=["complete"], tools_call_ids=["done"],
+                    tools_call_args=[wire]))[0]
+                self.assertTrue(call.error)
+                self.assertEqual(call.raw_arguments, wire)
+        self.assertEqual(_reconstruction_output('{"background": ' + body + '}')[0], body)
+
+    def test_mixed_paragraphs_keep_wording_and_only_model_supplied_belief(self):
+        body = format_background(["甲说的是自己的朋友。", {"text": "乙可能误会了。", "belief": {"把握": "尚未确认"}},
+                                  {"text": "还没有后续。", "references": "无效地址"}])
+        self.assertIn("甲说的是自己的朋友。", body)
+        self.assertIn("乙可能误会了。", body)
+        self.assertIn('"把握":"尚未确认"', body)
+        self.assertNotIn('"stance":"unconfirmed"', body)
+        self.assertIn('"status":"invalid_address"', body)
+
+    def test_native_parser_receives_valid_json_without_mutating_shared_provider_or_wire(self):
+        wire = '{"background": 作者是甲，乙只是在引用。}'
+        completion = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[
+            SimpleNamespace(id="done", function=SimpleNamespace(name="complete", arguments=wire))]))])
+
+        class Provider:
+            provider_config = {}
+            async def _prepare_chat_payload(self, **kwargs): return {}, None
+            async def _parse_openai_completion(self, value, tools):
+                arguments = json.loads(value.choices[0].message.tool_calls[0].function.arguments)
+                return SimpleNamespace(raw_completion=value, tools_call_args=[arguments])
+            async def _query(self, payload, tools, **kwargs):
+                return await self._parse_openai_completion(completion, tools)
+
+        provider = Provider()
+        response = asyncio.run(MemoryAgent(provider, None)._generate([], "test", object()))
+        self.assertEqual(response.tools_call_args, [{"background": "作者是甲，乙只是在引用。"}])
+        self.assertIs(response.raw_completion, completion)
+        self.assertEqual(completion.choices[0].message.tool_calls[0].function.arguments, wire)
+        self.assertNotIn("_parse_openai_completion", provider.__dict__)
+        self.assertTrue(response_calls(response)[0].format_note)
 
     def test_invalid_final_is_repaired_within_existing_round_limit(self):
         class Agent(MemoryAgent):
@@ -65,13 +122,17 @@ class ModelEnvelopeTests(unittest.TestCase):
             class Agent(MemoryAgent):
                 async def _model_turn(self, *args, **kwargs):
                     return SimpleNamespace(completion_text="", tools_call_name=["complete"], tools_call_ids=["done"],
-                        tools_call_args=[{"background": [{"text": "甲正在说明画的作者。", "belief": {"scope": "原话中的说明"},
-                            "references": [{"message_id": original["id"]}]}]}])
+                        tools_call_args=[{"background": "甲正在说明画的作者。",
+                            "references": [{"message_id": original["id"]}]}])
             with patch("mr_memory.agent._tool_set", return_value=object()):
                 result = asyncio.run(Agent(None, store).reconstruct({"sent_at": 101}, [], {}))
             self.assertEqual(result.status, "completed", result.detail)
             self.assertIn('"sender_id":"1001"', result.background)
             self.assertEqual(result.background.count(original["plain_text"]), 1)
-            self.assertIn("anyOf", tool_definitions(basic=True)["complete"]["parameters"]["properties"]["background"])
+            self.assertIn("references", tool_definitions(basic=True)["complete"]["parameters"]["properties"])
+            legacy = format_background([{"text": "甲正在说明画的作者。", "belief": {"scope": "原话中的说明"},
+                "references": [{"message_id": original["id"]}]}], store, 101)
+            self.assertIn('"sender_id":"1001"', legacy)
+            self.assertEqual(legacy.count(original["plain_text"]), 1)
         finally:
             store.close()

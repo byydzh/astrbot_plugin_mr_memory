@@ -58,6 +58,23 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(again.apply(args, "cycle").written), 2)
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0], 5)
 
+    def test_connection_reuses_read_target_address_without_guessing_or_copying_target_revision(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        target = writer.apply({"items": [{"kind": "semantic", "content": "原来约在东门", "source_ids": self.ids}]}, "old").written[0]
+        result = writer.apply({"items": [{"kind": "episode", "content": "这次改在西门", "source_ids": self.ids,
+            "connections": [{"relation": "更改地点", "target_ref": {"kind": target["kind"], "id": target["id"],
+                "title": "旧安排", "revision_no": 7}}]}]}, "new")
+        self.assertFalse(result.rejected)
+        saved = result.written[0]
+        links = self.store.memory_graph.connections({"kind": saved["kind"], "id": saved["id"]})
+        self.assertEqual(links[0]["target"]["id"], target["id"])
+        self.assertEqual(links[0]["relation"], "更改地点")
+        self.assertEqual(self.store.memory(target["kind"], target["id"])["content"], "原来约在东门")
+        ambiguous = writer.apply({"items": [{"kind": "episode", "content": "冲突地址不猜测",
+            "connections": [{"relation": "相关", "kind": target["kind"], "id": target["id"] + 1,
+                "target_ref": {"kind": target["kind"], "id": target["id"]}}]}]}, "ambiguous")
+        self.assertEqual(len(ambiguous.rejected), 1)
+
     def test_cycle_failure_rolls_back_objects_edges_and_receipts_but_not_other_draft(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
         result = writer.apply({"items": [
@@ -234,10 +251,13 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         tools_call_args=[{"terms": ["西门"]}], tools_call_ids=["large"], reasoning_content="继续查以前的安排",
                         usage={"input_other": 4500, "output": 500}, raw_completion={"choices": [{"finish_reason": "tool_calls"}]})
                 receipt = json.loads(next(row['content'] for row in messages if row.get('tool_call_id')=='large'))
+                owner.assertEqual(kwargs["tool_choice"], "none")
+                owner.assertEqual(kwargs["response_format"], {"type": "json_object"})
                 owner.assertEqual(receipt["status"], "deferred_for_budget")
                 owner.assertNotIn(large[0]["summary"], json.dumps(messages, ensure_ascii=False))
                 agent.ref = receipt["result_ref"]
-                return SimpleNamespace(completion_text=json.dumps({"items": [], "progress": {
+                return SimpleNamespace(completion_text=json.dumps({"items": [
+                    {"kind": "episode", "content": "周末改到西门见", "source_ids": [owner.ids[0]]}], "progress": {
                     "completed_ids": [owner.ids[0]], "checkpoint": "地点原话已理解；待继续读保存的查询结果。"}},ensure_ascii=False),
                     tools_call_name=[], reasoning_content="", usage={"input_other": 4700, "output": 500},
                     raw_completion={"choices": [{"finish_reason": "stop"}]})
@@ -250,6 +270,8 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
             result = await agent.consolidate(self.rows, {}, task=task, token_budget=16000)
         await trace.finish({"status": result.status})
         self.assertEqual(agent.calls, 2)
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(len(result.written), 1)
         self.assertEqual(self.store.learning_task("background")["completed_ids"], [self.ids[0]])
         read = self.store.reflections.interaction(**agent.ref)
         self.assertEqual(read["data"]["result"], large)

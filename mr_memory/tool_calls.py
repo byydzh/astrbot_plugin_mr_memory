@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 import json
 import re
 
-from .model_json import decode_envelope
+from .model_json import decode_background, decode_envelope
 
 
 def field(value, name, default=None):
@@ -45,8 +46,12 @@ class ToolCall:
     format_note: str = ""
 
     def message(self):
+        # Keep original wire data in the trace, but replay a repaired call as
+        # valid JSON so it cannot poison the following native request.
+        arguments = (json.dumps(self.arguments, ensure_ascii=False) if self.format_note
+                     and self.arguments is not None else self.raw_arguments)
         value = {"id": self.id, "type": "function", "function": {
-            "name": self.name, "arguments": self.raw_arguments}}
+            "name": self.name, "arguments": arguments}}
         if self.extra_content is not None:
             value["extra_content"] = self.extra_content
         return value
@@ -70,18 +75,42 @@ def response_calls(response) -> list[ToolCall]:
         if isinstance(value, str):
             value = json.loads(value)
         function = field(value, "function")
+        name = str(field(function, "name", ""))
         arguments = field(function, "arguments")
         wire = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
         error, format_note = "", ""
         try:
-            parsed, format_note = decode_envelope(wire)
+            parsed, format_note = (decode_background(wire) if name == "complete" else decode_envelope(wire))
             if not isinstance(parsed, dict):
                 raise ValueError("Tool arguments must be a JSON object")
         except (ValueError, TypeError) as exc:
             parsed = None
             error = f"工具参数未执行：{exc}。上一条调用保留了完整原始参数；请修正 JSON 后重发此调用，已成功的其他调用不用重做。"
-        calls.append(ToolCall(str(field(value, "id", "")), str(field(function, "name", "")),
+        calls.append(ToolCall(str(field(value, "id", "")), name,
                               wire, parsed, error, field(value, "extra_content"), format_note))
     if any(not call.id or not call.name for call in calls) or len({call.id for call in calls}) != len(calls):
         raise ValueError("Provider returned missing or repeated tool call IDs/names")
     return calls
+
+
+async def parse_completion(parser, completion, tools):
+    """Normalize this MR response before AstrBot parses it; retain original wire."""
+    calls = response_calls({"raw_completion": completion})
+    repaired = {call.id: call for call in calls if call.format_note and call.arguments is not None}
+    prepared = completion
+    if repaired:
+        prepared = copy.deepcopy(completion)
+        raw = field(field(field(prepared, "choices")[0], "message"), "tool_calls")
+        for index, value in enumerate(raw):
+            if isinstance(value, str):
+                value = raw[index] = json.loads(value)
+            if call := repaired.get(str(field(value, "id", ""))):
+                function = field(value, "function")
+                arguments = call.message()["function"]["arguments"]
+                if isinstance(function, dict):
+                    function["arguments"] = arguments
+                else:
+                    function.arguments = arguments
+    response = await parser(prepared, tools)
+    response.raw_completion = completion
+    return response

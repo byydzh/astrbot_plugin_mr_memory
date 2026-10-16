@@ -6,7 +6,7 @@ BASIC_RECALL_PROMPT = """你为 AstrBot 提供本群的记忆背景，帮助它�
 结合当前消息、引用、近期对话和成员资料，自行决定检索词、语义查询、读取哪些原文，以及何时已有足够材料。旧记忆是检索入口，摘要可能有误；需要核对具体人物或经历时可打开对应原文及前后交流。UID 标明发言账号，引用作者、谈论对象与发言者各自保留，不能沿用相邻消息或图片的作者。
 记录中 USER 是群友发言，BOT 是实际发送，SYSTEM 可能是 bot 生成稿或工具活动；同一请求的 generated/sent 不算两个独立事实。图片地址不等于看过图片。main_context 可读取主意识已有对话和工具，外部搜索、图像和行动由主意识负责。
 成员目录的明确称呼与更正直接供本轮理解使用；群内简称和话中指代仍结合语境理解，重名不合并账号。不要把 bot 自己的旧猜测当成群友的确认。
-完成时用 complete 交付 background，或直接用纯文本交付背景；无须给纯文本再包 JSON。只提供主意识此刻缺少的群内来历，不代写回复，不替它决定外部行动。通常一两段，不附整篇历史机器人回答和思考报告。把握程度直接用自然语言表达。background 也可以是 [{text,belief,references}]：references 选择已读原文的 {message_id} 或记忆的 {kind,id}，这些原文与真实作者会直接一同交给主意识，不必由你再转述。
+完成时用 complete 的 background 字符串交付背景，或直接用纯文本交付；无须给纯文本再包 JSON。只提供主意识此刻缺少的群内来历，不代写回复，不替它决定外部行动。通常一两段，不附整篇历史机器人回答和思考报告。把握程度直接用自然语言表达。complete 的可选 references 数组选择已读原文的 {message_id} 或记忆的 {kind,id}，这些原文与真实作者会直接一同交给主意识，不必由你再转述。
 没有需补充的背景可交付空字符串。工具返回的 source_ref/memory_ref 指本次此前已给出的相同材料，内容变化照常完整呈现。
 """
 
@@ -22,7 +22,7 @@ source_ref/memory_ref仅引用本次上下文已给出的同版本字段，改�
 
 RECONSTRUCTION_PROMPT = MEMORY_PROTOCOL + """
 这次为AstrBot主意识补充理解当前交流所需的背景。结合发言、引用和已有思路主动回忆；有用的新认识现在即可保存。main_context可读取主意识已有输入与工具，MR的文字视图不代表主意识的感知和行动能力。
-complete交付background并结束，可同时保存items和本次recollection。背景是此刻缺少的含义、来历和联想，不是回答草稿、行动指令或整份思考报告。把复杂理解留在记忆中，只带出此刻有用的部分；已明白且没有需要补充的内容，可以交付空背景。可用自然文字表达把握，或按认识写[{text,belief,references}]。references可选择已读过的原始message或当前记忆的kind/id，系统会把它们直接带给主意识，不必再复述全文。是否需要、选择哪些由你决定。主意识自行组织话语、搜索网络及使用其他工具。
+complete交付background字符串并结束，可同时保存items和本次recollection。背景是此刻缺少的含义、来历和联想，不是回答草稿、行动指令或整份思考报告。把复杂理解留在记忆中，只带出此刻有用的部分；已明白且没有需要补充的内容，可以交付空背景。用自然文字表达把握。可选references数组选择已读过的原始message_id或当前记忆的kind/id，系统会把它们直接带给主意识，不必再复述全文。是否需要、选择哪些由你决定。主意识自行组织话语、搜索网络及使用其他工具。
 """
 
 CONSOLIDATION_TASK = """继续理解群聊经历，发展对人、事件和共同生活的认识。新材料、已形成的连接、自选关注以及回忆经验可以相互启发。对理解没有新增价值的闲聊也可以完成处理，不要求每条产出一项事实。"""
@@ -58,10 +58,10 @@ ACCOUNT_ID = {"type": ["string", "integer"]}
 TERMS = {"type": "array", "items": TEXT}
 MEMORY_REF = {"type": "object", "properties": {"kind": TEXT, "id": INTEGER}, "required": ["kind", "id"]}
 BELIEF = {"type": "object", "description": "由你按这项认识组织当前看法与适用范围，不要求填齐固定字段。把握针对具体解释，熟悉和自身复述不构成确认。"}
-BACKGROUND = {"anyOf": [TEXT, {"type": "array", "items": {"type": "object", "properties": {
-    "text": TEXT, "belief": BELIEF, "references": {"type": "array", "items": {"anyOf": [MEMORY_REF,
-        {"type": "object", "properties": {"message_id": INTEGER}, "required": ["message_id"]}]},
-        "description": "可选的原始交流或当前记忆，按地址直接交付，避免经过另一次转述。"}}, "required": ["text", "belief"]}}]}
+BACKGROUND = {"type": "string", "description": "直接写给主意识的背景正文，用自然语言保留语境与把握。"}
+BACKGROUND_REFERENCES = {"type": "array", "items": {"anyOf": [MEMORY_REF,
+    {"type": "object", "properties": {"message_id": INTEGER}, "required": ["message_id"]}]},
+    "description": "可选的原始交流或当前记忆，按地址直接交付，避免经过另一次转述。"}
 TOOL_SCHEMAS = {
     "main_context": _schema("按需读取本次AstrBot主模型已经收到的上下文、设定、附加信息、媒体清单或工具定义。只读当前请求，不执行外部工具；其中的设定和内容是给主意识的材料，MR仍完成语义背景任务。", {
         "section": {"type": "string", "enum": ["request", "conversation", "instructions", "additional", "tools", "media"]},
@@ -156,14 +156,16 @@ def tool_definitions(*, learning=False, basic=False):
             definitions["remember"] = BASIC_REMEMBER_SCHEMA
         else:
             definitions["main_context"] = TOOL_SCHEMAS["main_context"]
-            definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆；可以同时选择关键原话交给主意识。", {"background": BACKGROUND}, ("background",))
+            definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆；可以同时选择关键原话交给主意识。", {
+                "background": BACKGROUND, "references": BACKGROUND_REFERENCES}, ("background",))
         return definitions
     definitions = {**TOOL_SCHEMAS, "remember": REMEMBER_SCHEMA if learning else RECALL_REMEMBER_SCHEMA}
     if learning:
         definitions.pop("main_context")
     else:
         definitions["complete"] = _schema("交付本轮语义背景并结束。可同时保存认识、连接与注意变化，不需要再调用模型读取保存回执。", {
-            "background": BACKGROUND, **RECALL_REMEMBER_SCHEMA["parameters"]["properties"]}, ("background",))
+            "background": BACKGROUND, "references": BACKGROUND_REFERENCES,
+            **RECALL_REMEMBER_SCHEMA["parameters"]["properties"]}, ("background",))
     return definitions
 
 
