@@ -75,6 +75,31 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "target_ref": {"kind": target["kind"], "id": target["id"]}}]}]}, "ambiguous")
         self.assertEqual(len(ambiguous.rejected), 1)
 
+    def test_nested_connection_targets_preserve_notes_and_resolve_cycles(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        old = writer.apply({"items": [{"kind": "episode", "content": "之前的约定",
+            "source_ids": self.ids}]}, "old").written[0]
+        args = {"items": [
+            {"kind": "episode", "handle": "trip", "content": "周末桌游", "source_ids": self.ids,
+             "connections": [{"target": {"handle": "plan"}, "relation": "安排", "note": "在西门碰面"},
+                             {"target": {"kind": old["kind"], "id": old["id"]},
+                              "relation": "延续", "note": "仍是原来的约定"}]},
+            {"kind": "semantic", "handle": "plan", "content": "西门集合", "source_ids": self.ids,
+             "connections": [{"target": {"handle": "trip"}, "relation": "出自"}]}]}
+        result = writer.apply(args, "nested")
+        self.assertFalse(result.rejected)
+        self.assertFalse(writer.pending_items)
+        refs = {row["handle"]: row for row in result.written}
+        links = self.store.memory_graph.connections(refs["trip"])
+        self.assertEqual([(link["target"]["kind"], link["target"]["id"], link["context"]) for link in links],
+                         [("semantic", refs["plan"]["id"], "在西门碰面"),
+                          (old["kind"], old["id"], "仍是原来的约定")])
+        count = self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0]
+        state = self.store.learning_task("background")["continuation"]["write_state"]
+        resumed = LearningWriter(self.store, self.sources, learning_kind="background", **state)
+        self.assertEqual(len(resumed.apply(args, "nested").written), 2)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0], count)
+
     def test_cycle_failure_rolls_back_objects_edges_and_receipts_but_not_other_draft(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
         result = writer.apply({"items": [

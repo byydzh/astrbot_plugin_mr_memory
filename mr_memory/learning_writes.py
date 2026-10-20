@@ -12,6 +12,29 @@ RETRY_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "required": ["pending_id"], "additionalProperties": False}}
 
 
+def connection_reference(link):
+    """Accept the explicit target address in flat or nested form."""
+    if not isinstance(link, dict):
+        return link
+    result = dict(link)
+    for field in ("target_ref", "target"):
+        if field not in link:
+            continue
+        target = link[field]
+        if not isinstance(target, dict) or not (
+            {"kind", "id"} <= target.keys() or "handle" in target
+        ):
+            raise ValueError(f"connection.{field} needs kind/id or handle")
+        address = {key: target[key] for key in ("kind", "id", "handle") if key in target}
+        if any(key in result and str(result[key]) != str(value) for key, value in address.items()):
+            raise ValueError("Connection supplies conflicting target addresses")
+        result.update(address)
+        result.pop(field)
+    if "context" not in result and "note" in result:
+        result["context"] = result["note"]
+    return result
+
+
 def dependency_groups(work, pending):
     """Strongly connected drafts, with dependencies before their dependants."""
     rows = {row[0]: row for row in work}
@@ -118,16 +141,7 @@ class LearningWriter:
         if "connections" in item:
             links = []
             for link in item["connections"]:
-                # Read results expose target_ref. Accept that same explicit
-                # address on write without interpreting names or edge meaning.
-                if isinstance(link, dict) and "target_ref" in link:
-                    target = link["target_ref"]
-                    if not isinstance(target, dict) or not {"kind", "id"} <= target.keys():
-                        raise ValueError("connection.target_ref needs kind and id")
-                    address = {"kind": str(target["kind"]), "id": int(target["id"])}
-                    if any(key in link and str(link[key]) != str(value) for key, value in address.items()):
-                        raise ValueError("Connection supplies conflicting target addresses")
-                    link = {**link, **address}
+                link = connection_reference(link)
                 links.append(self.resolve(link, bindings, component))
             item["connections"] = links
         if "source_ids" not in item:
@@ -256,6 +270,15 @@ class LearningWriter:
         for key, index, item in work:
             refs = ([item.get("source"), item.get("target"), *(item.get("connections") if isinstance(item.get("connections"), list) else [])]
                     if isinstance(item, dict) else [])
+            # Discover nested handles before sorting/committing dependencies,
+            # including cycles. Invalid addresses stay as this draft's error.
+            normalized = []
+            for ref in refs:
+                try:
+                    normalized.append(connection_reference(ref))
+                except ValueError:
+                    normalized.append(ref)
+            refs = normalized
             names = {str(ref["handle"]) for ref in refs if isinstance(ref, dict) and "handle" in ref}
             local_bindings = {name: address for name, address in bindings.items() if name in names}
             self.pending_items[key] = {**self.pending_items.get(key, {}), "item_index": index, "item": copy.deepcopy(item),

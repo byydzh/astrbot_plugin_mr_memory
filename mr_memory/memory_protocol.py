@@ -128,6 +128,9 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
         "cues": {"type": "array", "items": {"type": "object", "properties": {"cue": TEXT, "aspect": TEXT}, "required": ["cue", "aspect"]}},
         "connections": {"type": "array", "items": {"type": "object", "properties": {
             "kind": TEXT, "id": INTEGER, "handle": TEXT, "relation": TEXT, "context": TEXT, "purpose": TEXT, "connection_id": INTEGER,
+            "target": {"type": "object", "description": "目标地址也可嵌套在这里，与平铺的kind/id或handle等价。",
+                       "properties": {"kind": TEXT, "id": INTEGER, "handle": TEXT}},
+            "note": {**TEXT, "description": "连接语境，与context等价。"},
             "belief": BELIEF, "reason": TEXT, "revision_no": INTEGER}, "required": ["relation"]}},
         "action": {"type": "string", "enum": ["revise", "withdraw"]},
         "started_at": INTEGER, "ended_at": INTEGER}, "required": ["kind"]}},
