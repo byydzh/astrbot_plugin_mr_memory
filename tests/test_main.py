@@ -308,8 +308,12 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.embedder.warmup.assert_awaited_once()
         self.assertEqual(self.plugin.stores, {})
         self.assertEqual(list(self.plugin.scope_dir.glob("*.db")), [])
-        self.assertEqual(len(self.plugin.tasks), 1)
-        self.assertFalse(next(iter(self.plugin.tasks)).done())
+        self.assertTrue(self.plugin.tasks)
+        self.assertTrue(all(not task.done() for task in self.plugin.tasks))
+        self.assertEqual(
+            {task.get_coro().__qualname__ for task in self.plugin.tasks},
+            {"MrMemoryPlugin.maintain", "HistoryRecovery.maintain"},
+        )
         self.context.get_provider_by_id.assert_not_called()
 
     async def test_initialize_restores_deferred_allowed_scopes_without_a_new_event(self):
