@@ -40,6 +40,42 @@ class BasicConsolidationTests(unittest.IsolatedAsyncioTestCase):
                 await indexing
                 self.plugin.stopping = False
 
+    async def test_repair_batch_runs_without_new_material_and_preserves_other_batches(self):
+        from astrbot_plugin_mr_memory.mr_memory.learning_writes import LearningWriter
+        store = await self.plugin.store_for(fixtures.event())
+        store.select_learning_mode("background", "basic")
+        message = store.append_message(self.plugin.message(fixtures.event()))
+        sources = {message["id"]: message["source_key"]}
+        target = store.save_memories([{"kind": "event", "content": "原活动", "source_ids": [message["id"]]}], [])[0]
+        for run in (7, 8):
+            store.start_learning_task("background", [message["id"]], pending_ids=[])
+            writer = LearningWriter(store, sources, learning_kind="background", run_id=run)
+            writer.apply({"items": [{"kind": "semantic", "content": f"活动补充{run}",
+                "source_ids": [message["id"]], "connections": ["来自原活动"]}],
+                "progress": {"completed_ids": [message["id"]]}}, f"save{run}")
+            store.finish_learning_task("background")
+
+        class Provider:
+            provider_config = {}
+            async def _prepare_chat_payload(self, **kwargs):
+                return {"messages": kwargs["contexts"]}, None
+            async def _query(self, payload, tools, **kwargs):
+                task = store.learning_task("background")
+                assert task["material_ids"] == []
+                assert set(task["continuation"]["write_state"]["pending_items"]) == {"save7:0"}
+                reply = {"items": [], "retry": [{"pending_id": "save7:0", "changes": {
+                    "connections": [{"kind": target["kind"], "id": target["id"],
+                                     "relation": "来自", "context": "来自原活动"}]}}]}
+                return SimpleNamespace(completion_text=json.dumps(reply), tools_call_name=[],
+                    usage={"input_other": 100, "input_cached": 50, "output": 80})
+
+        self.context.get_provider_by_id.return_value = Provider()
+        result = await self.plugin.learn(store, force=True)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["written_count"], 1)
+        self.assertEqual(set(store.load_working_state()["pending_learning_drafts"]["background"]), {"save8:0"})
+        self.assertIsNone(store.learning_task("background"))
+
     async def test_basic_graph_write_and_retrieval_without_resuming_reflection(self):
         store = await self.plugin.store_for(fixtures.event())
         first = self.plugin.message(fixtures.event())

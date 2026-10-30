@@ -75,6 +75,21 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "target_ref": {"kind": target["kind"], "id": target["id"]}}]}]}, "ambiguous")
         self.assertEqual(len(ambiguous.rejected), 1)
 
+    def test_repeated_connection_is_reused_and_visible_in_background_receipt(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        target = writer.apply({"items": [{"kind": "episode", "content": "original event",
+            "source_ids": self.ids}]}, "target").written[0]
+        link = {"kind": target["kind"], "id": target["id"], "relation": "related", "context": "same occasion"}
+        first = writer.apply({"items": [{"kind": "semantic", "content": "understanding",
+            "source_ids": self.ids, "connections": [link]}]}, "first").written[0]
+        self.assertEqual(len(first["saved_connections"]), 1)
+        repeated = writer.apply({"items": [{"kind": first["kind"], "id": first["id"],
+            "connections": [link]}]}, "repeat").written[0]
+        self.assertEqual(repeated["saved_connections"], first["saved_connections"])
+        changed = writer.apply({"items": [{"kind": first["kind"], "id": first["id"],
+            "connections": [{**link, "context": "another interpretation"}]}]}, "different").written[0]
+        self.assertEqual(len(changed["saved_connections"]), 2)
+
     def test_nested_connection_targets_preserve_notes_and_resolve_cycles(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
         old = writer.apply({"items": [{"kind": "episode", "content": "之前的约定",
@@ -181,7 +196,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.written), 1)
         self.assertEqual(self.store.pending_status()["count"], 0)
 
-    async def test_last_affordable_call_saves_progress_through_native_write_tool(self):
+    async def test_last_affordable_call_saves_progress_through_final_json(self):
         task = copy.deepcopy(self.task)
         task["continuation"] = {"input_tokens_per_byte": 0.3, "output_token_reserve": 6000}
         estimate = estimate_learning_input(self.rows, {}, task=task)
@@ -191,7 +206,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         class ClosingAgent(MemoryAgent):
             async def _model_turn(agent, messages, prompt, tools, turn, **kwargs):
                 owner.assertIs(tools, schema)
-                owner.assertNotIn("tool_choice", kwargs)
+                owner.assertEqual(kwargs["tool_choice"], "none")
                 owner.assertTrue(json.loads(messages[-1]["content"])["resource_state"]["save_this_turn"])
                 owner.assertEqual(turn, 1)
                 return SimpleNamespace(completion_text=json.dumps({"items": [], "finish": True,
@@ -389,7 +404,7 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[0] for row in self.store.db.execute(
             "SELECT message_id FROM mr_feedback_processed")], self.ids[:1])
 
-    async def test_final_json_checkpoint_keeps_later_tools_and_can_end_with_pending_draft(self):
+    async def test_final_json_checkpoint_keeps_later_tools_and_reports_unsaved_draft(self):
         args = self.args()
         writer = LearningWriter(self.store, self.sources, learning_kind="background")
         writer.apply(args, "save")
@@ -407,8 +422,72 @@ class LearningWriteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     usage={"input_other": 100, "output": 10}, raw_completion={"choices": [{"finish_reason": "stop"}]})
         with patch("mr_memory.agent._tool_set", return_value=object()):
             result = await FinishAgent(None, self.store, max_turns=1).consolidate([], {}, task=compact)
-        self.assertEqual(result.status, "completed", result.detail)
+        self.assertEqual(result.status, "partial", result.detail)
         self.assertIn("save:0", result.continuation["write_state"]["pending_items"])
+
+    async def test_final_connection_failure_returns_receipt_and_repairs_without_rewriting_success(self):
+        owner = self
+
+        class RepairAgent(MemoryAgent):
+            async def _model_turn(agent, messages, *unused, **kwargs):
+                agent.calls += 1
+                if agent.calls == 1:
+                    value = {"items": [
+                        {"kind": "event", "content": "周末西门见面", "source_ids": owner.ids},
+                        {"kind": "semantic", "content": "带桌游参加这次见面", "source_ids": owner.ids,
+                         "connections": ["属于这次西门见面安排"]}],
+                        "progress": {"completed_ids": owner.ids}}
+                else:
+                    receipt = next(json.loads(row["content"])["write_result"] for row in reversed(messages)
+                                   if str(row.get("content", "")).startswith('{"write_result":'))
+                    owner.assertEqual(receipt["status"], "partial")
+                    owner.assertEqual(len(receipt["written"]), 1)
+                    owner.assertIn("connections[0]", receipt["detail"])
+                    pending = receipt["pending_items"][0]
+                    target = receipt["written"][0]
+                    value = {"retry": [{"pending_id": pending["pending_id"], "changes": {
+                        "connections": [{"kind": target["kind"], "id": target["id"],
+                                         "relation": "活动安排", "context": "属于这次西门见面安排"}]}}], "items": []}
+                return SimpleNamespace(completion_text=json.dumps(value, ensure_ascii=False),
+                    tools_call_name=[], reasoning_content="", usage={"input_other": 100, "output": 30},
+                    raw_completion={"choices": [{"finish_reason": "stop"}]})
+
+        agent = RepairAgent(None, self.store, max_turns=2, advanced=False)
+        agent.calls = 0
+        with patch("mr_memory.agent._tool_set", return_value=object()):
+            result = await agent.consolidate(self.rows, {}, task=self.task)
+        self.assertEqual(agent.calls, 2)
+        self.assertEqual(result.status, "completed", result.detail)
+        self.assertFalse(result.continuation["write_state"]["pending_items"])
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='event'").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='semantic'").fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM mr_memory_objects WHERE kind='association'").fetchone()[0], 1)
+
+    def test_recovery_batch_keeps_dependencies_and_leaves_other_drafts_queued(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background", run_id=7)
+        writer.apply(self.args(), "save")
+        self.store.finish_learning_task("background")
+        queued = self.store.load_working_state()["pending_learning_drafts"]["background"]
+        queued["dependency"] = {**copy.deepcopy(queued["save:0"]), "origin_run_id": 8, "bindings": {}}
+        queued["unrelated"] = {**copy.deepcopy(queued["save:0"]), "origin_run_id": 9, "bindings": {}}
+        queued["save:0"]["bindings"] = {"next": {"receipt_key": "dependency"}}
+        self.store.update_working_state({"pending_learning_drafts": {"background": queued}})
+        selected = self.store.pending_learning_batch("background")
+        self.assertEqual(set(selected), {"save:0", "dependency"})
+        task = self.store.start_learning_task("background", [], pending_ids=list(selected))
+        self.assertEqual(set(task["continuation"]["write_state"]["pending_items"]), set(selected))
+        self.assertEqual(set(self.store.load_working_state()["pending_learning_drafts"]["background"]), {"unrelated"})
+        self.store.finish_learning_task("background")
+        self.assertEqual(set(self.store.load_working_state()["pending_learning_drafts"]["background"]), set(queued))
+
+    def test_retry_item_wrapper_applies_the_source_correction(self):
+        writer = LearningWriter(self.store, self.sources, learning_kind="background")
+        writer.apply(self.args(), "save")
+        repaired = writer.apply({"retry": [{"pending_id": "save:0",
+            "changes": {"item": {"source_ids": [self.ids[0]]}}}]}, "repair")
+        self.assertFalse(repaired.rejected)
+        self.assertFalse(writer.pending_items)
+        self.assertEqual(repaired.written[0]["source_ids"], [self.ids[0]])
 
     async def test_association_receipt_and_pending_state_commit_with_the_write(self):
         writer = LearningWriter(self.store, self.sources, learning_kind="background")

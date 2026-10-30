@@ -1055,8 +1055,27 @@ class Store:
             (self.umo, kind, _encode(task), task["updated_at"]))
 
     @_serialized
+    def pending_learning_batch(self, kind: str) -> dict:
+        """Recover one original batch together, including its unresolved dependencies."""
+        drafts = self.load_working_state().get("pending_learning_drafts", {}).get(self._usage_kind(kind), {})
+        if not drafts:
+            return {}
+        def origin(key, row):
+            return row.get("origin_run_id") or key.rsplit(":", 1)[0]
+        first = next(iter(drafts))
+        selected = {key for key, row in drafts.items() if origin(key, row) == origin(first, drafts[first])}
+        frontier = list(selected)
+        while frontier:
+            for address in drafts[frontier.pop()].get("bindings", {}).values():
+                key = address.get("receipt_key")
+                if key in drafts and key not in selected:
+                    selected.add(key)
+                    frontier.append(key)
+        return {key: row for key, row in drafts.items() if key in selected}
+
+    @_serialized
     def start_learning_task(self, kind: str, material_ids: list[int], context_ids: list[int] | None = None,
-                            working: dict | None = None) -> dict:
+                            working: dict | None = None, *, pending_ids: list[str] | None = None) -> dict:
         kind = self._usage_kind(kind)
         existing = self.learning_task(kind)
         if existing is not None:
@@ -1075,7 +1094,10 @@ class Store:
                 "updated_at": int(time.time()), "run_id": None, "continuation": {}}
         with self.db:
             state = self.load_working_state()
-            drafts = state.get("pending_learning_drafts", {}).pop(kind, {})
+            queued = state.get("pending_learning_drafts", {}).get(kind, {})
+            drafts = {key: queued.pop(key) for key in list(queued) if pending_ids is None or key in pending_ids}
+            if not queued:
+                state.get("pending_learning_drafts", {}).pop(kind, None)
             if drafts:
                 task["continuation"]["write_state"] = {"pending_items": drafts}
                 self.db.execute("""INSERT INTO mr_working_state VALUES(?,?,?) ON CONFLICT(umo)
@@ -1112,7 +1134,7 @@ class Store:
                 row.setdefault("origin_run_id", task.get("run_id"))
                 row.setdefault("saved_memory_refs", task.get("memory_refs", []))
             if drafts:
-                state.setdefault("pending_learning_drafts", {})[kind] = drafts
+                state.setdefault("pending_learning_drafts", {}).setdefault(kind, {}).update(drafts)
             if (kind == "feedback" and task and task["material_ids"]
                     and set(task["material_ids"]) <= set(task["completed_ids"])):
                 order = task.get("working", {}).get("feedback_order", "oldest")
@@ -1425,7 +1447,9 @@ class Store:
                          "pending_items": {key: row for key, row in state.get("pending_items", {}).items() if key not in receipts}}
                 task["continuation"] = {**task.get("continuation", {}), "write_state": state}
                 self._write_learning_task(learning_kind, task)
-        return {key: [self.memory(ref["kind"], ref["id"]) or ref] for key, ref in addresses.items()}
+        return {key: [{**(self.memory(ref["kind"], ref["id"]) or ref),
+                      **({"saved_connections": self.memory_graph.connections(ref)} if learning_kind is not None else {})}]
+                for key, ref in addresses.items()}
 
     @_serialized
     def save_memories(self, items, sources=(), mark_processed=True, *, run_id=None,
@@ -1470,5 +1494,7 @@ class Store:
                 self.db.execute("""INSERT INTO message_processing(message_id,content_sha256,status,distilled_at)
                     VALUES(?,?,'DISTILLED',?) ON CONFLICT(message_id) DO UPDATE SET status='DISTILLED',
                     distilled_at=excluded.distilled_at,content_sha256=excluded.content_sha256,last_error=''""", (message["id"], raw[0], int(time.time())))
-        return [self.memory(kind, owner) or {"kind": kind, "id": owner,
-                "status": self.memory_graph.raw(kind, owner)["status"]} for kind, owner in outputs]
+        return [{**(self.memory(kind, owner) or {"kind": kind, "id": owner,
+                 "status": self.memory_graph.raw(kind, owner)["status"]}),
+                 **({"saved_connections": self.memory_graph.connections({"kind": kind, "id": owner})}
+                    if learning_kind is not None else {})} for kind, owner in outputs]

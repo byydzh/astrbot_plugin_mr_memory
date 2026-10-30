@@ -683,6 +683,7 @@ class MrMemoryPlugin(Star):
                     task.get("continuation", {}).get("output_token_reserve", 0))
             maximum = int(self.config["distillation_max_messages"])
             resuming = task is not None
+            repair_drafts = await asyncio.to_thread(store.pending_learning_batch, kind) if task is None else {}
             reflection_tasks = []
             memory_activity = await asyncio.to_thread(store.reconsider, after=state.get("cognition_offered", 0), kind="foreground") if advanced else {}
             recall_drafts = await asyncio.to_thread(store.recall_drafts) if advanced and not feedback else {}
@@ -709,7 +710,7 @@ class MrMemoryPlugin(Star):
                 # its later tool turns instead of replaying all processed text.
                 material_done = set(task["material_ids"]) <= set(task["completed_ids"])
                 native = task.get("continuation", {}).get("conversation")
-                if task.get("checkpoint") and native and (material_done or (remaining is not None
+                if native and (material_done or (task.get("checkpoint") and remaining is not None
                         and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace, **estimate_options) * 2 > remaining)):
                     task = checkpoint_learning_task(task)
                 if remaining is not None and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace, **estimate_options) >= remaining:
@@ -718,6 +719,12 @@ class MrMemoryPlugin(Star):
                     memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
                                 for ref in task["memory_refs"]]
                     working["saved_memories"] = [row for row in memories if row]
+            elif repair_drafts:
+                source_ids = {int(value) for row in repair_drafts.values()
+                              for item in (row.get("item", {}), row.get("item", {}).get("item", {}))
+                              if isinstance(item, dict) for value in item.get("source_ids", [])}
+                messages = await asyncio.to_thread(store.messages, sorted(source_ids))
+                messages = [{**row, "context_only": True} for row in messages]
             elif feedback:
                 reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due, include_sources=False)
                 feedback_order = state.get("feedback_next_order", "recent")
@@ -737,7 +744,7 @@ class MrMemoryPlugin(Star):
                 # Live group experience gets the next batch; idle capacity catches up older history.
                 messages = await asyncio.to_thread(store.pending_messages, maximum, newest=True)
             if not task:
-                if not messages and not reflection_tasks and not new_activity:
+                if not messages and not reflection_tasks and not new_activity and not repair_drafts:
                     return report("idle", "没有待处理互动")
                 if feedback:
                     waiting = await asyncio.to_thread(store.reflections.waiting, include_sources=False) if messages else []
@@ -753,6 +760,17 @@ class MrMemoryPlugin(Star):
                 previous_learning = await asyncio.to_thread(store.unfinished_learning, kind) if advanced else None
                 if previous_learning:
                     working["previous_learning"] = previous_learning
+                if repair_drafts:
+                    working["write_recovery"] = (
+                        "本轮只恢复 pending_items 中原批次尚未保存的记忆与连接，不重新整理新消息。"
+                        "所附原文用于核对原意，已处理过，不需再次声明材料进度。"
+                        "用 retry 的 pending_id 与 changes 修正保存字段；changes 直接包含记忆字段，不再套 item。"
+                        "旧草稿若嵌套了 item，那是曾未生效的修正内容；核对后将有效修正及原文 source_ids 放回直接字段。"
+                        "连接描述需要查找或建立明确目标，保留原描述的语境与把握，不为消除报错丢弃有用连接。"
+                        "如原草稿确实重复或错误，核对后说明实际处置理由。")
+                    refs = {(ref["kind"], ref["id"]): ref for row in repair_drafts.values()
+                            for ref in row.get("saved_memory_refs", [])}
+                    working["saved_memories"] = await asyncio.to_thread(store.memory_directory, list(refs.values()))
 
             # A long-running material batch must still see understanding formed
             # by intervening interactions, rather than resume a frozen worldview.
@@ -786,9 +804,8 @@ class MrMemoryPlugin(Star):
             # the available input/continuation budget; omitted messages remain
             # queued and can also be opened by the model's context tool.
             estimate_task = task
-            queued_drafts = state.get("pending_learning_drafts", {}).get(kind, {})
-            if task is None and queued_drafts:
-                estimate_task = {"continuation": {"write_state": {"pending_items": queued_drafts}}}
+            if task is None and repair_drafts:
+                estimate_task = {"continuation": {"write_state": {"pending_items": repair_drafts}}}
             estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density, workspace=workspace, **estimate_options)
             while remaining is not None and (estimate + output_reserve) * 2 > remaining and not (task or {}).get("continuation"):
                 material = [row for row in messages if not row.get("context_only")]
@@ -818,7 +835,8 @@ class MrMemoryPlugin(Star):
             if task is None:
                 task = await asyncio.to_thread(store.start_learning_task, kind,
                     [row["id"] for row in messages if not row.get("context_only")],
-                    [row["id"] for row in messages if row.get("context_only")], working)
+                    [row["id"] for row in messages if row.get("context_only")], working,
+                    pending_ids=list(repair_drafts))
                 if density:
                     task["continuation"]["input_tokens_per_byte"] = density
                     task["continuation"]["output_token_reserve"] = output_reserve

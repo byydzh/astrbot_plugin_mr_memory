@@ -359,7 +359,7 @@ class MemoryGraph:
             attrs["participant_id"] = None
         # Exact repeated assertions with the same provenance are one write;
         # this does not infer identity or merge similarly named people/nodes.
-        if not stored and allocated_id is None and kind not in {"node", "association"} and not item.get("connections") and not item.get("cues"):
+        if not stored and allocated_id is None and kind != "node" and not item.get("connections") and not item.get("cues"):
             identical = self.db.execute("SELECT id FROM mr_memory_objects WHERE umo=? AND kind=? AND title=? AND content=? AND attributes_json=? AND status='ACTIVE'",
                                         (self.umo, kind, title, content, encode(attrs))).fetchone()
             if identical:

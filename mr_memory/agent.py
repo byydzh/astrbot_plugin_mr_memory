@@ -882,8 +882,12 @@ class MemoryAgent:
                 raise
             latest = {(row["kind"], row["id"]): row for row in result.written + outcome.written}
             result.written = list(latest.values())
-            if outcome.progress_error:
-                pending_write_errors["remember"] = outcome.progress_error
+            if outcome.progress_error or outcome.rejected or writer.pending_items:
+                details = [outcome.progress_error] if outcome.progress_error else []
+                details.extend(row["detail"] for row in outcome.rejected)
+                if writer.pending_items:
+                    details.append(f"{len(writer.pending_items)} drafts are still unsaved; repair them using retry and pending_id")
+                pending_write_errors["remember"] = "; ".join(dict.fromkeys(details))
             else:
                 pending_write_errors.pop("remember", None)
             return outcome.receipt(writer.pending_items)
@@ -972,6 +976,7 @@ class MemoryAgent:
                         resource_state["action"] = (
                             "这是本次可用的最后一轮，暂停继续读取，直接输出完整 JSON 保存已形成的认识和实际进度："
                             '{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[],"recollection":{}}。'
+                            "items 与 retry 使用 remember 的相同字段结构；connections 元素用 {kind,id,relation,context} 或 {handle,relation,context}，不写描述字符串。"
                             "只写尚未保存的内容；只完成确已理解的材料，不为收尾编造结论。"
                             "未完线索、未读结果地址及尚待核对的问题写入 checkpoint，之后继续。")
                     resource_state["estimated_input_tokens"] = estimated_input
@@ -1159,8 +1164,10 @@ class MemoryAgent:
             result.detail = f"{type(exc).__name__}: {exc}"
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
-            if result.status == "completed" and writer.pending_items:
-                result.detail = f"本批材料已完成；{len(writer.pending_items)}条记忆草稿仍待修复，已独立保留"
+            if writer.pending_items:
+                if result.status == "completed":
+                    result.status = "partial"
+                result.detail = f"{len(writer.pending_items)}条记忆草稿尚未保存；已保存材料进度，后续继续修复。" + result.detail
             pending_calls = []
             for message in conversation:
                 if message.get("role") == "assistant":

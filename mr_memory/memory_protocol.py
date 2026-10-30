@@ -47,6 +47,14 @@ pending_items 是待修草稿，用 retry 的 pending_id 和 changes 补字段�
 queue 与 resource_state 表示各批次共享的资源；理解并保存后即可结束，不必用满额度。
 """
 
+LEARNING_WRITE_FORMAT = """
+工具调用与最后 JSON 使用相同的记忆结构。connections 每个元素是带目标地址的对象：已存目标用 {kind,id,relation,context}，本批新目标用 {handle,relation,context}；关系描述写在 context，不能只写一个描述字符串。地址来自实际读取的记忆，新目标由同次提交的对象声明 handle。
+修复旧草稿使用 retry:[{pending_id,changes:{...记忆字段...}}]；changes 不包 item。相互连接的待修草稿可以在同次 retry 一起提交并用 handle 互相引用。旧草稿里的错误结构是待修内容，不是保存示例。saved_connections 列出已经持久保存的连接；是否保存以写入回执为准，checkpoint 只记录思路。
+"""
+CONSOLIDATION_PROMPT += LEARNING_WRITE_FORMAT
+BASIC_CONSOLIDATION_PROMPT += LEARNING_WRITE_FORMAT
+
+
 def _schema(description: str, properties: dict, required: tuple = ()) -> dict:
     return {"description": description, "parameters": {"type": "object", "properties": properties,
             "required": list(required), "additionalProperties": False}}

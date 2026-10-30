@@ -140,7 +140,13 @@ class LearningWriter:
                 item[side] = self.resolve(item[side], bindings, component)
         if "connections" in item:
             links = []
-            for link in item["connections"]:
+            for index, link in enumerate(item["connections"]):
+                if not isinstance(link, dict):
+                    raise ValueError(
+                        f"connections[{index}] is a description, not a memory address. "
+                        "Resolve the intended target with the memory tools and use "
+                        "{kind,id,relation,context}, or {handle,relation,context} for a new item. "
+                        "Keep the supplied description in context; the original draft is retained.")
                 link = connection_reference(link)
                 links.append(self.resolve(link, bindings, component))
             item["connections"] = links
@@ -257,6 +263,8 @@ class LearningWriter:
                 changes = retry.get("changes", {})
                 if not isinstance(changes, dict):
                     raise ValueError("retry.changes must be an object of memory fields")
+                if set(changes) == {"item"} and isinstance(changes["item"], dict):
+                    changes = changes["item"]
                 original = self.pending_items[key]
                 item = {**(original["item"] if isinstance(original["item"], dict) else {}), **changes}
                 work.append((key, original["item_index"], item))
