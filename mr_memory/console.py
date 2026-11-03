@@ -112,7 +112,8 @@ class Console:
             "background_enabled": config["subconscious_enabled"],
             "feedback": config["advanced_memory_enabled"] and config["subconscious_enabled"] and config["feedback_learning_enabled"],
             "embedding_enabled": config["embedding_enabled"],
-            "embedding_loaded": getattr(self.plugin.embedder, "_model", None) is not None,
+            "embedding_loaded": (self.plugin.embedder.loaded if hasattr(self.plugin.embedder, "loaded")
+                                 else getattr(self.plugin.embedder, "_model", None) is not None),
             "memory_timeout_seconds": config["local_serving_timeout_seconds"],
             "background_rolling24h_budget": config["private_daily_token_budget"],
             "feedback_rolling24h_budget": config["feedback_daily_token_budget"],

@@ -33,6 +33,7 @@
   "feedback_window_seconds": {"description": "反馈可关联到多久前的回答（秒）", "type": "int", "default": 21600, "hint": "21600 秒即六小时；按反馈发生时间关联此前的回答，不是待学习材料的过期时间，排到工作时段不会丢失白天的反馈。"},
   "feedback_debounce_seconds": {"description": "连续反馈合并等待（秒）", "type": "int", "default": 15, "hint": "合并短时间连续收到的反馈，减少重复调用。"},
   "embedding_enabled": {"description": "启用本地语义检索", "type": "bool", "default": true, "hint": "在本地计算语义候选；关闭后仍可由记忆模型使用原文、成员与关系查询工具。"},
+  "embedding_provider_id": {"description": "共享向量 Provider ID", "type": "string", "default": "", "hint": "留空由 MR 独立加载；填写后使用共享本地向量插件，不再加载第二份模型。模型名、查询提示和输入长度须与现有索引一致；共享服务不可用时明确报错，不自动切换模型。"},
   "embedding_model_name": {"description": "本地语义检索模型", "type": "string", "default": "BAAI/bge-small-zh-v1.5"},
   "embedding_query_prompt_name": {"description": "向量模型查询提示名", "type": "string", "default": "auto", "hint": "auto 为 Harrier 选择 web_search_query，其他模型不加查询提示。"},
   "embedding_cpu_threads": {"description": "本地向量推理 CPU 线程数", "type": "int", "default": 1},

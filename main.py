@@ -22,6 +22,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .mr_memory.agent import MemoryAgent, checkpoint_learning_task, compact_learning_task, estimate_learning_input
 from .mr_memory.embedding import Embedder
+from .mr_memory.shared_embedding import SharedEmbedder
 from .mr_memory.store import Store
 from .mr_memory.settings import normalize_settings
 from .mr_memory.schedule import work_window
@@ -148,14 +149,23 @@ class MrMemoryPlugin(Star):
         self.learning_status: dict[str, dict] = {}
         self.stopping = False
         self.history = HistoryRecovery(self)
-        self.embedder = Embedder(
-            str(config.get("embedding_model_name", "microsoft/harrier-oss-v1-270m")),
-            self.data_dir / "models" / "sentence_transformers",
-            threads=int(config.get("embedding_cpu_threads", 1)),
-            batch_size=int(config.get("embedding_batch_size", 1)),
-            query_prompt=str(config.get("embedding_query_prompt_name", "web_search_query")),
+        embedding_options = dict(
+            model_name=str(config.get("embedding_model_name", "microsoft/harrier-oss-v1-270m")),
+            query_prompt=str(self.config["embedding_query_prompt_name"]),
             max_seq_length=int(config.get("embedding_max_seq_length", 512)),
         )
+        if self.config["embedding_provider_id"]:
+            self.embedder = SharedEmbedder(
+                context, self.config["embedding_provider_id"],
+                binding_path=self.data_dir / "shared_embedding_space.json", **embedding_options,
+            )
+        else:
+            self.embedder = Embedder(
+                cache_dir=self.data_dir / "models" / "sentence_transformers",
+                threads=int(config.get("embedding_cpu_threads", 1)),
+                batch_size=int(config.get("embedding_batch_size", 1)),
+                **embedding_options,
+            )
         self.console = register_console(self)
 
     def spawn(self, coroutine) -> asyncio.Task:
@@ -268,7 +278,10 @@ class MrMemoryPlugin(Star):
         provider = self.context.get_provider_by_id(provider_id)
         if provider is None:
             raise RuntimeError(f"MR provider is unavailable: {provider_id}")
-        return MemoryAgent(provider, store, self.embedder if self.config["embedding_enabled"] else None,
+        embedder = self.embedder if self.config["embedding_enabled"] else None
+        if background and isinstance(embedder, SharedEmbedder):
+            embedder = embedder.background_view()
+        return MemoryAgent(provider, store, embedder,
                            timeout_seconds=float(self.config["maintenance_llm_timeout_seconds"] if background
                                                  else self.config["local_serving_timeout_seconds"]),
                            max_turns=None if background else int(self.config["max_loop_steps"]),
