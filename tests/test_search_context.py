@@ -1,8 +1,10 @@
 import unittest
 import uuid
+import json
 from pathlib import Path
 
 from mr_memory.agent import MemoryAgent
+from mr_memory.content import text_view
 from mr_memory.store import Store
 
 
@@ -67,6 +69,32 @@ class SearchContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["matches"], [hit["id"]])
         self.assertEqual(result["context"], [hit])
         self.assertEqual(self.store.search_message_context(terms=["不存在"])["context"], [])
+
+    async def test_mcp_media_is_read_as_attachment_but_original_bytes_remain_archived(self):
+        data = "UNIQUEBASE64PAYLOAD" * 1000
+        result = {"content": [{"type": "image", "mimeType": "image/jpeg", "data": data},
+                              {"type": "audio", "mimeType": "audio/wav", "data": data},
+                              {"type": "resource", "resource": {"uri": "file:///diagram.pdf",
+                                  "mimeType": "application/pdf", "blob": data}},
+                              {"type": "text", "text": "西门路线图", "data": "ordinary data"}]}
+        for number, value in enumerate([result, json.dumps(result)], 1):
+            row = self.store.append_message(dict(platform_id="test", umo=self.store.umo,
+                group_id="42", message_id=str(number), sender_id="bot", sender_name="bot",
+                sent_at=100 + number, plain_text="西门路线图", role="SYSTEM",
+                content=[{"type": "tool_result", "name": "read_file", "result": value}]))
+            raw = self.store.db.execute("SELECT content_json FROM messages WHERE id=?", (row["id"],)).fetchone()[0]
+            self.assertIn(data, raw)
+        agent = MemoryAgent(None, self.store)
+        viewed = await agent._execute("search_messages", {"terms": ["西门路线图"]}, 1000)
+        encoded = json.dumps(viewed, ensure_ascii=False)
+        self.assertEqual(len(viewed["matches"]), 2)
+        self.assertNotIn(data, encoded)
+        self.assertIn("image/jpeg", encoded)
+        self.assertIn("diagram.pdf", encoded)
+        self.assertIn("ordinary data", encoded)
+        self.assertEqual(text_view(viewed), viewed)
+        self.assertEqual(self.store.search_messages(terms=["UNIQUEBASE64PAYLOAD"]), [])
+        self.assertEqual(len(self.store.search_messages(terms=["ordinary data"])), 2)
 
 
 if __name__ == "__main__":

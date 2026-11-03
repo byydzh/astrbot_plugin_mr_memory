@@ -498,6 +498,43 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(store.learning_task("background"))
         self.assertEqual([row["id"] for row in store.pending_messages(10)], [new["id"]])
 
+    async def test_background_rotates_messages_and_repairs_without_draining_old_queue_first(self):
+        self.plugin.config.update(advanced_memory_enabled=False, auto_distillation_min_pending=1)
+        store = await self.plugin.store_for(event())
+        store.select_learning_mode("background", "basic")
+        base = self.plugin.message(event())
+        source = store.append_message({**base, "message_id": "old-source"})
+        store.save_memories([], [source["source_key"]])
+        store.update_working_state({"pending_learning_drafts": {"background": {
+            f"old-{i}:0": {"item": {"kind": "episode", "summary": f"old event {i}",
+                "source_ids": [source["id"]]}, "origin_run_id": i} for i in [1, 2]}}})
+        first = store.append_message({**base, "message_id": "new-material-1"})
+        selections = []
+
+        async def learn(messages, working, **options):
+            task = options["task"]
+            selections.append((list(task["material_ids"]), bool(working.get("write_recovery"))))
+            if working.get("write_recovery"):
+                self.assertEqual(set(task["continuation"]["write_state"]["pending_items"]), {"old-1:0"})
+                task["continuation"]["write_state"]["pending_items"] = {}
+                store.update_learning_task("background", {"continuation": task["continuation"]})
+            else:
+                self.assertFalse(task["continuation"].get("write_state", {}).get("pending_items"))
+                store.save_learning_progress("background", {"completed_ids": task["material_ids"]})
+            return ConsolidationResult(status="completed", usage={"input_other": 20}, model_attempts=1)
+
+        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)):
+            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
+            self.assertEqual(selections, [([first["id"]], False)])
+            second = store.append_message({**base, "message_id": "new-material-2"})
+            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
+            self.assertEqual(selections[-1], ([], True))
+            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
+        self.assertEqual(selections, [([first["id"]], False), ([], True), ([second["id"]], False)])
+        self.assertEqual(store.pending_status()["count"], 0)
+        self.assertEqual(set(store.load_working_state()["pending_learning_drafts"]["background"]), {"old-2:0"})
+        self.assertEqual(store.usage_total("background"), 60)
+
     async def test_closed_window_defers_routine_but_visits_explicit_appointment_once(self):
         store = await self.plugin.store_for(event())
         source = store.append_message(self.plugin.message(event()))

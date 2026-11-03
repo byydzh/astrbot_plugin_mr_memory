@@ -1135,6 +1135,14 @@ class Store:
                 row.setdefault("saved_memory_refs", task.get("memory_refs", []))
             if drafts:
                 state.setdefault("pending_learning_drafts", {}).setdefault(kind, {}).update(drafts)
+            # Alternate completed background batches instead of making every
+            # queued repair a prerequisite for learning new group messages.
+            # This cursor commits with task removal and survives hot reloads.
+            if kind == "background" and task:
+                if task.get("working", {}).get("write_recovery"):
+                    state["background_next_work"] = "messages"
+                elif task["material_ids"]:
+                    state["background_next_work"] = "repair"
             if (kind == "feedback" and task and task["material_ids"]
                     and set(task["material_ids"]) <= set(task["completed_ids"])):
                 order = task.get("working", {}).get("feedback_order", "oldest")

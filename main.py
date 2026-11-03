@@ -684,6 +684,14 @@ class MrMemoryPlugin(Star):
             maximum = int(self.config["distillation_max_messages"])
             resuming = task is not None
             repair_drafts = await asyncio.to_thread(store.pending_learning_batch, kind) if task is None else {}
+            if repair_drafts and not feedback and state.get("background_next_work", "messages") == "messages":
+                pending = await asyncio.to_thread(store.pending_status)
+                messages_due = pending["count"] > 0 and (force
+                    or pending["count"] >= self.config["auto_distillation_min_pending"]
+                    or (pending["oldest_at"] is not None
+                        and time.time() - pending["oldest_at"] >= self.config["maintenance_interval_seconds"]))
+                if messages_due:
+                    repair_drafts = {}
             reflection_tasks = []
             memory_activity = await asyncio.to_thread(store.reconsider, after=state.get("cognition_offered", 0), kind="foreground") if advanced else {}
             recall_drafts = await asyncio.to_thread(store.recall_drafts) if advanced and not feedback else {}
