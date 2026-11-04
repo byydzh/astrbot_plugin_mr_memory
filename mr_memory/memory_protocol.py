@@ -54,6 +54,14 @@ LEARNING_WRITE_FORMAT = """
 CONSOLIDATION_PROMPT += LEARNING_WRITE_FORMAT
 BASIC_CONSOLIDATION_PROMPT += LEARNING_WRITE_FORMAT
 
+MESSAGE_CONTEXT_GUIDANCE = """
+消息可附 message_context／source_contexts，标明插件提供的实际语境。sender_id/role 仍是发送账号；speaker 才是该段扮演角色，addressed_to 是对话对象，session_id/turn_id 标明归属。roleplay 里的角色生活、关系与剧情保留角色和会话语境，不归到运输消息的机器人或真实群友名下。群友参与了这场交流以及明确说出的现实信息仍可正常理解，不因带有 RP 语境而整段丢弃。forwarding=not_forwarded 表示未转给角色，不构成角色听过或回应过的经历。相同 utterance_id 的语音、字幕、原文和译文是同一表达；scene 是角色场景示意。它们都不增加独立事实支持。保留来源边界，具体意思、玩笑和现实自述仍结合语义判断。
+"""
+BASIC_RECALL_PROMPT += MESSAGE_CONTEXT_GUIDANCE
+RECONSTRUCTION_PROMPT += MESSAGE_CONTEXT_GUIDANCE
+BASIC_CONSOLIDATION_PROMPT += MESSAGE_CONTEXT_GUIDANCE
+CONSOLIDATION_PROMPT += MESSAGE_CONTEXT_GUIDANCE
+
 
 def _schema(description: str, properties: dict, required: tuple = ()) -> dict:
     return {"description": description, "parameters": {"type": "object", "properties": properties,

@@ -354,6 +354,18 @@ class Store:
                                   card=message.get("group_card"), at=at)
         return self._message(current)
 
+    @_serialized
+    def annotate_message_context(self, source_key: str, context: dict) -> dict | None:
+        """Enrich an already captured message after its producer has routed it."""
+        from .message_context import replace_context
+        row = self.db.execute("SELECT * FROM messages WHERE umo=? AND source_key=? AND is_deleted=0",
+                              (self.umo, source_key)).fetchone()
+        if row is None:
+            return None
+        message = dict(row)
+        message["content"] = replace_context(json.loads(message["content_json"]), context)
+        return self.append_message(message)
+
     def _forgotten(self, platform_id: str, account_id: str) -> bool:
         digest = hashlib.sha256("\x1f".join((self.umo, platform_id, str(account_id))).encode()).hexdigest()
         return self.db.execute("SELECT 1 FROM forgotten_accounts WHERE umo=? AND platform_id=? AND account_hash=?",
@@ -510,7 +522,7 @@ class Store:
             if str(part.get("type", "")).casefold() != "reply":
                 return part
             original = None
-            fields = "id,source_key,sent_at,sender_id,sender_name,role"
+            fields = "id,source_key,sent_at,sender_id,sender_name,role,content_json"
             if part.get("source_key"):
                 original = self.db.execute(f"SELECT {fields} FROM messages WHERE umo=? AND source_key=? AND is_deleted=0",
                                            (self.umo, str(part["source_key"]))).fetchone()
@@ -525,6 +537,10 @@ class Store:
             if original is not None:
                 part.update(source_id=original["id"], source_key=original["source_key"],
                             sender_id=original["sender_id"], sender_name=original["sender_name"], role=original["role"])
+                from .message_context import from_content
+                contexts = from_content(json.loads(original["content_json"]))
+                if contexts:
+                    part["message_context"] = contexts
                 if original["sent_at"] > 0:
                     part.update(sent_at=original["sent_at"], time_status="original_message")
             return part
@@ -544,6 +560,11 @@ class Store:
                 # A recent-message window may start at the tool result. Keep its
                 # actual request and author even when that request is outside it.
                 result["reply_to_message"] = dict(original)
+                from .message_context import from_content
+                original_content = self.db.execute("SELECT content_json FROM messages WHERE id=?", (original["id"],)).fetchone()
+                contexts = from_content(json.loads(original_content[0]))
+                if contexts:
+                    result["reply_to_message"]["message_context"] = contexts
         if "message_attachments" in self.tables:
             result["attachments"] = self._rows("SELECT position,attachment_type,extraction_status,descriptor_text,reference_sha256 FROM message_attachments WHERE message_id=?", (row["id"],))
         return text_view(result)
@@ -1338,7 +1359,7 @@ class Store:
                 self._queue_embedding(row["kind"], row["id"])
             # Raw speech remains semantically searchable when LLM learning is off.
             # Index the original text; no inferred profile or summary is created.
-            originals = self._rows("""SELECT m.id,m.sender_name,m.sender_id,m.plain_text,m.revision_no FROM messages m
+            originals = self._rows("""SELECT m.id,m.sender_name,m.sender_id,m.plain_text,m.revision_no,m.content_json FROM messages m
                 WHERE m.umo=? AND m.is_deleted=0 AND m.role IN('USER','BOT') AND m.plain_text<>''
                 AND NOT EXISTS(SELECT 1 FROM memory_embeddings v WHERE v.umo=m.umo AND v.owner_type='message'
                     AND v.owner_key=CAST(m.id AS TEXT) AND v.model=?)
@@ -1347,6 +1368,10 @@ class Store:
                 (self.umo, model_id, _limit(limit)))
             for row in originals:
                 text = f"{row['sender_name']} (UID {row['sender_id']})：" + searchable_text(row["plain_text"])
+                from .message_context import from_content
+                for context in from_content(json.loads(row["content_json"])):
+                    text += "\n消息语境：" + _encode({key: context[key] for key in (
+                        "mode", "kind", "speaker", "character", "addressed_to", "forwarding") if key in context})
                 self.db.execute("INSERT OR IGNORE INTO mr_index_pending VALUES(?,'message',?,?,?)",
                                 (self.umo, str(row["id"]), text, int(time.time())))
         return self._rows("SELECT owner_type,owner_key,text,updated_at FROM mr_index_pending WHERE umo=? ORDER BY updated_at DESC,owner_type,owner_key LIMIT ?", (self.umo, _limit(limit)))

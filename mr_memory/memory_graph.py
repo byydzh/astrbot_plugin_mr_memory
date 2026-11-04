@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from .message_context import from_content
 
 
 SCHEMA = """
@@ -67,10 +68,13 @@ class MemoryGraph:
             row = self.db.execute("SELECT * FROM messages WHERE umo=? AND id=?", (self.umo, int(owner))).fetchone()
             if row is None:
                 return None
+            contexts = from_content(json.loads(row["content_json"]))
+            speaker = next((c["speaker"]["name"] for c in contexts if c.get("speaker", {}).get("name")), None)
             return {"umo": self.umo, "kind": "message", "id": row["id"],
-                    "title": row["sender_name"] + "的原始发言", "content": row["plain_text"],
+                    "title": (f"{speaker}（经 {row['sender_name']} 发送）" if speaker else row["sender_name"]) + "的原始发言", "content": row["plain_text"],
                     "attributes_json": encode({"source_ids": [row["id"]], "sender_id": row["sender_id"],
-                                               "sender_name": row["sender_name"], "role": row["role"], "sent_at": row["sent_at"]}),
+                                               "sender_name": row["sender_name"], "role": row["role"], "sent_at": row["sent_at"],
+                                               **({"message_context": contexts} if contexts else {})}),
                     "revision": row["revision_no"], "status": "INVALIDATED" if row["is_deleted"] else "ACTIVE",
                     "created_at": row["created_at"], "updated_at": row["updated_at"]}
         row = self.db.execute("SELECT * FROM mr_memory_objects WHERE umo=? AND kind=? AND id=?",
@@ -99,7 +103,10 @@ class MemoryGraph:
             return self.store.messages(ids)
         if not ids:
             return []
-        return self.store._rows("SELECT id,source_key,sender_participant_id participant_id,sender_id,sender_name,role FROM messages WHERE umo=? AND is_deleted=0 AND id IN(" + ",".join("?" for _ in ids) + ")", [self.umo, *ids])
+        rows = self.store._rows("SELECT id,source_key,sender_participant_id participant_id,sender_id,sender_name,role,content_json FROM messages WHERE umo=? AND is_deleted=0 AND id IN(" + ",".join("?" for _ in ids) + ")", [self.umo, *ids])
+        for source in rows:
+            source["content"] = from_content(json.loads(source.pop("content_json")))
+        return rows
 
     def get(self, kind, owner, *, include_sources=True, include_history=False, attention=True):
         row = self.raw(kind, owner)
@@ -116,6 +123,9 @@ class MemoryGraph:
         speakers = {(r.get("participant_id"), r["sender_id"], r["sender_name"], r["role"]) for r in sources}
         result["source_speakers"] = [dict(participant_id=p, account_id=a, name_at_message=n, role=r)
                                      for p, a, n, r in sorted(speakers, key=lambda s: str(s[1:]))]
+        contexts = [{"message_id": s["id"], **c} for s in sources for c in from_content(s.get("content", []))]
+        if contexts:
+            result["source_contexts"] = contexts
         if include_sources:
             result["sources"] = sources
         if row["kind"] == "node":

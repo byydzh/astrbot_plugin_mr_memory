@@ -52,6 +52,45 @@ def event() -> AstrMessageEvent:
 
 
 class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qq_official_receipt_keeps_role_context_only_for_successful_send(self):
+        current = event()
+        current.get_platform_name = Mock(return_value="qq_official")
+        current._post_send_one = AsyncMock(return_value={"id": "official-receipt"})
+        await self.plugin.capture_group_message(current)
+        current._mr_output_context = {"producer": "example_rp", "mode": "roleplay",
+                                      "speaker": {"id": "actor-a", "name": "角色甲"},
+                                      "utterance_id": "t1", "presentation": "bilingual_text"}
+        receipt = await current._post_send_one(MessageChain([Plain(text="角色台词")]))
+        store = await self.plugin.store_for(current)
+        self.assertEqual(receipt["id"], "official-receipt")
+        self.assertEqual(store.recent()[-1]["content"][-1]["speaker"]["id"], "actor-a")
+        current._mr_memory_original_post.side_effect = RuntimeError("failed upload")
+        with self.assertRaises(RuntimeError):
+            await current._post_send_one(MessageChain([Plain(text="未发送台词")]))
+        self.assertEqual(len(store.recent()), 2)
+
+    async def test_optional_context_enriches_captured_input_and_scopes_output(self):
+        current = event()
+        current.send = AsyncMock()
+        await self.plugin.capture_group_message(current)
+        store = await self.plugin.store_for(current)
+        current._mr_input_context = {"producer": "example_rp", "mode": "roleplay",
+                                     "forwarding": "forwarded", "turn_id": "t1"}
+        await current._mr_update_input_context()
+        self.assertEqual(store.recent()[0]["content"][-1]["turn_id"], "t1")
+        self.assertEqual(self.plugin.message(current)["content"][-1]["turn_id"], "t1")
+        current._mr_output_context = {"producer": "example_rp", "mode": "roleplay",
+                                      "speaker": {"id": "actor-a", "name": "角色甲"}, "utterance_id": "t1"}
+        await current.send(current.plain_result("角色台词"))
+        del current._mr_output_context
+        await current.send(current.plain_result("普通群回复"))
+        rows = store.recent()
+        self.assertEqual(rows[-2]["content"][-1]["speaker"]["name"], "角色甲")
+        self.assertFalse(any(c["type"] == "message_context" for c in rows[-1]["content"]))
+        self.assertEqual(rows[-2]["sender_id"], current.get_self_id())
+        await self.plugin.terminate()
+        self.assertFalse(hasattr(current, "_mr_update_input_context"))
+
     async def asyncSetUp(self):
         self.test_root = Path(__file__).resolve().parents[1] / ".dev"
         self.directory = self.test_root / f"test-main-{uuid.uuid4().hex}"

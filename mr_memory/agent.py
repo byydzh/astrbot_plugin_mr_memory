@@ -139,7 +139,7 @@ def _json(value: Any, *, seen_messages: dict | None = None) -> str:
             previous = seen.get(key, {})
             seen[key] = {**previous, **part}
             repeated = [name for name in ("summary", "content", "statement", "description", "context",
-                        "source_speakers", "subject", "representation", "belief", "reflections", "sources",
+                        "source_speakers", "source_contexts", "subject", "representation", "belief", "reflections", "sources",
                         "basis", "connections", "cues", "attention")
                         if name in part and name in previous and part[name] == previous[name]]
             if repeated:

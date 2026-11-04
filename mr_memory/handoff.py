@@ -42,7 +42,7 @@ def selected_context(store, ref, before=None):
     row = store.memory(kind, owner, include_sources=False)
     if row is None:
         return {**address, "status": "unavailable"}
-    keys = ("title", "revision_no", "content", "representation", "belief", "source_ids", "source_speakers", "basis")
+    keys = ("title", "revision_no", "content", "representation", "belief", "source_ids", "source_speakers", "source_contexts", "basis")
     return {**address, **{key: text_view(row[key]) for key in keys if key in row},
             "meaning": "记忆网络中当前的理解，包含模型形成的解释，并非另一份独立观察。"}
 

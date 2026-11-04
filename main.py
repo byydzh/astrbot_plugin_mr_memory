@@ -33,6 +33,7 @@ from .mr_memory.profiles import parse_profile_changes
 from .mr_memory.history import HistoryRecovery
 from .mr_memory.handoff import request_clock
 from .mr_memory.identity import IdentityBindings, import_unlearned_messages
+from .mr_memory.message_context import from_event as message_context
 
 
 def json_value(value: Any) -> Any:
@@ -316,7 +317,7 @@ class MrMemoryPlugin(Star):
                 "umo": event.unified_msg_origin, "group_id": str(event.get_group_id()),
                 "message_id": str(obj.message_id), "sender_id": str(obj.sender.user_id),
                 "sender_name": str(obj.sender.nickname or ""), "sent_at": int(stamp),
-                "plain_text": str(obj.message_str or ""), "content": content, "role": "USER",
+                "plain_text": str(obj.message_str or ""), "content": content + message_context(event, "input"), "role": "USER",
                 "platform_nickname": platform_sender.get("nickname"), "group_card": platform_sender.get("card"),
                 "reply_to": next((x["message_id"] for x in content if x["type"] == "reply"), "")}
 
@@ -338,6 +339,16 @@ class MrMemoryPlugin(Star):
         """Record successful sends on this event, including streamed segments."""
         if getattr(event, "_mr_memory_send_observed", None) is self:
             return
+        async def update_input_context():
+            if self.stopping or not self.config["capture_enabled"] or not self.allowed(event):
+                return
+            store = await self.store_for(event)
+            row = self.for_store(self.message(event), store)
+            source_key = row.get("source_key") or f"{row['platform_id']}|{store.umo}|{row['message_id']}"
+            for context in message_context(event, "input"):
+                await asyncio.to_thread(store.annotate_message_context, source_key, context)
+
+        event._mr_update_input_context = update_input_context
         original_send = getattr(event, "_mr_memory_original_send", event.send)
         observes_receipts = isinstance(event, AiocqhttpMessageEvent)
         official = event.get_platform_name() in {"qq_official", "qq_official_webhook"}
@@ -616,7 +627,8 @@ class MrMemoryPlugin(Star):
                    platform_nickname=None, group_card=None,
                    sent_at=int(time.time()), plain_text=text, role="BOT" if kind == "sent" else "SYSTEM",
                    content=[{"type": "response_to", "message_id": request_id},
-                            {"type": "bot_event", "event": kind}, *content], reply_to=request_id)
+                            {"type": "bot_event", "event": kind}, *content,
+                            *message_context(event, "output")], reply_to=request_id)
         await asyncio.to_thread(store.append_message, self.for_store(row, store))
         await self.refresh_identities(event.unified_msg_origin, store, bot_id=bot_id)
 
@@ -1068,7 +1080,8 @@ class MrMemoryPlugin(Star):
                         event._post_send_one = event._mr_memory_original_post
                     for name in ("_mr_memory_original_post", "_mr_memory_post_wrapper", "_mr_memory_record_official_receipt"):
                         delattr(event, name)
-                for name in ("_mr_memory_send_observed", "_mr_memory_original_send", "_mr_memory_send_wrapper"):
+                for name in ("_mr_memory_send_observed", "_mr_memory_original_send", "_mr_memory_send_wrapper",
+                             "_mr_update_input_context"):
                     delattr(event, name)
         self.observed_events.clear()
         for task in list(self.tasks):
