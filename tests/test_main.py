@@ -97,7 +97,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
         store = await self.plugin.store_for(current)
         correction = "原图属于乙；甲是上一张图，作者在消息17纠正过。"
-        store.save_memories([{"kind": "understanding", "content": correction, "attention": "接着理解"}], mark_processed=False)
+        saved = store.save_memories([{"kind": "understanding", "content": correction}], mark_processed=False)[0]
         replies = [
             ReconstructionResult(background="本轮理解了作者纠正。", status="completed"),
             ReconstructionResult(background="这轮只调整另一张图的颜色。", status="completed"),
@@ -113,7 +113,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for call in memory_agent.reconstruct.call_args_list[1:]:
             self.assertNotIn("working_memory", call.args[2])
         self.assertNotIn("working_memory", store.load_working_state())
-        self.assertEqual(store.workspace()["active"][0]["memory"]["content"], correction)
+        self.assertEqual(store.memory("understanding", saved["id"])["content"], correction)
 
     async def test_user_generation_tools_and_sent_output_survive_store_reopen(self):
         current = event()

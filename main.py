@@ -273,7 +273,7 @@ class MrMemoryPlugin(Star):
         await self.refresh_identities(current.umo, legacy)
         return {"imported_messages": copied, "message": "已接续旧群记忆。后续消息静默进入同一记忆库，成员名称对照已启用。"}
 
-    def agent(self, store: Store, *, background: bool = False, feedback: bool = False) -> MemoryAgent:
+    def agent(self, store: Store, *, background: bool = False) -> MemoryAgent:
         provider_id = str(self.config["subconscious_provider_id"])
         if not background:
             provider_id = self.config["local_serving_reader_provider_id"] or provider_id
@@ -289,10 +289,8 @@ class MrMemoryPlugin(Star):
                            max_turns=None if background else int(self.config["max_loop_steps"]),
                            max_output_tokens=int(self.config["distillation_max_output_tokens"] if background
                                                  else self.config["memory_max_tokens"]),
-                           thinking_mode=self.config["feedback_thinking_mode"] if feedback else
-                           self.config["distillation_thinking_mode"] if background else
-                           self.config["local_serving_reader_thinking_mode"],
-                           advanced=self.config["advanced_memory_enabled"])
+                           thinking_mode=self.config["distillation_thinking_mode"] if background else
+                           self.config["local_serving_reader_thinking_mode"])
 
     @staticmethod
     def message(event: AstrMessageEvent) -> dict:
@@ -534,13 +532,7 @@ class MrMemoryPlugin(Star):
             view = request_view(current, pool['members'], getattr(store, 'identity_links', {}))
             req.extra_user_content_parts.append(TextPart(text='<mr_request_context>\n' +
                 json.dumps(view, ensure_ascii=False, separators=(',', ':')) + '\n</mr_request_context>').mark_as_temp())
-            # Continuing understanding is read from the shared graph by the agent.
-            advanced = self.config["advanced_memory_enabled"]
-            changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0)) if advanced else {"cursor": 0}
-            recent_learning = await asyncio.to_thread(store.memory_directory, working.get("recent_learning_refs", [])) if advanced else []
             working = {key: working[key] for key in ("question", "request_at") if key in working}
-            working["memory_changes"] = changes
-            working["recent_learning"] = [item for item in recent_learning if item]
             await trace.emit("input", "已准备问题、发言者与近期对话", current=current,
                              messages=recent, working=working, message_count=len(recent), operation_id="prepare")
             prepared = True
@@ -586,7 +578,6 @@ class MrMemoryPlugin(Star):
                             update = {
                                 "background": result.background, "request_at": current["sent_at"],
                                 "question": current["question"], "status": result.status}
-                            update["memory_change_cursor"] = changes["cursor"]
                             await asyncio.to_thread(store.update_working_state, update)
                             await trace.emit("write", "已记录本次背景与记忆目录进度", target="working_state")
                 except Exception as exc:
@@ -659,10 +650,9 @@ class MrMemoryPlugin(Star):
         return await self.spawn(self.learn(store, force=force))
 
     async def learn(self, store: Store, *, force: bool = False, feedback: bool = False) -> dict:
-        advanced = self.config["advanced_memory_enabled"]
-        if feedback and not (advanced and self.config["feedback_learning_enabled"]):
+        if feedback:
             return {"status": "disabled", "reason": "反馈学习已关闭"}
-        kind = "feedback" if feedback else "background"
+        kind = "background"
         if self.stopping or not self.config["subconscious_enabled"]:
             return {"status": "disabled", "reason": "后台潜意识已关闭"}
         allowed = {self.identities.canonical(umo) for umo in self.config["allowed_umos"]}
@@ -679,18 +669,14 @@ class MrMemoryPlugin(Star):
 
             # Persist the model's already-declared progress even while paid
             # learning waits for its work window or rolling quota.
-            await asyncio.to_thread(store.select_learning_mode, kind, "advanced" if advanced else "basic")
+            await asyncio.to_thread(store.select_learning_mode, kind, "basic")
             task = await asyncio.to_thread(store.resume_learning_task, kind)
             window = work_window(self.config)
-            scheduled = []
             if not force and not window["open"]:
-                if feedback:
-                    scheduled = await asyncio.to_thread(store.reflections.due, scheduled_only=True, include_sources=False)
-                if not scheduled:
-                    return report("deferred", "等待服务当地工作时段", **window)
+                return report("deferred", "等待服务当地工作时段", **window)
             state = await asyncio.to_thread(store.load_working_state)
             used = await asyncio.to_thread(store.usage_total, kind)
-            budget = int(self.config["feedback_daily_token_budget" if feedback else "private_daily_token_budget"])
+            budget = int(self.config["private_daily_token_budget"])
             if budget > 0 and used >= budget:
                 return report("budget_exhausted", "滚动24小时额度已用完", used_tokens=used)
             remaining = budget - used if budget > 0 else None
@@ -705,7 +691,7 @@ class MrMemoryPlugin(Star):
             maximum = int(self.config["distillation_max_messages"])
             resuming = task is not None
             repair_drafts = await asyncio.to_thread(store.pending_learning_batch, kind) if task is None else {}
-            if repair_drafts and not feedback and state.get("background_next_work", "messages") == "messages":
+            if repair_drafts and state.get("background_next_work", "messages") == "messages":
                 pending = await asyncio.to_thread(store.pending_status)
                 messages_due = pending["count"] > 0 and (force
                     or pending["count"] >= self.config["auto_distillation_min_pending"]
@@ -713,36 +699,19 @@ class MrMemoryPlugin(Star):
                         and time.time() - pending["oldest_at"] >= self.config["maintenance_interval_seconds"]))
                 if messages_due:
                     repair_drafts = {}
-            reflection_tasks = []
-            memory_activity = await asyncio.to_thread(store.reconsider, after=state.get("cognition_offered", 0), kind="foreground") if advanced else {}
-            recall_drafts = await asyncio.to_thread(store.recall_drafts) if advanced and not feedback else {}
-            new_activity = bool(memory_activity.get("items") or recall_drafts)
-            workspace = await asyncio.to_thread(store.workspace) if advanced else None
             pool = await asyncio.to_thread(store.member_pool, self.config["member_prefix_capacity"])
-            estimate_options = {"basic": not advanced, "member_prefix": pool["prefix"]}
+            estimate_options = {"member_prefix": pool["prefix"]}
             if task:
                 messages = await asyncio.to_thread(store.learning_messages, task)
                 done = set(task["completed_ids"])
                 messages = [row for row in messages if row.get("context_only") or row["id"] not in done]
                 working = dict(task["working"])
-                # A model appointment can bring an unfinished feedback task
-                # forward. It is not an invitation to process fresh backlog.
-                if scheduled:
-                    working["scheduled_reflections"] = scheduled
-                    working["focus"] = "工作时段外先处理这些模型预约到期的关注；其余材料可继续留待工作时段。"
-                refs = working.get("reflections", [])
-                refreshed = [await asyncio.to_thread(store.reflections.get, row["id"], include_sources=False) for row in refs]
-                reflection_tasks = [row for row in refreshed if row and row["status"] != "resolved"]
-                working["reflections"] = reflection_tasks
-                # A completed material pass can still have real reflection work.
-                # Resume that work from the model's saved checkpoint and retain
-                # its later tool turns instead of replaying all processed text.
                 material_done = set(task["material_ids"]) <= set(task["completed_ids"])
                 native = task.get("continuation", {}).get("conversation")
                 if native and (material_done or (task.get("checkpoint") and remaining is not None
-                        and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace, **estimate_options) * 2 > remaining)):
+                        and estimate_learning_input(messages, working, task=task, **estimate_options) * 2 > remaining)):
                     task = checkpoint_learning_task(task)
-                if remaining is not None and estimate_learning_input(messages, working, feedback=feedback, task=task, workspace=workspace, **estimate_options) >= remaining:
+                if remaining is not None and estimate_learning_input(messages, working, task=task, **estimate_options) >= remaining:
                     task = compact_learning_task(task)
                 if not task.get("continuation", {}).get("conversation"):
                     memories = [await asyncio.to_thread(store.memory, ref["kind"], ref["id"], include_sources=False)
@@ -754,41 +723,17 @@ class MrMemoryPlugin(Star):
                               if isinstance(item, dict) for value in item.get("source_ids", [])}
                 messages = await asyncio.to_thread(store.messages, sorted(source_ids))
                 messages = [{**row, "context_only": True} for row in messages]
-            elif feedback:
-                reflection_tasks = scheduled or await asyncio.to_thread(store.reflections.due, include_sources=False)
-                feedback_order = state.get("feedback_next_order", "recent")
-                messages = await asyncio.to_thread(store.feedback_messages,
-                    int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)), maximum,
-                    newest=feedback_order == "recent") if not scheduled else []
-                if messages and time.time() - messages[-1]["sent_at"] < self.config["feedback_debounce_seconds"]:
-                    if not reflection_tasks:
-                        return report("waiting", "等待当前互动结束")
-                    messages = []
             else:
-                reflection_tasks = await asyncio.to_thread(store.reflections.due, include_sources=False) if advanced else []
                 pending = await asyncio.to_thread(store.pending_status)
-                if not force and not reflection_tasks and not new_activity and pending["count"] < self.config["auto_distillation_min_pending"]:
+                if not force and pending["count"] < self.config["auto_distillation_min_pending"]:
                     if pending["oldest_at"] is None or time.time() - pending["oldest_at"] < self.config["maintenance_interval_seconds"]:
                         return report("waiting", "等待积累消息或到达最长等待时间")
                 # Live group experience gets the next batch; idle capacity catches up older history.
                 messages = await asyncio.to_thread(store.pending_messages, maximum, newest=True)
             if not task:
-                if not messages and not reflection_tasks and not new_activity and not repair_drafts:
+                if not messages and not repair_drafts:
                     return report("idle", "没有待处理互动")
-                if feedback:
-                    waiting = await asyncio.to_thread(store.reflections.waiting, include_sources=False) if messages else []
-                    reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
-                    working = {"interactions": await asyncio.to_thread(store.reflections.feedback_context, messages),
-                               "reflections": reflection_tasks, "feedback_order": feedback_order}
-                else:
-                    waiting = await asyncio.to_thread(store.reflections.waiting, include_sources=False) if advanced else []
-                    reflection_tasks = list({item["id"]: item for item in reflection_tasks + waiting}.values())
-                    working = {"reflections": reflection_tasks} if reflection_tasks else {}
-                if memory_activity.get("items"):
-                    working["memory_activity"] = memory_activity
-                previous_learning = await asyncio.to_thread(store.unfinished_learning, kind) if advanced else None
-                if previous_learning:
-                    working["previous_learning"] = previous_learning
+                working = {}
                 if repair_drafts:
                     working["write_recovery"] = (
                         "本轮只恢复 pending_items 中原批次尚未保存的记忆与连接，不重新整理新消息。"
@@ -801,22 +746,6 @@ class MrMemoryPlugin(Star):
                             for ref in row.get("saved_memory_refs", [])}
                     working["saved_memories"] = await asyncio.to_thread(store.memory_directory, list(refs.values()))
 
-            # A long-running material batch must still see understanding formed
-            # by intervening interactions, rather than resume a frozen worldview.
-            if memory_activity.get("items"):
-                working["memory_activity"] = memory_activity
-            if recall_drafts:
-                resumed_drafts = (task or {}).get("continuation", {}).get("write_state", {}).get("pending_items", {})
-                working["pending_recall_writes"] = {key: value for key, value in recall_drafts.items()
-                                                   if key not in resumed_drafts}
-            change_cursor = state.get("learning_memory_change_cursor", 0)
-            if task:
-                change_cursor = task.get("continuation", {}).get("working", task["working"]).get("memory_change_cursor", change_cursor)
-            changes = await asyncio.to_thread(store.memory_changes, after=change_cursor) if advanced else {"cursor": 0}
-            if advanced:
-                working["memory_changes"] = changes
-                working["memory_change_cursor"] = changes["cursor"]
-
             accounts = {str(row.get("sender_id") or "") for row in messages}
             for row in messages:
                 accounts.update(str(part.get("account_id") or part.get("sender_id") or "")
@@ -825,11 +754,10 @@ class MrMemoryPlugin(Star):
             working.pop("participants", None)
             working["members"] = member_updates(participants, pool["members"], getattr(store, 'identity_links', {}))
 
-            if not feedback:
-                pending = await asyncio.to_thread(store.pending_status)
-                working["queue"] = {"pending_messages": pending["count"],
-                    "this_batch_messages": len([row for row in messages if not row.get("context_only")]),
-                    "meaning": "滚动额度由本群所有待整理批次共享，不是本批的目标消耗。当前材料理解并保存后，后续调用会继续其他批次。"}
+            pending = await asyncio.to_thread(store.pending_status)
+            working["queue"] = {"pending_messages": pending["count"],
+                "this_batch_messages": len([row for row in messages if not row.get("context_only")]),
+                "meaning": "滚动额度由本群所有待整理批次共享，不是本批的目标消耗。当前材料理解并保存后，后续调用会继续其他批次。"}
 
             # The configured message count is a maximum. Fit whole messages to
             # the available input/continuation budget; omitted messages remain
@@ -837,27 +765,16 @@ class MrMemoryPlugin(Star):
             estimate_task = task
             if task is None and repair_drafts:
                 estimate_task = {"continuation": {"write_state": {"pending_items": repair_drafts}}}
-            estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density, workspace=workspace, **estimate_options)
+            estimate = estimate_learning_input(messages, working, task=estimate_task, input_tokens_per_byte=density, **estimate_options)
             while remaining is not None and (estimate + output_reserve) * 2 > remaining and not (task or {}).get("continuation"):
                 material = [row for row in messages if not row.get("context_only")]
                 if len(material) <= 1:
                     break
                 context = [row for row in messages if row.get("context_only")]
                 count = max(1, len(material) // 2)
-                if feedback and task is None and working.get("feedback_order") == "recent":
-                    # Re-select the shorter interaction so its bot/question
-                    # prefix follows the new first reaction, too.
-                    messages = await asyncio.to_thread(store.feedback_messages,
-                        int(self.config["feedback_window_seconds"]), int(state.get("feedback_after", 0)),
-                        max(2, len(messages) // 2), newest=True)
-                else:
-                    keep_oldest = task is not None or feedback
-                    messages = context + (material[:count] if keep_oldest else material[-count:])
-                if feedback:
-                    working["interactions"] = await asyncio.to_thread(store.reflections.feedback_context, messages)
-                estimate = estimate_learning_input(messages, working, feedback=feedback, task=estimate_task, input_tokens_per_byte=density, workspace=workspace, **estimate_options)
-            if not feedback:
-                working["queue"]["this_batch_messages"] = len([row for row in messages if not row.get("context_only")])
+                messages = context + (material[:count] if task is not None else material[-count:])
+                estimate = estimate_learning_input(messages, working, task=estimate_task, input_tokens_per_byte=density, **estimate_options)
+            working["queue"]["this_batch_messages"] = len([row for row in messages if not row.get("context_only")])
             required = estimate + 1 if (task or {}).get("continuation") else (estimate + output_reserve) * 2
             if remaining is not None and required > remaining:
                 return report("budget_wait", "剩余额度不足以读取并保存当前材料，等待滚动额度释放",
@@ -872,13 +789,13 @@ class MrMemoryPlugin(Star):
                     task["continuation"]["input_tokens_per_byte"] = density
                     task["continuation"]["output_token_reserve"] = output_reserve
             task = {**task, "offered_ids": [row["id"] for row in messages if not row.get("context_only")]}
-            agent = self.agent(store, background=True, feedback=feedback)
+            agent = self.agent(store, background=True)
             agent.member_prefix = pool["prefix"]
             allowance = remaining
             batch_share = False
             queue_size = working.get("queue", {}).get("pending_messages", 0)
             batch_size = len(task["offered_ids"])
-            if (remaining is not None and not (resuming or advanced or feedback)
+            if (remaining is not None and not resuming
                     and queue_size > batch_size > 0):
                 # Other queued batches also need to read and save. Leave this
                 # batch enough for a read, then its material + comparable search
@@ -899,14 +816,14 @@ class MrMemoryPlugin(Star):
             await trace.start()
             try:
                 report("running", "接着上次已保存的进度继续" if resuming else "正在学习本批交流")
-                await trace.emit("input", "继续上次未完成的学习" if resuming else "已选取原回答与后续交流" if feedback else "已选取待整理群聊",
+                await trace.emit("input", "继续上次未完成的学习" if resuming else "已选取待整理群聊",
                                  messages=messages, message_count=len(messages), working=working,
                                  budget_kind=kind, rolling_budget=budget, used_tokens=used, batch_allowance=allowance,
                                  previous_run_id=task.get("run_id"), completed_ids=task["completed_ids"],
                                  checkpoint=task["checkpoint"], memory_refs=task["memory_refs"])
                 agent.trace = trace
                 result = await agent.consolidate(
-                    messages, working, feedback=feedback, token_budget=allowance, task=task,
+                    messages, working, token_budget=allowance, task=task,
                     budget_is_batch_share=batch_share)
                 observed_density = result.continuation.get("input_tokens_per_byte", 0.0)
                 if observed_density:
@@ -934,24 +851,9 @@ class MrMemoryPlugin(Star):
                                  checkpoint=progress["checkpoint"], memory_refs=progress["memory_refs"])
                 if written:
                     await self.update_state(store, {"recent_learning_refs": [
-                        {"kind": item["kind"], "id": item["id"]} for item in written],
-                        **({"feedback_at": int(time.time())} if feedback else {})})
-                if not feedback and completed:
-                    await self.update_state(store, {"consolidated_at": int(time.time())})
-                if completed and (reflection_tasks or scheduled):
-                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in reflection_tasks + scheduled],
-                        time.time() + float(self.config["maintenance_interval_seconds"]), started_at)
-                elif result.status == "completed" and scheduled:
-                    await asyncio.to_thread(store.reflections.reviewed, [item["id"] for item in scheduled],
-                        time.time() + float(self.config["maintenance_interval_seconds"]), started_at)
+                        {"kind": item["kind"], "id": item["id"]} for item in written]})
                 if completed:
-                    # Delivery of an activity directory is not reconsideration.
-                    # Keep the history readable, but do not start an identical
-                    # paid task every interval when the model leaves it open.
-                    if memory_activity.get("items"):
-                        await self.update_state(store, {"cognition_offered": memory_activity["cursor"]})
-                    if advanced:
-                        await self.update_state(store, {"learning_memory_change_cursor": changes["cursor"]})
+                    await self.update_state(store, {"consolidated_at": int(time.time())})
                     await asyncio.to_thread(store.finish_learning_task, kind)
                 else:
                     await asyncio.to_thread(store.update_learning_task, kind,
@@ -1000,8 +902,6 @@ class MrMemoryPlugin(Star):
                     if indexing:
                         await self.index_pending(store)
                     else:
-                        if self.config["advanced_memory_enabled"] and self.config["feedback_learning_enabled"]:
-                            await self.learn(store, feedback=True)
                         if self.config["auto_distillation_enabled"]:
                             await self.consolidate(store)
                 except asyncio.CancelledError:

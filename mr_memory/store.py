@@ -23,6 +23,7 @@ from uuid import uuid4
 from .reflection import Reflection, SCHEMA as REFLECTION_SCHEMA
 from .content import searchable_text, text_view
 from .memory_graph import MemoryGraph, canonical
+from .run_ledger import STORAGE_KEY, pack_run, unpack_run
 
 
 SCHEMA = """
@@ -750,27 +751,6 @@ class Store:
         return self.memory_graph.navigate(**query)
 
     @_serialized
-    def reconsider(self, limit=8, offset=0, ref=None, after=0, kind=None):
-        return self.cognition.reconsider(limit, offset, ref, after, kind)
-
-    @_serialized
-    def workspace(self):
-        return self.cognition.workspace()
-
-    @_serialized
-    def continuity(self, before):
-        return self.cognition.continuity(before)
-
-    @_serialized
-    def record_cognition(self, **experience):
-        with self.db:
-            self.cognition.record(**experience)
-
-    @_serialized
-    def memory_changes(self, after=0, limit=20):
-        return self.memory_graph.changes(after, limit)
-
-    @_serialized
     def memory_directory(self, refs):
         return [self.memory_graph.brief(ref) for ref in refs]
 
@@ -788,76 +768,6 @@ class Store:
             return []
         rows = self._rows(f"SELECT * FROM messages WHERE umo=? AND source_key IN({','.join('?' for _ in keys)}) AND is_deleted=0 ORDER BY sent_at,id", [self.umo, *keys])
         return [self._message(r) for r in rows]
-
-    @_serialized
-    def memory_sources(self, kind: str, id: int | str) -> list[dict]:
-        """Open a memory's retained original messages, including quote authors."""
-        entry = self.memory(kind, id)
-        return entry.get("sources", []) if entry else []
-
-    @_serialized
-    def feedback_messages(self, window_seconds: int, after: int, limit: int = 500, *, newest: bool = True) -> list[dict]:
-        """Select a recent or historical conversation without skipping other work.
-
-        `after` is the old FIFO cursor, retained only as a legacy floor. New
-        progress is recorded per message, so completing a recent batch cannot
-        erase the older queue. Relevance within this conversation is for the model.
-        """
-        pending = """m.umo=? AND m.is_deleted=0 AND m.id>?
-            AND NOT EXISTS(SELECT 1 FROM mr_feedback_processed p WHERE p.umo=m.umo AND p.message_id=m.id)"""
-        reaction = """m.role='USER' AND EXISTS(SELECT 1 FROM messages b WHERE b.umo=m.umo AND b.is_deleted=0
-            AND b.role='BOT' AND b.sent_at>=m.sent_at-? AND (b.sent_at,b.id)<(m.sent_at,m.id))"""
-        direction = "DESC" if newest else "ASC"
-        first = self.db.execute(f"""SELECT m.* FROM messages m WHERE {pending} AND {reaction}
-            ORDER BY m.sent_at {direction},m.id {direction} LIMIT 1""",
-            (self.umo, int(after), int(window_seconds))).fetchone()
-        if first is None:
-            return []
-        if newest:
-            # Take a whole recent segment ending at the newest reaction, not
-            # just that one line. A late historical import sorts by event time.
-            candidates = self._rows(f"""SELECT m.*,({reaction}) AS is_reaction FROM messages m
-                WHERE {pending} AND (m.sent_at,m.id)<=(?,?)
-                ORDER BY m.sent_at DESC,m.id DESC LIMIT ?""",
-                (int(window_seconds), self.umo, int(after), first["sent_at"], first["id"], _limit(limit)))
-            candidates.reverse()
-            start = next(index for index, row in enumerate(candidates) if row["is_reaction"])
-            material_rows = candidates[start:]
-        else:
-            material_rows = self._rows(f"""SELECT m.*,({reaction}) AS is_reaction FROM messages m
-                WHERE {pending} AND (m.sent_at,m.id)>=(?,?) ORDER BY m.sent_at,m.id LIMIT ?""",
-                (int(window_seconds), self.umo, int(after), first["sent_at"], first["id"], _limit(limit)))
-        while True:
-            first = next(row for row in material_rows if row["is_reaction"])
-            prefix = self._feedback_prefix(first, int(window_seconds))[-max(1, _limit(limit) - 1):]
-            material_ids = {row["id"] for row in material_rows}
-            prefix = [row for row in prefix if row["id"] not in material_ids]
-            room = max(1, _limit(limit) - len(prefix))
-            if len(material_rows) <= room:
-                break
-            material_rows = material_rows[-room:] if newest else material_rows[:room]
-            # Trimming can move the first reaction into another interaction.
-            # Rebuild its original bot/question prefix from that actual anchor.
-        material = [self._message(row) for row in material_rows]
-        # The window describes a reaction's relation to a bot response. Waiting
-        # until tonight must not expire already observed daytime feedback.
-        return [{**row, "context_only": True} for row in prefix] + [
-            {**row, "context_only": False} for row in material]
-
-    def _feedback_prefix(self, first: dict, window_seconds: int) -> list[dict]:
-        bot = self.db.execute("""SELECT * FROM messages WHERE umo=? AND is_deleted=0 AND role='BOT'
-            AND sent_at>=? AND (sent_at,id)<(?,?) ORDER BY sent_at DESC,id DESC LIMIT 1""",
-            (self.umo, first["sent_at"] - window_seconds, first["sent_at"], first["id"])).fetchone()
-        bot_message = self._message(dict(bot))
-        if not bot_message["reply_to"]:
-            return [bot_message]
-        rows = self._rows("""SELECT m.* FROM messages m WHERE m.umo=? AND m.is_deleted=0
-            AND (m.sent_at,m.id)<=(?,?) AND (m.source_key=? OR EXISTS(
-                SELECT 1 FROM message_relations r WHERE r.source_message_id=m.id AND r.umo=m.umo
-                AND r.target_source_key=? AND r.relation IN('REPLY_TO','RESPONDS_TO')))
-            ORDER BY m.sent_at,m.id""", (self.umo, bot["sent_at"], bot["id"],
-                                         bot_message["reply_to"], bot_message["reply_to"]))
-        return [self._message(row) for row in rows]
 
     @staticmethod
     def _usage_kind(kind: str) -> str:
@@ -1247,7 +1157,14 @@ class Store:
             row = self.db.execute("SELECT payload_json FROM mr_runs WHERE umo=? AND id=?", (self.umo, int(run_id))).fetchone()
             if row is None:
                 raise ValueError("Run does not exist in this group")
-            combined = {**json.loads(row["payload_json"]), **payload}
+            previous = json.loads(row["payload_json"])
+            if STORAGE_KEY in previous or payload.get("tool_calls") or payload.get("messages"):
+                steps = self._rows("""SELECT seq,data_json FROM mr_run_steps
+                    WHERE run_id=? AND phase IN ('read','write') AND status!='running' ORDER BY seq""", (run_id,))
+                bodies = [{"seq": step["seq"], "data": json.loads(step["data_json"])} for step in steps]
+                combined = pack_run({**unpack_run(previous, bodies), **payload}, bodies)
+            else:
+                combined = {**previous, **payload}
             self.db.execute("UPDATE mr_runs SET payload_json=? WHERE umo=? AND id=?", (_encode(combined), self.umo, int(run_id)))
 
     @_serialized
@@ -1260,7 +1177,7 @@ class Store:
         for row in rows:
             payload = json.loads(row["payload_json"])
             updated = payload.get("finished_at") or row["step_at"] or row["started_at"] if payload.get("trace_version") else None
-            result.append({**{k: v for k, v in payload.items() if k not in ("messages", "tool_calls", "items", "written")},
+            result.append({**{k: v for k, v in payload.items() if k not in ("messages", "tool_calls", "items", "written", STORAGE_KEY)},
                            "id": row["id"], "kind": row["kind"], "started_at": row["started_at"], "updated_at": updated,
                            "step_count": row["step_count"], "latest_phase": row["latest_phase"], "latest_title": row["latest_title"]})
         return result
@@ -1271,7 +1188,7 @@ class Store:
         steps = self._rows("SELECT seq,at,phase,status,title,data_json FROM mr_run_steps WHERE run_id=? ORDER BY seq", (int(run_id),)) if row else []
         for step in steps:
             step["data"] = json.loads(step.pop("data_json"))
-        return {**json.loads(row["payload_json"]), "id": row["id"], "kind": row["kind"],
+        return {**unpack_run(json.loads(row["payload_json"]), steps), "id": row["id"], "kind": row["kind"],
                 "started_at": row["started_at"], "steps": steps} if row else None
 
     @_serialized

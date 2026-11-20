@@ -114,14 +114,8 @@ class BasicConsolidationTests(unittest.IsolatedAsyncioTestCase):
 
         provider = Provider()
         self.context.get_provider_by_id.return_value = provider
-        blocked = AssertionError("Advanced background work must stay paused")
-        with patch.object(store, "workspace", side_effect=blocked), \
-                patch.object(store, "reconsider", side_effect=blocked), \
-                patch.object(store, "recall_drafts", side_effect=blocked), \
-                patch.object(store, "record_cognition", side_effect=blocked), \
-                patch.object(store.reflections, "due", side_effect=blocked), \
-                patch.object(store.reflections, "waiting", side_effect=blocked), \
-                patch.object(self.plugin, "index_pending", new_callable=AsyncMock):
+        self.plugin.config.update(advanced_memory_enabled=True, feedback_learning_enabled=True)
+        with patch.object(self.plugin, "index_pending", new_callable=AsyncMock):
             result = await self.plugin.learn(store, force=True)
             disabled = await self.plugin.learn(store, force=True, feedback=True)
         self.assertEqual(result["status"], "completed", result)

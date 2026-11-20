@@ -1,12 +1,7 @@
-"""Model-selected working memories and the experience of using them.
-
-Selection is an index into the revisable graph, never a second copy of its
-meaning. The model supplies representations and decides what to keep in view.
-"""
+"""Visible memory references and compatibility with older working notes."""
 from __future__ import annotations
 
 import json
-import time
 
 from .memory_graph import encode, reference
 
@@ -64,22 +59,10 @@ class Cognition:
         with self.db:
             if isinstance(note, str) and note.strip():
                 self.store.memory_graph.write({"kind": "understanding", "title": "此前延续的理解",
-                    "content": note, "attention": {"reason": "从旧工作笔记延续，结合当前经历继续理解"}})
+                    "content": note})
             self.store.save_working_state(state)
 
-    def select(self, ref, attention):
-        ref = reference(ref)
-        if attention is None or attention is False:
-            self.db.execute("DELETE FROM mr_working_set WHERE umo=? AND kind=? AND owner_id=?",
-                            (self.store.umo, ref["kind"], ref["id"]))
-            return
-        if attention is True:
-            attention = {}
-        self.db.execute("""INSERT INTO mr_working_set VALUES(?,?,?,?,?)
-            ON CONFLICT(umo,kind,owner_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at""",
-            (self.store.umo, ref["kind"], ref["id"], encode(attention), time.time()))
-
-    def workspace(self):
+    def archived_workspace(self):
         rows = self.store._rows("""SELECT * FROM mr_working_set
             WHERE umo=? ORDER BY updated_at,kind,owner_id""",
             (self.store.umo,))
@@ -93,50 +76,13 @@ class Cognition:
         catalog = self.store._rows("SELECT kind,count(*) count FROM mr_memory_objects WHERE umo=? AND status='ACTIVE' GROUP BY kind ORDER BY kind", (self.store.umo,))
         return {"active": active, "catalog": catalog,
             "characters": sum(row["characters"] for row in active),
-            "meaning": "这些是你选择继续用于理解的认识，正文按图中当前版本读取。characters是本视图字符量，不是Token。用remember.items的kind/id/attention逐项调整关注；attention=null移出注意，不删除记忆，也不影响其他并行工作留下的关注。"}
+            "meaning": "此前选中的记忆，按当前仍可读取的版本展示。"}
 
-    def continuity(self, before):
-        row = self.db.execute("""SELECT c.* FROM mr_cognition_turns c JOIN messages m
-            ON m.umo=c.umo AND m.id=c.observation_id WHERE c.umo=? AND c.kind='foreground'
-            AND m.sent_at<? ORDER BY m.sent_at DESC,c.id DESC LIMIT 1""",
-            (self.store.umo, int(before))).fetchone()
-        if row is None:
-            return None
-        payload = json.loads(row["payload_json"])
-        events, more = self.store.reflections._events(row["request_id"]) if row["request_id"] else ([], False)
-        events = [event for event in events if event["sent_at"] < before]
-        subsequent = self.store.reflections.following_context(events, {"id": row["observation_id"]})
-        return {"id": row["id"], "request_id": row["request_id"],
-                **{key: payload.get(key) for key in ("request", "recollection", "background", "status")},
-                "actual_response": [self.store.reflections._event_summary(event) for event in events],
-                "more_response_events": more,
-                "subsequent_context": [item for item in subsequent if item["sent_at"] < before],
-                "meaning": "上一轮自己当时的理解，以及此后实际记录到的参与和交流。自己的解释可继续修订，邻接交流不自动算认可。可用reconsider、interaction、context继续展开。"}
-
-    def record(self, *, run_key, run_id, kind, current, payload):
-        request_id = current.get("message_id")
-        if not request_id and current.get("id"):
-            original = self.db.execute("SELECT message_id FROM messages WHERE umo=? AND id=?", (self.store.umo, current["id"])).fetchone()
-            request_id = original[0] if original else None
-        self.db.execute("""INSERT INTO mr_cognition_turns(umo,run_key,run_id,kind,at,
-            request_id,observation_id,payload_json) VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(umo,run_key) DO UPDATE SET payload_json=excluded.payload_json""",
-            (self.store.umo, run_key, run_id, kind, time.time(),
-             str(request_id or "") or None, current.get("id"), encode(payload)))
-
-    def reconsider(self, limit=8, offset=0, ref=None, after=0, kind=None):
-        limit, offset = max(1, min(100, int(limit))), max(0, int(offset))
-        clauses, args = ["umo=?", "id>?"], [self.store.umo, int(after)]
-        if kind:
-            clauses.append("kind=?")
-            args.append(kind)
-        if ref:
-            ref = reference(ref)
-            clauses.append("""EXISTS(SELECT 1 FROM json_each(payload_json,'$.available_memories') m
-                WHERE json_extract(m.value,'$.kind')=? AND json_extract(m.value,'$.id')=?)""")
-            args.extend([ref["kind"], ref["id"]])
-        rows = self.store._rows("SELECT * FROM mr_cognition_turns WHERE " + " AND ".join(clauses)
-                               + " ORDER BY id DESC LIMIT ? OFFSET ?", [*args, limit + 1, offset])
+    def archived_experiences(self, ref, limit=5):
+        rows = self.store._rows("""SELECT * FROM mr_cognition_turns WHERE umo=? AND EXISTS (
+            SELECT 1 FROM json_each(payload_json,'$.available_memories') m
+            WHERE json_extract(m.value,'$.kind')=? AND json_extract(m.value,'$.id')=?)
+            ORDER BY id DESC LIMIT ?""", (self.store.umo, ref["kind"], ref["id"], limit + 1))
         experiences = []
         current_refs = {}
         for row in rows[:limit]:
@@ -161,5 +107,5 @@ class Cognition:
                 "current_memories": [{**graph.brief(ref), "basis": graph.connections(ref, purpose="basis")}
                                      for ref in current_refs.values()],
                 "cursor": cursor, "more": len(rows) > limit,
-                "next_offset": offset + limit,
-                "meaning": "available_memories保留当时可见的版本与把握，current_memories为现在的版本。recollection是模型自述，不能证明某记忆造成回答；actual_response是实际回复，subsequent_context是邻接交流，不自动算赞同或反对。理解其对象与含义后，可改变原认识、连接和把握；用interaction或context继续展开。"}
+                "next_offset": limit,
+                "meaning": "available_memories保留当时可见的版本与把握，current_memories为现在的版本。recollection是模型自述，不能证明某记忆造成回答；actual_response是实际回复，subsequent_context是邻接交流，不自动算赞同或反对。可用 interaction 或 context 继续回看原始材料。"}

@@ -10,15 +10,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 from .content import text_view
 from .prompt_view import learning_address_view, learning_material_view, learning_search_view, memory_match_view, prepend_directory
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
 from .handoff import format_background as _background_text
-from .memory_protocol import (BASIC_RECALL_PROMPT, BASIC_CONSOLIDATION_PROMPT, RECONSTRUCTION_PROMPT, CONSOLIDATION_TASK, REFLECTION_TASK,
-    CONSOLIDATION_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions)
+from .memory_protocol import BASIC_CONSOLIDATION_PROMPT, BASIC_RECALL_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions
 from .tool_calls import response_calls, memory_text_arguments, parse_completion
 from .model_json import decode_background, decode_envelope
 
@@ -362,33 +360,27 @@ def _memory_output(text: str) -> dict:
     raise ValueError("Memory output must end with a complete JSON items list")
 
 
-def _reconstruction_output(text: str, store=None, before=None, *, known_people=()) -> tuple[str, Any, str, dict]:
-    """Read the delivered background, memory changes and experience of this turn."""
+def _reconstruction_output(text: str, store=None, before=None, *, known_people=()) -> tuple[str, str]:
+    """Read a plain or structured background without changing the memory graph."""
     value = text.strip()
     if value.startswith("```json"):
         value = value[7:].strip()
         if value.endswith("```"):
             value = value[:-3].strip()
     if not value.startswith(("{", "[")):
-        return text, {}, "本次仅返回文本背景", {}
+        return text, "本次仅返回文本背景"
     try:
         result, repair = decode_background(value)
     except ValueError:
-        return "", {}, "本次结构化输出未完整返回", {}
+        return "", "本次结构化输出未完整返回"
     if not isinstance(result, dict) or "background" not in result:
-        return "", {}, "本次结构化输出缺少 background 字段", {}
-    writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
+        return "", "本次结构化输出缺少 background 字段"
     try:
         background = _background_text(result.get("background"), store, before,
                                       references=result.get("references"), belief=result.get("belief"), known_people=known_people)
     except ValueError as exc:
-        return "", {}, str(exc), writes
-    recollection = result.get("recollection", {})
-    return background.strip(), recollection, repair if background else "", writes
-
-
-def _memory_items(text: str) -> list:
-    return _memory_output(text)["items"]
+        return "", str(exc)
+    return background.strip(), repair if background else ""
 
 
 def _learning_material(messages: list, working: dict, task: dict | None) -> dict:
@@ -486,9 +478,9 @@ def _draft_repair_messages(task, state, conversation):
     return None
 
 
-def _learning_input_state(task, *, basic):
+def _learning_input_state(task):
     previous = _learning_continuation(task)
-    if (basic and not previous.get("format_repair_output")
+    if (not previous.get("format_repair_output")
             and set(previous.get("pending_write_errors", {})) <= {"remember"}):
         repair = _draft_repair_messages(task, previous.get("write_state", {}), previous.get("conversation", []))
         if repair:
@@ -504,7 +496,7 @@ def _learning_format_repair(text: str, conversation: list) -> list:
         "保留全部内容、人物、编号、把握与进度，不增加事实或解释，不重新整理原始材料。"
         "已读地址目录供核对连接目标，kind/id 合起来才是地址，同一数字在不同 kind 下指不同对象。"
         "局部含义无法判断时保留为待修草稿，已有正文仍保留。输出完整 JSON，"
-        "items、connections、progress、retry、recollection 使用 remember 的相同结构。"},
+        "items、connections、progress、retry 使用 remember 的相同结构。"},
         {"role": "user", "content": _json({"read_addresses": _read_addresses(conversation)})},
         {"role": "assistant", "content": text},
         {"role": "user", "content": "输出修正后的完整 JSON。"}]
@@ -596,13 +588,12 @@ def checkpoint_learning_task(task: dict) -> dict:
     }}
 
 
-def _checkpoint_conversation(material: dict, task: dict | None, *, basic: bool = False, seen_messages=None) -> list:
+def _checkpoint_conversation(material: dict, task: dict | None, *, seen_messages=None) -> list:
     conversation = [{"role": "user", "content": _learning_json(material, seen_messages=seen_messages)}]
     tail = _learning_continuation(task).get("checkpoint_tail", [])
     if tail:
         conversation.extend(copy.deepcopy(tail))
-        purpose = ("从当前checkpoint、实际写入回执与未完成材料继续整理；材料处理完即可结束。" if basic else
-                   "从当前checkpoint、实际写入回执与尚未完成的关注继续；材料已处理不等于反思必须立即结束。")
+        purpose = "从当前checkpoint、实际写入回执与未完成材料继续整理；材料处理完即可结束。"
         conversation.append({"role": "user", "content": "以上工具记录已实际执行；" + purpose + "不需要重做已经保存的部分。此处从checkpoint续接，部分source_ref引用的正文位于已省去的旧输入；地址仍有效，需要核对时用context(message_id)重新打开原文。"})
     return conversation
 
@@ -623,18 +614,17 @@ def _learning_resume_update(messages: list, working: dict, task: dict, previous:
     return update
 
 
-def _learning_prompt(feedback: bool, basic: bool, member_prefix: str = "") -> str:
-    prompt = (BASIC_CONSOLIDATION_PROMPT if basic else
-              (REFLECTION_TASK if feedback else CONSOLIDATION_TASK) + CONSOLIDATION_PROMPT)
+def _learning_prompt(member_prefix: str = "") -> str:
+    prompt = BASIC_CONSOLIDATION_PROMPT
     if member_prefix:
         prompt += "\n<mr_member_directory>\n" + member_prefix + "\n</mr_member_directory>"
     return prompt
 
 
-def _learning_bytes(conversation: list, feedback: bool, *, basic: bool = False, member_prefix: str = "") -> int:
-    prompt = _learning_prompt(feedback, basic, member_prefix)
+def _learning_bytes(conversation: list, *, member_prefix: str = "") -> int:
+    prompt = _learning_prompt(member_prefix)
     request = {"messages": [{"role": "system", "content": prompt}, *conversation],
-               "tools": tool_definitions(learning=True, basic=basic)}
+               "tools": tool_definitions(learning=True)}
     return len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1024
 
 
@@ -646,14 +636,13 @@ def _estimate_input_tokens(input_bytes: int, previous_tokens: int, previous_byte
     return round(input_bytes * tokens_per_byte) if tokens_per_byte else input_bytes
 
 
-def estimate_learning_input(messages: list, working: dict, *, feedback: bool = False,
-                            task: dict | None = None, input_tokens_per_byte: float = 0.0,
-                            workspace: dict | None = None, basic: bool = False, member_prefix: str = "") -> int:
+def estimate_learning_input(messages: list, working: dict, *, task: dict | None = None,
+                            input_tokens_per_byte: float = 0.0, member_prefix: str = "") -> int:
     """Budget the next input, preserving the observed cost of a resumable prefix."""
-    previous = _learning_input_state(task, basic=basic)
+    previous = _learning_input_state(task)
     if previous.get("format_repair_output"):
         repair = _learning_format_repair(previous["format_repair_output"], previous.get("conversation", []))
-        input_bytes = _learning_bytes(repair, feedback, basic=basic, member_prefix=member_prefix) + 2048
+        input_bytes = _learning_bytes(repair, member_prefix=member_prefix) + 2048
         return _estimate_input_tokens(input_bytes, 0, 0,
                                       previous.get("input_tokens_per_byte", 0.0) or input_tokens_per_byte)
     conversation = list(previous.get("conversation", []))
@@ -662,55 +651,27 @@ def estimate_learning_input(messages: list, working: dict, *, feedback: bool = F
         update = _learning_resume_update(messages, working, task, previous)
         conversation.append({"role": "user", "content": _learning_json(update, seen_messages=seen)})
     else:
-        conversation = _checkpoint_conversation(_learning_material(messages, working, task), task, basic=basic)
+        conversation = _checkpoint_conversation(_learning_material(messages, working, task), task)
         seen = {}
-    if workspace is not None and workspace != previous.get("workspace"):
-        conversation.append({"role": "user", "content": _json({"workspace": workspace}, seen_messages=seen)})
     # The resource report and possible save hint are appended immediately before
     # a call. Include their small transport overhead in scheduler admission.
-    input_bytes = _learning_bytes(conversation, feedback, basic=basic, member_prefix=member_prefix) + 2048
+    input_bytes = _learning_bytes(conversation, member_prefix=member_prefix) + 2048
     tokens, size = previous.get("previous_input_tokens", 0), previous.get("previous_input_bytes", 0)
     return _estimate_input_tokens(input_bytes, tokens, size, previous.get("input_tokens_per_byte", 0.0) or input_tokens_per_byte)
 
 
 class MemoryAgent:
     def __init__(self, provider, store, embedder=None, timeout_seconds=20,
-                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled", advanced=False):
+                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled"):
         self.provider, self.store, self.embedder = provider, store, embedder
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.max_turns = None if max_turns is None else max(1, int(max_turns))
         self.max_output_tokens = max(64, int(max_output_tokens))
         self.thinking_mode = thinking_mode
-        self.advanced = bool(advanced)
         self.member_prefix = ""
         self.handoff_people = []
         self.trace = None
-        self.run_key = uuid4().hex
-        self.available_memories = {}
         self.observed_revisions = {}
-        self.last_workspace = None
-
-    async def _workspace_update(self, messages, seen_messages):
-        workspace = await self.store.read_async(self.store.workspace)
-        if workspace != self.last_workspace:
-            messages.append({"role": "user", "content": _json({"workspace": workspace}, seen_messages=seen_messages)})
-            self.last_workspace = workspace
-            await self._emit("input", "延续中的理解已更新", workspace=workspace)
-
-    async def _record_experience(self, kind, current, result, writer):
-        result.recollection = copy.deepcopy(writer.recollection)
-        payload = {"status": result.status, "recollection": result.recollection,
-                   "request": {key: current[key] for key in ("question", "plain_text", "sender_id", "sender_name", "sent_at") if key in current},
-                   "available_memories": list(self.available_memories.values()),
-                   "written": [{key: row[key] for key in ("kind", "id")} for row in result.written],
-                   "background": getattr(result, "background", ""), "usage": result.usage,
-                   "elapsed_ms": result.elapsed_ms}
-        try:
-            await asyncio.to_thread(self.store.record_cognition, run_key=self.run_key,
-                                    run_id=getattr(self.trace, "id", None), kind=kind, current=current, payload=payload)
-        except Exception as exc:
-            result.detail = "; ".join(filter(None, [result.detail, f"Understanding experience was not recorded: {exc}"]))
-            await self._emit("write", "理解过程记录未保存", "error", detail=str(exc))
 
     async def _emit(self, phase, title, status="completed", **data):
         if self.trace is not None:
@@ -731,7 +692,6 @@ class MemoryAgent:
             except (ValueError, TypeError):
                 continue
             for ref in visible_memories(value):
-                self.available_memories[(ref["kind"], ref["id"], ref["revision_no"])] = ref
                 address = f"{ref['kind']}:{ref['id']}"
                 self.observed_revisions[address] = max(self.observed_revisions.get(address, 0), ref["revision_no"])
         began = time.monotonic()
@@ -827,10 +787,6 @@ class MemoryAgent:
             return context.read(**args)
         if name == "interaction":
             return await self.store.read_async(self.store.reflections.interaction, **args)
-        if name == "reflect":
-            if set(args) == {"id"}:
-                return await self.store.read_async(self.store.reflections.get, args["id"])
-            return await asyncio.to_thread(self.store.reflections.save, args)
         if name == "semantic_search":
             if self.embedder is None:
                 return {"status": "unavailable", "detail": "Semantic index is not configured; literal search remains available."}
@@ -863,38 +819,20 @@ class MemoryAgent:
         cutoff = int(current.get("sent_at") or time.time())
         messages = []
         seen_messages = {}
-        tools = _tool_set(basic=not self.advanced)
-        allowed_tools = tool_definitions(basic=not self.advanced)
-        prompt = RECONSTRUCTION_PROMPT if self.advanced else BASIC_RECALL_PROMPT
+        tools = _tool_set()
+        allowed_tools = tool_definitions()
+        prompt = BASIC_RECALL_PROMPT
         if self.member_prefix:
             prompt = prepend_directory(prompt, self.member_prefix)
-        sources = {row["id"]: row["source_key"] for row in [*recent, current] if "id" in row and "source_key" in row}
-        writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
-                                foreground=True)
-        self.observed_revisions = writer.observed_revisions
-        working = {key: value for key, value in working.items() if key != "pending_recall_writes"} if self.advanced else {}
-        if self.advanced:
-            working["continuity"] = await self.store.read_async(self.store.continuity, cutoff)
-        async def persist_changes(args, key):
-            operation = asyncio.create_task(asyncio.to_thread(writer.apply, args, self.run_key + ":" + key))
-            try:
-                outcome = await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                await operation
-                raise
-            result.written.extend(outcome.written)
-            return outcome
         cancelled = False
         completed_response = False
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 messages.append({"role": "user", "content": _learning_json({"current": current, "recent": learning_material_view(recent),
-                                "working": working,
+                                "working": {},
                                 "now_unix": cutoff, "service_local_time": datetime.fromtimestamp(cutoff, timezone.utc).astimezone().isoformat()}, seen_messages=seen_messages)})
                 last_round_seconds = 0.0
                 for turn in range(self.max_turns):
-                    if self.advanced:
-                        await self._workspace_update(messages, seen_messages)
                     round_started = time.monotonic()
                     remaining = self.timeout_seconds - (round_started - started)
                     messages.append({"role": "user", "content": _json({"resource_state": {
@@ -906,14 +844,10 @@ class MemoryAgent:
                     forced_finish = turn == self.max_turns - 1 or (turn > 0 and remaining <= 6 + last_round_seconds)
                     if forced_finish:
                         messages.append({"role": "user", "content":
-                            "这是本次可用的最后一轮，交付已经形成的理解，不再发起工具调用。"
-                            "直接返回 JSON 对象，字段与 complete 一致：background，以及可选的 references、items、retry、recollection。"
-                            "背景仍保留当前把握；未解决的思路可以留在 recollection 或记忆里。" if self.advanced else
                             "这是本次可用的最后一轮，直接用纯文本交付已读材料中的有用背景，不加 JSON 或工具标签，不再请求工具。没有需要补充的背景时返回 {\"background\":\"\"}。"})
                     response = await self._model_turn(
                         messages, prompt, tools, turn + 1,
-                        tool_choice="none" if forced_finish else None,
-                        response_format={"type": "json_object"} if forced_finish and self.advanced else None)
+                        tool_choice="none" if forced_finish else None)
                     _add_usage(result.usage, response)
                     native_calls = response_calls(response)
                     names = [call.name for call in native_calls]
@@ -921,7 +855,7 @@ class MemoryAgent:
                     if names and text:
                         # Tool-planning prose is part of this agent's conversation,
                         # not a completed background for the main model.
-                        background, recollection, detail, _ = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
+                        background, detail = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
                                                                                      known_people=self.handoff_people)
                         if background and detail != "本次仅返回文本背景":
                             result.background = background
@@ -931,7 +865,7 @@ class MemoryAgent:
                             result.detail = "Provider returned neither text nor tool calls"
                             break
                         messages.append({"role": "assistant", "content": text})
-                        background, recollection, detail, final_writes = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
+                        background, detail = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
                                                                                                 known_people=self.handoff_people)
                         result.background = background
                         result.detail = ""
@@ -942,24 +876,12 @@ class MemoryAgent:
                             if turn + 1 < self.max_turns and _finish_reason(response) != "length":
                                 messages.append({"role": "user", "content":
                                     "刚才的交付格式无法读取：" + detail + "。保留已经形成的含义和不确定性，修正输出格式；不要重新检索或添加新解释。"
-                                    + ("返回完整 JSON。" if self.advanced else "仅交付纯文本背景即可。")})
+                                    + "仅交付纯文本背景即可。"})
                                 continue
                         if detail and background:
                             await self._emit("output", "已读取背景正文", detail=detail)
                         if result.status == "partial":
                             result.detail = result.detail or "Model turn or output budget reached; background may be incomplete"
-                        if final_writes and self.advanced:
-                            await self._emit("write", "保存最终输出中的记忆变化", "running", operation_id="final_memories", items=final_writes)
-                            try:
-                                outcome = await persist_changes(final_writes, "final")
-                                receipt = outcome.receipt(writer.pending_items)
-                                if outcome.rejected:
-                                    result.status, result.detail = "partial", "Background produced; some final memory changes remain unsaved"
-                                await self._emit("write", "最终记忆变化保存结果", "partial" if outcome.rejected else "completed",
-                                                 operation_id="final_memories", result=receipt)
-                            except Exception as exc:
-                                result.status, result.detail = "partial", f"Background produced; final memory write failed: {exc}"
-                                await self._emit("write", "最终记忆变化未保存", "error", operation_id="final_memories", detail=str(exc))
                         break
                     tool_messages = [call.message() for call in native_calls]
                     assistant = {"role": "assistant", "content": text or None, "tool_calls": tool_messages,
@@ -977,7 +899,7 @@ class MemoryAgent:
                             record.update(raw_arguments=call.raw_arguments, format_note=call.format_note)
                         result.tool_calls.append(record)
                         value = None
-                        phase = "write" if name in {"remember", "complete"} or (name == "reflect" and set(args or {}) != {"id"}) else "read"
+                        phase = "write" if name == "complete" else "read"
                         await self._emit(phase, f"{'关注' if phase == 'write' else '读取'} {name}", "running", turn=turn + 1,
                                          tool_call_id=call_id, name=name, arguments=args)
                         try:
@@ -989,18 +911,11 @@ class MemoryAgent:
                                 result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff,
                                                                             references=args.get("references"), belief=args.get("belief"),
                                                                             known_people=self.handoff_people)
-                                changes = {key: args[key] for key in ("items", "retry", "recollection") if key in args}
-                                outcome = await persist_changes(changes, call_id) if changes and self.advanced else None
-                                value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
-                                result.status = "partial" if _finish_reason(response) == "length" or outcome and outcome.rejected else "completed"
+                                value = {"status": "completed"}
+                                result.status = "partial" if _finish_reason(response) == "length" else "completed"
                                 if _finish_reason(response) == "length":
                                     result.detail = "Model output reached its token limit; background may be incomplete"
-                                if outcome and outcome.rejected:
-                                    result.detail = "Background produced; some memory changes remain unsaved"
                                 completed_response = True
-                            elif name == "remember":
-                                outcome = await persist_changes(args, call_id)
-                                value = outcome.receipt(writer.pending_items)
                             else:
                                 value = await self._execute(name, args, cutoff)
                             record["status"] = value.get("status", "completed") if isinstance(value, dict) else "completed"
@@ -1017,8 +932,7 @@ class MemoryAgent:
                         record["result"] = value
                         return call_id, value
 
-                    # Reads can overlap; a model-directed reflection may be read by a later call.
-                    if "reflect" in names or "remember" in names or "complete" in names:
+                    if "complete" in names:
                         outputs = [await execute_one(call) for call in native_calls]
                     else:
                         outputs = await asyncio.gather(*(execute_one(call) for call in native_calls))
@@ -1041,9 +955,6 @@ class MemoryAgent:
             result.status, result.detail = "error", f"{type(exc).__name__}: {exc}"
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
-            result.pending_items = writer.pending_items
-            if self.advanced:
-                await self._record_experience("foreground", current, result, writer)
             # Debug evidence is private; hidden model reasoning is not persisted.
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"} for message in messages]
             await self._emit("output", "本次记忆背景产出", "cancelled" if cancelled else result.status,
@@ -1051,14 +962,11 @@ class MemoryAgent:
                              detail=result.detail, usage=result.usage, elapsed_ms=result.elapsed_ms)
         return result
 
-    async def consolidate(self, messages: list, working: dict, *, feedback: bool = False,
+    async def consolidate(self, messages: list, working: dict, *,
                           token_budget: int | None = None, task: dict | None = None, budget_is_batch_share: bool = False):
-        if feedback and not self.advanced:
-            return ConsolidationResult(status="disabled", detail="Feedback learning requires advanced mode")
         started = time.monotonic()
         result = ConsolidationResult()
-        previous = _learning_input_state(task, basic=not self.advanced and not feedback)
-        self.last_workspace = previous.get("workspace")
+        previous = _learning_input_state(task)
         conversation = copy.deepcopy(previous.get("conversation", []))
         format_repair_output = previous.get("format_repair_output", "")
         seen_messages = _restore_seen(previous.get("seen_messages", {}))
@@ -1070,11 +978,10 @@ class MemoryAgent:
         usage_this_turn = dict(previous.get("previous_call_usage", {}))
         output_token_reserve = max(int(previous.get("output_token_reserve", 0)), usage_this_turn.get("output", 0))
         previous_call_seconds = float(previous.get("previous_call_seconds", 0))
-        learning_kind = "feedback" if feedback else "background"
+        learning_kind = "background"
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 learning_kind=learning_kind if task is not None else None,
-                                from_group_messages=not self.advanced and not feedback and bool(messages),
-                                recover_recall=self.advanced and not feedback,
+                                from_group_messages=bool(messages),
                                 offered_ids=[row["id"] for row in messages if not row.get("context_only")],
                                 **previous.get("write_state", {}))
         self.observed_revisions = writer.observed_revisions
@@ -1123,7 +1030,7 @@ class MemoryAgent:
 
         async def resume_drafts_only():
             nonlocal conversation, seen_messages, previous_input_tokens, previous_input_bytes
-            if (self.advanced or feedback or task is None or not writer.pending_items
+            if (task is None or not writer.pending_items
                     or set(pending_write_errors) != {"remember"}):
                 return False
             progress = await asyncio.to_thread(self.store.learning_task, learning_kind)
@@ -1141,18 +1048,18 @@ class MemoryAgent:
             read_sources(working)
             if not messages and not working and not conversation and not (task or {}).get("checkpoint") and not writer.pending_items:
                 raise ValueError("Consolidation requires an experience or a reflection to revisit")
-            tools = _tool_set(learning=True, basic=not self.advanced)
-            allowed_tools = tool_definitions(learning=True, basic=not self.advanced)
-            prompt = _learning_prompt(feedback, not self.advanced, self.member_prefix)
+            tools = _tool_set(learning=True)
+            allowed_tools = tool_definitions(learning=True)
+            prompt = _learning_prompt(self.member_prefix)
             def request_bytes(conversation):
-                return _learning_bytes(conversation, feedback, basic=not self.advanced, member_prefix=self.member_prefix)
+                return _learning_bytes(conversation, member_prefix=self.member_prefix)
             cutoff = int(time.time())
             async with asyncio.timeout(self.timeout_seconds):
                 if not conversation:
                     material = _learning_material(messages, working, task)
                     if writer.pending_items:
                         material["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
-                    conversation = _checkpoint_conversation(material, task, basic=not self.advanced, seen_messages=seen_messages)
+                    conversation = _checkpoint_conversation(material, task, seen_messages=seen_messages)
                 else:
                     # Previous messages remain byte-for-byte intact for prefix reuse.
                     update = _learning_resume_update(messages, working, task, previous)
@@ -1167,11 +1074,9 @@ class MemoryAgent:
                     if token_budget is not None and sum(result.usage.values()) >= token_budget:
                         result.status, result.detail = "partial", "Rolling token budget reached during learning"
                         break
-                    if self.advanced:
-                        await self._workspace_update(conversation, seen_messages)
                     remaining = max(0, token_budget - sum(result.usage.values())) if token_budget is not None else None
                     seconds_left = self.timeout_seconds - (time.monotonic() - started)
-                    # Saving may need remember -> returned IDs -> reflect ->
+                    # Saving may need remember -> returned IDs ->
                     # completion. Reserve several calls using observed usage,
                     # including room for the longer context after tool results.
                     begin_saving = not saving and (
@@ -1185,15 +1090,11 @@ class MemoryAgent:
                         "previous_call_total_tokens": sum(usage_this_turn.values()),
                         "remaining_seconds": round(max(0, seconds_left), 1),
                         "estimated_input_tokens": 0, "remaining_after_current_input_tokens": None,
-                        "meaning": "总余额是调用前数值，本次输入（含缓存）也要从中扣除。remaining_after_current_input_tokens才是扣除本次输入估算后可用于本次输出和后续调用的余额；下一次调用还要再次支付整个上下文。若不够再携带一次上下文，可在本次最后JSON的items和progress中直接保存认识与进度，无需再等待remember回执。未完思路写checkpoint，独立待查关注可用reflect。"}
-                    if not self.advanced:
-                        resource_state["meaning"] = "输入含缓存也计入余额，每轮重新携带上下文。已理解的材料及时用remember或最后JSON保存items与progress；不必耗尽额度或查遍所有关联。未完部分留checkpoint供下一次续接。"
+                        "meaning": "输入含缓存也计入余额，每轮重新携带上下文。已理解的材料及时用remember或最后JSON保存items与progress；不必耗尽额度或查遍所有关联。未完部分留checkpoint供下一次续接。"}
                     resource_message = {"role": "user", "content": _json({"resource_state": resource_state})}
                     conversation.append(resource_message)
                     if begin_saving:
                         saving_hint = "本次剩余资源适合保存已经形成的记忆与实际进度，未完部分留checkpoint，下一次从进度继续。"
-                        if self.advanced:
-                            saving_hint += "独立关注可用reflect更新，已解决的设为resolved。"
                         conversation.append({"role": "user", "content": saving_hint})
                     model_conversation = (_learning_format_repair(format_repair_output, conversation) + [resource_message]
                                           if format_repair_output else conversation)
@@ -1227,7 +1128,7 @@ class MemoryAgent:
                     if save_this_turn:
                         resource_state["action"] = (
                             "这是本次可用的最后一轮，直接输出完整 JSON 保存已形成的认识和实际进度："
-                            '{"items":[],"progress":{},"retry":[],"recollection":{}}。'
+                            '{"items":[],"progress":{},"retry":[]}。'
                             "全部当前材料已处理时用 progress.complete_offered=true，系统展开编号。部分完成时才逐项列 completed_ids。"
                             "items 与 retry 使用 remember 的相同字段结构；新条目含 kind、source_ids、title、content。"
                             "connections 元素用 {kind,id,relation,context} 或 {handle,relation,context}。"
@@ -1329,7 +1230,6 @@ class MemoryAgent:
                                 result.detail = ""
                             break
                         result.items = await clean_items(envelope["items"])
-                        writer.recollection = envelope.get("recollection", {})
                         result.progress = writer.normalize_progress(envelope["progress"])
                         if pending_write_errors and ("reflect" in pending_write_errors or not result.items):
                             result.status, result.detail = "partial", "; ".join(pending_write_errors.values())
@@ -1350,8 +1250,8 @@ class MemoryAgent:
                             record.update(raw_arguments=call.raw_arguments, format_note=call.format_note)
                         result.tool_calls.append(record)
                         value = None
-                        phase = "write" if name == "remember" or (name == "reflect" and set(args or {}) != {"id"}) else "read"
-                        extra = {"target": "long_term_memory" if name == "remember" else "reflection"} if phase == "write" else {}
+                        phase = "write" if name == "remember" else "read"
+                        extra = {"target": "long_term_memory"} if phase == "write" else {}
                         await self._emit(phase, f"{'保存' if phase == 'write' else '读取'} {name}", "running",
                                          turn=turn + 1, tool_call_id=call_id, name=name, arguments=args, **extra)
                         try:
@@ -1365,10 +1265,8 @@ class MemoryAgent:
                                 if "finish" in args:
                                     finish_requested = args["finish"]
                             else:
-                                read_args = {"include_sources": False, **args} if name == "memory" and not self.advanced else args
+                                read_args = {"include_sources": False, **args} if name == "memory" else args
                                 value = await self._execute(name, read_args, cutoff)
-                                if name == "reflect" and set(args) != {"id"}:
-                                    pending_write_errors.pop("reflect", None)
                             read_sources(value)
                             record["status"] = "partial" if name == "remember" and (
                                 "remember" in pending_write_errors or isinstance(value, dict)
@@ -1379,7 +1277,7 @@ class MemoryAgent:
                         except Exception as exc:
                             value = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
                             record["status"] = "error"
-                            if name == "remember" or (name == "reflect" and set(args or {}) != {"id"}):
+                            if name == "remember":
                                 pending_write_errors[name] = f"{name} write has not completed: " + value["detail"]
                         finally:
                             record["elapsed_ms"] = (time.monotonic() - began) * 1000
@@ -1392,7 +1290,7 @@ class MemoryAgent:
                         # A save acknowledges normalized content and real addresses;
                         # its top-level sources were already read to perform the save.
                         receipt = learning_search_view(value, include_sources=False) if name == "remember" else value
-                        if name in {"search_memories", "semantic_search"} and not self.advanced:
+                        if name in {"search_memories", "semantic_search"}:
                             receipt = memory_match_view(receipt)
                         elif name in {"search_memories", "semantic_search", "graph"}:
                             receipt = learning_search_view(receipt)
@@ -1449,11 +1347,10 @@ class MemoryAgent:
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": _json({
                     "status": "interrupted", "detail": "调用中断，结果尚未收到；恢复后结合已保存的进度与实际记忆检查再继续。"})})
             next_conversation = _learning_format_repair(format_repair_output, conversation) if format_repair_output else conversation
-            input_bytes = _learning_bytes(next_conversation, feedback, basic=not self.advanced, member_prefix=self.member_prefix)
+            input_bytes = _learning_bytes(next_conversation, member_prefix=self.member_prefix)
             result.continuation = {
                 "conversation": conversation, "sources": sources, "seen_messages": seen_messages,
                 "format_repair_output": format_repair_output,
-                "workspace": self.last_workspace,
                 "write_state": writer.state(),
                 "pending_write_errors": pending_write_errors, "previous_input_tokens": previous_input_tokens,
                 "previous_input_bytes": previous_input_bytes, "previous_call_usage": usage_this_turn,
@@ -1469,8 +1366,6 @@ class MemoryAgent:
                     "updated_at": time.time()})
             result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
                                for message in conversation]
-            if self.advanced:
-                await self._record_experience(learning_kind, {}, result, writer)
             await self._emit("output", "本次学习产出", "cancelled" if cancelled else result.status,
                              pending_item_count=len(result.items), written_count=len(result.written), detail=result.detail,
                              usage=result.usage, elapsed_ms=result.elapsed_ms)

@@ -129,4 +129,13 @@ def migrate_reflections(graph):
         db.execute("INSERT OR IGNORE INTO mr_memory_objects VALUES(?,?,?,?,?,?,1,'ACTIVE',?,?,0)",
             (umo, "reflection", row["id"], row["content"].splitlines()[0][:100], row["content"],
              json.dumps(attrs, ensure_ascii=False), row["created_at"], row["updated_at"]))
-        graph.focus_connections(row["id"], attrs["memory_refs"])
+        source = {"kind": "reflection", "id": row["id"]}
+        existing = {(edge["target"]["kind"], edge["target"]["id"])
+                    for edge in graph.connections(source, purpose="focus")}
+        for ref in attrs["memory_refs"]:
+            target = graph.raw(ref["kind"], ref["id"])
+            if target and (target["kind"], target["id"]) not in existing:
+                address = {"kind": target["kind"], "id": target["id"]}
+                graph.write({"kind": "association", "source": source, "target": address,
+                             "relation": "继续思考", "purpose": "focus", "statement": "这项思路所关注的记忆"})
+                existing.add((target["kind"], target["id"]))

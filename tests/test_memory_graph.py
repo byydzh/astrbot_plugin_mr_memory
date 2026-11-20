@@ -98,20 +98,20 @@ class MemoryGraphTests(unittest.TestCase):
 
     def test_withdrawn_basis_remains_visible_to_its_dependent_memory(self):
         episode = self.save(kind="episode", content="共同经历", source_ids=[self.message["id"]])
-        pattern = self.save(kind="pattern", content="当时的解释", attention=True, connections=[{
+        pattern = self.save(kind="pattern", content="当时的解释", connections=[{
             "kind": "episode", "id": episode["id"], "relation": "由此推想", "purpose": "basis",
             "belief": {"stance": "可能有关"}}])
         edge = pattern["basis"][0]
         self.assertEqual(edge["belief"]["stance"], "可能有关")
         self.save(kind="association", id=edge["id"], action="withdraw", reason="后续交流改变了理解",
                   belief={"stance": "这条推论不成立"})
-        updated = self.store.workspace()["active"][0]["memory"]
+        updated = self.store.memory("pattern", pattern["id"])
         self.assertEqual(updated["basis"][0]["status"], "RETRACTED")
         self.assertTrue(updated["basis"][0]["basis_changed"])
         self.assertEqual(updated["basis"][0]["change_reason"], "后续交流改变了理解")
         self.assertEqual(self.store.graph(ref={"kind": "pattern", "id": pattern["id"]}), [])
-        change = next(row for row in self.store.memory_changes()["items"] if row["kind"] == "association")
-        self.assertEqual(change["dependent_memories"][0]["id"], pattern["id"])
+        history = self.store.memory("association", edge["id"], include_history=True)["history"]
+        self.assertTrue(any(row["operation"] == "withdraw" for row in history))
         self.assertEqual(self.store.memory("episode", episode["id"])["content"], "共同经历")
 
     def test_legacy_topic_and_entity_graph_import_once_with_addresses_intact(self):

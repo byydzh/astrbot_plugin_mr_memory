@@ -1,12 +1,7 @@
-"""Persistent, model-directed reflection and the conversation it refers to.
-
-This module records what the model wants to revisit. It neither diagnoses a
-person nor decides that a retrieved memory caused a later answer.
-"""
+"""Read recorded interactions and existing reflections, including their original sources."""
 from __future__ import annotations
 
 import json
-import time
 from functools import wraps
 
 
@@ -76,82 +71,6 @@ class Reflection:
         return self._record(row, include_sources=include_sources) if row else None
 
     @_locked
-    def save(self, item: dict) -> dict:
-        """Create a concern or update its supplied fields; omitted fields survive.
-
-        Explicit source_ids and memory_refs replace their previous lists. The
-        model can therefore correct a mistaken link as well as retain evidence.
-        """
-        now = time.time()
-        id = item.get("id")
-        old = self.get(int(id)) if id is not None else None
-        # A complete new concern can be saved even when the caller has guessed
-        # a not-yet-allocated address. Always return the actual allocated id.
-        value = {"priority": 1, "status": "pending", "source_ids": [], "memory_refs": [],
-                 "request_id": None, "next_review_at": None, **(old or {}), **item}
-        if old and old["status"] != "waiting" and value["status"] == "waiting" and "next_review_at" not in item:
-            # A previous pending retry is not an appointment to revisit a task
-            # that the model has now left waiting for new information.
-            value["next_review_at"] = None
-        content = str(value.get("content") or "").strip()
-        if not content:
-            raise ValueError("Reflection content is required")
-        if value["status"] not in {"pending", "waiting", "resolved"}:
-            raise ValueError("Reflection status must be pending, waiting or resolved")
-        explicit = (bool(old and old["next_review_explicit"]) if "next_review_at" not in item
-                    else value["next_review_at"] is not None)
-        if value["next_review_at"] is None or value["status"] == "resolved":
-            explicit = False
-        sources = list(dict.fromkeys(int(source) for source in value["source_ids"]))
-        refs = []
-        for ref in value["memory_refs"]:
-            normalized = {"kind": str(ref["kind"]), "id": int(ref["id"])}
-            if normalized not in refs:
-                refs.append(normalized)
-        # A model call may finish after /mrforget. Its old input must not write
-        # the explicitly forgotten experience back through this newer endpoint.
-        anchors = self.store._rows(
-            f"SELECT DISTINCT platform_id,sender_id FROM messages WHERE umo=? AND id IN({','.join('?' for _ in sources)})",
-            [self.store.umo, *sources]) if sources else []
-        if value["request_id"] is not None:
-            anchors.extend(self.store._rows("SELECT DISTINCT platform_id,sender_id FROM messages WHERE umo=? AND message_id=?",
-                                            (self.store.umo, str(value["request_id"]))))
-        if any(self.store._forgotten(row["platform_id"], row["sender_id"]) for row in anchors):
-            raise ValueError("Reflection refers to an explicitly forgotten source or request")
-        with self.store.db:
-            schedule_changed = (not old or value["status"] != old["status"] or "next_review_at" in item
-                                or explicit != old["next_review_explicit"])
-            saved = self.store.memory_graph.write({"kind": "reflection", **({"id": int(id)} if old else {}),
-                "content": content, "title": str(item.get("title") or content.splitlines()[0][:100]),
-                "priority": float(value["priority"]), "review_status": value["status"],
-                "source_ids": sources, "memory_refs": refs,
-                "request_id": str(value["request_id"]) if value["request_id"] is not None else None,
-                "next_review_at": float(value["next_review_at"]) if value["next_review_at"] is not None else None,
-                "next_review_explicit": int(explicit),
-                **({"schedule_updated_at": now} if schedule_changed else {})})
-            id = saved["id"]
-        return self.get(id)
-
-    @_locked
-    def due(self, limit: int = 8, now: float | None = None, *, scheduled_only: bool = False,
-            include_sources: bool = True) -> list[dict]:
-        now = time.time() if now is None else float(now)
-        rows = self.store._rows("""SELECT * FROM mr_reflection_schedule WHERE umo=? AND
-            ((status='pending' AND (next_review_at IS NULL OR next_review_at<=?)) OR
-             (status='waiting' AND next_review_at IS NOT NULL AND next_review_at<=?))
-            AND (?=0 OR (next_review_explicit=1 AND next_review_at IS NOT NULL))
-            ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
-            (self.store.umo, now, now, int(scheduled_only), _limit(limit)))
-        return [self._record(row, include_sources=include_sources) for row in rows]
-
-    @_locked
-    def waiting(self, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
-        rows = self.store._rows("""SELECT * FROM mr_reflection_schedule WHERE umo=? AND status='waiting'
-            ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
-            (self.store.umo, _limit(limit)))
-        return [self._record(row, include_sources=include_sources) for row in rows]
-
-    @_locked
     def associated(self, kind: str, id: int, limit: int = 8, *, include_sources: bool = True) -> list[dict]:
         rows = self.store._rows("""SELECT r.* FROM mr_reflection_schedule r WHERE umo=? AND status!='resolved'
             AND EXISTS(SELECT 1 FROM json_each(r.memory_refs_json) ref
@@ -159,27 +78,6 @@ class Reflection:
             ORDER BY priority DESC,COALESCE(last_reviewed_at,created_at),id LIMIT ?""",
             (self.store.umo, str(kind), int(id), _limit(limit)))
         return [self._record(row, include_sources=include_sources) for row in rows]
-
-    @_locked
-    def reviewed(self, ids, default_next_at: float, call_started_at: float) -> None:
-        """Record the visit, preserving any schedule/status the model just chose."""
-        now = time.time()
-        with self.store.db:
-            for id in dict.fromkeys(int(id) for id in ids):
-                row = self.store.db.execute("SELECT * FROM mr_reflection_schedule WHERE umo=? AND id=?",
-                                            (self.store.umo, id)).fetchone()
-                if row is None:
-                    continue
-                next_at, explicit = row["next_review_at"], row["next_review_explicit"]
-                if row["schedule_updated_at"] <= call_started_at:
-                    if row["status"] == "pending":
-                        next_at, explicit = float(default_next_at), 0
-                    elif row["status"] == "waiting" and next_at is not None and next_at <= now:
-                        next_at, explicit = None, 0
-                # Scheduling changes are bookkeeping, not a new semantic revision.
-                self.store.db.execute("""UPDATE mr_memory_objects SET attributes_json=json_set(attributes_json,
-                    '$.last_reviewed_at',?,'$.next_review_at',?,'$.next_review_explicit',?)
-                    WHERE umo=? AND kind='reflection' AND id=?""", (now, next_at, explicit, self.store.umo, id))
 
     def _events(self, request_id: str) -> tuple[list[dict], bool]:
         rows = self.store._rows("""SELECT DISTINCT m.* FROM message_relations r
@@ -268,7 +166,7 @@ class Reflection:
                   "truncated": {"runs": len(rows) > 4, "response_events": events_more,
                                 "past_reflections": len(reflection_rows) > 12},
                   "interpretation": "记录呈现本轮实际输入、读取、注入、输出与后续交流；读取过某条记忆并不证明它造成了回答。"}
-        result["reflection_context"] = "past_reflections是当时形成的理解；resolved表示当时认为已解决，后来仍可重新理解和修订。用reflect(id)展开来源。"
+        result["reflection_context"] = "past_reflections是当时形成的理解；resolved表示当时认为已解决，后来仍可重新理解和修订。用memory(kind='reflection', id=...)展开来源。"
         for run in runs:
             delivered = [step for step in run.get("steps", []) if step["phase"] == "inject"]
             if detailed:
@@ -316,24 +214,3 @@ class Reflection:
                 view.update({key: run[key] for key in ("messages", "tool_calls") if key in run})
         return {"status": "recorded", "run_id": run["id"], "runs": [view],
                 "interpretation": "这是之前一次学习的实际材料、写入和续接线索；按需展开详细记录，不需要从头重做。"}
-
-    @_locked
-    def feedback_context(self, messages: list[dict], limit: int = 8) -> list[dict]:
-        """Link only request IDs retained on bot activity in this feedback batch."""
-        requests = []
-        for message in messages:
-            content = message.get("content", [])
-            bot_event = any(isinstance(part, dict) and part.get("type") == "bot_event" for part in content)
-            if message.get("role") != "BOT" and not bot_event:
-                continue
-            linked = [str(part["message_id"]) for part in content if isinstance(part, dict)
-                      and part.get("type") == "response_to" and part.get("message_id") is not None]
-            if not linked and message.get("reply_to"):
-                row = self.store.db.execute("SELECT message_id FROM messages WHERE umo=? AND source_key=?",
-                                            (self.store.umo, message["reply_to"])).fetchone()
-                if row:
-                    linked = [str(row[0])]
-            for request in linked:
-                if request not in requests:
-                    requests.append(request)
-        return [self.interaction(request_id=request) for request in requests[-_limit(limit):]]

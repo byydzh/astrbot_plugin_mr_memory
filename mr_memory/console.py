@@ -106,11 +106,11 @@ class Console:
             "capture": config["capture_enabled"],
             "history_recovery": config["capture_enabled"] and config["history_recovery_enabled"],
             "recall": config["local_serving_enabled"],
-            "advanced": config["advanced_memory_enabled"],
+            "advanced": False,
             "member_prefix_capacity": config["member_prefix_capacity"],
             "learning": config["subconscious_enabled"] and config["auto_distillation_enabled"],
             "background_enabled": config["subconscious_enabled"],
-            "feedback": config["advanced_memory_enabled"] and config["subconscious_enabled"] and config["feedback_learning_enabled"],
+            "feedback": False,
             "embedding_enabled": config["embedding_enabled"],
             "embedding_loaded": (self.plugin.embedder.loaded if hasattr(self.plugin.embedder, "loaded")
                                  else getattr(self.plugin.embedder, "_model", None) is not None),
@@ -187,13 +187,13 @@ class Console:
         if getattr(store, "platform_migrated", False) or (adapter and adapter.meta().name in {"qq_official", "qq_official_webhook"}):
             history = {**history, "status": "unsupported", "last_error": "官方 QQ 没有历史补拉接口；在线普通消息持续记录，旧库已接续的历史仍可检索。"}
         return {"counts": counts, "state": state, "history": history,
-                "workspace": await asyncio.to_thread(store.workspace), **await self.learning_overview(store),
+                "workspace": await store.read_async(store.cognition.archived_workspace), **await self.learning_overview(store),
                 "background_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "background"),
                 "feedback_tokens_rolling24h": await asyncio.to_thread(store.usage_total, "feedback")}
 
     async def runs(self, scope_id):
         store = await self.get_store(scope_id)
-        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30), "workspace": await asyncio.to_thread(store.workspace),
+        return {"runs": await asyncio.to_thread(store.recent_runs, limit=30), "workspace": await store.read_async(store.cognition.archived_workspace),
                 **await self.learning_overview(store)}
 
     async def recover_history(self, scope_id):
@@ -226,7 +226,7 @@ class Console:
         if item is None:
             raise FileNotFoundError("这条记忆不存在或已失效")
         item["navigation"] = await asyncio.to_thread(store.navigate, ref={"kind": kind, "id": int(item_id)})
-        item["experiences"] = await asyncio.to_thread(store.reconsider, ref={"kind": kind, "id": int(item_id)}, limit=5)
+        item["experiences"] = await store.read_async(store.cognition.archived_experiences, ref={"kind": kind, "id": int(item_id)}, limit=5)
         return item
 
     async def graph(self, scope_id):

@@ -282,23 +282,6 @@ class MemoryGraph:
         saved = self.write(value, run_id=run_id, pending_refs=pending_refs)
         return reference(saved)
 
-    def focus_connections(self, owner, refs):
-        """Index a thought's explicit focus links without a second copy of prose."""
-        current = self.connections({"kind": "reflection", "id": owner}, purpose="focus")
-        wanted = {(canonical(ref["kind"]), int(ref["id"])) for ref in refs}
-        retained = set()
-        for edge in current:
-            key = (edge["target"]["kind"], edge["target"]["id"])
-            if key in wanted:
-                retained.add(key)
-            else:
-                self.write({"kind": "association", "id": edge["id"], "action": "withdraw", "reason": "思路已改变关注对象"})
-        for kind, target in wanted - retained:
-            if self.raw(kind, target):
-                self.write({"kind": "association", "source": {"kind": "reflection", "id": owner},
-                    "target": {"kind": kind, "id": target}, "relation": "继续思考", "purpose": "focus",
-                    "statement": "这项思路所关注的记忆"})
-
     def write(self, item, *, run_id=None, allocated_id=None, pending_refs=None):
         kind = canonical(str(item.get("kind") or ""))
         if not kind or kind in {"all", "cue", "participant"}:
@@ -306,9 +289,8 @@ class MemoryGraph:
         stored = self.raw(kind, item["id"]) if item.get("id") is not None else None
         if item.get("id") is not None and not stored:
             raise ValueError(f"No {kind} memory with id {item['id']}")
-        if stored and "attention" in item and not (set(item) - {"kind", "id", "revision_no", "attention", "source_keys"}):
-            self.store.cognition.select({"kind": kind, "id": stored["id"]}, item["attention"])
-            return self.get(kind, stored["id"], include_sources=False)
+        if "attention" in item:
+            raise ValueError("Attention updates are no longer supported")
         if kind == "message":
             raise ValueError("Original messages are observations maintained by capture; save interpretations as a memory connected to this message")
         if stored and item.get("revision_no") is not None and int(item["revision_no"]) != stored["revision"]:
@@ -373,8 +355,6 @@ class MemoryGraph:
             identical = self.db.execute("SELECT id FROM mr_memory_objects WHERE umo=? AND kind=? AND title=? AND content=? AND attributes_json=? AND status='ACTIVE'",
                                         (self.umo, kind, title, content, encode(attrs))).fetchone()
             if identical:
-                if "attention" in item:
-                    self.store.cognition.select({"kind": kind, "id": identical[0]}, item["attention"])
                 return self.get(kind, identical[0], include_sources=False)
         owner = stored["id"] if stored else allocated_id
         if owner is None:
@@ -403,10 +383,6 @@ class MemoryGraph:
                                 (self.umo, kind, owner, str(cue["cue"]), str(cue.get("aspect", ""))))
         self.store._clear_memory_derivatives(kind, owner)
         self.store._queue_embedding(kind, owner)
-        if "attention" in item:
-            self.store.cognition.select({"kind": kind, "id": owner}, item["attention"])
-        if kind == "reflection" and "memory_refs" in item:
-            self.focus_connections(owner, attrs["memory_refs"])
         self.connect({"kind": kind, "id": owner}, item.get("connections", []), run_id=run_id, pending_refs=pending_refs)
         # A relabelled endpoint changes the searchable description of its incident edges.
         if stored and (title != stored["title"] or content != stored["content"] or attrs.get("aliases") != old.get("aliases")):
@@ -429,20 +405,3 @@ class MemoryGraph:
                         **{key: link[key] for key in ("belief", "reason", "revision_no") if key in link},
                         **({"id": link["connection_id"]} if link.get("connection_id") is not None else {})},
                        run_id=run_id, pending_refs=pending_refs)
-
-    def changes(self, after=0, limit=20):
-        rows = self.store._rows("SELECT kind,id,change_seq FROM mr_memory_objects WHERE umo=? AND change_seq>? ORDER BY change_seq LIMIT ?",
-                                (self.umo, int(after), max(1, min(100, int(limit))) + 1))
-        chosen = rows[:limit]
-        items = []
-        for row in chosen:
-            # Return formation links, not a verdict that dependent ideas are false.
-            edges = self.store._rows("""SELECT attributes_json FROM mr_memory_objects WHERE umo=? AND kind='association'
-                AND json_extract(attributes_json,'$.purpose')='basis' AND
-                ((json_extract(attributes_json,'$.target_ref.kind')=? AND json_extract(attributes_json,'$.target_ref.id')=?)
-                 OR (?='association' AND id=?))""", (self.umo, row["kind"], row["id"], row["kind"], row["id"]))
-            refs = {encode(json.loads(edge["attributes_json"])["source_ref"]) for edge in edges}
-            items.append({**self.brief(row), "change_seq": row["change_seq"],
-                          "dependent_memories": [self.brief(json.loads(ref)) for ref in sorted(refs)]})
-        return {"items": items,
-                "cursor": chosen[-1]["change_seq"] if chosen else after, "more": len(rows) > limit}
