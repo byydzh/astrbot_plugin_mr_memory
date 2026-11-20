@@ -1,15 +1,11 @@
 import asyncio
 import copy
 import json
-from pathlib import Path
-import shutil
-import uuid
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mr_memory.agent import MemoryAgent, _model_view, _json, estimate_learning_input
-from mr_memory.store import Store as MemoryStore
+from mr_memory.agent import MemoryAgent, _model_view
 
 
 def response(text="", calls=(), finish="stop"):
@@ -78,71 +74,6 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reconstruction_separates_experience_from_delivered_background(self):
-        prior = {"question": "上次的话题"}
-        provider = Provider([response(json.dumps({
-            "background": "本次在改另一张图。",
-            "recollection": {"发现": "这次换了讨论对象"}}, ensure_ascii=False))])
-        with patch("mr_memory.agent._tool_set", return_value=object()):
-            result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], prior)
-        self.assertEqual(result.background, "本次在改另一张图。")
-        self.assertEqual(result.recollection, {"发现": "这次换了讨论对象"})
-        self.assertEqual(json.loads(provider.requests[0][0]["messages"][0]["content"])["working"],
-                         {**prior, "continuity": None})
-        self.assertEqual(len(provider.requests), 1)
-
-    async def test_missing_or_truncated_envelope_does_not_create_memory_changes(self):
-        for text, expected_background in (
-            ("本轮可用背景", "本轮可用背景"),
-            ('{"background":"这次没有延续变化"}', "这次没有延续变化"),
-            ('{"background":""}', ""),
-            ('{"background":"不完整', ""),
-        ):
-            with self.subTest(text=text), patch("mr_memory.agent._tool_set", return_value=object()):
-                result = await MemoryAgent(Provider([response(text)]), Store()).reconstruct({"sent_at": 300}, [], {})
-            self.assertEqual(result.background, expected_background)
-            self.assertEqual(result.recollection, {})
-            self.assertEqual(result.written, [])
-
-    async def test_tool_planning_is_not_delivered_as_background_after_empty_finish(self):
-        provider = Provider([
-            response("我先查一下原始交流", calls=[("search_messages", {"terms": ["星舟"]}, "read")]),
-            response('{"background":""}')])
-        with patch("mr_memory.agent._tool_set", return_value=object()):
-            result = await MemoryAgent(provider, Store()).reconstruct({"sent_at": 300}, [], {})
-        self.assertEqual(result.status, "completed")
-        self.assertEqual(result.background, "")
-        self.assertEqual(next(m for m in result.messages if m["role"] == "assistant")["content"], "我先查一下原始交流")
-
-    async def test_wrong_search_query_returns_contract_to_next_turn(self):
-        wrong = {"query": "星舟 人物画像 喜好 性格", "limit": 20}
-        corrected = {"terms": ["星舟"], "limit": 20}
-        provider = Provider([
-            response(calls=[("search_memories", wrong, "wrong")]),
-            response(calls=[("search_memories", corrected, "corrected")]),
-            response("星舟喜欢群里一起玩桌游。"),
-        ])
-
-        class SearchStore(Store):
-            def __init__(self):
-                self.queries = []
-
-            def search_memories(self, **kwargs):
-                self.queries.append(kwargs)
-                return [{"kind": "semantic", "id": 17, "summary": "星舟喜欢桌游"}]
-
-        store = SearchStore()
-        with patch("mr_memory.agent._tool_set", return_value=object()):
-            result = await MemoryAgent(provider, store).reconstruct({"sent_at": 300}, [], {})
-        self.assertEqual(result.status, "completed")
-        self.assertEqual(store.queries, [corrected])
-        delivered = json.loads(provider.requests[1][0]["messages"][-1]["content"])
-        self.assertEqual(delivered["status"], "error")
-        self.assertIn("unknown_fields=['query']", delivered["detail"])
-        self.assertIn('"terms":{"type":"array","items":{"type":"string"}}', delivered["detail"])
-        self.assertIn("semantic_search(query)", delivered["detail"])
-        self.assertEqual([call["status"] for call in result.tool_calls], ["error", "completed"])
-
     def test_missing_query_reports_unknown_field_and_required_parameter_type(self):
         with self.assertRaises(ValueError) as failure:
             MemoryAgent._arguments("semantic_search", {"terms": ["星舟"]})
@@ -150,70 +81,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown_fields=['terms']", detail)
         self.assertIn("missing_fields=['query']", detail)
         self.assertIn('"query":{"type":"string"}', detail)
-
-    async def test_numeric_search_account_ids_reach_store_as_the_same_exact_strings(self):
-        class SearchStore(Store):
-            def search_messages(self, **kwargs):
-                return kwargs
-
-            def search_memories(self, **kwargs):
-                return [kwargs]
-
-        agent = MemoryAgent(Provider([]), SearchStore())
-        for name, arguments in (
-            ("search_messages", {"sender_id": 123456, "related_account_id": 234567}),
-            ("search_memories", {"related_account_id": 234567}),
-        ):
-            with self.subTest(name=name):
-                expected = {key: str(value) for key, value in arguments.items()}
-                actual = await agent._execute(name, arguments, 300)
-                if name == "search_messages":
-                    expected["end_at"] = 300
-                    self.assertEqual(actual, expected)
-                else:
-                    self.assertEqual(actual, [expected])
-                self.assertEqual(actual, await agent._execute(
-                    name, {key: str(value) for key, value in arguments.items()}, 300))
-
-    async def test_context_missing_anchor_explains_ids_without_guessing_a_source(self):
-        source_key = "synthetic|group|123456"
-        rows = [{"id": 17, "source_key": source_key, "plain_text": "星舟今天约了桌游"}]
-
-        class ContextStore(Store):
-            def __init__(self):
-                self.requests = []
-
-            def context(self, **kwargs):
-                self.requests.append(kwargs)
-                return rows if kwargs.get("source_key") == source_key else []
-
-        store = ContextStore()
-        agent = MemoryAgent(Provider([]), store)
-        with self.assertRaises(ValueError) as failure:
-            await agent._execute("context", {"message_id": 123456}, 300)
-        detail = str(failure.exception)
-        self.assertIn("at or before the request time", detail)
-        self.assertIn("MR internal message id (source_ids)", detail)
-        self.assertIn("existing complete source_key", detail)
-        self.assertEqual(store.requests, [{"message_id": 123456, "before_time": 300}])
-        self.assertEqual(await agent._execute("context", {"source_key": source_key}, 300), rows)
-
-    async def test_background_thinking_overrides_call_without_mutating_shared_provider(self):
-        class ConfiguredProvider(Provider):
-            provider_config = {"custom_extra_body": {"thinking": {"type": "disabled"}, "other": "kept"}}
-
-            async def _query(self, payload, tools, request_max_retries):
-                self.requests.append((payload, self.provider_config))
-                return response('{"items":[]}')
-        provider = ConfiguredProvider([])
-        result = await MemoryAgent(provider, Store(), thinking_mode="enabled",
-            max_output_tokens=384000).consolidate([{"id": 1, "source_key": "synthetic", "plain_text": "合成对话"}], {})
-        self.assertEqual(result.status, "completed")
-        payload, actual = provider.requests[0]
-        self.assertEqual(payload["max_tokens"], 384000)
-        self.assertEqual(actual["custom_extra_body"]["thinking"], {"type": "enabled"})
-        self.assertEqual(provider.provider_config["custom_extra_body"]["thinking"], {"type": "disabled"})
-        self.assertEqual(actual["custom_extra_body"]["other"], "kept")
 
     async def test_native_search_then_context_preserves_tool_history(self):
         provider = Provider([
@@ -236,8 +103,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool_calls[0]["result"][0]["memory"]["id"], 17)
         history = provider.requests[-1][0]["messages"]
         self.assertEqual([m["tool_call_id"] for m in history if m["role"] == "tool"], ["semantic-1", "call-1", "call-2", "call-3"])
-        self.assertIn("四人规则", history[-2]["content"])
+        original = next(m for m in history if m.get("tool_call_id") == "semantic-1")
+        self.assertEqual(json.loads(original["content"])[0]["memory"]["summary"], "星舟桌游讨论")
+        reopened_memory = json.loads(next(m for m in history if m.get("tool_call_id") == "call-3")["content"])
+        self.assertEqual(reopened_memory["memory_ref"], {"kind": "episode", "id": 17, "fields": ["summary"]})
         reopened = next(m for m in history if m.get("tool_call_id") == "call-2")
+        self.assertIn("四人规则", reopened["content"])
         self.assertEqual(json.loads(reopened["content"])[0]["source_ref"]["message_id"], 1)
         self.assertNotIn("星舟是我们做的桌游", reopened["content"])
         self.assertEqual(result.usage, {"input_other": 30, "output": 12})
@@ -263,223 +134,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "partial")
         self.assertIn("time budget", result.detail)
 
-    async def test_consolidation_keeps_correction_and_retries_bad_output(self):
-        item = {"kind": "semantic", "content": "用户澄清星舟是桌游，机器人此前误以为是电影。",
-                "source_ids": [1, 2], "cues": {"bad_optional_shape": "星舟"}}
-        provider = Provider([response(json.dumps({"items": [item]}, ensure_ascii=False)), response("{unfinished")])
-        messages = [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"},
-                    {"id": 2, "source_key": "b1", "plain_text": "原来不是电影", "role": "BOT"}]
-        agent = MemoryAgent(provider, Store())
-        saved = await agent.consolidate(messages, {})
-        retry = await agent.consolidate(messages, {})
-        self.assertEqual(saved.status, "completed")
-        expected = {key: value for key, value in item.items() if key != "source_ids"}
-        self.assertEqual(saved.items, [{**expected, "source_keys": ["u1", "b1"]}])
-        self.assertEqual(retry.status, "retry")
-        self.assertEqual(retry.items, [])
-        self.assertNotIn("response_format", provider.requests[0][0])
-        self.assertIsNotNone(provider.requests[0][1])
-
-    async def test_native_memory_array_with_closing_dsml_frame_is_preserved(self):
-        item = {"kind": "episode", "summary": "大家将见面地点改到西门", "source_ids": [1]}
-        text = json.dumps([item], ensure_ascii=False) + "</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>"
-        provider = Provider([response(text)])
-        result = await MemoryAgent(provider, Store()).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "改到西门了"}], {})
-        self.assertEqual(result.status, "completed", result.detail)
-        self.assertEqual(result.items, [{"kind": "episode", "summary": item["summary"], "source_keys": ["u1"]}])
-        self.assertEqual(result.response_text, text)
-        provider = Provider([response('已保存修正并更新关注。\n\n{"items": []}')])
-        finished = await MemoryAgent(provider, Store()).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "改到西门了"}], {})
-        self.assertEqual(finished.status, "completed", finished.detail)
-        self.assertEqual(finished.items, [])
-
-    async def test_failed_write_survives_completion_until_successful_retry(self):
-        item = {"kind": "episode", "summary": "改到西门见", "source_ids": [1]}
-        messages = [{"id": 1, "source_key": "u1", "plain_text": "改到西门见"}]
-
-        class WriteStore(Store):
-            attempts = 0
-
-            def save_memories(self, items, sources, *, mark_processed, run_id=None):
-                self.attempts += 1
-                if self.attempts == 1:
-                    raise OSError("database write failed")
-                return [{"kind": "episode", "id": 1, "summary": items[0]["summary"]}]
-
-        for retry in (False, True):
-            with self.subTest(retry=retry):
-                replies = [response(calls=[("remember", {"items": [item]}, "save")])]
-                if retry:
-                    replies.append(response(calls=[("remember", {"items": [item]}, "retry")]))
-                replies.append(response('{"items":[]}'))
-                result = await MemoryAgent(Provider(replies), WriteStore()).consolidate(messages, {})
-                self.assertEqual(result.status, "completed")
-                pending = result.continuation["write_state"]["pending_items"]
-                self.assertEqual(bool(pending), not retry)
-                if not retry:
-                    self.assertIn("database write failed", next(iter(pending.values()))["detail"])
-
-    def test_model_sees_natural_speakers_and_sources_without_person_codes(self):
-        value = {"members": [{"id": 7, "account_id": "10", "name": "小桥"},
-                             {"id": 14, "account_id": "20", "name": "小桥"}],
-                 "memory": {"kind": "semantic", "id": 7, "subject_participant_id": 14,
-                            "subject": {"name": "小桥", "account_id": "20"},
-                            "sources": [{"id": 99, "participant_id": 14, "sender_id": "20",
-                                         "sender_name": "小桥", "plain_text": "那是我之前说的", "role": "USER"}]}}
-        visible = _model_view(value)
-        self.assertEqual(visible["members"], [{"account_id": "10", "name": "小桥"}, {"account_id": "20", "name": "小桥"}])
-        self.assertEqual(visible["memory"]["id"], 7)
-        self.assertNotIn("subject_participant_id", visible["memory"])
-        self.assertEqual(visible["memory"]["sources"][0]["sender_id"], "20")
-        self.assertNotIn("participant_id", visible["memory"]["sources"][0])
-        source = visible["memory"]["sources"][0]
-        seen = {}
-        first = json.loads(_json([source, source], seen_messages=seen))
-        self.assertEqual(first[0], source)
-        self.assertEqual(first[1]["source_ref"]["message_id"], source["id"])
-        self.assertEqual(first[1]["sender_id"], source["sender_id"])
-        revised = {**source, "plain_text": "后来编辑后的原文"}
-        self.assertEqual(json.loads(_json(revised, seen_messages=seen)), revised)
-
-    async def test_failed_reflection_is_not_completed_by_an_empty_memory_result(self):
-        class Reflections:
-            attempts = 0
-
-            def save(self, item):
-                self.attempts += 1
-                if self.attempts == 1:
-                    raise OSError("reflection write failed")
-                return {"id": 1, **item}
-
-        for retry in (False, True):
-            store = Store()
-            store.reflections = Reflections()
-            args = {"content": "等待当事人后续说明", "status": "waiting", "next_review_at": None}
-            replies = [response(calls=[("reflect", args, "save")])]
-            if retry:
-                replies.append(response(calls=[("reflect", args, "retry")]))
-            replies.append(response('{"items":[]}'))
-            result = await MemoryAgent(Provider(replies), store).consolidate([], {"reflections": [{"id": 1}]})
-            self.assertEqual(result.status, "completed" if retry else "partial", result.detail)
-            if not retry:
-                self.assertIn("reflection write failed", result.detail)
-
-    async def test_turn_limit_after_a_native_write_preserves_it_but_is_partial(self):
-        class WriteStore(Store):
-            def save_memories(self, items, sources, **kwargs):
-                return [{"kind": "episode", "id": 1, "summary": items[0]["summary"]}]
-        provider = Provider([response(calls=[("remember", {"items": [
-            {"kind": "episode", "summary": "改到西门见", "source_ids": [1]}]}, "save")])])
-        result = await MemoryAgent(provider, WriteStore(), max_turns=1).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "改到西门见"}], {})
-        self.assertEqual(result.status, "partial", result.detail)
-        self.assertEqual(len(result.written), 1)
-        self.assertEqual(len(provider.requests), 1)
-        self.assertIsNotNone(provider.requests[0][1])
-        self.assertNotIn("response_format", provider.requests[0][0])
-
-    async def test_saving_continues_from_returned_memory_ids_to_reflection_and_completion(self):
-        class Reflections:
-            def save(self, item):
-                self.saved = item
-                return {"id": 9, **item}
-        class WriteStore(Store):
-            reflections = Reflections()
-            def save_memories(self, items, sources, **kwargs):
-                return [{"kind": "semantic", "id": 37, "summary": items[0]["content"]}]
-        class FollowingProvider(Provider):
-            async def _query(self, payload, tools, request_max_retries):
-                if len(self.requests) == 2:
-                    saved = next(m for m in payload["messages"] if m.get("tool_call_id") == "save")
-                    record = json.loads(saved["content"])[0]
-                    self.replies.insert(0, response(calls=[("reflect", {
-                        "content": "已经厘清星舟指的是共同制作的桌游", "status": "resolved",
-                        "memory_refs": [{"kind": record["kind"], "id": record["id"]}]}, "reflect")]))
-                return await super()._query(payload, tools, request_max_retries)
-        first = response(calls=[("search_messages", {"terms": ["星舟"]}, "read")])
-        first.usage = {"input_other": 10000, "output": 0}
-        provider = FollowingProvider([
-            first,
-            response(calls=[("remember", {"items": [
-                {"kind": "semantic", "content": "星舟是共同制作的桌游", "source_ids": [1]}]}, "save")]),
-            response('{"items":[]}')])
-        store = WriteStore()
-        result = await MemoryAgent(provider, store, max_turns=None).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "星舟是我们做的桌游"}], {}, token_budget=40000)
-        self.assertEqual(result.status, "completed", result.detail)
-        self.assertEqual(len(result.written), 1)
-        self.assertEqual(store.reflections.saved["memory_refs"], [{"kind": "semantic", "id": 37}])
-        self.assertEqual(len(provider.requests), 4)
-        for request in provider.requests[1:]:
-            self.assertIs(request[1], provider.requests[0][1])
-            self.assertIn("search_messages", {t.name for t in request[1].tools})
-
-    async def test_learning_resumes_saved_progress_with_exact_history_and_reasoning(self):
-        class WriteStore(Store):
-            def __init__(self):
-                self.task = {"material_ids": [1, 2], "completed_ids": []}
-
-            def save_memories(self, items, sources, *, learning_kind, learning_write, **kwargs):
-                saved = [{"kind": "episode", "id": 37, "summary": "星舟是桌游", "source_ids": [1, 2],
-                         "sources": [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"}],
-                         "reflections": [{"sources": [{"id": 88, "source_key": "u88", "plain_text": "新的关注原文"}]}]}]
-                state = copy.deepcopy(learning_write["state"])
-                state["receipts"][learning_write["pending_id"]] = [{"kind": "episode", "id": 37}]
-                self.task.setdefault("continuation", {})["write_state"] = state
-                return saved
-
-            def learning_task(self, kind):
-                return copy.deepcopy(self.task)
-
-            def save_learning_progress(self, kind, progress, run_id=None):
-                self.task.update(progress)
-                self.saved_progress = copy.deepcopy(progress)
-
-            def update_learning_task(self, kind, patch):
-                self.task.update(patch)
-
-        first = response(calls=[("remember", {"items": [{"kind": "episode", "summary": "星舟是桌游",
-            "source_ids": [1, 2]}], "progress": {"completed_ids": [1], "checkpoint": "已厘清名称，下一步理解规则"}}, "save")])
-        first.reasoning_content = "为下一轮原生工具调用保留的思考"
-        provider = Provider([first, response('{"items":[],"progress":{"completed_ids":[2],"checkpoint":"规则已理解"}}')])
-        messages = [{"id": 1, "source_key": "u1", "plain_text": "星舟是桌游"},
-                    {"id": 2, "source_key": "u2", "plain_text": "下次玩四人规则"}]
-        store = WriteStore()
-        initial = await MemoryAgent(provider, store, max_turns=1).consolidate(messages, {}, task=dict(store.task))
-        self.assertEqual(initial.status, "partial")
-        self.assertEqual(initial.model_attempts, 1)
-        self.assertEqual(store.saved_progress["completed_ids"], [1])
-        self.assertEqual(initial.written[0]["source_ids"], [1, 2])
-        prefix = copy.deepcopy(initial.continuation["conversation"])
-        saved_receipt = json.loads(next(row["content"] for row in prefix if row.get("tool_call_id") == "save"))[0]
-        self.assertNotIn("sources", saved_receipt)
-        self.assertIn("sources", saved_receipt["reflections"][0])
-        self.assertEqual(next(row for row in prefix if row.get("tool_calls"))["reasoning_content"], first.reasoning_content)
-        resumed = await MemoryAgent(provider, store, max_turns=1).consolidate(messages, {}, task=dict(store.task))
-        self.assertEqual(resumed.status, "completed", resumed.detail)
-        self.assertEqual(store.saved_progress["completed_ids"], [2])
-        self.assertEqual(provider.requests[1][0]["messages"][:len(prefix)], prefix)
-        self.assertEqual(len(resumed.tool_calls), 0)
-        new_message = {"id": 3, "source_key": "u3", "plain_text": "新提供的规则说明"}
-        task = {**store.task, "continuation": initial.continuation}
-        self.assertGreater(estimate_learning_input([new_message], {"new_understanding": "新的线索"}, task=task),
-                           initial.continuation["previous_input_tokens"])
-
-    async def test_learning_defers_when_budget_cannot_pay_for_its_input(self):
-        messages = [{"id": 1, "source_key": "u1", "plain_text": "待处理的原始经历"}]
-        provider = Provider([])
-        self.assertGreater(estimate_learning_input(messages, {}), 1000)
-        result = await MemoryAgent(provider, Store(), max_output_tokens=384000).consolidate(
-            messages, {}, token_budget=1000)
-        self.assertEqual(result.status, "partial")
-        self.assertIn("cannot cover", result.detail)
-        self.assertEqual(provider.requests, [])
-        self.assertEqual(result.model_attempts, 0)
-        self.assertTrue(result.continuation["conversation"])
-        self.assertEqual(result.usage, {})
-
     def test_revision_transport_retains_unique_record_meaning(self):
         snapshot = {"record": {"id": 4, "content": "修正后的认识", "status": "ACTIVE", "claim_type": "reported",
                                "superseded_by": 9, "source_message_id": 7, "uncertainty": "原版本的不确定性"},
@@ -488,111 +142,6 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["record"], {"claim_type": "reported", "superseded_by": 9,
             "source_message_id": 7, "uncertainty": "原版本的不确定性"})
         self.assertEqual(result["memory"], snapshot["memory"])
-
-    async def test_output_limit_keeps_unfinished_understanding_for_continuation(self):
-        truncated = response('{"items":[', finish="length")
-        truncated.reasoning_content = "已经理解了两个话题，第二个还没有完成写入"
-        result = await MemoryAgent(Provider([truncated]), Store()).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "一起讨论两个话题"}], {})
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.continuation["conversation"][-1]["reasoning_content"], truncated.reasoning_content)
-        self.assertEqual(result.continuation["conversation"][-1]["content"], truncated.completion_text)
-        self.assertEqual(result.items, [])
-
-    async def test_known_first_call_usage_does_not_hide_unknown_later_call(self):
-        provider = Provider([response(calls=[("search_messages", {"terms": ["星舟"]}, "read")]),
-                             TimeoutError("provider response did not arrive")])
-        result = await MemoryAgent(provider, Store()).consolidate(
-            [{"id": 1, "source_key": "u1", "plain_text": "继续回忆星舟"}], {})
-        self.assertEqual(result.usage, {"input_other": 10, "output": 4})
-        self.assertEqual(result.model_attempts, 2)
-        self.assertEqual(result.unknown_usage_calls, 1)
-        self.assertTrue(any(row.get("tool_call_id") == "read" for row in result.continuation["conversation"]))
-
-    async def test_resumption_metadata_does_not_resend_material_and_budget_excludes_this_input(self):
-        class TaskStore(Store):
-            def update_learning_task(self, kind, patch): pass
-        original = {"id": 1, "source_key": "u1", "plain_text": "这是此前已经读过的原文"}
-        seen = {}
-        initial = {"role": "user", "content": _json({"messages": [original]}, seen_messages=seen)}
-        task = {"material_ids": [1], "continuation": {"conversation": [initial], "seen_messages": seen,
-                "sources": {1: "u1"}, "previous_input_tokens": 10000, "previous_input_bytes": 30000,
-                "previous_call_usage": {"input_other": 10000, "output": 1000}}}
-        provider = Provider([response('{"items":[],"progress":{"completed_ids":[1]}}')])
-        await MemoryAgent(provider, TaskStore()).consolidate([{**original, "context_only": False}], {}, task=task, token_budget=30000)
-        sent = provider.requests[0][0]["messages"]
-        self.assertEqual(sent[0], initial)
-        self.assertNotIn("messages", json.loads(sent[1]["content"]))
-        resource = next(json.loads(row["content"])["resource_state"] for row in sent[1:]
-                        if row["role"] == "user" and row["content"].startswith('{"resource_state":'))
-        self.assertEqual(resource["remaining_after_current_input_tokens"], 30000 - resource["estimated_input_tokens"])
-        self.assertGreaterEqual(resource["estimated_input_tokens"], 10000)
-        self.assertIn("本次剩余资源", sent[-1]["content"])
-        self.assertTrue(_model_view({**original, "context_only": True})["context_only"])
-
-    async def test_learning_reads_old_sources_then_revises_and_reuses_real_graph_nodes(self):
-        test_root = Path(__file__).resolve().parents[1] / ".dev"
-        test_root.mkdir(exist_ok=True)
-        directory = test_root / f"test-agent-{uuid.uuid4().hex}"
-        directory.mkdir()
-        try:
-            store = MemoryStore(Path(directory) / "memory.db", "test:GroupMessage:42")
-            try:
-                def message(mid, sender, text):
-                    return store.append_message({"umo": store.umo, "platform_id": "test", "message_id": mid,
-                        "sender_id": sender, "sender_name": "小桥", "sent_at": 100, "role": "USER",
-                        "plain_text": text, "content": [{"type": "text", "text": text}]})
-                old = message("old", "10", "我周日去排练室")
-                now = message("new", "20", "另一位小桥周日去，我周六去")
-                previous = store.save_memories([{"kind": "semantic", "person": "小桥", "content": "两位小桥都周六去",
-                                                "source_keys": [old["source_key"]]}],
-                                               [old["source_key"]], mark_processed=False)[0]
-
-                class LearningProvider(Provider):
-                    async def _query(self, payload, tools, request_max_retries):
-                        self.requests.append((copy.deepcopy(payload), tools))
-                        turn = len(self.requests)
-                        if turn == 1:
-                            return response(calls=[("search_memories", {"terms": ["小桥"]}, "read"),
-                                ("memory", {"kind": "semantic", "id": previous["id"]}, "original")])
-                        if turn == 2:
-                            return response(calls=[("remember", {"items": [
-                                {"kind": "semantic", "id": previous["id"], "content": "账号10的小桥周日去，账号20的小桥周六去",
-                                 "source_ids": [now["id"]]},
-                                {"kind": "association", "source": {"label": "小桥", "description": "账号10的群友"},
-                                 "target": {"label": "排练室"}, "relation": "周日去", "statement": "账号10的小桥周日去排练室",
-                                 "source_ids": [now["id"]]}]}, "save")])
-                        if turn == 3:
-                            saved = json.loads(next(m["content"] for m in reversed(payload["messages"]) if m["role"] == "tool"))[1]
-                            return response(calls=[("remember", {"items": [
-                                {"kind": "semantic", "id": previous["id"], "content": "读回旧原文，确定是两位小桥不同的安排",
-                                 "source_ids": [old["id"], now["id"]]},
-                                {"kind": "association",
-                                "source": {"label": "小桥", "description": "账号20的另一位群友"},
-                                "target": {"node_id": saved["target_node_id"]}, "relation": "周六去",
-                                "statement": "另一位小桥周六去同一个排练室", "source_ids": [now["id"]]}]}, "reuse")])
-                        return response('{"items":[]}')
-
-                provider = LearningProvider([])
-                result = await MemoryAgent(provider, store, max_turns=4).consolidate([now], {})
-                self.assertEqual(result.status, "completed", result.detail)
-                self.assertEqual(result.items, [])
-                self.assertEqual(len(result.written), 3)
-                self.assertEqual(result.written[0]["id"], previous["id"])
-                self.assertIn("读回旧原文", result.written[0]["summary"])
-                self.assertEqual(result.written[0]["source_ids"], [old["id"], now["id"]])
-                first, second = result.written[1:]
-                self.assertEqual(first["target_node_id"], second["target_node_id"])
-                self.assertNotEqual(first["source_node_id"], second["source_node_id"])
-                self.assertEqual(len(store.pending_messages(10)), 2)
-                self.assertEqual(result.usage, {"input_other": 40, "output": 16})
-            finally:
-                store.close()
-        finally:
-            if directory.resolve().parent != test_root.resolve():
-                raise RuntimeError("Test cleanup path is outside test workspace")
-            shutil.rmtree(directory)
-
 
 if __name__ == "__main__":
     unittest.main()

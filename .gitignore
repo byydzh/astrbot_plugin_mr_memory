@@ -11,6 +11,7 @@ __pycache__/
 .test-artifacts/
 *.private.*
 /data/
+/docs/
 /pytest-cache-files-*/
 /tmp*/
 dist/

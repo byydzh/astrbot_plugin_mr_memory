@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 
+from .memory_graph import canonical
+
 
 RETRY_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "pending_id": {"type": "string"},
@@ -33,6 +35,53 @@ def connection_reference(link):
     if "context" not in result and "note" in result:
         result["context"] = result["note"]
     return result
+
+
+def temporary_id(value):
+    """String labels name drafts; numeric IDs still address stored memories."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        int(value)
+    except ValueError:
+        return value
+    return None
+
+
+def draft_addresses(item):
+    """Normalize local labels without changing stored numeric addresses."""
+    if not isinstance(item, dict):
+        return item
+    item = copy.deepcopy(item)
+    label = temporary_id(item.get("id"))
+    if label and item.get("handle", label) == label and not item.get("action"):
+        item["handle"] = item.pop("id")
+    association = canonical(str(item.get("kind", ""))) == "association"
+    fields = ("source", "target", "from", "to") if association else ("source", "target")
+    for field in fields:
+        if field in item:
+            item[field] = draft_reference(item[field])
+    if association:
+        for alias, field in (("from", "source"), ("to", "target")):
+            if alias in item:
+                item.setdefault(field, item[alias])
+    if isinstance(item.get("connections"), list):
+        item["connections"] = [draft_reference(link) for link in item["connections"]]
+    return item
+
+
+def draft_reference(ref):
+    if not isinstance(ref, dict):
+        return ref
+    ref = copy.deepcopy(ref)
+    for field in ("target", "target_ref"):
+        if field in ref:
+            ref[field] = draft_reference(ref[field])
+    label = temporary_id(ref.get("id"))
+    if label and ref.get("handle", label) == label:
+        ref["handle"] = ref.pop("id")
+        ref.pop("kind", None)
+    return ref
 
 
 def dependency_groups(work, pending):
@@ -94,7 +143,8 @@ class LearningWriter:
     def __init__(self, store, sources: dict[int, str], *, run_id=None, learning_kind=None,
                  pending_items: dict | None = None, deferred_progress: dict | None = None,
                  receipts: dict | None = None, foreground=False, handles=None, recollection=None,
-                 recover_recall=False, recall_draft_ids=None):
+                 recover_recall=False, recall_draft_ids=None, observed_revisions=None, offered_ids=None,
+                 from_group_messages=False):
         self.store, self.sources = store, sources
         self.run_id, self.learning_kind = run_id, learning_kind
         self.pending_items = copy.deepcopy(pending_items or {})
@@ -102,7 +152,10 @@ class LearningWriter:
         self.receipts = copy.deepcopy(receipts or {})
         self.handles = copy.deepcopy(handles or {})
         self.recollection = copy.deepcopy({} if recollection is None else recollection)
+        self.observed_revisions = dict(observed_revisions or {})
+        self.offered_ids = None if offered_ids is None else list(dict.fromkeys(offered_ids))
         self.foreground = foreground
+        self.from_group_messages = from_group_messages
         self.recall_draft_ids = set(recall_draft_ids or ())
         if recover_recall:
             queued = store.recall_drafts()
@@ -114,7 +167,24 @@ class LearningWriter:
         return copy.deepcopy({"pending_items": self.pending_items,
                               "deferred_progress": self.deferred_progress, "receipts": self.receipts,
                               "handles": self.handles, "recollection": self.recollection,
+                              "observed_revisions": self.observed_revisions,
                               "recall_draft_ids": sorted(self.recall_draft_ids)})
+
+    def normalize_progress(self, progress):
+        if not isinstance(progress, dict):
+            raise ValueError("Learning progress must be an object")
+        progress = copy.deepcopy(progress)
+        complete = progress.pop("complete_offered", False)
+        if type(complete) is not bool:
+            raise ValueError("progress.complete_offered must be a boolean")
+        if complete:
+            if self.offered_ids is None:
+                raise ValueError("This writer has no offered material list")
+            completed = progress.get("completed_ids", [])
+            if not isinstance(completed, list):
+                raise ValueError("progress.completed_ids must be a list")
+            progress["completed_ids"] = list(dict.fromkeys([*completed, *self.offered_ids]))
+        return progress
 
     def persist(self):
         if self.foreground:
@@ -135,6 +205,18 @@ class LearningWriter:
             raise ValueError("Memory item must be an object")
         item = copy.deepcopy(item)
         item.pop("handle", None)
+        if canonical(str(item.get("kind", ""))) == "association":
+            for alias, field in (("from", "source"), ("to", "target")):
+                if alias in item and (
+                    self.resolve(item.pop(alias), bindings, component) != self.resolve(item.get(field), bindings, component)
+                ):
+                    raise ValueError(f"Connection supplies conflicting {field} addresses")
+        if item.get("id") is not None:
+            address = f"{canonical(str(item.get('kind', '')))}:{int(item['id'])}"
+            if address in self.observed_revisions:
+                # The read snapshot owns the write precondition. The model may
+                # describe a new revision, but it does not manage SQL versions.
+                item["revision_no"] = self.observed_revisions[address]
         for side in ("source", "target"):
             if side in item:
                 item[side] = self.resolve(item[side], bindings, component)
@@ -150,6 +232,13 @@ class LearningWriter:
                 link = connection_reference(link)
                 links.append(self.resolve(link, bindings, component))
             item["connections"] = links
+        if (self.from_group_messages and item.get("id") is None
+                and canonical(str(item.get("kind", ""))) in {"event", "episode", "semantic"}
+                and not item.get("source_ids")
+                and not any(isinstance(link, dict) and link.get("purpose") == "basis"
+                            for link in item.get("connections", []) or [])):
+            raise ValueError("New group memory needs the source_ids of the original messages supporting it. "
+                             "The draft is saved; supply just retry changes.source_ids.")
         if "source_ids" not in item:
             # Derived thoughts may cite other memories through connections;
             # updating an object without changing its sources keeps those sources.
@@ -170,6 +259,8 @@ class LearningWriter:
         return row
 
     def resolve(self, ref, bindings=None, component=()):
+        if isinstance(ref, str) and (ref in (bindings or {}) or ref in self.handles):
+            ref = {"handle": ref}
         if not isinstance(ref, dict) or "handle" not in ref:
             return ref
         handle = str(ref["handle"])
@@ -186,7 +277,10 @@ class LearningWriter:
             raise ValueError(f"Memory handle {handle!r} has no saved address; supply its object or resolve its unfinished draft")
         return {**{key: value for key, value in ref.items() if key != "handle"}, **{key: target[key] for key in ("kind", "id")}}
 
-    def remember_handle(self, item, saved):
+    def remember_saved(self, item, saved):
+        for row in saved:
+            if type(row.get("revision_no")) is int:
+                self.observed_revisions[f"{canonical(row['kind'])}:{row['id']}"] = row["revision_no"]
         if isinstance(item, dict) and item.get("handle") and saved:
             self.handles[str(item["handle"])] = {key: saved[0][key] for key in ("kind", "id")}
 
@@ -213,19 +307,40 @@ class LearningWriter:
             rows = saved[key]
             outcome.written.extend([{**row, "handle": item["handle"]} if item.get("handle") else row for row in rows])
             self.receipts[key] = [{"kind": row["kind"], "id": row["id"]} for row in rows]
-            self.remember_handle(item, rows)
+            self.remember_saved(item, rows)
             self.pending_items.pop(key, None)
 
     def apply(self, args: dict, call_id: str) -> WriteOutcome:
-        if not isinstance(args, dict) or set(args) - {"items", "progress", "finish", "retry", "recollection"}:
+        if isinstance(args, dict) and set(args) == {'arguments'} and isinstance(args['arguments'], dict):
+            args = args['arguments']
+        if not isinstance(args, dict) or set(args) - {"items", "connections", "progress", "finish", "retry", "recollection"}:
             raise ValueError("remember accepts items, progress, finish, retry and recollection")
         if not args:
             raise ValueError("remember received empty arguments; no memory or progress was saved. Supply items, progress, retry or finish.")
         items, retries, progress = args.get("items", []), args.get("retry", []), args.get("progress", {})
         if not isinstance(items, list) or not isinstance(retries, list):
             raise ValueError("remember.items and remember.retry must be lists")
-        if not isinstance(progress, dict):
-            raise ValueError("Learning progress must be an object")
+        if 'connections' in args:
+            if not isinstance(args['connections'], list):
+                raise ValueError('remember.connections must be a list')
+            items = list(items)
+            for connection in args['connections']:
+                if not isinstance(connection, dict):
+                    items.append(connection)
+                    continue
+                item = dict(connection)
+                # A top-level connection needs both endpoints. A nested-style
+                # target keeps its explicit address; its missing source remains
+                # a repairable draft rather than invalidating the other items.
+                if not any(key in item for key in ('source', 'target', 'from', 'to')):
+                    target = {key: item.pop(key) for key in ('kind', 'id', 'handle') if key in item}
+                    if target:
+                        item['target'] = target
+                item['kind'] = 'association'
+                if 'content' not in item and 'context' in item:
+                    item['content'] = item.pop('context')
+                items.append(item)
+        progress = self.normalize_progress(progress)
         if "finish" in args and type(args["finish"]) is not bool:
             raise ValueError("remember.finish must be a boolean")
         if "recollection" in args:
@@ -237,11 +352,12 @@ class LearningWriter:
         outcome = WriteOutcome()
         work = []
         for index, item in enumerate(items):
+            item = draft_addresses(item)
             # Older prompts may resend an unchanged failed draft in full.
-            pending_id = next((key for key, value in self.pending_items.items() if value["item"] == item),
+            pending_id = next((key for key, value in self.pending_items.items() if draft_addresses(value["item"]) == item),
                               f"{call_id}:{index}")
             if pending_id in self.receipts:
-                self.remember_handle(item, self.receipts[pending_id])
+                self.remember_saved(item, self.receipts[pending_id])
                 outcome.written.extend(self.receipts[pending_id])
                 continue
             work.append((pending_id, index, copy.deepcopy(item)))
@@ -267,7 +383,7 @@ class LearningWriter:
                     changes = changes["item"]
                 original = self.pending_items[key]
                 item = {**(original["item"] if isinstance(original["item"], dict) else {}), **changes}
-                work.append((key, original["item_index"], item))
+                work.append((key, original["item_index"], draft_addresses(item)))
             except (TypeError, ValueError) as exc:
                 outcome.rejected.append({"retry_index": index, "detail": str(exc)})
         options = {"mark_processed": False, "run_id": self.run_id}
@@ -288,6 +404,7 @@ class LearningWriter:
                     normalized.append(ref)
             refs = normalized
             names = {str(ref["handle"]) for ref in refs if isinstance(ref, dict) and "handle" in ref}
+            names.update(ref for ref in refs if isinstance(ref, str) and ref in bindings)
             local_bindings = {name: address for name, address in bindings.items() if name in names}
             self.pending_items[key] = {**self.pending_items.get(key, {}), "item_index": index, "item": copy.deepcopy(item),
                                        "bindings": {**local_bindings, **self.pending_items.get(key, {}).get("bindings", {})},
@@ -302,7 +419,7 @@ class LearningWriter:
                 self.apply_component(cycles[key], outcome)
                 continue
             if key in self.receipts:
-                self.remember_handle(item, self.receipts[key])
+                self.remember_saved(item, self.receipts[key])
                 outcome.written.extend(self.receipts[key])
                 self.pending_items.pop(key, None)
                 continue
@@ -322,12 +439,12 @@ class LearningWriter:
                 outcome.written.extend(saved)
                 self.pending_items.pop(key, None)
                 self.receipts[key] = [{"kind": row["kind"], "id": row["id"]} for row in saved]
-                self.remember_handle(item, saved)
+                self.remember_saved(item, saved)
             except Exception as exc:
                 durable_receipt = self.store.write_receipt(key) if self.foreground else None
                 if durable_receipt is not None:
                     self.receipts[key] = durable_receipt
-                    self.remember_handle(item, durable_receipt)
+                    self.remember_saved(item, durable_receipt)
                     self.pending_items.pop(key, None)
                     outcome.written.extend(durable_receipt)
                     continue
@@ -338,7 +455,7 @@ class LearningWriter:
                     saved = durable.get("receipts", {}).get(key)
                     if saved is not None:
                         self.receipts[key] = saved
-                        self.remember_handle(item, saved)
+                        self.remember_saved(item, saved)
                         self.pending_items.pop(key, None)
                         outcome.written.extend(saved)
                         continue

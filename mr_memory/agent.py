@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from .content import text_view
+from .prompt_view import learning_address_view, learning_material_view, learning_search_view, memory_match_view, prepend_directory
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
 from .handoff import format_background as _background_text
@@ -109,19 +110,32 @@ def _model_view(value: Any) -> Any:
     return result
 
 
-def _json(value: Any, *, seen_messages: dict | None = None) -> str:
+def _json(value: Any, *, seen_messages: dict | None = None, learning: bool = False) -> str:
     seen = {} if seen_messages is None else seen_messages
 
-    def once(part):
+    def once(part, *, quoted=False):
         if isinstance(part, list):
             return [once(item) for item in part]
         if not isinstance(part, dict):
             return part
+        if (learning and part.get("type") == "message_context"
+                and type(part.get("message_id")) is int and isinstance(part.get("producer"), str)):
+            if part.get("context_ref") is True:
+                return part
+            key = f"context:{part['message_id']}:{part['producer']}"
+            if seen.get(key) == part:
+                return {"message_id": part["message_id"], "producer": part["producer"],
+                        "type": "message_context", "context_ref": True}
+            seen[key] = part
         if type(part.get("id")) is int and "plain_text" in part:
             previous = seen.get(part["id"], {})
             if ("revision_no" in part and "revision_no" in previous
                     and part["revision_no"] != previous["revision_no"]):
                 previous = {}
+            if learning and quoted and previous and all(
+                key in previous and previous[key] == item for key, item in part.items()
+            ):
+                return {"id": part["id"]}
             # Quotes carry fewer fields than full messages. Retain the fields
             # already delivered instead of replacing that knowledge with a quote.
             seen[part["id"]] = {**previous, **part}
@@ -130,6 +144,18 @@ def _json(value: Any, *, seen_messages: dict | None = None) -> str:
             if repeated:
                 part = {key: item for key, item in part.items() if key not in repeated}
                 part["source_ref"] = {"message_id": part["id"], "fields": repeated}
+            if learning and part.get("plain_text") and part.get("role") in {"BOT", "SYSTEM"}:
+                event = next((row.get("event") for row in part.get("content", [])
+                              if isinstance(row, dict) and row.get("type") == "bot_event"), None)
+                target = part.get("reply_to")
+                if event in {"generated", "sent"} and target:
+                    key = f"delivery:{part.get('sender_id')}:{json.dumps(target, sort_keys=True)}"
+                    earlier = seen.get(key)
+                    seen[key] = {"id": part["id"], "event": event, "plain_text": part["plain_text"]}
+                    if (earlier and earlier["event"] != event and earlier["plain_text"] == part["plain_text"]
+                            and "source_ref" not in part):
+                        part = {key: value for key, value in part.items() if key != "plain_text"}
+                        part["source_ref"] = {"message_id": earlier["id"], "fields": ["plain_text"]}
         if (isinstance(part.get("kind"), str) and type(part.get("id")) is int
                 and (type(part.get("revision_no")) is int or "summary" in part)):
             # Reflections and connection views have content/context rather than
@@ -147,7 +173,8 @@ def _json(value: Any, *, seen_messages: dict | None = None) -> str:
                 part["memory_ref"] = {"kind": part["kind"], "id": part["id"], "fields": repeated}
                 if revision is not None:
                     part["memory_ref"]["revision_no"] = revision
-        return {key: item if key in {"representation", "recollection", "attention", "belief"} else once(item) for key, item in part.items()}
+        return {key: item if key in {"representation", "recollection", "attention", "belief"}
+                else once(item, quoted=key == "reply_to_message") for key, item in part.items()}
 
     # Overlapping memories often cite the same dialogue. Keep its complete text
     # once in the conversation; references retain every memory's source links.
@@ -165,18 +192,74 @@ def _message_tables(value):
     if not isinstance(value, list):
         return value
     rows = [_message_tables(item) for item in value]
-    if len(rows) < 2 or not all(isinstance(row, dict) and
-            {"id", "sender_id", "sender_name", "role", "sent_at"} <= row.keys() for row in rows):
+    if len(rows) < 2 or not all(isinstance(row, dict) for row in rows):
         return rows
+    messages = all({"id", "sender_id", "sender_name", "role", "sent_at"} <= row.keys() for row in rows)
+    contexts = all(row.get("type") == "message_context" and "message_id" in row for row in rows)
+    speakers = all({"account_id", "name_at_message", "role"} <= row.keys() for row in rows)
+    if not (messages or contexts or speakers):
+        return rows
+    table = "message" if messages else "context" if contexts else "speaker"
+    metadata = {}
+    if messages and len(rows) >= 8:
+        rows, metadata = _timeline_rows(rows)
     columns = [key for key in rows[0] if all(key in row for row in rows)]
     defaults = {key: rows[0][key] for key in columns if all(row[key] == rows[0][key] for row in rows)}
     columns = [key for key in columns if key not in defaults]
     extra = [dict((key, item) for key, item in row.items() if key not in columns and key not in defaults)
              for row in rows]
     has_extra = any(extra)
-    return {"message_defaults": defaults, "message_columns": columns + (["fields"] if has_extra else []),
-            "message_rows": [[row[key] for key in columns] + ([fields] if has_extra else [])
+    return {**metadata, table + "_defaults": defaults, table + "_columns": columns + (["fields"] if has_extra else []),
+            table + "_rows": [[row[key] for key in columns] + ([fields] if has_extra else [])
                              for row, fields in zip(rows, extra)]}
+
+
+def _timeline_rows(rows):
+    """Factor account and date information shared by a chronological transcript."""
+    pairs = {}
+    counts = {}
+    for row in rows:
+        name = row["sender_name"]
+        if isinstance(name, str) and name and isinstance(row["sender_id"], str) and isinstance(row["role"], str):
+            pairs.setdefault(name, set()).add((row["sender_id"], row["role"]))
+            counts[name] = counts.get(name, 0) + 1
+    speakers = {name: list(next(iter(values))) for name, values in pairs.items()
+                if len(values) == 1 and counts[name] > 1}
+    calendar = {}
+    instants = []
+    for row in rows:
+        stamp = row.get("sent_at_local", "")
+        if "local_time" in row or type(row["sent_at"]) is not int or not isinstance(stamp, str):
+            break
+        iso = stamp.partition(" ")[0]
+        try:
+            instant = datetime.fromisoformat(iso)
+        except ValueError:
+            break
+        if (instant.tzinfo is None or len(iso) != 25 or iso[10] != "T"
+                or instant.timestamp() != row["sent_at"]):
+            break
+        day, clock, suffix = iso[:10], iso[11:19], stamp[19:]
+        if calendar.setdefault(day, suffix) != suffix:
+            break
+        instants.append((day, clock))
+    use_clock = len(instants) == len(rows)
+    metadata = {}
+    if use_clock:
+        metadata["local_dates"] = calendar
+    if speakers:
+        metadata["uid_and_role_by_sender_name"] = speakers
+    packed = []
+    for index, row in enumerate(rows):
+        item = row.copy()
+        if speakers.get(row["sender_name"]) == [row["sender_id"], row["role"]]:
+            del item["sender_id"], item["role"]
+        if use_clock:
+            del item["sent_at"], item["sent_at_local"]
+            day, clock = instants[index]
+            item["local_time"] = clock if len(calendar) == 1 else day + "T" + clock
+        packed.append(item)
+    return packed, metadata
 
 
 def _expand_message_tables(value):
@@ -184,19 +267,47 @@ def _expand_message_tables(value):
         return [_expand_message_tables(item) for item in value]
     if not isinstance(value, dict):
         return value
-    if set(value) == {"message_defaults", "message_columns", "message_rows"}:
+    table = "context" if "context_rows" in value else "speaker" if "speaker_rows" in value else "message"
+    keys = {table + "_defaults", table + "_columns", table + "_rows"}
+    metadata = {"local_dates", "uid_and_role_by_sender_name"} if table == "message" else set()
+    if keys <= value.keys() <= keys | metadata:
         rows = []
-        for cells in value["message_rows"]:
-            row = dict(zip(value["message_columns"], cells, strict=True))
+        for cells in value[table + "_rows"]:
+            row = dict(zip(value[table + "_columns"], cells, strict=True))
             fields = row.pop("fields", {})
-            rows.append(_expand_message_tables({**value["message_defaults"], **row, **fields}))
+            row = {**value[table + "_defaults"], **row, **fields}
+            speaker = value.get("uid_and_role_by_sender_name", {}).get(row.get("sender_name"))
+            if speaker and "sender_id" not in row:
+                row["sender_id"], row["role"] = speaker
+            if dates := value.get("local_dates"):
+                local = row.pop("local_time")
+                if len(dates) == 1:
+                    local = next(iter(dates)) + "T" + local
+                stamp = local + dates[local[:10]]
+                row["sent_at_local"] = stamp
+                row["sent_at"] = int(datetime.fromisoformat(stamp.partition(" ")[0]).timestamp())
+            rows.append(_expand_message_tables(row))
         return rows
     return {key: _expand_message_tables(item) for key, item in value.items()}
 
 
 def _learning_json(value, *, seen_messages=None):
-    visible = json.loads(_json(value, seen_messages=seen_messages))
+    if isinstance(value, dict) and isinstance(value.get("learning_task"), dict) and isinstance(value.get("messages"), list):
+        ids = [row.get("id") for row in value["messages"] if isinstance(row, dict)]
+        if len(ids) >= 8 and len(ids) == len(value["messages"]) and all(type(i) is int for i in ids):
+            task = {key: ("messages[].id" if key in {"material_ids", "offered_ids"} and item == ids else item)
+                    for key, item in value["learning_task"].items()}
+            value = {**value, "learning_task": task}
+    visible = json.loads(_json(learning_address_view(value), seen_messages=seen_messages, learning=True))
     return json.dumps(_message_tables(visible), ensure_ascii=False, separators=(",", ":"))
+
+
+def _read_result_json(name, value, seen):
+    if name in {"search_memories", "semantic_search"}:
+        value = learning_search_view(value)
+    elif name == "search_messages" and isinstance(value, dict) and isinstance(value.get("context"), list):
+        value = {**value, "context": learning_material_view(value["context"])}
+    return _learning_json(value, seen_messages=seen)
 
 
 def _add_usage(target: dict[str, int], response: Any) -> None:
@@ -227,6 +338,7 @@ def _memory_output(text: str) -> dict:
             raise ValueError("Memory output must contain an items list")
         return {"items": native.get("items", []), "progress": native.get("progress", {}),
                 "retry": native.get("retry", []), "recollection": native.get("recollection", {}),
+                **({"connections": native["connections"]} if "connections" in native else {}),
                 **({"finish": native["finish"]} if "finish" in native else {})}
     if text.startswith("```json"):
         text = text[7:].lstrip()
@@ -238,16 +350,19 @@ def _memory_output(text: str) -> dict:
             payload, repair = decode_envelope(text[start:])
         except ValueError:
             continue
+        if isinstance(payload, dict) and set(payload) == {'arguments'} and isinstance(payload['arguments'], dict):
+            payload = payload['arguments']
         items = payload.get("items") if isinstance(payload, dict) else payload
         if isinstance(items, list):
             return {"items": items, "progress": payload.get("progress", {}) if isinstance(payload, dict) else {},
                     "retry": payload.get("retry", []) if isinstance(payload, dict) else [],
                     "recollection": payload.get("recollection", {}) if isinstance(payload, dict) else {},
+                    **({"connections": payload["connections"]} if isinstance(payload, dict) and "connections" in payload else {}),
                     **({"_format_repair": repair} if repair else {})}
     raise ValueError("Memory output must end with a complete JSON items list")
 
 
-def _reconstruction_output(text: str, store=None, before=None) -> tuple[str, Any, str, dict]:
+def _reconstruction_output(text: str, store=None, before=None, *, known_people=()) -> tuple[str, Any, str, dict]:
     """Read the delivered background, memory changes and experience of this turn."""
     value = text.strip()
     if value.startswith("```json"):
@@ -265,7 +380,7 @@ def _reconstruction_output(text: str, store=None, before=None) -> tuple[str, Any
     writes = {key: result[key] for key in ("items", "retry", "recollection") if key in result}
     try:
         background = _background_text(result.get("background"), store, before,
-                                      references=result.get("references"), belief=result.get("belief"))
+                                      references=result.get("references"), belief=result.get("belief"), known_people=known_people)
     except ValueError as exc:
         return "", {}, str(exc), writes
     recollection = result.get("recollection", {})
@@ -277,7 +392,7 @@ def _memory_items(text: str) -> list:
 
 
 def _learning_material(messages: list, working: dict, task: dict | None) -> dict:
-    value = {"messages": messages, "working": working}
+    value = {"messages": learning_material_view(messages), "working": working}
     if task is not None:
         value["learning_task"] = {key: task[key] for key in (
             "material_ids", "offered_ids", "context_ids", "completed_ids", "checkpoint", "memory_refs", "run_id") if key in task}
@@ -295,6 +410,12 @@ def _learning_material(messages: list, working: dict, task: dict | None) -> dict
 def _learning_continuation(task: dict | None) -> dict:
     original = (task or {}).get("continuation") or {}
     previous = text_view(original)
+    if (not previous.get("format_repair_output") and
+            previous.get("pending_write_errors", {}).get("remember", "").startswith("最后输出未保存")):
+        last_answer = next((row for row in reversed(previous.get("conversation", []))
+                            if row.get("role") == "assistant"), {})
+        if not last_answer.get("tool_calls"):
+            previous["format_repair_output"] = str(last_answer.get("content") or "")
     if previous.get("conversation") != original.get("conversation"):
         # Old tasks may contain archived media bytes. Once those bytes are no
         # longer model input, the old observed token/byte ratio is inapplicable.
@@ -302,6 +423,91 @@ def _learning_continuation(task: dict | None) -> dict:
         previous["previous_input_bytes"] = 0
         previous["input_tokens_per_byte"] = 0.0
     return previous
+
+
+def _read_addresses(conversation):
+    addresses = {}
+    for message in conversation:
+        if message.get("role") not in {"user", "tool"}:
+            continue
+        try:
+            value = json.loads(message.get("content") or "")
+        except (TypeError, ValueError):
+            continue
+        for ref in visible_memories(value):
+            addresses[(ref["kind"], ref["id"])] = {key: ref[key] for key in ("kind", "id", "title")}
+    return list(addresses.values())
+
+
+def _draft_repair_messages(task, state, conversation):
+    """Hand off a completed batch's uncommitted drafts without replaying the batch."""
+    if (not task or not state.get("pending_items") or not task.get("material_ids")
+            or set(task["material_ids"]) - set(task.get("completed_ids", []))):
+        return None
+    # A subsequent lookup, model answer or tool request must survive a resume.
+    # Only compact at an actual write acknowledgement. A mixed tool turn
+    # can also contain unread lookup results that the drafts do not cover.
+    for index in range(len(conversation) - 1, -1, -1):
+        message = conversation[index]
+        content = message.get("content") or ""
+        role = message.get("role")
+        if role == "user" and isinstance(content, str) and content.startswith("finish尚未完成，已有写入和进度已保留："):
+            continue
+        try:
+            value = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+        if role == "user" and isinstance(value, dict) and set(value) == {"resource_state"}:
+            continue
+        if role == "user" and isinstance(value, dict):
+            receipt = value.get("write_result")
+        elif role == "tool" and index:
+            caller = conversation[index - 1]
+            calls = caller.get("tool_calls") or []
+            if (caller.get("role") != "assistant" or len(calls) != 1
+                    or calls[0].get("id") != message.get("tool_call_id")
+                    or calls[0].get("function", {}).get("name") != "remember"):
+                return None
+            receipt = value
+        else:
+            return None
+        if not isinstance(receipt, dict) or not receipt.get("rejected"):
+            return None
+        written = [{key: item[key] for key in ("kind", "id", "title", "handle") if key in item}
+                   for item in receipt.get("written", []) if isinstance(item, dict)]
+        packet = {"write_result": {"status": "partial", "written": written, "detail": receipt.get("detail", ""),
+                  "pending_items": [{"pending_id": key, **draft} for key, draft in state["pending_items"].items()]},
+                  "draft_repair": "本批原文已经处理完。以下是实际待修草稿。按 pending_id 补改出错字段，"
+                  "已成功写入的条目可以按地址打开；需要原话时仍可检索和读取。",
+                  "handles": state.get("handles", {}), "saved_memories": task.get("memory_refs", []),
+                  "read_addresses": _read_addresses(conversation), "material_ids": task["material_ids"],
+                  "checkpoint": task.get("checkpoint", "")}
+        return [{"role": "user", "content": _learning_json(packet)}]
+    return None
+
+
+def _learning_input_state(task, *, basic):
+    previous = _learning_continuation(task)
+    if (basic and not previous.get("format_repair_output")
+            and set(previous.get("pending_write_errors", {})) <= {"remember"}):
+        repair = _draft_repair_messages(task, previous.get("write_state", {}), previous.get("conversation", []))
+        if repair:
+            return {**previous, "conversation": repair, "new_draft_repair": True, "seen_messages": {}, "previous_input_tokens": 0,
+                    "previous_input_bytes": 0, "previous_call_usage": {}, "previous_call_seconds": 0}
+    return previous
+
+
+def _learning_format_repair(text: str, conversation: list) -> list:
+    """Repair an already formed answer without paying for the original search again."""
+    return [{"role": "user", "content":
+        "最后输出未保存，下面是已经形成的记忆保存内容。只修正 JSON 语法和字段容器位置，"
+        "保留全部内容、人物、编号、把握与进度，不增加事实或解释，不重新整理原始材料。"
+        "已读地址目录供核对连接目标，kind/id 合起来才是地址，同一数字在不同 kind 下指不同对象。"
+        "局部含义无法判断时保留为待修草稿，已有正文仍保留。输出完整 JSON，"
+        "items、connections、progress、retry、recollection 使用 remember 的相同结构。"},
+        {"role": "user", "content": _json({"read_addresses": _read_addresses(conversation)})},
+        {"role": "assistant", "content": text},
+        {"role": "user", "content": "输出修正后的完整 JSON。"}]
 
 
 def compact_learning_task(task: dict) -> dict:
@@ -322,6 +528,9 @@ def compact_learning_task(task: dict) -> dict:
     density = previous.get("input_tokens_per_byte", 0.0)
     if previous.get("previous_input_tokens") and previous.get("previous_input_bytes"):
         density = previous["previous_input_tokens"] / previous["previous_input_bytes"]
+    # The conversation is still complete. A reference in its rewritten text
+    # cannot replace the original observation when checking for edits on resume.
+    seen.update(_restore_seen(previous.get("seen_messages", {})))
     return {**task, "continuation": {**previous, "conversation": conversation,
         "seen_messages": seen, "previous_input_tokens": 0, "previous_input_bytes": 0,
         "input_tokens_per_byte": density}}
@@ -332,6 +541,8 @@ def checkpoint_learning_task(task: dict) -> dict:
     if not task.get("checkpoint"):
         return task
     previous = _learning_continuation(task)
+    if previous.get("format_repair_output"):
+        return task
     conversation = previous.get("conversation", [])
     boundary = None
     for index, message in enumerate(conversation):
@@ -385,8 +596,8 @@ def checkpoint_learning_task(task: dict) -> dict:
     }}
 
 
-def _checkpoint_conversation(messages: list, working: dict, task: dict | None, *, basic: bool = False) -> list:
-    conversation = [{"role": "user", "content": _learning_json(_learning_material(messages, working, task))}]
+def _checkpoint_conversation(material: dict, task: dict | None, *, basic: bool = False, seen_messages=None) -> list:
+    conversation = [{"role": "user", "content": _learning_json(material, seen_messages=seen_messages)}]
     tail = _learning_continuation(task).get("checkpoint_tail", [])
     if tail:
         conversation.extend(copy.deepcopy(tail))
@@ -399,14 +610,15 @@ def _checkpoint_conversation(messages: list, working: dict, task: dict | None, *
 def _learning_resume_update(messages: list, working: dict, task: dict, previous: dict) -> dict:
     update = {"resume": "接着上次未完成的工作继续。"}
     seen = previous.get("seen_messages", {})
-    fresh = [row for row in messages if _model_view(row) != seen.get(row.get("id"), seen.get(str(row.get("id"))))]
+    fresh = [row for row in learning_address_view(learning_material_view(messages))
+             if _model_view(row) != seen.get(row.get("id"), seen.get(str(row.get("id"))))]
     if fresh:
         update["messages"] = fresh
     changes = {key: value for key, value in working.items() if previous.get("working", {}).get(key) != value}
     if changes:
         update["working_updates"] = changes
     task_state = _learning_material([], {}, task).get("learning_task", {})
-    if previous.get("task_state") != task_state:
+    if previous.get("task_state") != task_state and not previous.get("new_draft_repair"):
         update["learning_task"] = task_state
     return update
 
@@ -438,14 +650,19 @@ def estimate_learning_input(messages: list, working: dict, *, feedback: bool = F
                             task: dict | None = None, input_tokens_per_byte: float = 0.0,
                             workspace: dict | None = None, basic: bool = False, member_prefix: str = "") -> int:
     """Budget the next input, preserving the observed cost of a resumable prefix."""
-    previous = _learning_continuation(task)
+    previous = _learning_input_state(task, basic=basic)
+    if previous.get("format_repair_output"):
+        repair = _learning_format_repair(previous["format_repair_output"], previous.get("conversation", []))
+        input_bytes = _learning_bytes(repair, feedback, basic=basic, member_prefix=member_prefix) + 2048
+        return _estimate_input_tokens(input_bytes, 0, 0,
+                                      previous.get("input_tokens_per_byte", 0.0) or input_tokens_per_byte)
     conversation = list(previous.get("conversation", []))
     if conversation:
         seen = _restore_seen(previous.get("seen_messages", {}))
         update = _learning_resume_update(messages, working, task, previous)
         conversation.append({"role": "user", "content": _learning_json(update, seen_messages=seen)})
     else:
-        conversation = _checkpoint_conversation(messages, working, task, basic=basic)
+        conversation = _checkpoint_conversation(_learning_material(messages, working, task), task, basic=basic)
         seen = {}
     if workspace is not None and workspace != previous.get("workspace"):
         conversation.append({"role": "user", "content": _json({"workspace": workspace}, seen_messages=seen)})
@@ -466,9 +683,11 @@ class MemoryAgent:
         self.thinking_mode = thinking_mode
         self.advanced = bool(advanced)
         self.member_prefix = ""
+        self.handoff_people = []
         self.trace = None
         self.run_key = uuid4().hex
         self.available_memories = {}
+        self.observed_revisions = {}
         self.last_workspace = None
 
     async def _workspace_update(self, messages, seen_messages):
@@ -513,6 +732,8 @@ class MemoryAgent:
                 continue
             for ref in visible_memories(value):
                 self.available_memories[(ref["kind"], ref["id"], ref["revision_no"])] = ref
+                address = f"{ref['kind']}:{ref['id']}"
+                self.observed_revisions[address] = max(self.observed_revisions.get(address, 0), ref["revision_no"])
         began = time.monotonic()
         await self._emit("model", f"第 {turn} 轮模型调用", "running", turn=turn)
         try:
@@ -646,10 +867,11 @@ class MemoryAgent:
         allowed_tools = tool_definitions(basic=not self.advanced)
         prompt = RECONSTRUCTION_PROMPT if self.advanced else BASIC_RECALL_PROMPT
         if self.member_prefix:
-            prompt += "\n<mr_member_directory>\n" + self.member_prefix + "\n</mr_member_directory>"
+            prompt = prepend_directory(prompt, self.member_prefix)
         sources = {row["id"]: row["source_key"] for row in [*recent, current] if "id" in row and "source_key" in row}
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 foreground=True)
+        self.observed_revisions = writer.observed_revisions
         working = {key: value for key, value in working.items() if key != "pending_recall_writes"} if self.advanced else {}
         if self.advanced:
             working["continuity"] = await self.store.read_async(self.store.continuity, cutoff)
@@ -666,7 +888,7 @@ class MemoryAgent:
         completed_response = False
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                messages.append({"role": "user", "content": _json({"current": current, "recent": recent,
+                messages.append({"role": "user", "content": _learning_json({"current": current, "recent": learning_material_view(recent),
                                 "working": working,
                                 "now_unix": cutoff, "service_local_time": datetime.fromtimestamp(cutoff, timezone.utc).astimezone().isoformat()}, seen_messages=seen_messages)})
                 last_round_seconds = 0.0
@@ -699,7 +921,8 @@ class MemoryAgent:
                     if names and text:
                         # Tool-planning prose is part of this agent's conversation,
                         # not a completed background for the main model.
-                        background, recollection, detail, _ = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
+                        background, recollection, detail, _ = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
+                                                                                     known_people=self.handoff_people)
                         if background and detail != "本次仅返回文本背景":
                             result.background = background
                         result.status = "partial"
@@ -708,7 +931,8 @@ class MemoryAgent:
                             result.detail = "Provider returned neither text nor tool calls"
                             break
                         messages.append({"role": "assistant", "content": text})
-                        background, recollection, detail, final_writes = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff)
+                        background, recollection, detail, final_writes = await asyncio.to_thread(_reconstruction_output, text, self.store, cutoff,
+                                                                                                known_people=self.handoff_people)
                         result.background = background
                         result.detail = ""
                         result.status = "partial" if _finish_reason(response) == "length" else "completed"
@@ -763,7 +987,8 @@ class MemoryAgent:
                                 raise ValueError("当前模式未提供此工具；基础模式只检索群聊记忆")
                             if name == "complete":
                                 result.background = await asyncio.to_thread(_background_text, args.get("background"), self.store, cutoff,
-                                                                            references=args.get("references"), belief=args.get("belief"))
+                                                                            references=args.get("references"), belief=args.get("belief"),
+                                                                            known_people=self.handoff_people)
                                 changes = {key: args[key] for key in ("items", "retry", "recollection") if key in args}
                                 outcome = await persist_changes(changes, call_id) if changes and self.advanced else None
                                 value = outcome.receipt(writer.pending_items) if outcome else {"status": "completed"}
@@ -800,8 +1025,8 @@ class MemoryAgent:
                     # Serialize in conversation order, after parallel reads finish:
                     # a reference must never precede the text it refers to.
                     messages.extend({"role": "tool", "tool_call_id": call_id,
-                                     "content": _json(value, seen_messages=seen_messages)}
-                                    for call_id, value in outputs)
+                                     "content": _read_result_json(call.name, value, seen_messages)}
+                                    for call, (call_id, value) in zip(native_calls, outputs, strict=True))
                     if completed_response:
                         break
                     last_round_seconds = time.monotonic() - round_started
@@ -827,14 +1052,15 @@ class MemoryAgent:
         return result
 
     async def consolidate(self, messages: list, working: dict, *, feedback: bool = False,
-                          token_budget: int | None = None, task: dict | None = None):
+                          token_budget: int | None = None, task: dict | None = None, budget_is_batch_share: bool = False):
         if feedback and not self.advanced:
             return ConsolidationResult(status="disabled", detail="Feedback learning requires advanced mode")
         started = time.monotonic()
         result = ConsolidationResult()
-        previous = _learning_continuation(task)
+        previous = _learning_input_state(task, basic=not self.advanced and not feedback)
         self.last_workspace = previous.get("workspace")
         conversation = copy.deepcopy(previous.get("conversation", []))
+        format_repair_output = previous.get("format_repair_output", "")
         seen_messages = _restore_seen(previous.get("seen_messages", {}))
         sources: dict[int, str] = {int(key): value for key, value in previous.get("sources", {}).items()}
         pending_write_errors = dict(previous.get("pending_write_errors", {}))
@@ -847,8 +1073,11 @@ class MemoryAgent:
         learning_kind = "feedback" if feedback else "background"
         writer = LearningWriter(self.store, sources, run_id=getattr(self.trace, "id", None),
                                 learning_kind=learning_kind if task is not None else None,
+                                from_group_messages=not self.advanced and not feedback and bool(messages),
                                 recover_recall=self.advanced and not feedback,
+                                offered_ids=[row["id"] for row in messages if not row.get("context_only")],
                                 **previous.get("write_state", {}))
+        self.observed_revisions = writer.observed_revisions
         working = {key: value for key, value in working.items() if key != "pending_recall_writes"}
         cancelled = False
 
@@ -892,6 +1121,21 @@ class MemoryAgent:
                 pending_write_errors.pop("remember", None)
             return outcome.receipt(writer.pending_items)
 
+        async def resume_drafts_only():
+            nonlocal conversation, seen_messages, previous_input_tokens, previous_input_bytes
+            if (self.advanced or feedback or task is None or not writer.pending_items
+                    or set(pending_write_errors) != {"remember"}):
+                return False
+            progress = await asyncio.to_thread(self.store.learning_task, learning_kind)
+            repair = _draft_repair_messages(progress, {"pending_items": writer.pending_items,
+                                                       "handles": writer.handles}, conversation)
+            if not repair:
+                return False
+            conversation = repair
+            seen_messages = {}
+            previous_input_tokens = previous_input_bytes = 0
+            return True
+
         try:
             read_sources(messages)
             read_sources(working)
@@ -904,16 +1148,15 @@ class MemoryAgent:
                 return _learning_bytes(conversation, feedback, basic=not self.advanced, member_prefix=self.member_prefix)
             cutoff = int(time.time())
             async with asyncio.timeout(self.timeout_seconds):
-                material = _learning_material(messages, working, task)
-                if writer.pending_items:
-                    material["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
                 if not conversation:
-                    conversation = _checkpoint_conversation(messages, working, task, basic=not self.advanced)
-                    conversation[0]["content"] = _learning_json(material, seen_messages=seen_messages)
+                    material = _learning_material(messages, working, task)
+                    if writer.pending_items:
+                        material["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
+                    conversation = _checkpoint_conversation(material, task, basic=not self.advanced, seen_messages=seen_messages)
                 else:
                     # Previous messages remain byte-for-byte intact for prefix reuse.
                     update = _learning_resume_update(messages, working, task, previous)
-                    if writer.pending_items:
+                    if writer.pending_items and not previous.get("new_draft_repair"):
                         update["pending_items"] = [{"pending_id": key, **row} for key, row in writer.pending_items.items()]
                     conversation.append({"role": "user", "content": _learning_json(update, seen_messages=seen_messages)})
                 saving = False
@@ -952,12 +1195,18 @@ class MemoryAgent:
                         if self.advanced:
                             saving_hint += "独立关注可用reflect更新，已解决的设为resolved。"
                         conversation.append({"role": "user", "content": saving_hint})
-                    input_bytes = request_bytes(conversation)
-                    estimated_input = _estimate_input_tokens(input_bytes, previous_input_tokens, previous_input_bytes,
+                    model_conversation = (_learning_format_repair(format_repair_output, conversation) + [resource_message]
+                                          if format_repair_output else conversation)
+                    if format_repair_output:
+                        await self._emit("input", "修复已有输出的保存格式", mode="format_repair",
+                                         characters=len(format_repair_output))
+                    input_bytes = request_bytes(model_conversation)
+                    estimated_input = _estimate_input_tokens(input_bytes, 0 if format_repair_output else previous_input_tokens,
+                                                             0 if format_repair_output else previous_input_bytes,
                                                              input_tokens_per_byte)
-                    if remaining is not None and remaining <= estimated_input:
+                    if remaining is not None and remaining <= estimated_input and not format_repair_output:
                         compact = compact_learning_task({"continuation": {"conversation": conversation,
-                            "input_tokens_per_byte": input_tokens_per_byte}})["continuation"]
+                            "seen_messages": seen_messages, "input_tokens_per_byte": input_tokens_per_byte}})["continuation"]
                         if compact["conversation"] != conversation:
                             conversation = compact["conversation"]
                             seen_messages = _restore_seen(compact["seen_messages"])
@@ -967,23 +1216,29 @@ class MemoryAgent:
                             # The old object is no longer part of the compacted transcript.
                             resource_message = next(row for row in reversed(conversation)
                                 if row.get("role") == "user" and row.get("content", "").startswith('{"resource_state":'))
+                            model_conversation = conversation
                     output_room = min(self.max_output_tokens, max(2048, output_token_reserve))
                     next_input = estimated_input + max(0, estimated_input - previous_input_tokens) if previous_input_tokens else estimated_input
                     save_this_turn = remaining is not None and remaining < estimated_input + next_input + 2 * output_room
-                    save_this_turn = save_this_turn or self.max_turns is not None and turn == self.max_turns - 1
+                    final_turn = self.max_turns is not None and turn == self.max_turns - 1
+                    save_this_turn = save_this_turn or final_turn
+                    save_this_turn = save_this_turn or bool(format_repair_output)
                     resource_state["save_this_turn"] = save_this_turn
                     if save_this_turn:
                         resource_state["action"] = (
-                            "这是本次可用的最后一轮，暂停继续读取，直接输出完整 JSON 保存已形成的认识和实际进度："
-                            '{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[],"recollection":{}}。'
-                            "items 与 retry 使用 remember 的相同字段结构；connections 元素用 {kind,id,relation,context} 或 {handle,relation,context}，不写描述字符串。"
+                            "这是本次可用的最后一轮，直接输出完整 JSON 保存已形成的认识和实际进度："
+                            '{"items":[],"progress":{},"retry":[],"recollection":{}}。'
+                            "全部当前材料已处理时用 progress.complete_offered=true，系统展开编号。部分完成时才逐项列 completed_ids。"
+                            "items 与 retry 使用 remember 的相同字段结构；新条目含 kind、source_ids、title、content。"
+                            "connections 元素用 {kind,id,relation,context} 或 {handle,relation,context}。"
                             "只写尚未保存的内容；只完成确已理解的材料，不为收尾编造结论。"
                             "未完线索、未读结果地址及尚待核对的问题写入 checkpoint，之后继续。")
                     resource_state["estimated_input_tokens"] = estimated_input
                     resource_state["remaining_after_current_input_tokens"] = max(0, remaining - estimated_input) if remaining is not None else None
                     resource_message["content"] = _json({"resource_state": resource_state})
-                    input_bytes = request_bytes(conversation)
-                    estimated_input = _estimate_input_tokens(input_bytes, previous_input_tokens, previous_input_bytes,
+                    input_bytes = request_bytes(model_conversation)
+                    estimated_input = _estimate_input_tokens(input_bytes, 0 if format_repair_output else previous_input_tokens,
+                                                             0 if format_repair_output else previous_input_bytes,
                                                              input_tokens_per_byte)
                     if remaining is not None and remaining <= estimated_input:
                         result.status, result.detail = "partial", "Remaining rolling budget cannot cover the next learning input"
@@ -993,11 +1248,14 @@ class MemoryAgent:
                     call_started = time.monotonic()
                     result.model_attempts += 1
                     try:
-                        response = await self._model_turn(conversation, prompt,
+                        # DeepSeek charges the whole prefix again when tool_choice or JSON
+                        # mode changes. A group batch with room to resume can save normally.
+                        force_json = save_this_turn and (not budget_is_batch_share or final_turn or bool(format_repair_output))
+                        response = await self._model_turn(model_conversation, prompt,
                                                          tools,
                                                          turn + 1, max_output_tokens=output_limit,
-                                                         tool_choice="none" if save_this_turn else None,
-                                                         response_format={"type": "json_object"} if save_this_turn else None)
+                                                         tool_choice="none" if force_json else None,
+                                                         response_format={"type": "json_object"} if force_json else None)
                     except (Exception, asyncio.CancelledError):
                         result.unknown_usage_calls += 1
                         raise
@@ -1038,6 +1296,7 @@ class MemoryAgent:
                         try:
                             envelope = _memory_output(text)
                         except ValueError as exc:
+                            format_repair_output = text
                             pending_write_errors["remember"] = f"最后输出未保存：{exc}"
                             conversation.append({"role": "user", "content": _json({"write_result": {
                                 "status": "error", "detail": pending_write_errors["remember"],
@@ -1045,14 +1304,20 @@ class MemoryAgent:
                             await self._emit("write", "最后输出未保存，等待模型修正", "error",
                                              target="long_term_memory", detail=str(exc))
                             continue
+                        if format_repair_output:
+                            # Later semantic work returns to the full transcript.
+                            # Its input size differs from this small repair call.
+                            previous_input_tokens = previous_input_bytes = 0
+                            format_repair_output = ""
                         if repair := envelope.pop("_format_repair", ""):
                             await self._emit("write", "已读取模型的完整保存内容", target="long_term_memory",
                                              format_repair=repair)
                         if task is not None:
                             receipt = await apply_write(envelope, f"final:{getattr(self.trace, 'id', 'local')}:{turn}")
                             if pending_write_errors:
-                                conversation.append({"role": "user", "content": _learning_json({"write_result": receipt,
+                                conversation.append({"role": "user", "content": _learning_json({"write_result": learning_search_view(receipt, include_sources=False),
                                     "unfinished_writes": pending_write_errors}, seen_messages=seen_messages)})
+                                await resume_drafts_only()
                                 result.status, result.detail = "partial", "; ".join(pending_write_errors.values())
                                 continue
                             progress = await asyncio.to_thread(self.store.learning_task, learning_kind)
@@ -1060,16 +1325,16 @@ class MemoryAgent:
                             result.status = "partial" if unfinished else "completed"
                             if unfinished:
                                 result.detail = f"已保存本轮成果与进度；还有 {len(unfinished)} 条材料待继续"
+                            else:
+                                result.detail = ""
                             break
                         result.items = await clean_items(envelope["items"])
                         writer.recollection = envelope.get("recollection", {})
-                        if not isinstance(envelope["progress"], dict):
-                            raise ValueError("Learning progress must be an object")
-                        result.progress = envelope["progress"]
+                        result.progress = writer.normalize_progress(envelope["progress"])
                         if pending_write_errors and ("reflect" in pending_write_errors or not result.items):
                             result.status, result.detail = "partial", "; ".join(pending_write_errors.values())
                         else:
-                            result.status = "completed"
+                            result.status, result.detail = "completed", ""
                         break
                     conversation.append({"role": "assistant", "content": text or None, "tool_calls": [call.message() for call in native_calls],
                         "reasoning_content": getattr(response, "reasoning_content", None) or ""})
@@ -1100,7 +1365,8 @@ class MemoryAgent:
                                 if "finish" in args:
                                     finish_requested = args["finish"]
                             else:
-                                value = await self._execute(name, args, cutoff)
+                                read_args = {"include_sources": False, **args} if name == "memory" and not self.advanced else args
+                                value = await self._execute(name, read_args, cutoff)
                                 if name == "reflect" and set(args) != {"id"}:
                                     pending_write_errors.pop("reflect", None)
                             read_sources(value)
@@ -1125,8 +1391,11 @@ class MemoryAgent:
                         # conversation are references, with authors still visible.
                         # A save acknowledges normalized content and real addresses;
                         # its top-level sources were already read to perform the save.
-                        receipt = ([{key: part for key, part in row.items() if key != "sources"} for row in value]
-                                   if name == "remember" and isinstance(value, list) else value)
+                        receipt = learning_search_view(value, include_sources=False) if name == "remember" else value
+                        if name in {"search_memories", "semantic_search"} and not self.advanced:
+                            receipt = memory_match_view(receipt)
+                        elif name in {"search_memories", "semantic_search", "graph"}:
+                            receipt = learning_search_view(receipt)
                         candidate_seen = copy.deepcopy(seen_messages)
                         tool_message = {"role": "tool", "tool_call_id": call_id,
                             "content": _learning_json(receipt, seen_messages=candidate_seen)}
@@ -1146,11 +1415,13 @@ class MemoryAgent:
                         if not unread_later:
                             seen_messages = candidate_seen
                         conversation.append(tool_message)
+                    if len(native_calls) == 1 and native_calls[0].name == "remember" and await resume_drafts_only():
+                        continue
                     if finish_requested:
                         progress = await asyncio.to_thread(self.store.learning_task, learning_kind) if task is not None else None
                         unfinished = set(progress["material_ids"]) - set(progress["completed_ids"]) if progress else set()
                         if not unfinished and not pending_write_errors:
-                            result.status = "completed"
+                            result.status, result.detail = "completed", ""
                             break
                         reason = (f"本批还有未处理材料 {sorted(unfinished)}。" if unfinished else "")
                         reason += "; ".join(pending_write_errors.values())
@@ -1177,9 +1448,11 @@ class MemoryAgent:
             for call_id in pending_calls:
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": _json({
                     "status": "interrupted", "detail": "调用中断，结果尚未收到；恢复后结合已保存的进度与实际记忆检查再继续。"})})
-            input_bytes = _learning_bytes(conversation, feedback, basic=not self.advanced, member_prefix=self.member_prefix)
+            next_conversation = _learning_format_repair(format_repair_output, conversation) if format_repair_output else conversation
+            input_bytes = _learning_bytes(next_conversation, feedback, basic=not self.advanced, member_prefix=self.member_prefix)
             result.continuation = {
                 "conversation": conversation, "sources": sources, "seen_messages": seen_messages,
+                "format_repair_output": format_repair_output,
                 "workspace": self.last_workspace,
                 "write_state": writer.state(),
                 "pending_write_errors": pending_write_errors, "previous_input_tokens": previous_input_tokens,
@@ -1188,8 +1461,8 @@ class MemoryAgent:
                 "output_token_reserve": output_token_reserve,
                 "previous_call_seconds": previous_call_seconds, "working": working,
                 "task_state": _learning_material([], {}, task).get("learning_task", {}),
-                "estimated_next_input_tokens": _estimate_input_tokens(input_bytes, previous_input_tokens,
-                                                                       previous_input_bytes, input_tokens_per_byte)}
+                "estimated_next_input_tokens": _estimate_input_tokens(input_bytes, 0 if format_repair_output else previous_input_tokens,
+                                                                       0 if format_repair_output else previous_input_bytes, input_tokens_per_byte)}
             if task is not None:
                 await asyncio.to_thread(self.store.update_learning_task, learning_kind, {
                     "continuation": result.continuation, "run_id": getattr(self.trace, "id", None),

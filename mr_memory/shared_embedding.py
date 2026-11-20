@@ -1,5 +1,4 @@
 """Resolve a shared embedding Provider per call, never own its model lifetime."""
-import asyncio
 import json
 from pathlib import Path
 
@@ -78,12 +77,11 @@ class SharedEmbedder:
     async def search(self, store, query, limit=8, *, priority='interactive'):
         if limit < 1:
             return []
-        rows = await asyncio.to_thread(store.vector_rows, self.model_id)
-        if not rows:
+        if not await store.read_async(store.vector_rows, self.model_id, limit=1):
             return []
         provider, _ = self._provider()
         vector = await provider.embed_query(query, client='mr', priority=priority)
-        return await asyncio.to_thread(self._search_rows, rows, vector, int(limit))
+        return await store.read_async(store.search_vectors, self.model_id, vector, int(limit))
 
     def background_view(self):
         return BackgroundSearch(self)

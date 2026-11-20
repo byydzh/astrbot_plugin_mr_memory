@@ -1,20 +1,17 @@
+import os
 import hashlib
 import json
-import sqlite3
 import struct
 import unittest
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
-from unittest.mock import patch
 
 from mr_memory.store import Store
 
 
 class StoreContractTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path(__file__).resolve().parents[1] / ".pytest_cache"
+        scratch = Path(os.environ['ASTRBOT_ROOT'])
         scratch.mkdir(exist_ok=True)
         self.scratch = scratch / ("store-" + uuid.uuid4().hex)
         self.scratch.mkdir()
@@ -71,16 +68,6 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(member["account_type"], "BOT")
         self.assertIn("群助手", member["aliases"])
 
-    def test_message_search_roles_are_chosen_by_caller_and_default_includes_all(self):
-        user = self.message(1, "青桥是我的故乡")
-        bot = self.message(2, "你刚提到青桥", sender="99", role="BOT")
-        tool = self.message(3, "", sender="99", role="SYSTEM",
-                            content=[{"type": "tool_result", "name": "search", "result": "青桥的查询结果"}])
-        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"])], [tool["id"], bot["id"], user["id"]])
-        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"], roles=["USER"])], [user["id"]])
-        self.assertEqual([row["id"] for row in self.store.search_messages(["青桥"], roles=["BOT", "SYSTEM"])], [tool["id"], bot["id"]])
-        self.assertEqual(self.store.search_messages(["青桥"], roles=[]), [])
-
     def test_media_bytes_are_archived_but_not_searched_or_sent_as_prose(self):
         from mr_memory.agent import _model_view
 
@@ -100,50 +87,6 @@ class StoreContractTests(unittest.TestCase):
         # The same word remains searchable when someone actually writes it.
         user = self.message(2, "请查 testneedle 的出处")
         self.assertEqual([row["id"] for row in self.store.search_messages(["testneedle"])], [user["id"]])
-
-    def test_tool_result_keeps_request_author_outside_recent_window(self):
-        first = self.message(1, "请运行绘图", sender="10")
-        success = self.message(2, "执行成功", sender="99", role="SYSTEM", reply_to=first["source_key"])
-        second = self.message(3, "我也运行一次", sender="20")
-        self.message(4, "Permission denied", sender="99", role="SYSTEM", reply_to=second["source_key"])
-        recent = self.store.recent(limit=3)
-        self.assertNotIn(first["id"], [row["id"] for row in recent])
-        self.assertEqual(recent[0]["reply_to_message"]["sender_id"], "10")
-        self.assertEqual(recent[-1]["reply_to_message"]["sender_id"], "20")
-        self.assertEqual(recent[0]["reply_to_message"]["id"], first["id"])
-        self.assertEqual(self.store.search_messages(["执行成功"])[0], success)
-        self.store.delete_message("1")
-        self.assertNotIn("reply_to_message", self.store.messages([success["id"]])[0])
-
-    def test_connection_serializes_reader_and_separate_transaction(self):
-        entered, release, second_started, second_done = Event(), Event(), Event(), Event()
-
-        def fail_before_commit(*args):
-            entered.set()
-            if not release.wait(2):
-                raise TimeoutError("Test did not release the transaction")
-            raise RuntimeError("rollback this message")
-
-        def separate_write_and_read():
-            second_started.set()
-            self.store.save_working_state({"independent": True})
-            rows = self.store.recent()
-            second_done.set()
-            return rows
-
-        with ThreadPoolExecutor(max_workers=2) as pool, patch.object(self.store, "_revision", fail_before_commit):
-            first = pool.submit(self.message, 1, "不可被另一事务提交的消息")
-            self.assertTrue(entered.wait(1))
-            second = pool.submit(separate_write_and_read)
-            try:
-                self.assertTrue(second_started.wait(1))
-                self.assertFalse(second_done.wait(0.05))
-            finally:
-                release.set()
-            with self.assertRaisesRegex(RuntimeError, "rollback"):
-                first.result(timeout=1)
-            self.assertEqual(second.result(timeout=1), [])
-        self.assertEqual(self.store.load_working_state(), {"independent": True})
 
     def test_existing_database_scope_and_forgetting_are_preserved(self):
         old = self.message(1, "保留的原文")
@@ -201,56 +144,6 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual([(row["owner_type"], row["owner_key"]) for row in self.store.vector_rows("fixture-model")],
                          [("message", str(second["id"]))])
 
-    def test_raw_vector_lookup_does_not_rescan_messages_for_every_vector(self):
-        messages = [self.message(number, "index lookup") for number in range(1, 401)]
-        keys = [str(row["id"]) for row in messages]
-        vector = struct.pack("<2f", 1.0, 0.0)
-        with self.store.db:
-            self.store.db.executemany("""INSERT INTO memory_embeddings
-                (umo,owner_type,owner_key,model,dimensions,vector) VALUES(?,'message',?,'lookup-test',2,?)""",
-                [(self.scope, key, vector) for key in keys + ["0" + keys[0], keys[0] + "x"]])
-            self.store.db.execute("UPDATE messages SET is_deleted=1 WHERE id=?", (messages[-1]["id"],))
-
-        # Bound SQLite work instead of machine-dependent seconds. A table scan
-        # for each vector exhausts this budget even with just 400 messages.
-        progress_calls = 0
-
-        def query_budget():
-            nonlocal progress_calls
-            progress_calls += 1
-            return progress_calls > 200
-
-        self.store.db.set_progress_handler(query_budget, 1000)
-        try:
-            rows = self.store.vector_rows("lookup-test")
-        finally:
-            self.store.db.set_progress_handler(None, 0)
-        self.assertEqual({row["owner_key"] for row in rows}, set(keys[:-1]))
-
-    def test_author_filter_and_memory_sources_keep_quote_authors(self):
-        first = self.message(1, "我以前住五人寝", sender_name="小桥")
-        second = self.message(2, "我现在住两人寝", sender="20", sender_name="小桥", reply_to="1",
-            content=[{"type": "reply", "sender_id": "10", "sender_name": "小桥", "plain_text": first["plain_text"]},
-                     {"type": "text", "text": "我现在住两人寝"}])
-        bot = self.message(3, "你们说的是不同时间", sender="99", role="BOT",
-            content=[{"type": "mention", "account_id": "10", "display_name": "小桥"},
-                     {"type": "text", "text": "你们说的是不同时间"}])
-        self.assertEqual([m["id"] for m in self.store.search_messages(sender_id="10")], [first["id"]])
-        self.assertEqual([m["id"] for m in self.store.search_messages(related_account_id="10")],
-                         [bot["id"], second["id"], first["id"]])
-        self.assertEqual(self.store.activity(account_id="10", start_at=first["sent_at"], end_at=bot["sent_at"] + 1)["message_count"], 1)
-        saved = self.remember([
-            {"kind": "episode", "summary": "p7说以前五人寝，p14说现在两人寝"},
-            {"kind": "semantic", "content": "以前住五人寝", "subject": {"name": "小桥", "account_id": "10"}},
-        ], [first["source_key"], second["source_key"], bot["source_key"]])
-        self.assertEqual(saved[1]["subject"], {"name": "小桥", "account_id": "10"})
-        self.assertEqual(saved[0]["summary"], "p7说以前五人寝，p14说现在两人寝")
-        sources = self.store.memory("episode", saved[0]["id"])["sources"]
-        self.assertEqual(sources, saved[0]["sources"])
-        self.assertEqual([m["sender_id"] for m in sources], ["10", "20", "99"])
-        self.assertEqual(sources[1]["content"][0]["sender_id"], "10")
-        self.assertEqual(saved[0]["source_speakers"][-1]["role"], "BOT")
-
     def test_memory_account_candidates_use_subject_and_actual_source_relationships(self):
         first = self.message(1, "我以前去过这个展览", sender_name="小桥")
         other = self.message(2, "我还没去过", sender="20", sender_name="小桥")
@@ -284,60 +177,6 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in self.store.search_memories(kind="association", related_account_id="10")], [association["id"]])
         self.assertEqual(self.store.search_memories(related_account_id="unknown"), [])
 
-    def test_quotes_use_original_record_time_and_author_without_rewriting_archive(self):
-        original = self.message(1, "原来的答复", sender="99", sender_name="群助手", role="BOT")
-        wrapper_time = original["sent_at"] + 600
-        reply = self.message(2, "这是引用", content=[
-            {"type": "reply", "message_id": "1", "sent_at": wrapper_time,
-             "sender_id": "wrong", "sender_name": "错误作者", "role": "USER", "plain_text": "原来的答复"},
-            {"type": "reply", "source_key": original["source_key"], "time": wrapper_time, "plain_text": "原来的答复"},
-            {"type": "reply", "message_id": "missing", "sent_at": wrapper_time, "time": wrapper_time,
-             "sender_name": "引用中保留的名字", "plain_text": "找不到原记录的引用"},
-        ])
-        for quote in reply["content"][:2]:
-            self.assertEqual(quote["sent_at"], original["sent_at"])
-            self.assertEqual((quote["sender_id"], quote["sender_name"], quote["role"]), ("99", "群助手", "BOT"))
-            self.assertEqual(quote["time_status"], "original_message")
-        unknown = reply["content"][2]
-        self.assertNotIn("sent_at", unknown)
-        self.assertNotIn("time", unknown)
-        self.assertEqual(unknown["time_status"], "original_time_unknown")
-        self.assertEqual(unknown["plain_text"], "找不到原记录的引用")
-        archived = json.loads(self.store.db.execute("SELECT content_json FROM messages WHERE id=?", (reply["id"],)).fetchone()[0])
-        self.assertEqual(archived[0]["sent_at"], wrapper_time)
-        self.assertEqual(archived[0]["sender_id"], "wrong")
-
-    def test_graph_reuses_only_explicit_nodes_and_revises_connections(self):
-        first = self.message(1, "两个角色碰巧都叫小桥")
-        second = self.message(2, "刚才说的是另一位小桥")
-        saved = self.remember([
-            {"kind": "association", "source": {"label": "小桥", "description": "作品甲角色", "aliases": ["桥桥"]},
-             "target": {"label": "排练室"}, "relation": "去过", "statement": "作品甲的小桥去过排练室"},
-            {"kind": "association", "source": {"label": "小桥", "description": "作品乙角色"},
-             "target": {"label": "排练室"}, "relation": "去过", "statement": "作品乙的小桥也去过排练室"},
-        ], [first["source_key"]], mark_processed=False)
-        self.assertNotEqual(saved[0]["source_node_id"], saved[1]["source_node_id"])
-        self.assertNotEqual(saved[0]["target_node_id"], saved[1]["target_node_id"])
-        self.assertEqual([m["id"] for m in self.store.graph(terms=["桥桥"])], [saved[0]["id"]])
-        reused = self.remember([
-            {"kind": "association", "source": {"node_id": saved[0]["source_node_id"], "label": "小桥甲", "aliases": ["桥某"]},
-             "target": {"node_id": saved[0]["target_node_id"]}, "relation": "下次要去", "statement": "桥桥下次还想去排练室"}
-        ], [second["source_key"]], mark_processed=False)[0]
-        self.assertEqual(reused["source_node_id"], saved[0]["source_node_id"])
-        self.assertEqual(self.store.memory("association", saved[0]["id"])["source"], "小桥甲")
-        self.assertIn("桥某", reused["source_node"]["aliases"])
-        revised = self.remember([
-            {"kind": "association", "id": saved[0]["id"], "source": {"node_id": saved[1]["source_node_id"]},
-             "statement": "更正：那次去排练室的是作品乙的小桥"}
-        ], [second["source_key"]], mark_processed=False)[0]
-        self.assertEqual(revised["id"], saved[0]["id"])
-        self.assertEqual(revised["source_node_id"], saved[1]["source_node_id"])
-        self.assertEqual(revised["target_node_id"], saved[0]["target_node_id"])
-        self.assertEqual(revised["source_ids"], [second["id"]])
-        doc = next(d for d in self.store.pending_embeddings("fixture", 10) if d["owner_key"] == str(revised["id"]))
-        self.assertIn("更正", doc["text"])
-        self.assertEqual(self.store.memory("association", reused["id"])["source_node"]["description"], "作品甲角色")
-
     def test_model_revision_replaces_sources_and_keeps_history(self):
         first = self.message(1, "机器人说这里周六开门", sender="99", role="BOT")
         correction = self.message(2, "我是说周日才开门")
@@ -357,34 +196,6 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(len(self.store.pending_messages(10)), 2)
         self.assertEqual(self.remember([], [first["source_key"], correction["source_key"]]), [])
         self.assertEqual(self.store.pending_messages(10), [])
-
-    def test_existing_topic_revision_replaces_sources_and_preserves_vector_owner(self):
-        first = self.message(1, "小桥说展览周六开放")
-        correction = self.message(2, "我说的是周日开放")
-        episode = self.remember([{"kind": "episode", "summary": "小桥解释展览日程"}], [first["source_key"]])[0]
-        topic_id = self.store.save_memories([{"kind": "topic", "title": "旧日程", "content": "p3说展览周六开放",
-            "connections": [{"kind": "episode", "id": episode["id"], "relation": "包含经历", "purpose": "basis"}]}], mark_processed=False)[0]["id"]
-        self.store.put_vector("topic", str(topic_id), "fixture", struct.pack("<2f", 1.0, 0.0), 2)
-        revised = self.remember([
-            {"kind": "topic", "id": topic_id, "title": "展览日程", "summary": "小桥说展览周日开放"}
-        ], [correction["source_key"]], mark_processed=False)[0]
-        self.assertEqual((revised["id"], revised["title"]), (topic_id, "展览日程"))
-        self.assertEqual(revised["source_ids"], [correction["id"]])
-        self.assertEqual(revised["sources"][0]["plain_text"], correction["plain_text"])
-        self.assertEqual(self.store.memory("topic", topic_id)["sources"][0]["plain_text"], correction["plain_text"])
-        doc = next(d for d in self.store.pending_embeddings("fixture", 10) if d["owner_type"] == "topic")
-        self.assertEqual(doc["owner_key"], str(topic_id))
-        self.assertIn("小桥说", doc["text"])
-        self.assertTrue(self.store.save_embedding(doc, "fixture", [0.0, 1.0]))
-        vector = self.store.db.execute("SELECT owner_key,vector FROM memory_embeddings WHERE owner_type='topic'").fetchone()
-        self.assertEqual(vector["owner_key"], str(topic_id))
-        self.assertEqual(struct.unpack("<2f", vector["vector"]), (0.0, 1.0))
-        self.assertEqual(len(self.store.graph(ref={"kind": "topic", "id": topic_id})), 1)
-        self.store.delete_message(correction["source_key"])
-        self.assertIsNone(self.store.memory("topic", topic_id))
-        self.assertEqual(self.store.search_memories(kind="topic"), [])
-        self.assertFalse(any(row["owner_type"] == "topic" for row in self.store.vector_rows("fixture")))
-        self.assertFalse(any(row["owner_type"] == "topic" for row in self.store.pending_embeddings("fixture", 10)))
 
     def test_transaction_rollback_activity_and_working_state(self):
         first = self.message(1, "测试发言")

@@ -9,6 +9,8 @@ import json
 import shlex
 import time
 
+from .prompt_view import directory_prefix
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mr_member_profiles (
@@ -25,9 +27,6 @@ CREATE TABLE IF NOT EXISTS mr_member_names (
  umo TEXT NOT NULL,account_id TEXT NOT NULL,name TEXT NOT NULL,source TEXT NOT NULL,
  PRIMARY KEY(umo,account_id,name,source));
 """
-
-PREFIX_GUIDE = """本群成员资料（按真实 UID 对应）：群名片、平台昵称和历史显示名来自平台；本人/管理员填写的称呼和说明标明来源。UID 标识发言账号，不表示这句话谈的经历都属于发言者。不同 UID 即使同名也分别列出，同 UID 的换名仍是同一账号。preferred_name 是明确选择的称呼；avoided_names 是明确不希望被叫的称呼，历史原话里的旧称呼不覆盖它。未指定称呼时，可用当前群名片、昵称或省略称呼，不把自行截取、拼接的缩名当作已确认昵称。description 是资料填写者的自述/说明，不是对其所有说法的事实认证。此名单只是活跃成员子集；缺席不表示不是群员，完整资料可按 UID/称呼查询。"""
-
 
 def encoded(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -221,7 +220,7 @@ class MemberProfiles:
                 rows = [self.prefix_row(person) for person in self.members(accounts)]
                 with self.db:
                     self.db.execute("UPDATE mr_member_pool SET members_json=? WHERE umo=?", (encoded(rows), self.umo))
-        prefix = PREFIX_GUIDE + "\n" + encoded(rows) if rows else ""
+        prefix = directory_prefix(rows, getattr(self.store, 'identity_links', {}))
         return {"day": day, "capacity": capacity, "account_ids": [r["uid"] for r in rows], "members": rows,
                 "prefix": prefix, "characters": len(prefix),
                 "notice": "仅限制固定前缀人数，完整资料持续保存。每日按近七天发言量选取、UID排序；当天名单与资料保持稳定，本人/管理员修改立即生效。缓存命中仍计费并占用模型上下文，未命中按普通输入计费。"}

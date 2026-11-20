@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,11 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from mr_memory.shared_embedding import SharedEmbedder
+from mr_memory.store import Store
 
 
 class SharedEmbeddingTests(unittest.IsolatedAsyncioTestCase):
     def temporary(self):
-        root = Path(__file__).resolve().parents[1] / '.dev'
+        root = Path(os.environ['ASTRBOT_ROOT'])
         root.mkdir(exist_ok=True)
         return tempfile.TemporaryDirectory(dir=root)
 
@@ -67,10 +69,14 @@ class SharedEmbeddingTests(unittest.IsolatedAsyncioTestCase):
                 await client.query('live')
             current = self.provider()
             import numpy as np
-            store = SimpleNamespace(vector_rows=Mock(return_value=[{'owner_type': 'episode', 'owner_key': '1',
-                                    'dimensions': 3, 'vector': np.array([1, 0, 0], dtype='<f4').tobytes()}]))
-            hits = await client.background_view().search(store, 'background search')
-            self.assertEqual(hits[0]['owner_key'], '1')
+            store = Store(Path(directory) / 'group.db', 'test:GroupMessage:42')
+            try:
+                for key, vector in [('first', [0, 1, 0]), ('second', [1, 0, 0])]:
+                    store.put_vector('cue', key, client.model_id, np.array(vector, dtype='<f4').tobytes(), 3)
+                hits = await client.background_view().search(store, 'background search', limit=1)
+                self.assertEqual([hit['owner_key'] for hit in hits], ['second'])
+            finally:
+                store.close()
             current.embed_query.assert_awaited_once_with('background search', client='mr', priority='background')
 
 

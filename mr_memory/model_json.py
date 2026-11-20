@@ -6,6 +6,7 @@ import re
 
 
 _CLOSING_TAGS = re.compile(r"(?:\s*</(?:[｜|]+DSML[｜|]+\s*)?(?:parameter|invoke|calls|tool_calls|function_calls|tool)>\s*)+")
+_JSON_STRINGS_OR_TRAILING_COMMAS = re.compile(r'"(?:\\.|[^"\\])*"|,\s*(?=[}\]])')
 
 
 def _unfence(text: str):
@@ -21,6 +22,20 @@ def _unfence(text: str):
 def decode_envelope(text: str):
     """Return (value, format note); ambiguous or incomplete values still fail."""
     value = _unfence(text)
+    try:
+        return _decode_envelope(value)
+    except json.JSONDecodeError:
+        # Keep quoted text intact. A comma before a closing delimiter carries
+        # no value, so removing it can recover an otherwise complete answer.
+        cleaned = _JSON_STRINGS_OR_TRAILING_COMMAS.sub(
+            lambda match: match[0] if match[0].startswith('"') else '', value)
+        if cleaned != value:
+            result, note = _decode_envelope(cleaned)
+            return result, "移除 JSON 尾逗号，字段和值未改动" + ("；" + note if note else "")
+        raise
+
+
+def _decode_envelope(value: str):
     decoder = json.JSONDecoder(strict=False)
     try:
         result, end = decoder.raw_decode(value)
@@ -38,6 +53,15 @@ def decode_envelope(text: str):
         tail = tail[3:].strip()
     if not tail:
         return result, ""
+    if isinstance(result, dict) and tail.startswith(','):
+        # Some providers close the outside object before its final fields.
+        # Both portions must be complete, with no competing value for a key.
+        try:
+            remaining = json.loads('{' + tail[1:].lstrip(), strict=False)
+        except json.JSONDecodeError:
+            remaining = None
+        if isinstance(remaining, dict) and not (result.keys() & remaining.keys()):
+            return {**result, **remaining}, "合并提前闭合外层对象后的完整字段；字段和值未改动"
     # DSML wrappers sometimes leak through the API's tool/text conversion.
     # Accept closing wrappers only; never ignore a second object or prose.
     if tail == "}" or _CLOSING_TAGS.fullmatch(tail) or tail in {"</tool", "</tool>"}:

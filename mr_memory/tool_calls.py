@@ -16,22 +16,39 @@ def field(value, name, default=None):
 def memory_text_arguments(text: str) -> dict | None:
     """Read one complete native DSML remember envelope returned as final text."""
     tag = r"[｜|]+DSML[｜|]+\s*"
-    root = re.fullmatch(rf"<{tag}(calls|tool_calls|function_calls)>\s*(.*?)\s*</{tag}\1>", text.strip(), re.S)
-    if not root:
-        return None
-    call = re.fullmatch(rf'<{tag}invoke\s+name="remember">\s*(.*?)\s*</{tag}invoke>', root[2], re.S)
-    if not call:
-        raise ValueError("Final DSML must contain one complete remember call")
+    text = text.strip()
+    root = re.fullmatch(rf"<{tag}(calls|tool_calls|function_calls)>\s*(.*?)\s*</{tag}\1>", text, re.S)
+    arguments = {}
+    if root:
+        call = re.fullmatch(rf'<{tag}invoke\s+name="remember">\s*(.*?)\s*</{tag}invoke>', root[2], re.S)
+        if not call:
+            raise ValueError("Final DSML must contain one complete remember call")
+        body = call[1]
+    else:
+        # A final bare array already means items in this protocol. Some native
+        # responses strip its opening tags but retain the following complete
+        # named parameters. Read those values without generating missing text.
+        if not text.startswith('['):
+            return None
+        try:
+            items, end = json.JSONDecoder(strict=False).raw_decode(text)
+        except json.JSONDecodeError:
+            return None
+        tail = re.fullmatch(rf'\s*</{tag}parameter>\s*(.*?)\s*</{tag}invoke>\s*</{tag}(?:calls|tool_calls|function_calls)>',
+                            text[end:], re.S)
+        if not tail:
+            return None
+        arguments['items'], body = items, tail[1]
     parameter = re.compile(rf'\s*<{tag}parameter\s+name="([^"]+)"\s+string="(true|false)">(.*?)</{tag}parameter>', re.S)
-    arguments, position = {}, 0
-    while call[1][position:].strip():
-        match = parameter.match(call[1], position)
+    position = 0
+    while body[position:].strip():
+        match = parameter.match(body, position)
         if not match or match[1] in arguments:
             raise ValueError("Incomplete or repeated DSML remember parameter")
         arguments[match[1]] = match[3] if match[2] == "true" else json.loads(match[3])
         position = match.end()
-    if not arguments or set(arguments) - {"items", "progress", "retry", "finish", "recollection"}:
-        raise ValueError("DSML remember accepts items, progress, retry, finish and recollection")
+    if not arguments or set(arguments) - {"items", "connections", "progress", "retry", "finish", "recollection"}:
+        raise ValueError("DSML remember accepts items, connections, progress, retry, finish and recollection")
     return arguments
 
 
@@ -83,6 +100,9 @@ def response_calls(response) -> list[ToolCall]:
             parsed, format_note = (decode_background(wire) if name == "complete" else decode_envelope(wire))
             if not isinstance(parsed, dict):
                 raise ValueError("Tool arguments must be a JSON object")
+            if set(parsed) == {'arguments'} and isinstance(parsed['arguments'], dict):
+                parsed = parsed['arguments']
+                format_note = (format_note + ' 已读取 arguments 外层中的完整工具参数').strip()
         except (ValueError, TypeError) as exc:
             parsed = None
             error = f"工具参数未执行：{exc}。上一条调用保留了完整原始参数；请修正 JSON 后重发此调用，已成功的其他调用不用重做。"

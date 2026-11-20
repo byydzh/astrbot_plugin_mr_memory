@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -103,33 +104,39 @@ class Embedder:
     @staticmethod
     def _search_rows(rows, vector: list[float], limit: int) -> list[dict]:
         query = np.asarray(vector, dtype=np.float32)
-        matrix = np.empty((len(rows), query.size), dtype=np.float32)
-        for index, row in enumerate(rows):
-            if int(row["dimensions"]) != query.size or len(row["vector"]) != query.size * 4:
-                raise ValueError("stored embedding dimensions or byte length differ from the query")
-            matrix[index] = np.frombuffer(row["vector"], dtype="<f4")
-        norms = np.linalg.norm(matrix, axis=1)
-        if not np.isfinite(matrix).all() or not np.isfinite(norms).all() or np.any(norms <= 0):
-            raise ValueError("stored embedding contains an invalid vector")
-        matrix /= norms[:, None]
-        scores = np.clip(matrix @ query, -1.0, 1.0)
-        selected = np.argsort(-scores, kind="stable")[:limit]
-        return [
-            {"owner_type": str(rows[index]["owner_type"]),
-             "owner_key": str(rows[index]["owner_key"]), "score": float(scores[index])}
-            for index in selected
-        ]
+        remaining = iter(rows)
+        selected, offset = [], 0
+        while batch := list(islice(remaining, 1024)):
+            matrix = np.empty((len(batch), query.size), dtype=np.float32)
+            for index, row in enumerate(batch):
+                if int(row["dimensions"]) != query.size or len(row["vector"]) != query.size * 4:
+                    raise ValueError("stored embedding dimensions or byte length differ from the query")
+                matrix[index] = np.frombuffer(row["vector"], dtype="<f4")
+            norms = np.linalg.norm(matrix, axis=1)
+            if not np.isfinite(matrix).all() or not np.isfinite(norms).all() or np.any(norms <= 0):
+                raise ValueError("stored embedding contains an invalid vector")
+            matrix /= norms[:, None]
+            scores = np.clip(matrix @ query, -1.0, 1.0)
+            for index in np.argsort(-scores, kind="stable")[:limit]:
+                row = batch[index]
+                selected.append((float(scores[index]), offset + int(index),
+                                 str(row["owner_type"]), str(row["owner_key"])))
+            # Stable ties keep the original database iteration order across blocks.
+            selected.sort(key=lambda row: (-row[0], row[1]))
+            del selected[limit:]
+            offset += len(batch)
+        return [{"owner_type": kind, "owner_key": key, "score": score}
+                for score, _, kind, key in selected]
 
     async def search(self, store, query: str, limit: int = 8) -> list[dict]:
         if limit < 1:
             return []
         # Read the actual index each time: additions/deletions are visible without
         # an invented cache fingerprint or a second index-version protocol.
-        rows = await asyncio.to_thread(store.vector_rows, self.model_id)
-        if not rows:
+        if not await store.read_async(store.vector_rows, self.model_id, limit=1):
             return []
         vector = await self.query(query)
-        return await asyncio.to_thread(self._search_rows, rows, vector, int(limit))
+        return await store.read_async(store.search_vectors, self.model_id, vector, int(limit))
 
     async def close(self) -> None:
         if self._closed:

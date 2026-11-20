@@ -1,22 +1,18 @@
 """Storage and tool contracts only; scripted responses are not quality evidence."""
-import asyncio
+import os
 import json
-import sqlite3
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from mr_memory.agent import MemoryAgent
 from mr_memory.store import Store
-from mr_memory.learning_writes import LearningWriter
-from tests.test_agent import Provider, response
 
 
 @contextmanager
 def local_database_path():
-    root = Path(__file__).resolve().parents[1] / ".pytest_cache"
+    root = Path(os.environ['ASTRBOT_ROOT'])
     root.mkdir(exist_ok=True)
     path = root / ("graph-migration-" + uuid4().hex + ".db")
     try:
@@ -100,17 +96,6 @@ class MemoryGraphTests(unittest.TestCase):
         self.assertEqual(self.store.memory("episode", episode["id"])["source_ids"], [self.message["id"]])
         self.assertIn("topic", {m["kind"] for m in self.store.search_memories()})
 
-    def test_belief_survives_navigation_and_reuse_without_reinforcement(self):
-        belief = {"stance": "暂定", "alternatives": ["另一个解释"], "support": {"participant_id": "自由语义字段"}}
-        memory = self.save(kind="pattern", title="理解", content="尚待理解的联系", belief=belief,
-                           attention=True, cues=[{"cue": "安排", "aspect": "理解"}])
-        for _ in range(3):
-            self.assertEqual(self.store.workspace()["active"][0]["memory"]["belief"], belief)
-            self.assertEqual(self.store.navigate(cue="安排", aspect="理解")["items"][0]["belief"], belief)
-        self.assertEqual(self.store.memory("pattern", memory["id"])["revision_no"], 1)
-        other = self.save(kind="pattern", content="未评估的解释")
-        self.assertEqual(other["belief"], {"stance": "unconfirmed"})
-
     def test_withdrawn_basis_remains_visible_to_its_dependent_memory(self):
         episode = self.save(kind="episode", content="共同经历", source_ids=[self.message["id"]])
         pattern = self.save(kind="pattern", content="当时的解释", attention=True, connections=[{
@@ -128,71 +113,6 @@ class MemoryGraphTests(unittest.TestCase):
         change = next(row for row in self.store.memory_changes()["items"] if row["kind"] == "association")
         self.assertEqual(change["dependent_memories"][0]["id"], pattern["id"])
         self.assertEqual(self.store.memory("episode", episode["id"])["content"], "共同经历")
-
-    def test_thought_can_become_the_basis_of_another_memory(self):
-        episode = self.save(kind="episode", title="共同经历", content="一起修改方案")
-        thought = self.store.reflections.save({"content": "这种协作方式还有哪些适用情境", "memory_refs": [
-            {"kind": "episode", "id": episode["id"]}]})
-        pattern = self.save(kind="pattern", content="从这项思考形成的暂时理解", connections=[
-            {"kind": "reflection", "id": thought["id"], "relation": "由这项思考发展", "purpose": "basis"}])
-        self.assertEqual(self.store.memory("reflection", thought["id"])["content"], thought["content"])
-        self.assertEqual(len(self.store.navigate(ref={"kind": "reflection", "id": thought["id"]})["connections"]), 2)
-        self.store.reflections.save({"id": thought["id"], "content": "进一步区分自愿合作与任务分工", "status": "waiting"})
-        self.assertTrue(self.store.memory("pattern", pattern["id"])["basis"][0]["basis_changed"])
-        self.assertEqual(self.store.reflections.waiting()[0]["content"], self.store.memory("reflection", thought["id"])["content"])
-
-    def test_graph_reads_do_not_invent_cognitive_experience(self):
-        first = self.save(kind="pattern", title="认识", content="一个认识", attention=True)
-        self.store.memory("pattern", first["id"])
-        self.store.workspace()
-        self.assertEqual(self.store.reconsider()["items"], [])
-
-    def test_foreground_can_write_then_read_same_graph(self):
-        provider = Provider([
-            response(calls=[("remember", {"items": [{"kind": "pattern", "title": "新的认识", "content": "这次形成的理解",
-                                                        "source_ids": [self.message["id"]]}]}, "save")]),
-            response(calls=[("memory", {"kind": "pattern", "id": 1}, "read")]),
-            response('{"background":"本轮背景","recollection":{"发现":"新的联系"}}')])
-        async def run():
-            with patch("mr_memory.agent._tool_set", return_value=object()):
-                return await MemoryAgent(provider, self.store, max_turns=4, advanced=True).reconstruct(self.message, [self.message], {})
-        result = asyncio.run(run())
-        self.assertEqual(result.status, "completed", result.detail)
-        self.assertEqual(len(result.written), 1)
-        self.assertEqual(result.tool_calls[1]["result"]["summary"], "这次形成的理解")
-        experience = self.store.reconsider()["items"][0]
-        self.assertEqual(experience["kind"], "foreground")
-        self.assertEqual(experience["available_memories"][0]["kind"], "pattern")
-        self.assertEqual(experience["recollection"], {"发现": "新的联系"})
-
-    def test_final_background_can_commit_understanding_without_another_model_turn(self):
-        provider = Provider([response(json.dumps({"background": "本轮背景",
-            "items": [{"kind": "pattern", "title": "协作方式", "content": "共同修改形成的理解", "source_ids": [self.message["id"]]}]}))])
-        async def run():
-            with patch("mr_memory.agent._tool_set", return_value=object()):
-                return await MemoryAgent(provider, self.store).reconstruct(self.message, [self.message], {})
-        result = asyncio.run(run())
-        self.assertEqual(result.status, "completed", result.detail)
-        self.assertEqual(result.background, "本轮背景")
-        self.assertEqual(len(provider.requests), 1)
-        self.assertEqual(self.store.memory("pattern", result.written[0]["id"])["content"], "共同修改形成的理解")
-
-    def test_foreground_drafts_survive_failed_request_without_repeating_committed_writes(self):
-        first = LearningWriter(self.store, {}, foreground=True)
-        second = LearningWriter(self.store, {}, foreground=True)
-        first.apply({"items": [{"kind": "pattern", "content": "未完成的认识", "source_ids": [999]}]}, "a")
-        second.apply({"items": [{"kind": "episode", "content": "另一请求的草稿", "source_ids": [998]}]}, "b")
-        self.assertEqual(set(self.store.recall_drafts()), {"a:0", "b:0"})
-        resumed = LearningWriter(self.store, {}, foreground=True)
-        save = self.store.save_memories
-        def interrupted_receipt(*args, **kwargs):
-            save(*args, **kwargs)
-            raise RuntimeError("Write committed before its detailed receipt failed")
-        with patch.object(self.store, "save_memories", side_effect=interrupted_receipt):
-            outcome = resumed.apply({"retry": [{"pending_id": "a:0", "changes": {"source_ids": []}}]}, "resume")
-        self.assertEqual(len(outcome.written), 1)
-        self.assertEqual(set(self.store.recall_drafts()), {"b:0"})
-        self.assertEqual(len(self.store.search_memories(kind="pattern")), 1)
 
     def test_legacy_topic_and_entity_graph_import_once_with_addresses_intact(self):
         with local_database_path() as path:

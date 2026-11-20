@@ -30,7 +30,7 @@ REFLECTION_TASK = """结合共同经历、自己的原回答与后续交流，�
 CONSOLIDATION_PROMPT = MEMORY_PROTOCOL + """
 learning_task记录本批material_ids、实际给到的offered_ids、参考用context_ids、已完成completed_ids、保存地址和checkpoint。输入可能为message_columns/message_rows/message_defaults表格，按表头阅读完整作者、时间、正文与引用。
 保持原有调用前缀并复用已有理解，必要时用interaction回看原运行或指定步骤。queue和resource_state说明所有批次共享的资源，不是本批必须消耗的目标。
-用remember.progress的completed_ids记录已经理解并处理的材料；checkpoint保存未完思路和继续入口。材料进度、记忆写入与仍待思考的问题各自保存；某项草稿失败不扣留已完成材料。
+已处理全部当前提供的材料时，用progress.complete_offered=true，由系统展开offered_ids；只完成部分时用completed_ids列出那部分。checkpoint保存未完思路和继续入口。材料进度、记忆写入与仍待思考的问题各自保存；某项草稿失败不扣留已完成材料。
 待修草稿在pending_items，用retry的pending_id补changes，或说明discard_reason放弃该草稿。保存回执里的地址可以直接引用，不重发成功写入。
 remember可以仅保存进度或recollection。finish=true表示本批完成且这轮思考已收束；还想利用回执继续连接或思考就继续。需要稍后继续的关注用reflect保存，不要求现在穷尽。
 若最后直接输出而非工具调用，使用完整JSON对象{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[],"recollection":{}}，只放未保存的内容。
@@ -38,17 +38,23 @@ remember可以仅保存进度或recollection。finish=true表示本批完成且�
 
 BASIC_CONSOLIDATION_PROMPT = """你为群聊机器人整理共同经历，建立以后能够主动检索、沿关联继续查阅的基础记忆图。
 根据本批交流保存有用的事件、群友自述、具体事物及它们的联系；已有对应记忆时查阅后补充或修订，避免把同一件事重复建成互不相通的摘要。记什么、怎样组织、需要沿哪些线索查阅，由你根据语义决定，不要求每条消息生成一项记忆。
-每项认识保留 source_ids 原文地址，cues 提供检索线索，connections 或 association 连接有关的事件、人物、事物和依据。新对象可以用 handle 相互引用；修订用查到的 kind/id 和 revision_no，保留纠正来历。基础记忆也可以表达不确定性、明确更正和直接的语义关系，不必为了建图猜测隐藏关系或发展抽象人格理论。
-UID 标明发言账号，不代表一句话里所有经历都属于作者。结合引用作者、谈论对象及前后文理解归属；成员目录提供平台身份和明确称呼，不把自己的简称写成群友公认外号。BOT 回答和 SYSTEM 生成稿、工具记录是交流的一部分，其中的猜测不是被群友确认的事实；generated/sent 也不是两份独立支持。图片路径不等于看过图片。
+新建一项写 kind（例如 episode 或 semantic）、source_ids（实际支撑这项认识的原话编号）、title、content。用原文区分谁说的、说的是谁、后来怎样纠正。需要区分猜测与确认时写 belief；cues、connections、representation 只补正文尚未表达的线索、联系或结构。修订用已读的 kind/id，本批新对象可用 handle 相连。
+搜索返回候选记忆的内容、版本、来源编号和关系地址。需要核对作者、原话或既有连接时，用 memory(kind,id) 打开对应的一项。群聊表中每行的 id 就是可引用的原文编号；同名不同账号在各自行内列出 UID，其他人的 UID 与角色见表内姓名对照。
+UID 标明发言账号。结合引用作者、谈论对象及前后文理解归属；成员目录记录平台身份与指定称呼。写“某人要求／自述”时回看该人的措辞。机器人在回答或工具参数中补写的细节归到机器人；区分用户的要求、实际执行和完成回执。generated/sent 是同一次输出。图片路径能说明有图，画面细节需要实际观察依据。
 本次工作以整理给定材料为目的，不启动独立反馈学习、持续关注或跨经历高级反思。原文中的明确纠正仍应体现在有关记忆中；模糊评价、反讽与身份推断保留语境和把握，不硬凑结论。
 learning_task 列出本批 material_ids、实际提供的 offered_ids、仅供参考的 context_ids、已完成 completed_ids 及保存地址。输入中的 message_columns/message_rows/message_defaults 是完整原文表格，按表头读取作者、时间、正文和引用。
-用 remember 保存 items 和 progress.completed_ids，或最后直接输出完整 JSON：{"items":[],"progress":{"completed_ids":[],"checkpoint":""},"retry":[]}。完成处理包括判断某些闲聊无需另存；无需穷尽所有关联才能完成本批。只保存未保存的内容，已保存回执地址可继续引用。finish=true 结束本批；尚未完成时 checkpoint 留下准确进度。
+用 remember 或最后完整 JSON 保存 items 和 progress。已处理全部当前提供的材料时，progress 写 {"complete_offered":true}，系统展开 offered_ids，省去逐个抄写和核数；只完成部分时用 completed_ids 列出那部分。完成处理包括判断某些闲聊无需另存；无需穷尽所有关联才能完成本批。只保存未保存的内容，已保存回执地址可继续引用。finish=true 结束本批；尚未完成时 checkpoint 留下准确进度。
 pending_items 是待修草稿，用 retry 的 pending_id 和 changes 补字段，或用 discard_reason 说明不再保存。草稿与材料进度分别保存。source_ref/memory_ref 指本次前文已给出的同版本字段，需要时可按地址重新打开。
 queue 与 resource_state 表示各批次共享的资源；理解并保存后即可结束，不必用满额度。
 """
 
 LEARNING_WRITE_FORMAT = """
+同轮可以发起多个互不依赖的读取，取得结果后再据新线索继续。每轮都重新携带本批材料，合并独立读取可以减少重复输入。
+message、context、speaker 的 columns/rows/defaults 均按表头读取完整记录。context_ref=true 复用此前相同 message_id 和 producer 的完整语境，角色、说话者和转发状态仍按那份记录理解。
+reply_to.message_id、target_message_id 和 source_id 是已解析的 MR 原文编号，可交给 context 的 message_id 继续查看。
+长工具结果的 result_preview 只展示开头，result_ref.message_id 指向完整记录；需要其细节时用 context(message_id,before=0,after=0) 读取。根据交流判断哪些外部材料值得进一步理解。
 工具调用与最后 JSON 使用相同的记忆结构。connections 每个元素是带目标地址的对象：已存目标用 {kind,id,relation,context}，本批新目标用 {handle,relation,context}；关系描述写在 context，不能只写一个描述字符串。地址来自实际读取的记忆，新目标由同次提交的对象声明 handle。
+新条目的非数字字符串 id 按临时 handle 理解，引用相同标签即可连接；数据库已有地址仍用整数 id。
 修复旧草稿使用 retry:[{pending_id,changes:{...记忆字段...}}]；changes 不包 item。相互连接的待修草稿可以在同次 retry 一起提交并用 handle 互相引用。旧草稿里的错误结构是待修内容，不是保存示例。saved_connections 列出已经持久保存的连接；是否保存以写入回执为准，checkpoint 只记录思路。
 """
 CONSOLIDATION_PROMPT += LEARNING_WRITE_FORMAT
@@ -91,7 +97,8 @@ TOOL_SCHEMAS = {
         "related_account_id": ACCOUNT_ID, "limit": INTEGER}),
     "memory": _schema("按已找到的kind和id打开记忆，附有关联原始发言；仍可用context继续展开前后文。", {
         "kind": TEXT,
-        "id": {"type": ["string", "integer"]}, "include_history": {"type": "boolean"}}, ("kind", "id")),
+        "id": {"type": ["string", "integer"]}, "include_history": {"type": "boolean"},
+        "include_sources": {"type": "boolean"}}, ("kind", "id")),
     "semantic_search": _schema("用语义相似度找不同措辞的记忆目录；请结合当前发言者和语境描述想找的经历。用memory打开候选及完整原文。", {
         "query": TEXT, "limit": INTEGER}, ("query",)),
     "context": _schema("按message_id或source_key展开连续原文，含机器人回复及已记录动作。message_id是MR内部原文id（记忆中的source_ids），不是平台消息号；平台消息须使用已返回的完整source_key，不自行拼接地址。两种编号选一个。", {
@@ -124,14 +131,18 @@ TOOL_SCHEMAS = {
 
 
 PROGRESS_SCHEMA = {"type": "object", "properties": {
-    "completed_ids": {"type": "array", "items": INTEGER}, "checkpoint": TEXT}, "additionalProperties": False}
+    "completed_ids": {"type": "array", "items": INTEGER},
+    "complete_offered": {"type": "boolean", "description": "已理解并处理本次提供的全部offered_ids时设为true，系统展开编号。只处理部分时填写completed_ids。"},
+    "checkpoint": TEXT}, "additionalProperties": False}
 
 
 REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，并可同步保存本批处理进度。source_ids是证据；progress.completed_ids是已完整处理的材料，两者不同。仅保存进度或结束时可省略items，默认空列表。返回已保存记录和可复用的图节点id。finish=true表示本批材料已处理完，且不需再读取回执继续反思；材料进度独立保存，单项待修草稿不会阻止本批结束。", {
     "items": {"type": "array", "items": {"type": "object", "properties": {
         "kind": TEXT,
-        "id": {"type": "integer", "description": "仅填写已读取的现有记忆地址。新建时省略id，用handle供同批其他对象引用；不要自行猜新编号。"}, "source_ids": {"type": "array", "items": INTEGER},
-        "revision_no": INTEGER, "handle": TEXT,
+        "id": {"type": "integer", "description": "仅填写已读取的现有记忆地址。新建时省略id，用handle供同批其他对象引用；不要自行猜新编号。"},
+        "source_ids": {"type": "array", "items": INTEGER,
+                       "description": "本项认识依据的原始消息编号，供以后核对作者、语境与原话；填写本项实际依据，不等同于本批已处理编号。"},
+        "handle": TEXT,
         "representation": {"type": "object", "description": "由你决定字段与层次的表示，随理解一起修订。"},
         "belief": BELIEF,
         "attention": {"type": ["object", "string", "boolean", "null"],
@@ -147,13 +158,13 @@ REMEMBER_SCHEMA = _schema("保存新记忆或用kind和id修订已有记忆，�
             "target": {"type": "object", "description": "目标地址也可嵌套在这里，与平铺的kind/id或handle等价。",
                        "properties": {"kind": TEXT, "id": INTEGER, "handle": TEXT}},
             "note": {**TEXT, "description": "连接语境，与context等价。"},
-            "belief": BELIEF, "reason": TEXT, "revision_no": INTEGER}, "required": ["relation"]}},
+            "belief": BELIEF, "reason": TEXT}, "required": ["relation"]}},
         "action": {"type": "string", "enum": ["revise", "withdraw"]},
         "started_at": INTEGER, "ended_at": INTEGER}, "required": ["kind"]}},
     "progress": PROGRESS_SCHEMA, "finish": {"type": "boolean"}, "retry": RETRY_SCHEMA,
     "recollection": {"description": "自己对这次理解过程的记录，内容与表示由你决定；可复用的认识用items保存。"}})
 REMEMBER_SCHEMA["description"] += " 每项分别保存；失败回执给出pending_id及原草稿，用retry:[{pending_id,changes:{source_ids:[...]}}]只补字段，不必重发已保存项。重新考虑后不保存某草稿可给discard_reason；其他草稿成功不会自动取消失败项。"
-WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connections引用；相互引用和自引用会连同对象一起保存，无须拆成多轮。修订用kind/id和revision_no，省略字段保留；withdraw撤回且保留历史。content写认识或关系语境，representation自定结构。connections从本项指向另一项，purpose=basis表示依据；connection_id可改已有边，新增不删除旧边。cues的cue/aspect说明自然线索及从它进入的方面。"
+WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connections引用；相互引用和自引用会连同对象一起保存，无须拆成多轮。修订用已读的kind/id，版本由系统管理，省略字段保留；withdraw撤回且保留历史。content写认识或关系语境，representation自定结构。connections从本项指向另一项，purpose=basis表示依据；connection_id可改已有边，新增不删除旧边。cues的cue/aspect说明自然线索及从它进入的方面。"
 REMEMBER_SCHEMA["description"] += WRITE_SEMANTICS
 
 RECALL_REMEMBER_SCHEMA = _schema("保存或修订自己的理解、表示、连接与注意，返回当前记忆地址。失败草稿可用retry修正。当前任务是为正在发生的交流提供背景，没有待完成的后台消息批次。", {
@@ -165,6 +176,10 @@ BASIC_REMEMBER_SCHEMA = deepcopy(REMEMBER_SCHEMA)
 BASIC_REMEMBER_SCHEMA["description"] = "保存本批的事件、语义记忆及有原文依据的关联，并记录处理进度。" + WRITE_SEMANTICS
 BASIC_REMEMBER_SCHEMA["parameters"]["properties"].pop("recollection")
 BASIC_REMEMBER_SCHEMA["parameters"]["properties"]["items"]["items"]["properties"].pop("attention")
+# New memories state their original evidence explicitly. Revisions may omit it
+# to preserve the existing sources, and derived memories can use an empty list.
+BASIC_REMEMBER_SCHEMA["parameters"]["properties"]["items"]["items"]["anyOf"] = [
+    {"required": ["id"]}, {"required": ["source_ids"]}]
 
 
 def tool_definitions(*, learning=False, basic=False):
@@ -172,6 +187,9 @@ def tool_definitions(*, learning=False, basic=False):
         names = ("search_messages", "search_memories", "memory", "semantic_search", "context", "member", "activity", "interaction", "graph", "navigate")
         definitions = {name: TOOL_SCHEMAS[name] for name in names}
         if learning:
+            definitions["memory"] = _schema("打开完整记忆条目及来源编号。核对发言原文可传 include_sources=true，或用 context 按编号单独读取。", {
+                **TOOL_SCHEMAS["memory"]["parameters"]["properties"],
+                "include_sources": {"type": "boolean", "default": False}}, ("kind", "id"))
             definitions["remember"] = BASIC_REMEMBER_SCHEMA
         else:
             definitions["main_context"] = TOOL_SCHEMAS["main_context"]

@@ -35,19 +35,72 @@ def selected_context(store, ref, before=None):
             row = None
         if row is None:
             return {**address, "status": "unavailable"}
-        keys = ("sender_id", "sender_name", "role", "sent_at", "plain_text", "content", "reply_to_message")
-        return {**address, **{key: text_view(row[key]) for key in keys if key in row},
-                "sent_at_local": datetime.fromtimestamp(row["sent_at"], timezone.utc).astimezone().isoformat(),
-                "meaning": "记录中的原始交流；话语内容及其含义仍需结合语境理解。"}
+        keys = ("sender_id", "sender_name", "role", "plain_text", "content", "reply_to_message")
+        result = {**address, **{key: text_view(row[key]) for key in keys if key in row},
+                  "sent_at_local": datetime.fromtimestamp(row["sent_at"], timezone.utc).astimezone().isoformat()}
+        body = result.get('plain_text')
+        if body and isinstance(result.get('content'), list):
+            result['content'] = [p for p in result['content'] if not (
+                isinstance(p, dict) and p.get('type') in ('text', 'plain') and p.get('text') == body)]
+            if not result['content']:
+                result.pop('content')
+        return result
     row = store.memory(kind, owner, include_sources=False)
     if row is None:
         return {**address, "status": "unavailable"}
-    keys = ("title", "revision_no", "content", "representation", "belief", "source_ids", "source_speakers", "source_contexts", "basis")
-    return {**address, **{key: text_view(row[key]) for key in keys if key in row},
-            "meaning": "记忆网络中当前的理解，包含模型形成的解释，并非另一份独立观察。"}
+    # Message IDs and revisions are retrieval bookkeeping, not reply context.
+    # The addressed memory and full provenance remain available in the store.
+    keys = ("title", "content", "representation", "belief", "source_speakers", "source_contexts", "basis")
+    return {**address, **{key: text_view(row[key]) for key in keys if key in row}}
 
 
-def format_background(value, store=None, before=None, *, references=None, belief=None):
+def source_packet(sources, known_people=()):
+    """Share author identities while retaining each source's participants/roles."""
+    known, canonical, owners = {}, {}, {}
+    for person in known_people:
+        uid = str(person['uid'])
+        names = {person.get('name'), person.get('call'), *person.get('names', []), *person.get('aliases', [])} - {None, ''}
+        for account in (uid, *person.get('ids', [])):
+            canonical[str(account)] = uid
+            known.setdefault(str(account), set()).update(names)
+        for name in names:
+            owners.setdefault(name, set()).add(uid)
+    for source in sources:
+        if source.get('kind') == 'message' and source.get('sender_name'):
+            uid = str(source['sender_id'])
+            owners.setdefault(source['sender_name'], set()).add(canonical.get(uid, uid))
+        for speaker in source.get('source_speakers', []):
+            uid = str(speaker['account_id'])
+            name = speaker.get('name_at_message')
+            if name:
+                owners.setdefault(name, set()).add(canonical.get(uid, uid))
+    people, records = {}, []
+    for source in sources:
+        record = dict(source)
+        speakers = record.pop("source_speakers", [])
+        authors = {}
+        for speaker in speakers:
+            uid = str(speaker["account_id"])
+            name = speaker.get("name_at_message")
+            if name and name not in known.get(uid, ()):
+                names = people.setdefault(uid, [])
+                if name not in names:
+                    names.append(name)
+            role = speaker.get("role", "USER")
+            authors.setdefault(role, [])
+            # Reuse a readable name only when the supplied directory resolves it
+            # to one account. Same-name users keep their explicit UID here.
+            author = (name if name and len(owners[name]) == 1 else
+                      {"uid": uid, "name": name} if name else {"uid": uid})
+            if author not in authors[role]:
+                authors[role].append(author)
+        if authors:
+            record["speakers"] = authors
+        records.append(record)
+    return {**({"people": people} if people else {}), "sources": records}
+
+
+def format_background(value, store=None, before=None, *, references=None, belief=None, known_people=()):
     if isinstance(value, str):
         text = value.strip()
         # Native output may serialize this optional structured value once more.
@@ -104,6 +157,7 @@ def format_background(value, store=None, before=None, *, references=None, belief
             if key not in selected:
                 selected[key] = selected_context(store, ref, before)
     if selected or unavailable:
-        parts.append("MR 选择同时带回的交流与记忆（相同来源只呈现一次）：\n"
-                     + json.dumps([*selected.values(), *unavailable], ensure_ascii=False, separators=(",", ":")))
+        packet = source_packet([*selected.values(), *unavailable], known_people)
+        parts.append("所选来源（message为原话，其余为记忆理解）：\n"
+                     + json.dumps(packet if packet.get("people") else packet["sources"], ensure_ascii=False, separators=(",", ":")))
     return "\n\n".join(parts)

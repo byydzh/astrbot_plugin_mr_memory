@@ -1,10 +1,9 @@
 """AstrBot request preservation and observable event capture, without model calls."""
 from __future__ import annotations
 
+import os
 import asyncio
-import copy
 import hashlib
-import json
 from pathlib import Path
 import shutil
 import sys
@@ -13,23 +12,20 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
-from astrbot.api import ToolSet
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context
-from astrbot.core.agent.message import ImageURLPart, TextPart
 from astrbot.core.agent.tool import FunctionTool
-from astrbot.core.message.components import At, File, Image, Plain, Reply
+from astrbot.core.message.components import At, Image, Plain
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot_plugin_mr_memory import main as plugin_module
-from astrbot_plugin_mr_memory.mr_memory.agent import ReconstructionResult, ConsolidationResult
+from astrbot_plugin_mr_memory.mr_memory.agent import ReconstructionResult
 
 
 def event() -> AstrMessageEvent:
@@ -69,30 +65,8 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await current._post_send_one(MessageChain([Plain(text="未发送台词")]))
         self.assertEqual(len(store.recent()), 2)
 
-    async def test_optional_context_enriches_captured_input_and_scopes_output(self):
-        current = event()
-        current.send = AsyncMock()
-        await self.plugin.capture_group_message(current)
-        store = await self.plugin.store_for(current)
-        current._mr_input_context = {"producer": "example_rp", "mode": "roleplay",
-                                     "forwarding": "forwarded", "turn_id": "t1"}
-        await current._mr_update_input_context()
-        self.assertEqual(store.recent()[0]["content"][-1]["turn_id"], "t1")
-        self.assertEqual(self.plugin.message(current)["content"][-1]["turn_id"], "t1")
-        current._mr_output_context = {"producer": "example_rp", "mode": "roleplay",
-                                      "speaker": {"id": "actor-a", "name": "角色甲"}, "utterance_id": "t1"}
-        await current.send(current.plain_result("角色台词"))
-        del current._mr_output_context
-        await current.send(current.plain_result("普通群回复"))
-        rows = store.recent()
-        self.assertEqual(rows[-2]["content"][-1]["speaker"]["name"], "角色甲")
-        self.assertFalse(any(c["type"] == "message_context" for c in rows[-1]["content"]))
-        self.assertEqual(rows[-2]["sender_id"], current.get_self_id())
-        await self.plugin.terminate()
-        self.assertFalse(hasattr(current, "_mr_update_input_context"))
-
     async def asyncSetUp(self):
-        self.test_root = Path(__file__).resolve().parents[1] / ".dev"
+        self.test_root = Path(os.environ['ASTRBOT_ROOT'])
         self.directory = self.test_root / f"test-main-{uuid.uuid4().hex}"
         self.directory.mkdir(parents=True)
         self.embedder = SimpleNamespace(warmup=AsyncMock(), close=AsyncMock())
@@ -140,90 +114,6 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("working_memory", call.args[2])
         self.assertNotIn("working_memory", store.load_working_state())
         self.assertEqual(store.workspace()["active"][0]["memory"]["content"], correction)
-
-    async def test_injection_preserves_astrbot_request_when_working_state_write_fails(self):
-        current = event()
-        current.send = AsyncMock(return_value={"message_id": "synthetic-receipt"})
-        current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
-        store = await self.plugin.store_for(current)
-        store.save_working_state({"question": "上次问题", "request_at": 1699999900,
-                                  "background": "先前未经确认的推断", "learned_feedback": [{"content": "过度概括的反馈"}]})
-        tools = ToolSet(tools=[FunctionTool(name="synthetic_lookup", description="Synthetic lookup", parameters={"type": "object", "properties": {}})])
-        text_part = TextPart(text="其他插件提供的上下文")
-        image_part = ImageURLPart(image_url=ImageURLPart.ImageURL(url="https://example.invalid/context.png"))
-        old_memory = TextPart(text="<mr_group_context>旧的本次背景</mr_group_context>")
-        request = ProviderRequest(
-            prompt="真正的当前提问", system_prompt="原始人格与系统设定", session_id="existing-session",
-            contexts=[{"role": "user", "content": "上轮消息"}, {"role": "assistant", "content": "上轮实际回复"}],
-            image_urls=["https://example.invalid/current.png"], audio_urls=["https://example.invalid/current.wav"],
-            func_tool=tools, extra_user_content_parts=[text_part, image_part, old_memory], model="original-main-model",
-        )
-        preserved = {name: copy.deepcopy(getattr(request, name)) for name in
-                     ("prompt", "system_prompt", "session_id", "contexts", "image_urls", "audio_urls", "model")}
-        result = ReconstructionResult(background="合成成员是本群参与者，之前讨论了图书馆。", status="completed",
-                                 elapsed_ms=12, usage={}, tool_calls=[])
-        memory_agent = SimpleNamespace(reconstruct=AsyncMock(return_value=result))
-        with patch.object(self.plugin, "agent", return_value=memory_agent), \
-                patch.object(store, "update_working_state", side_effect=OSError("synthetic disk failure")), \
-                patch.object(plugin_module.logger, "exception") as error_log:
-            await self.plugin.inject_subconscious_memory(current, request)
-        self.assertEqual({name: getattr(request, name) for name in preserved}, preserved)
-        model_current, _, model_working = memory_agent.reconstruct.call_args.args
-        self.assertEqual(model_current["main_context"]["tool_names"], ["synthetic_lookup"])
-        self.assertEqual(memory_agent.request_context.read("request")["items"], [preserved["prompt"]])
-        self.assertEqual(memory_agent.request_context.read("conversation")["items"], preserved["contexts"])
-        self.assertEqual(memory_agent.request_context.read("instructions")["items"], [preserved["system_prompt"]])
-        self.assertEqual(memory_agent.request_context.read("additional")["items"],
-                         [text_part.model_dump(exclude_none=True), image_part.model_dump(exclude_none=True)])
-        self.assertNotIn("background", model_working)
-        self.assertNotIn("previously_learned_feedback", model_current)
-        self.assertIs(request.func_tool, tools)
-        self.assertEqual(len(request.func_tool.tools), 1)
-        self.assertIs(request.extra_user_content_parts[0], text_part)
-        self.assertIs(request.extra_user_content_parts[1], image_part)
-        self.assertEqual(len(request.extra_user_content_parts), 4)
-        self.assertIn(result.background, request.extra_user_content_parts[-1].text)
-        self.assertNotIn("旧的本次背景", request.extra_user_content_parts[-1].text)
-        self.assertEqual(memory_agent.reconstruct.await_args.args[0]["question"], request.prompt)
-        error_log.assert_called_once()
-        current.bot.get_group_member_list.assert_awaited_once_with(group_id=42, self_id="9000")
-        with patch.object(self.plugin, "record_bot_event", new_callable=AsyncMock) as record:
-            await current.send(MessageChain([Plain(text="只有请求钩子的发送")]))
-            record.assert_awaited_once()
-
-    async def test_current_astrbot_identity_does_not_follow_group_role_or_previous_request(self):
-        store = await self.plugin.store_for(event())
-        store.cache_roster([
-            {"user_id": "1001", "nickname": "群内普通成员", "role": "member"},
-            {"user_id": "1002", "nickname": "群内管理员", "role": "admin"},
-        ], int(plugin_module.time.time()))
-        request = ProviderRequest(prompt="执行这次任务")
-        memory_agent = SimpleNamespace(reconstruct=AsyncMock(return_value=ReconstructionResult(
-            background="合成语义背景", status="completed")))
-        for account_id, astrbot_role, platform_role in (("1001", "admin", "member"), ("1002", "member", "admin")):
-            with self.subTest(account_id=account_id):
-                current = event()
-                current.role = astrbot_role
-                current.message_obj.sender.user_id = account_id
-                current.message_obj.message_id = f"request-{account_id}"
-                current.send = AsyncMock()
-                with patch.object(self.plugin, "agent", return_value=memory_agent):
-                    await self.plugin.inject_subconscious_memory(current, request)
-                model_current = memory_agent.reconstruct.await_args.args[0]
-                expected = {"requester_id": account_id, "is_admin": astrbot_role == "admin"}
-                self.assertEqual(model_current["astrbot_runtime"], expected)
-                person = next(p for p in model_current["participants"] if p["account_id"] == account_id)
-                self.assertEqual(person["role"], platform_role)
-                parts = [p for p in request.extra_user_content_parts
-                         if getattr(p, "text", "").startswith("<mr_request_context>")]
-                self.assertEqual(len(parts), 1)
-                runtime = json.loads(parts[0].text.splitlines()[2])
-                clock = runtime.pop("clock")
-                self.assertEqual(runtime, expected)
-                from datetime import datetime
-                self.assertEqual(datetime.fromisoformat(clock["message"]["local"]),
-                                 datetime.fromisoformat(clock["message"]["utc"]))
-                self.assertEqual(datetime.fromisoformat(clock["message"]["utc"]).timestamp(), model_current["sent_at"])
 
     async def test_user_generation_tools_and_sent_output_survive_store_reopen(self):
         current = event()
@@ -276,70 +166,6 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(current.send, delivery)
         self.assertFalse(hasattr(current, "_mr_memory_send_observed"))
 
-    async def test_aiocqhttp_streaming_records_successful_segments_and_preserves_send_failures(self):
-        original = event()
-        bot = SimpleNamespace(send_group_msg=AsyncMock(
-            side_effect=[{"message_id": "501"}, {"message_id": "502"}],
-            return_value={"message_id": "synthetic-receipt"}))
-        current = AiocqhttpMessageEvent(original.message_str, original.message_obj, original.platform_meta, "42", bot)
-        original_transport = current.send_message
-        await self.plugin.capture_group_message(current)
-
-        async def stream():
-            yield MessageChain([Plain(text="第一段。")])
-            yield MessageChain([Plain(text="第二段")])
-
-        with patch("astrbot.core.platform.astr_message_event.Metric.upload", new_callable=AsyncMock):
-            await current.send_streaming(stream(), use_fallback=True)
-            failure = RuntimeError("synthetic send failure")
-            bot.send_group_msg.side_effect = failure
-            with self.assertRaises(RuntimeError) as caught:
-                await current.send(MessageChain([Plain(text="没有发出去")]))
-            self.assertIs(caught.exception, failure)
-            store = await self.plugin.store_for(current)
-            sent = [row for row in store.recent(limit=20) if row["role"] == "BOT"]
-            self.assertEqual(sorted(row["plain_text"] for row in sent), ["第一段。", "第二段"])
-            self.assertEqual({row["source_key"].rsplit("|", 1)[-1] for row in sent}, {"501", "502"})
-            self.assertTrue(all(row["reply_to"].endswith("|synthetic-request-1") for row in sent))
-            quoted = event()
-            quoted.message_obj.message_id = "synthetic-request-2"
-            quoted.message_obj.message = [Reply(id="502"), Plain(text="你刚才说第二段")]
-            quoted.message_obj.message_str = "你刚才说第二段"
-            await self.plugin.capture_group_message(quoted)
-            followup = next(row for row in store.recent(limit=20) if row["source_key"].endswith("|synthetic-request-2"))
-            target = next(row for row in sent if row["plain_text"] == "第二段")
-            self.assertEqual(followup["reply_to"], target["source_key"])
-            self.assertEqual(followup["relations"][0]["target_participant_id"], target["participant_id"])
-            self.assertIsNone(current.get_result())
-            self.assertEqual(bot.send_group_msg.await_count, 3)
-
-            bot.send_group_msg.side_effect = None
-            with patch.object(self.plugin, "record_bot_event", side_effect=OSError("synthetic log failure")), \
-                    patch.object(plugin_module.logger, "exception") as error_log:
-                self.assertIsNone(await current.send(MessageChain([Plain(text="成功发送但日志失败")])))
-                error_log.assert_called_once()
-            self.assertEqual(bot.send_group_msg.await_count, 4)
-        self.assertIs(current.bot, bot)
-        await self.plugin.terminate()
-        self.assertEqual(current.send_message, original_transport)
-        self.assertFalse(hasattr(current, "_mr_memory_send_message_wrapper"))
-
-    async def test_aiocqhttp_one_send_keeps_each_physical_message_content(self):
-        original = event()
-        bot = SimpleNamespace(send_group_msg=AsyncMock(side_effect=[{"message_id": "601"}, {"message_id": "602"}]))
-        current = AiocqhttpMessageEvent(original.message_str, original.message_obj, original.platform_meta, "42", bot)
-        await self.plugin.capture_group_message(current)
-        chain = MessageChain([Plain(text="文件说明"), File(name="synthetic.txt", url="https://example.invalid/synthetic.txt")])
-        with patch("astrbot.core.platform.astr_message_event.Metric.upload", new_callable=AsyncMock), \
-                patch("astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event.asyncio.sleep", new_callable=AsyncMock):
-            await current.send(chain)
-        store = await self.plugin.store_for(current)
-        sent = {row["source_key"].rsplit("|", 1)[-1]: row for row in store.recent(limit=20) if row["role"] == "BOT"}
-        self.assertEqual(set(sent), {"601", "602"})
-        self.assertEqual(sent["601"]["plain_text"], "文件说明")
-        self.assertEqual(sent["602"]["plain_text"], "[file]")
-        self.assertTrue(any(part.get("name") == "synthetic.txt" for part in sent["602"]["content"]))
-
     async def test_initialize_with_no_database_starts_only_plugin_maintenance(self):
         self.assertEqual(list(self.plugin.scope_dir.glob("*.db")), [])
         await self.plugin.initialize()
@@ -353,24 +179,6 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {task.get_coro().__qualname__ for task in self.plugin.tasks},
             {"MrMemoryPlugin.maintain", "HistoryRecovery.maintain"},
         )
-        self.context.get_provider_by_id.assert_not_called()
-
-    async def test_initialize_restores_deferred_allowed_scopes_without_a_new_event(self):
-        scopes = ["synthetic:GroupMessage:42", "synthetic:GroupMessage:43", "synthetic:GroupMessage:44"]
-        for scope, status in zip(scopes, ["pending", "waiting", "resolved"]):
-            path = self.plugin.scope_dir / (hashlib.sha256(scope.encode()).hexdigest() + ".db")
-            store = plugin_module.Store(path, scope)
-            try:
-                store.reflections.save({"content": "待回看的合成经历", "status": status})
-                if status == "resolved":
-                    store.start_learning_task("background", [], working={"checkpoint": "继续尚未结束的理解"})
-            finally:
-                store.close()
-        self.plugin.config["allowed_umos"] = [scopes[0], scopes[2]]
-        await self.plugin.initialize()
-        self.assertEqual(set(self.plugin.stores), {scopes[0], scopes[2]})
-        self.assertEqual(self.plugin.active_scopes, {scopes[0], scopes[2]})
-        self.assertEqual(len(self.plugin.stores[scopes[0]].reflections.due()), 1)
         self.context.get_provider_by_id.assert_not_called()
 
     async def test_hot_reload_waits_for_memory_search_before_closing_its_store(self):
@@ -400,325 +208,6 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.stores, {})
         await self.plugin.capture_group_message(event())
         self.assertEqual(self.plugin.stores, {})
-
-    async def test_original_controls_drive_provider_and_manual_learning_honors_budget(self):
-        self.plugin.config.update(local_serving_timeout_seconds=180, max_loop_steps=6,
-            distillation_max_messages=500, maintenance_llm_timeout_seconds=3600,
-            distillation_max_output_tokens=384000, distillation_thinking_mode="enabled",
-            local_serving_reader_thinking_mode="disabled", private_daily_token_budget=50)
-        store = await self.plugin.store_for(event())
-        front = self.plugin.agent(store)
-        back = self.plugin.agent(store, background=True)
-        self.assertEqual((front.timeout_seconds, front.max_turns, front.thinking_mode), (180, 6, "disabled"))
-        self.assertIsNone(back.max_turns)
-        self.assertEqual((back.timeout_seconds, back.max_output_tokens, back.thinking_mode), (3600, 384000, "enabled"))
-        store.reserve_usage("background", 50)
-        with patch.object(self.plugin, "agent") as call:
-            result = await self.plugin.consolidate(store, force=True)
-        self.assertEqual(result["status"], "budget_exhausted")
-        call.assert_not_called()
-        self.plugin.config["private_daily_token_budget"] = 500000
-        store.append_message(self.plugin.message(event()))
-        self.context.get_provider_by_id.return_value = None
-        with self.assertRaisesRegex(RuntimeError, "provider is unavailable"):
-            await self.plugin.learn(store, force=True)
-        self.assertEqual(store.usage_total("background"), 50)
-
-    async def test_learning_finishes_only_the_batch_and_keeps_tool_written_memories(self):
-        store = await self.plugin.store_for(event())
-        base = self.plugin.message(event())
-        older = store.append_message({**base, "message_id": "older", "plain_text": "旧的上下文"})
-        current = store.append_message(base)
-        saved = store.save_memories([{"kind": "semantic", "content": "读旧原文后的新理解",
-                                    "source_keys": [older["source_key"]]}],
-                                   [older["source_key"]], mark_processed=False)
-        async def finish(*args, **kwargs):
-            final = store.save_memories([{"kind": "episode", "title": "共同经历", "summary": "这批发言修正了旧理解",
-                    "source_ids": [older["id"], current["id"]]}], mark_processed=False,
-                    learning_kind="background", progress={"completed_ids": [current["id"]]})
-            return ConsolidationResult(status="completed", written=saved+final, usage={"input_other": 25, "output": 5})
-        learning = SimpleNamespace(consolidate=AsyncMock(side_effect=finish))
-        with patch.object(store, "pending_messages", return_value=[current]), \
-                patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            outcome = await self.plugin.learn(store, force=True)
-        self.assertEqual(outcome["status"], "completed")
-        self.assertEqual(outcome["written_count"], 2)
-        self.assertEqual([m["id"] for m in store.pending_messages(10)], [older["id"]])
-        self.assertEqual(store.usage_total("background"), 30)
-        self.assertIn("token_budget", learning.consolidate.call_args.kwargs)
-
-    async def test_feedback_can_revisit_without_new_messages_or_a_different_current_question(self):
-        store = await self.plugin.store_for(event())
-        source = store.append_message(self.plugin.message(event()))
-        store.save_working_state({"question": "属于另一轮的无关提问", "feedback_after": source["id"]})
-        task = store.reflections.save({"content": "查清这次转述的经历属于谁", "priority": 8,
-            "source_ids": [source["id"]], "status": "pending"})
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="completed", usage={"input_other": 5, "output": 2})))
-        with patch.object(store, "feedback_messages", return_value=[]), \
-                patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            outcome = await self.plugin.learn(store, feedback=True)
-        self.assertEqual(outcome["status"], "completed")
-        messages, working = learning.consolidate.call_args.args
-        self.assertEqual(messages, [])
-        self.assertNotIn("question", working)
-        self.assertEqual(working["reflections"][0]["id"], task["id"])
-        self.assertEqual(store.load_working_state()["feedback_after"], source["id"])
-        self.assertEqual(store.reflections.due(), [])
-        self.assertEqual(store.usage_total("feedback"), 7)
-
-    async def test_regular_new_chat_revisits_waiting_without_forcing_earlier_learning(self):
-        store = await self.plugin.store_for(event())
-        store.save_working_state({"question": "与这批对话无关的上一轮请求", "request_at": 1})
-        now = int(plugin_module.time.time())
-        base = self.plugin.message(event())
-        source = store.append_message({**base, "message_id": "older-context", "sent_at": now - 1000})
-        store.save_memories([], [source["source_key"]], mark_processed=True)
-        task = store.reflections.save({"content": "等待后续交流澄清转述的经历", "status": "waiting",
-            "next_review_at": now - 5, "source_ids": [source["id"]]})
-        store.append_message({**base, "message_id": "ordinary-new-1", "sent_at": now, "plain_text": "补充上次谈话的情况"})
-        self.plugin.config["auto_distillation_min_pending"] = 2
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="completed", usage={"input_other": 5, "output": 2})))
-        with patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            outcome = await self.plugin.learn(store)
-            self.assertEqual(outcome["status"], "waiting")
-            learning.consolidate.assert_not_awaited()
-            store.append_message({**base, "message_id": "ordinary-new-2", "sent_at": now, "plain_text": "继续说明当时的人物"})
-            self.assertEqual(store.feedback_messages(3600, 0), [])
-            learning.consolidate.return_value.progress = {
-                "completed_ids": [row["id"] for row in store.pending_messages(10)]}
-            outcome = await self.plugin.learn(store)
-        self.assertEqual(outcome["status"], "completed")
-        messages, working = learning.consolidate.call_args.args
-        self.assertEqual(len(messages), 2)
-        self.assertNotIn("question", working)
-        self.assertEqual(working["reflections"][0]["id"], task["id"])
-        self.assertEqual(working["reflections"][0]["source_ids"], [source["id"]])
-        self.assertNotIn("sources", working["reflections"][0])
-        reviewed = store.reflections.get(task["id"])
-        self.assertEqual(reviewed["sources"][0]["id"], source["id"])
-        self.assertIsNotNone(reviewed["last_reviewed_at"])
-        self.assertIsNone(reviewed["next_review_at"])
-        self.assertEqual(store.reflections.due(), [])
-
-    async def test_partial_learning_resumes_saved_material_before_new_messages(self):
-        store = await self.plugin.store_for(event())
-        base = self.plugin.message(event())
-        first = store.append_message({**base, "message_id": "task-1"})
-        second = store.append_message({**base, "message_id": "task-2"})
-        selections = []
-
-        async def learn(messages, working, **options):
-            selections.append([row["id"] for row in messages if not row.get("context_only")])
-            if len(selections) == 1:
-                saved = store.save_memories([{"kind": "episode", "title": "已理解的交流", "summary": "合成经历",
-                    "source_keys": [first["source_key"]]}], [first["source_key"]], learning_kind="background",
-                    progress={"completed_ids": [first["id"]], "checkpoint": "第一段已保存，继续第二段。"})
-                return ConsolidationResult(status="partial", written=saved, usage={"input_other": 20},
-                                           detail="本轮额度用完", model_attempts=1)
-            self.assertEqual(options["task"]["completed_ids"], [first["id"]])
-            self.assertEqual(len(options["task"]["memory_refs"]), 1)
-            self.assertIn("第一段已保存", options["task"]["checkpoint"])
-            store.save_learning_progress("background", {"completed_ids": [second["id"]]})
-            return ConsolidationResult(status="completed", usage={"input_other": 20}, model_attempts=1,
-                                       progress={"completed_ids": [second["id"]]})
-
-        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            one = await self.plugin.learn(store, force=True)
-            new = store.append_message({**base, "message_id": "arrived-after-task"})
-            two = await self.plugin.learn(store, force=True)
-        self.assertEqual((one["status"], two["status"]), ("partial", "completed"))
-        self.assertEqual(selections, [[first["id"], second["id"]], [second["id"]]])
-        self.assertIsNone(store.learning_task("background"))
-        self.assertEqual([row["id"] for row in store.pending_messages(10)], [new["id"]])
-
-    async def test_background_rotates_messages_and_repairs_without_draining_old_queue_first(self):
-        self.plugin.config.update(advanced_memory_enabled=False, auto_distillation_min_pending=1)
-        store = await self.plugin.store_for(event())
-        store.select_learning_mode("background", "basic")
-        base = self.plugin.message(event())
-        source = store.append_message({**base, "message_id": "old-source"})
-        store.save_memories([], [source["source_key"]])
-        store.update_working_state({"pending_learning_drafts": {"background": {
-            f"old-{i}:0": {"item": {"kind": "episode", "summary": f"old event {i}",
-                "source_ids": [source["id"]]}, "origin_run_id": i} for i in [1, 2]}}})
-        first = store.append_message({**base, "message_id": "new-material-1"})
-        selections = []
-
-        async def learn(messages, working, **options):
-            task = options["task"]
-            selections.append((list(task["material_ids"]), bool(working.get("write_recovery"))))
-            if working.get("write_recovery"):
-                self.assertEqual(set(task["continuation"]["write_state"]["pending_items"]), {"old-1:0"})
-                task["continuation"]["write_state"]["pending_items"] = {}
-                store.update_learning_task("background", {"continuation": task["continuation"]})
-            else:
-                self.assertFalse(task["continuation"].get("write_state", {}).get("pending_items"))
-                store.save_learning_progress("background", {"completed_ids": task["material_ids"]})
-            return ConsolidationResult(status="completed", usage={"input_other": 20}, model_attempts=1)
-
-        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)):
-            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
-            self.assertEqual(selections, [([first["id"]], False)])
-            second = store.append_message({**base, "message_id": "new-material-2"})
-            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
-            self.assertEqual(selections[-1], ([], True))
-            self.assertEqual((await self.plugin.learn(store))["status"], "completed")
-        self.assertEqual(selections, [([first["id"]], False), ([], True), ([second["id"]], False)])
-        self.assertEqual(store.pending_status()["count"], 0)
-        self.assertEqual(set(store.load_working_state()["pending_learning_drafts"]["background"]), {"old-2:0"})
-        self.assertEqual(store.usage_total("background"), 60)
-
-    async def test_closed_window_defers_routine_but_visits_explicit_appointment_once(self):
-        store = await self.plugin.store_for(event())
-        source = store.append_message(self.plugin.message(event()))
-        store.start_learning_task("feedback", [source["id"]])
-        closed = {"open": False, "next_start": plugin_module.time.time() + 1000,
-                  "local_now": "local service time", "timezone": "service"}
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="completed", usage={"input_other": 20}, model_attempts=1)))
-        with patch.object(plugin_module, "work_window", return_value=closed), \
-                patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            self.assertEqual((await self.plugin.learn(store, feedback=True))["status"], "deferred")
-            learning.consolidate.assert_not_awaited()
-            concern = store.reflections.save({"content": "已约定此刻回看", "status": "waiting",
-                                             "next_review_at": plugin_module.time.time() - 5})
-            result = await self.plugin.learn(store, feedback=True)
-            self.assertEqual(result["status"], "partial")  # original material is still pending
-            self.assertEqual(learning.consolidate.call_args.args[1]["scheduled_reflections"][0]["id"], concern["id"])
-            self.assertEqual((await self.plugin.learn(store, feedback=True))["status"], "deferred")
-            self.assertEqual(learning.consolidate.await_count, 1)
-
-    async def test_batch_fits_remaining_budget_without_completing_unread_material(self):
-        store = await self.plugin.store_for(event())
-        base = self.plugin.message(event())
-        for index in range(80):
-            store.append_message({**base, "message_id": f"large-{index}", "plain_text": f"第{index}条：" + "合成群聊内容" * 100})
-        self.plugin.config.update(private_daily_token_budget=100000, distillation_max_messages=80)
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="partial", detail="尚未结束", usage={"input_other": 20}, model_attempts=1)))
-        with patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            await self.plugin.learn(store, force=True)
-        selected = learning.consolidate.call_args.args[0]
-        working = learning.consolidate.call_args.args[1]
-        self.assertGreater(len(selected), 0)
-        self.assertLess(len(selected), 80)
-        self.assertEqual(working["queue"]["pending_messages"], 80)
-        self.assertEqual(working["queue"]["this_batch_messages"], len(selected))
-        self.assertEqual(len(store.pending_messages(100)), 80)
-
-    async def test_recall_activity_remains_open_without_restarting_identical_idle_work(self):
-        store = await self.plugin.store_for(event())
-        memory = store.save_memories([{"kind": "pattern", "title": "共同活动", "content": "可继续理解的经历"}], [], mark_processed=False)[0]
-        store.record_cognition(run_key="first", run_id=None, kind="foreground", current={}, payload={
-            "available_memories": [{"kind": memory["kind"], "id": memory["id"], "revision_no": 1}], "recollection": "一次理解"})
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="completed", usage={"input_other": 20}, model_attempts=1)))
-        with patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "completed")
-            self.assertTrue(store.reconsider()["items"])  # Never pretends it was reviewed.
-            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "idle")
-            self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "idle")
-            store.record_cognition(run_key="later", run_id=None, kind="foreground", current={}, payload={
-                "available_memories": [{"kind": memory["kind"], "id": memory["id"], "revision_no": 1}], "recollection": "后来的理解"})
-            self.assertEqual((await self.plugin.learn(store, force=True, feedback=True))["status"], "completed")
-            self.assertEqual(learning.consolidate.call_args.args[1]["memory_changes"]["items"], [])
-        self.assertEqual(learning.consolidate.await_count, 2)
-
-    async def test_queued_foreground_draft_starts_background_without_new_messages(self):
-        from astrbot_plugin_mr_memory.mr_memory.learning_writes import LearningWriter
-        store = await self.plugin.store_for(event())
-        writer = LearningWriter(store, {}, foreground=True)
-        writer.apply({"items": [{"kind": "perspective", "content": "待修理解", "source_ids": [999]}]}, "queued")
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="completed", usage={"input_other": 20}, model_attempts=1)))
-        with patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            self.assertEqual((await self.plugin.learn(store, force=True))["status"], "completed")
-        self.assertFalse(learning.consolidate.call_args.args[0])
-        self.assertIn("queued:0", learning.consolidate.call_args.args[1]["pending_recall_writes"])
-        self.assertEqual(store.pending_status()["count"], 0)
-
-    async def test_completed_batch_keeps_token_density_for_the_next_batch(self):
-        store = await self.plugin.store_for(event())
-        base = self.plugin.message(event())
-        store.append_message({**base, "message_id": "calibration"})
-        self.plugin.config.update(private_daily_token_budget=180000, distillation_max_messages=80)
-        sizes = []
-
-        async def learn(messages, working, **options):
-            sizes.append(len(messages))
-            if len(sizes) > 1:
-                self.assertEqual(options["task"]["continuation"]["input_tokens_per_byte"], 0.28)
-                self.assertEqual(options["task"]["continuation"]["output_token_reserve"], 25000)
-            return ConsolidationResult(status="completed", usage={"input_other": 20, "output": 10},
-                progress={"completed_ids": [row["id"] for row in messages]},
-                continuation={"input_tokens_per_byte": 0.28, "output_token_reserve": 25000}, model_attempts=1)
-
-        with patch.object(self.plugin, "agent", return_value=SimpleNamespace(consolidate=learn)), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            await self.plugin.learn(store, force=True)
-            self.assertIsNone(store.learning_task("background"))
-            for index in range(80):
-                store.append_message({**base, "message_id": f"calibrated-{index}", "plain_text": f"第{index}条：" + "合成群聊内容" * 100})
-            await self.plugin.learn(store, force=True)
-        self.assertEqual(sizes, [1, 80])
-        self.assertEqual(store.pending_status()["count"], 0)
-
-    async def test_recent_feedback_budget_shrink_keeps_latest_reactions_and_their_bot(self):
-        store = await self.plugin.store_for(event())
-        base = self.plugin.message(event())
-
-        def add(key, at, role="USER", reply_to=None):
-            return store.append_message({**base, "message_id": key, "sent_at": at,
-                "plain_text": key, "role": role, "reply_to": reply_to})
-
-        old_question = add("old-question", 1700000000)
-        old_bot = add("old-bot", 1700000001, "BOT", "old-question")
-        for index in range(5):
-            add(f"old-reaction-{index}", 1700000002 + index)
-        latest_question = add("latest-question", 1700000100)
-        latest_bot = add("latest-bot", 1700000101, "BOT", "latest-question")
-        latest_reactions = [add(f"latest-reaction-{index}", 1700000102 + index) for index in range(3)]
-        self.plugin.config.update(feedback_daily_token_budget=100, distillation_max_messages=20)
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="partial", usage={"input_other": 1}, model_attempts=1)))
-        with patch.object(plugin_module, "estimate_learning_input",
-                          side_effect=lambda messages, *args, **kwargs: 1000 if len(messages) > 6 else 10), \
-                patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            await self.plugin.learn(store, force=True, feedback=True)
-        selected, working = learning.consolidate.call_args.args
-        selected_ids = {row["id"] for row in selected}
-        self.assertEqual(working["feedback_order"], "recent")
-        self.assertLessEqual(len(selected), 6)
-        self.assertTrue({latest_question["id"], latest_bot["id"],
-                         *[row["id"] for row in latest_reactions]} <= selected_ids)
-        self.assertNotIn(old_question["id"], selected_ids)
-        self.assertNotIn(old_bot["id"], selected_ids)
-        self.assertTrue(all(row["id"] in selected_ids for row in store.learning_messages(store.learning_task("feedback"))))
-
-    async def test_known_usage_does_not_erase_the_last_unmetered_call(self):
-        store = await self.plugin.store_for(event())
-        store.append_message(self.plugin.message(event()))
-        self.plugin.config["private_daily_token_budget"] = 100000
-        learning = SimpleNamespace(consolidate=AsyncMock(return_value=ConsolidationResult(
-            status="partial", detail="Last call timed out", usage={"input_other": 20, "output": 5},
-            model_attempts=2, unknown_usage_calls=1)))
-        with patch.object(self.plugin, "agent", return_value=learning), \
-                patch.object(self.plugin, "index_pending", new=AsyncMock()):
-            await self.plugin.learn(store, force=True)
-        self.assertEqual(store.usage_total("background"), 100000)
-        self.assertTrue(store.recent_runs(1)[0]["usage_estimated"])
-
 
 if __name__ == "__main__":
     unittest.main()

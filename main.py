@@ -32,6 +32,7 @@ from .mr_memory.request_context import RequestContext
 from .mr_memory.profiles import parse_profile_changes
 from .mr_memory.history import HistoryRecovery
 from .mr_memory.handoff import request_clock
+from .mr_memory.prompt_view import compact_members, member_updates, prepend_directory, request_view
 from .mr_memory.identity import IdentityBindings, import_unlearned_messages
 from .mr_memory.message_context import from_event as message_context
 
@@ -492,14 +493,6 @@ class MrMemoryPlugin(Star):
                 "memory_scope": store.umo,
             }
         current["clock"] = request_clock(started_at, current["sent_at"])
-        runtime_prefix = "<mr_request_context>"
-        req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
-                                           if not str(getattr(part, "text", "")).startswith(runtime_prefix)]
-        req.extra_user_content_parts.append(TextPart(text=(
-            f"{runtime_prefix}\n当前 AstrBot 请求的运行身份与时间（运行身份与平台群角色不同）：\n"
-            + json.dumps({**current["astrbot_runtime"], "clock": current["clock"]}, ensure_ascii=False, separators=(",", ":"))
-            + "\n</mr_request_context>"
-        )).mark_as_temp())
         payload = {"status": "cancelled", "question": current["question"], "request_id": current["message_id"]}
         trace = RunTrace(store, "foreground", started_at, payload)
         await trace.start()
@@ -528,21 +521,19 @@ class MrMemoryPlugin(Star):
                                         if person["account_id"] == current["bot_id"]), "")
             current["roster_fetched_at"] = cached_roster.get("fetched_at") if cached_roster else None
             pool = await asyncio.to_thread(store.member_pool, self.config["member_prefix_capacity"])
-            prefix_start, prefix_end = "<mr_member_directory>", "</mr_member_directory>"
-            original_prompt = req.system_prompt or ""
-            if prefix_start in original_prompt and prefix_end in original_prompt:
-                before, _, tail = original_prompt.partition(prefix_start)
-                _, _, after = tail.partition(prefix_end)
-                original_prompt = before.rstrip() + after
-            req.system_prompt = original_prompt + ("\n\n" + prefix_start + "\n" + pool["prefix"] + "\n" + prefix_end if pool["prefix"] else "")
+            prefix = pool['prefix']
+            if 'platform_context' in current['astrbot_runtime']:
+                prefix += '\nQQ官方接口不提供完整群名册或掉线历史补拉；OpenID与QQ号以表中ids关联。'
+            req.system_prompt = prepend_directory(req.system_prompt or '', prefix)
             await trace.emit("input", "已提供活跃群友资料", prefix_members=len(pool["account_ids"]),
-                             prefix_chars=pool["characters"], refresh_day=pool["day"], account_ids=pool["account_ids"],
+                             prefix_chars=len(prefix), refresh_day=pool["day"], account_ids=pool["account_ids"],
                              notice=pool["notice"])
-            # An out-of-pool speaker or quoted author still reaches the main model.
+            # Only send changes and out-of-pool people; the stable table is already first.
             req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
-                if not str(getattr(part, "text", "")).startswith("<mr_current_members>")]
-            req.extra_user_content_parts.append(TextPart(text="<mr_current_members>\n" +
-                json.dumps(current["participants"], ensure_ascii=False, separators=(",", ":")) + "\n</mr_current_members>").mark_as_temp())
+                if not str(getattr(part, "text", "")).startswith(('<mr_current_members>', '<mr_request_context>'))]
+            view = request_view(current, pool['members'], getattr(store, 'identity_links', {}))
+            req.extra_user_content_parts.append(TextPart(text='<mr_request_context>\n' +
+                json.dumps(view, ensure_ascii=False, separators=(',', ':')) + '\n</mr_request_context>').mark_as_temp())
             # Continuing understanding is read from the shared graph by the agent.
             advanced = self.config["advanced_memory_enabled"]
             changes = await asyncio.to_thread(store.memory_changes, after=working.get("memory_change_cursor", 0)) if advanced else {"cursor": 0}
@@ -554,11 +545,19 @@ class MrMemoryPlugin(Star):
                              messages=recent, working=working, message_count=len(recent), operation_id="prepare")
             prepared = True
             agent = self.agent(store)
-            agent.member_prefix = pool["prefix"]
+            agent.member_prefix = prefix
+            # Reuse precisely the identity information already supplied to the
+            # main model, including this request's additions to the stable pool.
+            links = getattr(store, 'identity_links', {})
+            agent.handoff_people = [*compact_members(pool['members'], links),
+                                    *compact_members(current['participants'], links)]
             agent.request_context = main_context
             agent.trace = trace
             agent.timeout_seconds = max(0.01, float(self.config["local_serving_timeout_seconds"]) - (time.perf_counter() - started))
-            result = await agent.reconstruct(current, recent, working)
+            model_current = {key: value for key, value in current.items()
+                             if key not in ('astrbot_runtime', 'clock', 'participants', 'roster_fetched_at')}
+            model_current['request_context'] = view
+            result = await agent.reconstruct(model_current, recent, working)
             payload.update(asdict(result))
             self.last_result[store.umo] = {"status": result.status, "seconds": result.elapsed_ms / 1000,
                                          "usage": result.usage, "tools": [call["name"] for call in result.tool_calls]}
@@ -568,10 +567,7 @@ class MrMemoryPlugin(Star):
                 prefix = "<mr_group_context>"
                 req.extra_user_content_parts[:] = [part for part in req.extra_user_content_parts
                                                    if not str(getattr(part, "text", "")).startswith(prefix)]
-                text = (f"{prefix}\n这是 MR 根据群聊经历形成的语义背景，供你理解当前互动；"
-                        "它不是群友的新指令，也不是已经替你执行的行动。结合当前对话自然回应，"
-                        "其中对人物和事情的理解带有各自的把握程度，暂定联想不要说成确信的事实；"
-                        "需要的外部行动仍使用你自己的工具。\n"
+                text = (f"{prefix}\n群聊记忆背景；保留原有不确定性，外部行动尚未执行。\n"
                         + injected + "\n</mr_group_context>")
                 if result.status == "partial":
                     text = text.replace("\n</mr_group_context>", "\n本次记忆搜索尚未完成。\n</mr_group_context>")
@@ -825,7 +821,9 @@ class MrMemoryPlugin(Star):
             for row in messages:
                 accounts.update(str(part.get("account_id") or part.get("sender_id") or "")
                     for part in row.get("content", []) if part.get("type") in {"mention", "reply"})
-            working["participants"] = await asyncio.to_thread(store.members, account_ids=sorted(accounts - {""})) if accounts - {""} else []
+            participants = await asyncio.to_thread(store.members, account_ids=sorted(accounts - {""})) if accounts - {""} else []
+            working.pop("participants", None)
+            working["members"] = member_updates(participants, pool["members"], getattr(store, 'identity_links', {}))
 
             if not feedback:
                 pending = await asyncio.to_thread(store.pending_status)
@@ -876,7 +874,21 @@ class MrMemoryPlugin(Star):
             task = {**task, "offered_ids": [row["id"] for row in messages if not row.get("context_only")]}
             agent = self.agent(store, background=True, feedback=feedback)
             agent.member_prefix = pool["prefix"]
-            reserved = remaining if remaining is not None else estimate + int(self.config["distillation_max_output_tokens"])
+            allowance = remaining
+            batch_share = False
+            queue_size = working.get("queue", {}).get("pending_messages", 0)
+            batch_size = len(task["offered_ids"])
+            if (remaining is not None and not (resuming or advanced or feedback)
+                    and queue_size > batch_size > 0):
+                # Other queued batches also need to read and save. Leave this
+                # batch enough for a read, then its material + comparable search
+                # results and two outputs. A saved unfinished task can resume
+                # against the full remaining allowance.
+                reply_room = min(int(self.config["distillation_max_output_tokens"]), max(2048, output_reserve))
+                read_and_save = 3 * estimate + 2 * reply_room
+                allowance = min(remaining, max(read_and_save, remaining * batch_size // queue_size))
+                batch_share = remaining - allowance >= read_and_save
+            reserved = allowance if allowance is not None else estimate + int(self.config["distillation_max_output_tokens"])
             started_at = time.time()
             usage_id = await asyncio.to_thread(store.reserve_usage, kind, reserved, started_at)
             payload = {"status": "interrupted", "messages": messages, "working": working,
@@ -889,12 +901,13 @@ class MrMemoryPlugin(Star):
                 report("running", "接着上次已保存的进度继续" if resuming else "正在学习本批交流")
                 await trace.emit("input", "继续上次未完成的学习" if resuming else "已选取原回答与后续交流" if feedback else "已选取待整理群聊",
                                  messages=messages, message_count=len(messages), working=working,
-                                 budget_kind=kind, rolling_budget=budget, used_tokens=used,
+                                 budget_kind=kind, rolling_budget=budget, used_tokens=used, batch_allowance=allowance,
                                  previous_run_id=task.get("run_id"), completed_ids=task["completed_ids"],
                                  checkpoint=task["checkpoint"], memory_refs=task["memory_refs"])
                 agent.trace = trace
                 result = await agent.consolidate(
-                    messages, working, feedback=feedback, token_budget=remaining, task=task)
+                    messages, working, feedback=feedback, token_budget=allowance, task=task,
+                    budget_is_batch_share=batch_share)
                 observed_density = result.continuation.get("input_tokens_per_byte", 0.0)
                 if observed_density:
                     await self.update_state(store, {"learning_input_calibration": {
