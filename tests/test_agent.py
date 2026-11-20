@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mr_memory.agent import MemoryAgent, _model_view
+from mr_memory.agent import MemoryAgent, _model_view, estimate_learning_input
 
 
 def response(text="", calls=(), finish="stop"):
@@ -74,6 +74,14 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_eidolon_basic_recall_and_learning_budget_keywords(self):
+        provider = Provider([response("群友之前讨论了桌游。")])
+        agent = MemoryAgent(provider, Store(), advanced=False)
+        self.assertEqual(estimate_learning_input([], {}, basic=True), estimate_learning_input([], {}))
+        with patch("mr_memory.agent._tool_set", return_value=None):
+            result = await agent.reconstruct({"plain_text": "桌游", "sent_at": 300}, [], {})
+        self.assertEqual(result.status, "completed")
+
     def test_missing_query_reports_unknown_field_and_required_parameter_type(self):
         with self.assertRaises(ValueError) as failure:
             MemoryAgent._arguments("semantic_search", {"terms": ["星舟"]})

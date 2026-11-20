@@ -636,9 +636,9 @@ def _estimate_input_tokens(input_bytes: int, previous_tokens: int, previous_byte
     return round(input_bytes * tokens_per_byte) if tokens_per_byte else input_bytes
 
 
-def estimate_learning_input(messages: list, working: dict, *, task: dict | None = None,
+def estimate_learning_input(messages: list, working: dict, *, task: dict | None = None, basic: bool = True,
                             input_tokens_per_byte: float = 0.0, member_prefix: str = "") -> int:
-    """Budget the next input, preserving the observed cost of a resumable prefix."""
+    """Budget the basic learning path. Eidolon explicitly passes basic=True."""
     previous = _learning_input_state(task)
     if previous.get("format_repair_output"):
         repair = _learning_format_repair(previous["format_repair_output"], previous.get("conversation", []))
@@ -662,7 +662,8 @@ def estimate_learning_input(messages: list, working: dict, *, task: dict | None 
 
 class MemoryAgent:
     def __init__(self, provider, store, embedder=None, timeout_seconds=20,
-                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled"):
+                 max_turns=4, max_output_tokens=1200, thinking_mode="disabled", advanced=False):
+        # Eidolon selects the basic agent explicitly. Only that mode ships now.
         self.provider, self.store, self.embedder = provider, store, embedder
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.max_turns = None if max_turns is None else max(1, int(max_turns))
