@@ -74,6 +74,38 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_thinking_field_uses_the_selected_endpoint_and_model(self):
+        class WireProvider:
+            async def _prepare_chat_payload(self, **kwargs):
+                return {"model": self.model, "thinking": {"type": "enabled"}}, []
+
+            async def _query(self, payload, tools, **kwargs):
+                return payload, self.provider_config["custom_extra_body"], tools
+
+        provider = WireProvider()
+        tools = object()
+        for endpoint, model, omit in [
+            ("https://api.poe.com/v1", "gemini-4-hydrogen", True),
+            ("https://api.deepseek.com", "deepseek-v4-flash", False),
+            ("https://api.poe.com/v1", "another-bot", False),
+        ]:
+            provider.model = model
+            original = {"thinking": {"type": "enabled"}, "temperature": 0.3}
+            provider.provider_config = {"api_base": endpoint, "custom_extra_body": original.copy()}
+            for mode in ("disabled", "enabled"):
+                with self.subTest(endpoint=endpoint, model=model, mode=mode):
+                    agent = MemoryAgent(provider, Store(), thinking_mode=mode)
+                    payload, extra, sent_tools = await agent._generate([], "test", tools, tool_choice="auto")
+                    for fields in (payload, extra):
+                        if omit:
+                            self.assertNotIn("thinking", fields)
+                        else:
+                            self.assertEqual(fields["thinking"], {"type": mode})
+                    self.assertIs(sent_tools, tools)
+                    self.assertEqual(payload["tool_choice"], "auto")
+                    self.assertEqual(extra["temperature"], 0.3)
+                    self.assertEqual(provider.provider_config["custom_extra_body"], original)
+
     async def test_eidolon_basic_recall_and_learning_budget_keywords(self):
         provider = Provider([response("群友之前讨论了桌游。")])
         agent = MemoryAgent(provider, Store(), advanced=False)

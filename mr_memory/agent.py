@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from .content import text_view
 from .prompt_view import learning_address_view, learning_material_view, learning_search_view, memory_match_view, prepend_directory
@@ -728,13 +729,20 @@ class MemoryAgent:
             async def parse_mr_response(completion, tools):
                 return await parse_completion(parser, completion, tools)
             provider._parse_openai_completion = parse_mr_response
-        config = getattr(provider, "provider_config", {})
-        provider.provider_config = {**config, "custom_extra_body": {
-            **config.get("custom_extra_body", {}), "thinking": {"type": self.thinking_mode}}}
         payload, _ = await provider._prepare_chat_payload(
             prompt=None, contexts=messages, system_prompt=system_prompt)
-        payload.update(thinking={"type": self.thinking_mode},
-                       max_tokens=self.max_output_tokens if max_output_tokens is None else max_output_tokens)
+        config = getattr(provider, "provider_config", {})
+        extra_body = dict(config.get("custom_extra_body") or {})
+        endpoint = config.get("api_base") or getattr(getattr(provider, "client", None), "base_url", "")
+        model = str(payload.get("model", "")).rsplit("/", 1)[-1].lower()
+        if urlsplit(str(endpoint)).hostname == "api.poe.com" and model == "gemini-4-hydrogen":
+            # This Poe bot rejects the field even when its value is "disabled".
+            payload.pop("thinking", None)
+            extra_body.pop("thinking", None)
+        else:
+            extra_body["thinking"] = payload["thinking"] = {"type": self.thinking_mode}
+        provider.provider_config = {**config, "custom_extra_body": extra_body}
+        payload["max_tokens"] = self.max_output_tokens if max_output_tokens is None else max_output_tokens
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
         if response_format is not None:
