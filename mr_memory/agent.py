@@ -1,4 +1,4 @@
-"""Private DeepSeek memory work, using the configured AstrBot provider."""
+"""Group memory work using the configured AstrBot chat provider."""
 from __future__ import annotations
 
 import asyncio
@@ -16,8 +16,9 @@ from .prompt_view import learning_address_view, learning_material_view, learning
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
 from .handoff import format_background as _background_text
-from .memory_protocol import BASIC_CONSOLIDATION_PROMPT, BASIC_RECALL_PROMPT, TOOL_SCHEMAS, _tool_set, is_poe_hydrogen, tool_definitions
-from .tool_calls import response_calls, memory_text_arguments, parse_completion
+from .memory_protocol import BASIC_CONSOLIDATION_PROMPT, BASIC_RECALL_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions
+from .tool_calls import response_calls, memory_text_arguments
+from .provider_transport import assistant_history, finish_reason as _finish_reason, generate
 from .model_json import decode_background, decode_envelope
 
 
@@ -316,15 +317,6 @@ def _add_usage(target: dict[str, int], response: Any) -> None:
         value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             target[key] = target.get(key, 0) + value
-
-
-def _finish_reason(response: Any) -> str:
-    raw = getattr(response, "raw_completion", None)
-    choices = raw.get("choices", []) if isinstance(raw, dict) else getattr(raw, "choices", [])
-    if not choices:
-        return ""
-    choice = choices[0]
-    return str(choice.get("finish_reason", "") if isinstance(choice, dict) else getattr(choice, "finish_reason", ""))
 
 
 def _memory_output(text: str) -> dict:
@@ -719,32 +711,9 @@ class MemoryAgent:
 
     async def _generate(self, messages, system_prompt, tools=None, *, max_output_tokens=None, tool_choice=None,
                         response_format=None):
-        # AstrBot's public text_chat drops generation kwargs on this provider.
-        # Keep its client/parser while placing native options in the prepared payload.
-        # Keep the configured client/model; isolate per-call thinking options from
-        # other users of the same AstrBot provider instance.
-        provider = copy.copy(self.provider)
-        if parser := getattr(provider, "_parse_openai_completion", None):
-            async def parse_mr_response(completion, tools):
-                return await parse_completion(parser, completion, tools)
-            provider._parse_openai_completion = parse_mr_response
-        payload, _ = await provider._prepare_chat_payload(
-            prompt=None, contexts=messages, system_prompt=system_prompt)
-        config = getattr(provider, "provider_config", {})
-        extra_body = dict(config.get("custom_extra_body") or {})
-        if is_poe_hydrogen(provider, payload.get("model", "")):
-            # This Poe bot rejects the field even when its value is "disabled".
-            payload.pop("thinking", None)
-            extra_body.pop("thinking", None)
-        else:
-            extra_body["thinking"] = payload["thinking"] = {"type": self.thinking_mode}
-        provider.provider_config = {**config, "custom_extra_body": extra_body}
-        payload["max_tokens"] = self.max_output_tokens if max_output_tokens is None else max_output_tokens
-        if tool_choice is not None:
-            payload["tool_choice"] = tool_choice
-        if response_format is not None:
-            payload["response_format"] = response_format
-        return await provider._query(payload, tools, request_max_retries=1)
+        return await generate(self.provider, messages, system_prompt, tools,
+                              limit=self.max_output_tokens if max_output_tokens is None else max_output_tokens,
+                              thinking=self.thinking_mode, choice=tool_choice, json_output=response_format is not None)
 
     @staticmethod
     def _arguments(name, arguments):
@@ -856,6 +825,9 @@ class MemoryAgent:
                         tool_choice="none" if forced_finish else None)
                     _add_usage(result.usage, response)
                     native_calls = response_calls(response)
+                    if forced_finish and native_calls:
+                        result.status, result.detail = "partial", "提供商在收尾轮返回了工具调用，本轮未执行"
+                        break
                     names = [call.name for call in native_calls]
                     text = str(getattr(response, "completion_text", "") or "").strip()
                     if names and text:
@@ -889,10 +861,7 @@ class MemoryAgent:
                         if result.status == "partial":
                             result.detail = result.detail or "Model turn or output budget reached; background may be incomplete"
                         break
-                    tool_messages = [call.message() for call in native_calls]
-                    assistant = {"role": "assistant", "content": text or None, "tool_calls": tool_messages,
-                                 "reasoning_content": getattr(response, "reasoning_content", None) or ""}
-                    messages.append(assistant)
+                    messages.append(assistant_history(response, text or None, native_calls))
 
                     async def execute_one(call):
                         nonlocal completed_response
@@ -962,7 +931,7 @@ class MemoryAgent:
         finally:
             result.elapsed_ms = (time.monotonic() - started) * 1000
             # Debug evidence is private; hidden model reasoning is not persisted.
-            result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"} for message in messages]
+            result.messages = [{key: value for key, value in message.items() if key not in {"reasoning_content", "reasoning_signature", "native_thoughts"}} for message in messages]
             await self._emit("output", "本次记忆背景产出", "cancelled" if cancelled else result.status,
                              background=result.background, recollection=result.recollection,
                              detail=result.detail, usage=result.usage, elapsed_ms=result.elapsed_ms)
@@ -1182,12 +1151,11 @@ class MemoryAgent:
                     text = str(getattr(response, "completion_text", "") or "")
                     result.response_text = text
                     native_calls = response_calls(response)
+                    if force_json and native_calls:
+                        result.status, result.detail = "partial", "提供商在 JSON 收尾轮返回了工具调用，本轮未执行"
+                        break
                     if _finish_reason(response) == "length":
-                        interrupted = {"role": "assistant", "content": text,
-                                       "reasoning_content": getattr(response, "reasoning_content", None) or ""}
-                        if native_calls:
-                            interrupted["tool_calls"] = [call.message() for call in native_calls]
-                        conversation.append(interrupted)
+                        conversation.append(assistant_history(response, text, native_calls))
                         for call in native_calls:
                             conversation.append({"role": "tool", "tool_call_id": call.id, "content": _json({
                                 "status": "error", "detail": "输出达到上限，本条调用未执行。原参数保留在上一条调用，请修正或拆小后重新保存。"})})
@@ -1198,8 +1166,7 @@ class MemoryAgent:
                         result.status, result.detail = "partial", "Consolidation output reached its token limit"
                         break
                     if not native_calls:
-                        conversation.append({"role": "assistant", "content": text,
-                                             "reasoning_content": getattr(response, "reasoning_content", None) or ""})
+                        conversation.append(assistant_history(response, text))
                         try:
                             envelope = _memory_output(text)
                         except ValueError as exc:
@@ -1242,8 +1209,7 @@ class MemoryAgent:
                         else:
                             result.status, result.detail = "completed", ""
                         break
-                    conversation.append({"role": "assistant", "content": text or None, "tool_calls": [call.message() for call in native_calls],
-                        "reasoning_content": getattr(response, "reasoning_content", None) or ""})
+                    conversation.append(assistant_history(response, text or None, native_calls))
                     # Learning may read its own writes; execute in the model's order.
                     finish_requested = False
                     for call in native_calls:
@@ -1370,7 +1336,7 @@ class MemoryAgent:
                 await asyncio.to_thread(self.store.update_learning_task, learning_kind, {
                     "continuation": result.continuation, "run_id": getattr(self.trace, "id", None),
                     "updated_at": time.time()})
-            result.messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
+            result.messages = [{key: value for key, value in message.items() if key not in {"reasoning_content", "reasoning_signature", "native_thoughts"}}
                                for message in conversation]
             await self._emit("output", "本次学习产出", "cancelled" if cancelled else result.status,
                              pending_item_count=len(result.items), written_count=len(result.written), detail=result.detail,

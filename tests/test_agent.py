@@ -17,7 +17,7 @@ def response(text="", calls=(), finish="stop"):
 
 
 class Provider:
-    provider_config = {}
+    provider_config = {"api_base": "https://api.deepseek.com/v1"}
 
     def __init__(self, replies):
         self.replies, self.requests = list(replies), []
@@ -75,58 +75,40 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
-    def test_hydrogen_remember_preserves_both_native_write_shapes_and_accounts_for_them(self):
-        provider = SimpleNamespace(provider_config={"api_base": "https://api.poe.com/v1"},
-                                   get_model=lambda: "gemini-4-hydrogen")
-        original = tool_definitions(learning=True)
-        actual = tool_definitions(learning=True, provider=provider)
-        self.assertEqual(original.keys(), actual.keys())
-        for name in original.keys() - {"remember"}:
-            self.assertEqual(original[name], actual[name])
-        original_properties = original["remember"]["parameters"]["properties"]
-        properties = actual["remember"]["parameters"]["properties"]
-        for key in original_properties.keys() - {"items"}:
-            self.assertEqual(original_properties[key], properties[key])
-        item = original_properties["items"]["items"]
-        alternatives = properties["items"]["items"]["anyOf"]
-        self.assertEqual([branch["required"] for branch in alternatives], [["kind", "id"], ["kind", "source_ids"]])
-        for branch in alternatives:
-            self.assertEqual(branch["type"], "object")
-            self.assertEqual(branch["properties"], item["properties"])
-        self.assertEqual(item["anyOf"], [{"required": ["id"]}, {"required": ["source_ids"]}])
-        self.assertGreater(estimate_learning_input([], {}, provider=provider), estimate_learning_input([], {}))
+    def test_portable_remember_keeps_both_complete_object_shapes(self):
+        schema = tool_definitions(learning=True)["remember"]["parameters"]
+        branches = schema["properties"]["items"]["items"]["anyOf"]
+        self.assertEqual([b["required"] for b in branches], [["kind", "id"], ["kind", "source_ids"]])
+        self.assertEqual(branches[0]["properties"], branches[1]["properties"])
+        self.assertIn("representation", branches[0]["properties"])
 
-    async def test_thinking_field_uses_the_selected_endpoint_and_model(self):
+    async def test_chat_provider_preserves_private_settings_and_omits_unrequested_thinking(self):
         class WireProvider:
             async def _prepare_chat_payload(self, **kwargs):
-                return {"model": self.model, "thinking": {"type": "enabled"}}, []
+                return {"model": self.model}, []
 
             async def _query(self, payload, tools, **kwargs):
                 return payload, self.provider_config["custom_extra_body"], tools
 
-        provider = WireProvider()
-        tools = object()
-        for endpoint, model, omit in [
-            ("https://api.poe.com/v1", "gemini-4-hydrogen", True),
-            ("https://api.deepseek.com", "deepseek-v4-flash", False),
-            ("https://api.poe.com/v1", "another-bot", False),
+        for host, model, expected in [
+            ("api.deepseek.com", "d", {"type": "disabled"}),
+            ("api.poe.com", "gemini-4-hydrogen", None),
+            ("custom.example", "new-model", None),
         ]:
+            provider = WireProvider()
             provider.model = model
-            original = {"thinking": {"type": "enabled"}, "temperature": 0.3}
-            provider.provider_config = {"api_base": endpoint, "custom_extra_body": original.copy()}
-            for mode in ("disabled", "enabled"):
-                with self.subTest(endpoint=endpoint, model=model, mode=mode):
-                    agent = MemoryAgent(provider, Store(), thinking_mode=mode)
-                    payload, extra, sent_tools = await agent._generate([], "test", tools, tool_choice="auto")
-                    for fields in (payload, extra):
-                        if omit:
-                            self.assertNotIn("thinking", fields)
-                        else:
-                            self.assertEqual(fields["thinking"], {"type": mode})
-                    self.assertIs(sent_tools, tools)
-                    self.assertEqual(payload["tool_choice"], "auto")
-                    self.assertEqual(extra["temperature"], 0.3)
-                    self.assertEqual(provider.provider_config["custom_extra_body"], original)
+            original = {"temperature": 0.3}
+            if host == "api.poe.com":
+                original["thinking"] = {"type": "disabled"}
+            provider.provider_config = {"api_base": "https://" + host, "custom_extra_body": original.copy()}
+            with self.subTest(host=host):
+                tools = object()
+                payload, extra, sent = await MemoryAgent(provider, Store())._generate([], "test", tools)
+                self.assertEqual(payload.get("thinking"), expected)
+                self.assertEqual(extra.get("thinking"), expected)
+                self.assertIs(sent, tools)
+                self.assertEqual(extra["temperature"], 0.3)
+                self.assertEqual(provider.provider_config["custom_extra_body"], original)
 
     async def test_eidolon_basic_recall_and_learning_budget_keywords(self):
         provider = Provider([response("群友之前讨论了桌游。")])
@@ -179,10 +161,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         provider = Provider([response(calls=[
             ("search_messages", {"terms": ["星舟"]}, "a"),
             ("activity", {"account_id": "synthetic-7", "start_at": 0, "end_at": 900}, "b"),
-        ])])
+        ]), response(calls=[("activity", {}, "forbidden")])])
         with patch("mr_memory.agent._tool_set", return_value=object()):
-            result = await MemoryAgent(provider, Store(), max_turns=1).reconstruct({"sent_at": 300}, [], {})
+            result = await MemoryAgent(provider, Store(), max_turns=2).reconstruct({"sent_at": 300}, [], {})
         self.assertEqual(result.status, "partial")
+        self.assertIn("未执行", result.detail)
         self.assertEqual(len(result.tool_calls), 2)
         self.assertEqual(result.tool_calls[1]["result"]["message_count"], 237)
         self.assertEqual(result.background, "")

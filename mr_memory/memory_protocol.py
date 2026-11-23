@@ -1,7 +1,4 @@
 """Shared memory capabilities and purpose, independent of call scheduling."""
-from copy import deepcopy
-from urllib.parse import urlsplit
-
 from .learning_writes import RETRY_SCHEMA
 
 BASIC_RECALL_PROMPT = """你为 AstrBot 提供本群的记忆背景，帮助它接上真实群聊。当前模式只检索，不创建人物画像、学习反馈或发展新的长期连接。
@@ -124,33 +121,11 @@ WRITE_SEMANTICS = " 新建省略id，可用handle供同批source/target/connecti
 REMEMBER_SCHEMA["description"] = "保存本批的事件、语义记忆及有原文依据的关联，并记录处理进度。" + WRITE_SEMANTICS
 # New memories state their original evidence explicitly. Revisions may omit it
 # to preserve the existing sources, and derived memories can use an empty list.
-REMEMBER_SCHEMA["parameters"]["properties"]["items"]["items"]["anyOf"] = [
-    {"required": ["id"]}, {"required": ["source_ids"]}]
-
-
-def is_poe_hydrogen(provider, model=None):
-    config = getattr(provider, "provider_config", {})
-    endpoint = config.get("api_base") or getattr(getattr(provider, "client", None), "base_url", "")
-    if urlsplit(str(endpoint)).hostname != "api.poe.com":
-        return False
-    if model is None:
-        model = provider.get_model()
-    return str(model).rsplit("/", 1)[-1].lower() == "gemini-4-hydrogen"
-
-
-def _hydrogen_remember_schema():
-    # Poe accepts complete alternatives, but rejects required-only anyOf branches.
-    definition = deepcopy(REMEMBER_SCHEMA)
-    items = definition["parameters"]["properties"]["items"]
-    item = items["items"]
-    alternatives = item.pop("anyOf")
-    items["items"] = {"anyOf": [
-        {**item, "required": [*item["required"], *branch["required"]]} for branch in alternatives
-    ]}
-    return definition
-
-
-HYDROGEN_REMEMBER_SCHEMA = _hydrogen_remember_schema()
+_items = REMEMBER_SCHEMA["parameters"]["properties"]["items"]
+_item = _items["items"]
+_items["items"] = {"anyOf": [
+    {**_item, "required": [*_item["required"], key]} for key in ("id", "source_ids")
+]}
 
 
 def tool_definitions(*, learning=False, provider=None):
@@ -160,7 +135,7 @@ def tool_definitions(*, learning=False, provider=None):
         definitions["memory"] = _schema("打开完整记忆条目及来源编号。核对发言原文可传 include_sources=true，或用 context 按编号单独读取。", {
             **TOOL_SCHEMAS["memory"]["parameters"]["properties"],
             "include_sources": {"type": "boolean", "default": False}}, ("kind", "id"))
-        definitions["remember"] = HYDROGEN_REMEMBER_SCHEMA if is_poe_hydrogen(provider) else REMEMBER_SCHEMA
+        definitions["remember"] = REMEMBER_SCHEMA
     else:
         definitions["main_context"] = TOOL_SCHEMAS["main_context"]
         definitions["complete"] = _schema("交付本次检索背景并结束，不写入长期记忆；可以同时选择关键原话交给主意识。", {
