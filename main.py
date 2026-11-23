@@ -700,7 +700,8 @@ class MrMemoryPlugin(Star):
                 if messages_due:
                     repair_drafts = {}
             pool = await asyncio.to_thread(store.member_pool, self.config["member_prefix_capacity"])
-            estimate_options = {"member_prefix": pool["prefix"]}
+            estimate_options = {"member_prefix": pool["prefix"],
+                                "provider": self.context.get_provider_by_id(self.config["subconscious_provider_id"])}
             if task:
                 messages = await asyncio.to_thread(store.learning_messages, task)
                 done = set(task["completed_ids"])

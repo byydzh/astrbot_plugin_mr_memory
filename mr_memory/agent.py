@@ -10,14 +10,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
 
 from .content import text_view
 from .prompt_view import learning_address_view, learning_material_view, learning_search_view, memory_match_view, prepend_directory
 from .learning_writes import LearningWriter
 from .cognition import visible_memories
 from .handoff import format_background as _background_text
-from .memory_protocol import BASIC_CONSOLIDATION_PROMPT, BASIC_RECALL_PROMPT, TOOL_SCHEMAS, _tool_set, tool_definitions
+from .memory_protocol import BASIC_CONSOLIDATION_PROMPT, BASIC_RECALL_PROMPT, TOOL_SCHEMAS, _tool_set, is_poe_hydrogen, tool_definitions
 from .tool_calls import response_calls, memory_text_arguments, parse_completion
 from .model_json import decode_background, decode_envelope
 
@@ -622,10 +621,10 @@ def _learning_prompt(member_prefix: str = "") -> str:
     return prompt
 
 
-def _learning_bytes(conversation: list, *, member_prefix: str = "") -> int:
+def _learning_bytes(conversation: list, *, member_prefix: str = "", provider=None) -> int:
     prompt = _learning_prompt(member_prefix)
     request = {"messages": [{"role": "system", "content": prompt}, *conversation],
-               "tools": tool_definitions(learning=True)}
+               "tools": tool_definitions(learning=True, provider=provider)}
     return len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1024
 
 
@@ -638,12 +637,12 @@ def _estimate_input_tokens(input_bytes: int, previous_tokens: int, previous_byte
 
 
 def estimate_learning_input(messages: list, working: dict, *, task: dict | None = None, basic: bool = True,
-                            input_tokens_per_byte: float = 0.0, member_prefix: str = "") -> int:
+                            input_tokens_per_byte: float = 0.0, member_prefix: str = "", provider=None) -> int:
     """Budget the basic learning path. Eidolon explicitly passes basic=True."""
     previous = _learning_input_state(task)
     if previous.get("format_repair_output"):
         repair = _learning_format_repair(previous["format_repair_output"], previous.get("conversation", []))
-        input_bytes = _learning_bytes(repair, member_prefix=member_prefix) + 2048
+        input_bytes = _learning_bytes(repair, member_prefix=member_prefix, provider=provider) + 2048
         return _estimate_input_tokens(input_bytes, 0, 0,
                                       previous.get("input_tokens_per_byte", 0.0) or input_tokens_per_byte)
     conversation = list(previous.get("conversation", []))
@@ -656,7 +655,7 @@ def estimate_learning_input(messages: list, working: dict, *, task: dict | None 
         seen = {}
     # The resource report and possible save hint are appended immediately before
     # a call. Include their small transport overhead in scheduler admission.
-    input_bytes = _learning_bytes(conversation, member_prefix=member_prefix) + 2048
+    input_bytes = _learning_bytes(conversation, member_prefix=member_prefix, provider=provider) + 2048
     tokens, size = previous.get("previous_input_tokens", 0), previous.get("previous_input_bytes", 0)
     return _estimate_input_tokens(input_bytes, tokens, size, previous.get("input_tokens_per_byte", 0.0) or input_tokens_per_byte)
 
@@ -733,9 +732,7 @@ class MemoryAgent:
             prompt=None, contexts=messages, system_prompt=system_prompt)
         config = getattr(provider, "provider_config", {})
         extra_body = dict(config.get("custom_extra_body") or {})
-        endpoint = config.get("api_base") or getattr(getattr(provider, "client", None), "base_url", "")
-        model = str(payload.get("model", "")).rsplit("/", 1)[-1].lower()
-        if urlsplit(str(endpoint)).hostname == "api.poe.com" and model == "gemini-4-hydrogen":
+        if is_poe_hydrogen(provider, payload.get("model", "")):
             # This Poe bot rejects the field even when its value is "disabled".
             payload.pop("thinking", None)
             extra_body.pop("thinking", None)
@@ -1057,11 +1054,11 @@ class MemoryAgent:
             read_sources(working)
             if not messages and not working and not conversation and not (task or {}).get("checkpoint") and not writer.pending_items:
                 raise ValueError("Consolidation requires an experience or a reflection to revisit")
-            tools = _tool_set(learning=True)
+            tools = _tool_set(learning=True, provider=self.provider)
             allowed_tools = tool_definitions(learning=True)
             prompt = _learning_prompt(self.member_prefix)
             def request_bytes(conversation):
-                return _learning_bytes(conversation, member_prefix=self.member_prefix)
+                return _learning_bytes(conversation, member_prefix=self.member_prefix, provider=self.provider)
             cutoff = int(time.time())
             async with asyncio.timeout(self.timeout_seconds):
                 if not conversation:
@@ -1356,7 +1353,7 @@ class MemoryAgent:
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": _json({
                     "status": "interrupted", "detail": "调用中断，结果尚未收到；恢复后结合已保存的进度与实际记忆检查再继续。"})})
             next_conversation = _learning_format_repair(format_repair_output, conversation) if format_repair_output else conversation
-            input_bytes = _learning_bytes(next_conversation, member_prefix=self.member_prefix)
+            input_bytes = _learning_bytes(next_conversation, member_prefix=self.member_prefix, provider=self.provider)
             result.continuation = {
                 "conversation": conversation, "sources": sources, "seen_messages": seen_messages,
                 "format_repair_output": format_repair_output,

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mr_memory.agent import MemoryAgent, _model_view, estimate_learning_input
+from mr_memory.memory_protocol import tool_definitions
 
 
 def response(text="", calls=(), finish="stop"):
@@ -74,6 +75,27 @@ class Store:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    def test_hydrogen_remember_preserves_both_native_write_shapes_and_accounts_for_them(self):
+        provider = SimpleNamespace(provider_config={"api_base": "https://api.poe.com/v1"},
+                                   get_model=lambda: "gemini-4-hydrogen")
+        original = tool_definitions(learning=True)
+        actual = tool_definitions(learning=True, provider=provider)
+        self.assertEqual(original.keys(), actual.keys())
+        for name in original.keys() - {"remember"}:
+            self.assertEqual(original[name], actual[name])
+        original_properties = original["remember"]["parameters"]["properties"]
+        properties = actual["remember"]["parameters"]["properties"]
+        for key in original_properties.keys() - {"items"}:
+            self.assertEqual(original_properties[key], properties[key])
+        item = original_properties["items"]["items"]
+        alternatives = properties["items"]["items"]["anyOf"]
+        self.assertEqual([branch["required"] for branch in alternatives], [["kind", "id"], ["kind", "source_ids"]])
+        for branch in alternatives:
+            self.assertEqual(branch["type"], "object")
+            self.assertEqual(branch["properties"], item["properties"])
+        self.assertEqual(item["anyOf"], [{"required": ["id"]}, {"required": ["source_ids"]}])
+        self.assertGreater(estimate_learning_input([], {}, provider=provider), estimate_learning_input([], {}))
+
     async def test_thinking_field_uses_the_selected_endpoint_and_model(self):
         class WireProvider:
             async def _prepare_chat_payload(self, **kwargs):
