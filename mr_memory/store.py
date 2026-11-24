@@ -173,6 +173,11 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO scope_meta(singleton,umo,platform_id,group_id) VALUES(1,?,?,?)",
                             (self.umo, parts[0], parts[-1]))
         self.tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.network_enabled = "network_scope" in self.tables and bool(self.db.execute(
+            "SELECT 1 FROM network_scope WHERE umo=?", (self.umo,)).fetchone())
+        if self.network_enabled:
+            from .manual_messages import ensure_schema
+            ensure_schema(self)
         if not feedback_queue_exists:
             # The old cursor remains a legacy floor. Preserve sparse progress
             # on the unfinished old task too, without advancing that floor.
@@ -188,6 +193,9 @@ class Store:
         self.cognition.migrate_notes()
         from .profiles import MemberProfiles
         self.profiles = MemberProfiles(self)
+        if self.network_enabled:
+            from .network.live import catch_up
+            catch_up(self)
 
     @_serialized
     def close(self) -> None:
@@ -346,6 +354,10 @@ class Store:
                 WHERE umo=? AND target_source_key=? AND target_message_id IS NULL""", (row_id, participant, self.umo, source))
             current = dict(self.db.execute("SELECT * FROM messages WHERE id=?", (row_id,)).fetchone())
             self._revision(current, "CAPTURED")
+            if self.network_enabled and not current["is_deleted"]:
+                from .network.live import captured
+                captured(self,current)
+                self.db.execute("UPDATE network_ingest SET cursor=max(cursor,?) WHERE singleton=1",(row_id,))
             self.db.execute("""INSERT INTO message_processing(message_id,content_sha256) VALUES(?,?)
                 ON CONFLICT(message_id) DO UPDATE SET status=CASE
                 WHEN message_processing.content_sha256<>excluded.content_sha256 THEN 'PENDING'
@@ -400,6 +412,9 @@ class Store:
         return counts
 
     def _invalidate_sources(self, ids):
+        if self.network_enabled and ids:
+            from .network.live import invalidate
+            invalidate(self,ids)
         if not ids:
             return {}
         marks = ",".join("?" for _ in ids)
@@ -486,6 +501,9 @@ class Store:
             for platform in platform_ids:
                 digest = hashlib.sha256("\x1f".join((self.umo, platform, str(account_id))).encode()).hexdigest()
                 self.db.execute("INSERT OR REPLACE INTO forgotten_accounts(umo,platform_id,account_hash,requested_at) VALUES(?,?,?,?)", (self.umo, platform, digest, int(time.time())))
+            if self.network_enabled:
+                from .network.live import invalidate
+                invalidate(self,[],account_id)
             invalidated = self._invalidate_sources(ids)
             self._forget_memory_context(rows, invalidated)
             for row_id in ids:
@@ -551,6 +569,8 @@ class Store:
         relations = self._rows("SELECT relation,target_source_key,target_participant_id FROM message_relations WHERE umo=? AND source_message_id=?",
                                (self.umo, row["id"]))
         result = {key: row[key] for key in ("id", "source_key", "platform_id", "group_id", "sender_id", "sender_name", "sent_at", "plain_text", "role")}
+        if row.get("platform") == "console" and row["sender_id"] == "console:operator":
+            result.update(source="console_manual", author_kind="operator")
         result.update(participant_id=row.get("sender_participant_id"), content=self.resolve_quotes(json.loads(row["content_json"]), row["platform_id"]),
                       reply_to=next((r["target_source_key"] for r in relations if r["relation"] in {"REPLY_TO", "RESPONDS_TO"}), None),
                       relations=relations, revision_no=row.get("revision_no", 1))
@@ -720,9 +740,9 @@ class Store:
 
     @_serialized
     def search_memories(self, kind="all", terms=(), participant_id=None, limit=12, *,
-                        related_account_id=None, include_sources=False):
+                        related_account_id=None, include_sources=False, offset=0):
         return self.memory_graph.search(kind, terms, participant_id, limit,
-            related_account_id=related_account_id, include_sources=include_sources)
+            related_account_id=related_account_id, include_sources=include_sources, offset=offset)
 
     @_serialized
     def memory(self, kind, id, *, include_sources=True, include_history=False):
@@ -742,9 +762,10 @@ class Store:
         self.db.execute("DELETE FROM mr_index_pending WHERE umo=? AND owner_type=? AND owner_key=?", (self.umo, canonical(kind), str(owner)))
 
     @_serialized
-    def graph(self, node_id=None, terms=(), limit=12, *, ref=None, related_account_id=None, include_sources=False, offset=0):
+    def graph(self, node_id=None, terms=(), limit=12, *, ref=None, related_account_id=None, include_sources=False,
+              offset=0, endpoint_kind="all", view="recent"):
         return self.memory_graph.graph(node_id, terms, limit, ref=ref, related_account_id=related_account_id,
-                                       include_sources=include_sources, offset=offset)
+                                       include_sources=include_sources, offset=offset, endpoint_kind=endpoint_kind, view=view)
 
     @_serialized
     def navigate(self, **query):

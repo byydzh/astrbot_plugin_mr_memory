@@ -1,68 +1,526 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MR · 群聊记忆</title>
-  <link rel="stylesheet" href="./style.css?v=20260920-members" />
-  <script src="./trajectory.js?v=20260908-trace3" defer></script>
-  <script src="./script.js?v=20261014-identity3" defer></script>
+  <title>MR · 群聊认知记忆控制台</title>
+  <link rel="stylesheet" href="./style.css?v=20261124-v3" />
+  <script src="./trajectory.js?v=20261124-v3" defer></script>
+  <script src="./script.js?v=20261124-v3-learning" defer></script>
 </head>
 <body>
-<main>
-  <header class="hero"><div class="brand">MR</div><div><p class="eyebrow">MR MEMORY</p><h1>群聊记忆</h1><p>看它如何回忆，学到了什么，以及这些理解来自哪里。</p></div><span id="connection" role="status">正在连接…</span></header>
-  <section class="scope-bar"><label>查看哪个群<select id="scope-select" disabled><option>正在读取…</option></select></label><div class="scope-copy"><strong id="scope-summary">尚未选择群聊</strong><small id="scope-meta"></small></div><button id="refresh" type="button">刷新</button><button id="distill" class="primary" type="button" disabled>整理新消息</button></section>
-  <p id="notice" class="notice" role="status" hidden></p>
-  <nav class="tabs" aria-label="控制台区域"><button data-tab="runtime" aria-current="page">运行与调用</button><button data-tab="memory">记忆与连接</button><button data-tab="people">账户与别名</button><button data-tab="messages">原始消息</button></nav>
+<div class="shell">
+  <!-- LEFT NAVIGATION RAIL -->
+  <aside class="rail" aria-label="控制台导航">
+    <div class="rail-brand">
+      <div class="brand-emblem" aria-hidden="true">MR</div>
+      <div class="brand-meta">
+        <strong>记忆控制台</strong>
+        <span id="engine-badge" class="engine-pill">READY</span>
+      </div>
+    </div>
 
-  <section data-view="runtime">
-    <div id="policies" class="policies"></div>
-    <section class="context-repair" aria-labelledby="context-repair-title">
-      <div><h2 id="context-repair-title">主模型持续回答异常？</h2><p>可以尝试清理当前群的主会话上下文，下一次请求从新会话开始。旧会话完整保留，MR 记忆和群聊原文也会保留。</p><small id="context-repair-target">请先选择群聊</small></div>
-      <button id="reset-conversation" type="button" disabled>清理主会话上下文</button>
-      <p id="context-repair-result" class="context-repair-result" role="status" hidden></p>
-    </section>
-    <section id="learning-plan" class="learning-plan" aria-label="后台工作安排"></section>
-    <section class="context-repair" aria-labelledby="history-title">
-      <div><h2 id="history-title">断线历史回补</h2><p id="history-status">正在读取回补进度…</p><small id="history-detail">只补入记忆库，不触发旧命令或重新回复。</small></div>
-      <button id="recover-history" type="button" disabled>补查近期历史</button>
-    </section>
-    <section class="panel" id="experimental-workspace"><div class="panel-heading"><div><h2>实验性持续理解</h2><p>开启高级连接后，显示模型选择继续关注的认识。</p></div></div><div id="workspace" class="card-list"></div></section>
-    <div id="metrics" class="metrics"></div>
-    <section class="panel"><div class="panel-heading"><div><h2>最近调用</h2><p>点开一次活跃，沿着模型输出、搜索、写入和背景交接逐步阅读。</p></div><small id="runs-live-note">最近 30 次 · 时间为北京时间</small></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>任务 / 问题</th><th>状态 / 当前步骤</th><th>耗时</th><th>Token</th><th></th></tr></thead><tbody id="runs"></tbody></table></div></section>
-    <p class="footnote">参数调整请使用 AstrBot 插件的配置面板。这里展示实际记录，调用完成或注入背景不代表回答质量合格。</p>
-  </section>
+    <nav class="rail-nav" aria-label="功能分区">
+      <button class="nav-item" data-tab="runtime" aria-current="page">
+        <span class="nav-ico" aria-hidden="true">◈</span>
+        <span class="nav-label">认知总览</span>
+        <span class="nav-count" id="nav-badge-runs"></span>
+      </button>
+      <button class="nav-item" data-tab="memory">
+        <span class="nav-ico" aria-hidden="true">✦</span>
+        <span class="nav-label">记忆星图</span>
+        <span class="nav-count" id="nav-badge-nodes"></span>
+      </button>
+      <button class="nav-item" data-tab="people">
+        <span class="nav-ico" aria-hidden="true">◎</span>
+        <span class="nav-label">群员矩阵</span>
+        <span class="nav-count" id="nav-badge-people"></span>
+      </button>
+      <button class="nav-item" data-tab="messages">
+        <span class="nav-ico" aria-hidden="true">⌘</span>
+        <span class="nav-label">原文与纠错</span>
+        <span class="nav-count" id="nav-badge-pending"></span>
+      </button>
+    </nav>
 
-  <section data-view="memory" hidden>
-    <form id="memory-search" class="search-bar"><label class="grow">查找群内经历、人物与概念<input id="memory-query" type="search" placeholder="输入关键词或昵称" /></label><label>记忆类型<select id="memory-kind"><option value="all">全部记忆与连接</option><option value="episode">共同经历</option><option value="semantic">形成的认识</option><option value="association">语义连接</option><option value="topic">主题</option><option value="pattern">跨经历的理解</option><option value="reflection">延续的思路</option><option value="node">人物与概念</option></select></label><button class="primary">搜索</button></form>
-    <div class="memory-layout"><section class="panel"><div class="panel-heading"><div><h2>记忆条目</h2><p>最多显示最近 60 条匹配记录，点开可回到原始消息。</p></div></div><div id="memory-list" class="card-list"></div></section>
-    <section class="panel"><div class="panel-heading"><div><h2>记忆图</h2><p id="graph-caption">数据库中保存的语义连接；点击节点展开相邻连接。</p></div><button id="graph-reset" type="button">返回概览</button></div><div class="graph-stage"><svg id="graph" viewBox="0 0 680 440" aria-label="语义记忆连接图"></svg></div><div id="edge-list" class="edge-list"></div></section></div>
-  </section>
+    <div class="rail-foot">
+      <div id="connection" class="conn-indicator" role="status">正在连接…</div>
+      <div class="rail-foot-btns">
+        <button id="theme-toggle" class="btn-icon" type="button" title="切换深色 / 浅色外观" aria-label="切换主题">☀️</button>
+        <button id="refresh" class="btn-icon" type="button" title="刷新当前数据" aria-label="刷新">↻</button>
+      </div>
+    </div>
+  </aside>
 
-  <section data-view="people" hidden>
-    <details class="panel inset" id="advanced-maintenance"><summary>高级维护</summary>
-      <details class="inset" id="platform-migration"><summary>平台迁移 · 旧群记忆与成员重绑定</summary>
-        <p>先在上方选择新官方机器人所在群。开启“获取群内全部消息”后，MR 会根据收到的发言静默对照群名片和昵称。</p>
-        <div class="search-bar"><label class="grow">对应的旧群<select id="migration-legacy"><option value="">选择旧群记忆库</option></select></label>
-          <button type="button" id="migration-preview">预览对照</button><button type="button" class="primary" id="migration-bind" disabled>接续这个旧群</button></div>
-        <p id="migration-status" role="status">展开后读取迁移状态。</p>
-        <p id="migration-bot-status" class="meta">机器人自身随旧群接续自动关联，无需手动选择。</p>
-        <h3>群员关联</h3>
-        <small>唯一同名成员自动关联；群员可自愿发送 /uid qqid 自己的QQ号。管理员可在下表修正，之后以管理员设置为准。关联只用于 MR 记忆，不授予机器人管理权限。</small>
-        <div class="table-wrap"><table><thead><tr><th>新成员 / OpenID</th><th>旧群成员 / QQ 号</th><th>对照结果</th><th></th></tr></thead><tbody id="migration-members"></tbody></table></div>
-      </details>
-    </details>
-    <section class="panel"><div class="panel-heading"><div><h2>群员资料与活跃前缀</h2><p>完整保存全员资料。点击 UID 编辑该群员；群内命令 /mr uid 只能修改本人。</p><p id="member-pool-summary"></p></div><form id="people-search"><input id="people-query" type="search" placeholder="昵称、别名或 UID" aria-label="搜索账户" /><button>搜索</button></form></div>
-    <details class="inset"><summary>查看实际成员前缀</summary><pre id="member-prefix-preview"></pre></details>
-    <form id="profile-form" class="search-bar inset profile-form"><label>UID<input id="profile-account" required readonly placeholder="请在下方选择群员" /></label><label>希望称呼<input id="profile-name" /></label><label>确认的别名（逗号分隔）<input id="profile-aliases" /></label><label>不使用的称呼（逗号分隔）<input id="profile-avoided" /></label><label class="grow">本人 / 管理员说明<textarea id="profile-description" rows="2"></textarea></label><button class="primary">保存此人资料</button><small>留空会清空对应字段。群名片与平台昵称由平台同步，不被手动称呼覆盖。缓存命中仍计费且占上下文；首次或前缀变化可能按普通输入计费。</small></form>
-    <div class="table-wrap"><table><thead><tr><th>UID / 前缀</th><th>群名片 / 平台昵称</th><th>历史与确认称呼</th><th>希望称呼 / 不使用</th><th>资料来源</th></tr></thead><tbody id="people"></tbody></table></div></section>
-  </section>
+  <!-- RIGHT MAIN STAGE -->
+  <div class="stage">
+    <!-- COMPACT CONTEXT TOPBAR -->
+    <header class="ctx-bar">
+      <div class="scope-box">
+        <label class="scope-select-wrap">
+          <span class="scope-tag">当前群聊</span>
+          <select id="scope-select" disabled>
+            <option>正在读取群列表…</option>
+          </select>
+        </label>
+        <div class="scope-status-chip">
+          <span id="scope-dot" class="status-dot"></span>
+          <strong id="scope-summary">尚未选择群聊</strong>
+          <code id="scope-meta" title="点击查看完整群聊标识"></code>
+        </div>
+      </div>
 
-  <section data-view="messages" hidden>
-    <form id="message-search" class="search-bar"><label class="grow">搜索原始消息<input id="message-query" type="search" placeholder="输入文字；留空查看最近消息" /></label><button class="primary">搜索</button></form>
-    <section class="panel"><div class="panel-heading"><div><h2>群聊原文</h2><p>包含群友、机器人实际发送，以及单独标注的生成与工具活动。新消息在前。</p></div></div><div id="message-list" class="message-list"></div><button id="older" class="more" type="button" hidden>读取更早的消息</button></section>
-  </section>
-</main>
-<dialog id="detail"><header><h2 id="detail-title">详情</h2><button id="close-detail" type="button" aria-label="关闭详情">关闭 ×</button></header><div id="detail-content"></div></dialog>
+      <div class="ctx-actions">
+        <span id="demo-banner" class="demo-chip" hidden>LOCAL DEMO</span>
+        <button id="distill" class="btn primary" type="button" disabled>整理新消息</button>
+      </div>
+    </header>
+
+    <div id="notice" class="toast-bar" role="status" hidden></div>
+
+    <!-- MAIN CONTENT CONTAINER -->
+    <main class="stage-body">
+
+      <!-- ==============================================================
+           WORKSPACE 1: COGNITIVE OVERVIEW & RUNS
+           ============================================================== -->
+      <section class="ws-scroll" data-view="runtime">
+        <!-- PLAN D 4-BRAIN-REGION TOPOLOGY HERO -->
+        <section id="network-hero" class="hero-card" aria-label="认知记忆图谱总览">
+          <div class="hero-top">
+            <div>
+              <div class="hero-kicker">
+                <span class="kicker-dot"></span>
+                <span id="hero-engine-label">认知网络拓扑</span>
+              </div>
+              <h2 id="hero-title">四脑区记忆分布</h2>
+            </div>
+            <div class="hero-stats-inline">
+              <div class="mini-stat">
+                <span>总节点</span>
+                <strong id="hero-total-nodes">—</strong>
+              </div>
+              <div class="mini-stat">
+                <span>总连接边</span>
+                <strong id="hero-total-edges">—</strong>
+              </div>
+              <div class="mini-stat">
+                <span>水位线</span>
+                <strong id="hero-watermark">—</strong>
+              </div>
+            </div>
+          </div>
+
+          <div id="region-bar" class="region-bar" aria-label="四区占比条"></div>
+
+          <div id="region-tiles" class="region-tiles"></div>
+        </section>
+
+        <!-- PRIMARY TELEMETRY KPIS -->
+        <div id="metrics" class="kpi-grid"></div>
+
+        <!-- RUNTIME POLICIES STRIP -->
+        <div id="policies" class="policy-strip"></div>
+
+        <!-- OPERATIONS DECK -->
+        <div class="ops-grid">
+          <section id="learning-plan" class="panel learning-panel" aria-label="夜间整理与后台工作安排"></section>
+
+          <div class="ops-side">
+            <section class="panel compact-panel" aria-labelledby="context-repair-title">
+              <div class="panel-head">
+                <div>
+                  <h3 id="context-repair-title">主会话上下文修复</h3>
+                  <p>开启新主会话而不改动 MR 记忆库与群聊原文。</p>
+                </div>
+                <button id="reset-conversation" class="btn danger-soft small" type="button" disabled>清理主会话</button>
+              </div>
+              <div class="panel-pad-sm">
+                <small id="context-repair-target" class="mono-muted">请先选择群聊</small>
+                <p id="context-repair-result" class="inline-feedback" role="status" hidden></p>
+              </div>
+            </section>
+
+            <section class="panel compact-panel" aria-labelledby="history-title">
+              <div class="panel-head">
+                <div>
+                  <h3 id="history-title">断线历史回补</h3>
+                  <p id="history-status">正在读取回补进度…</p>
+                </div>
+                <button id="recover-history" class="btn small" type="button" disabled>补查近期历史</button>
+              </div>
+              <div class="panel-pad-sm">
+                <small id="history-detail" class="muted-note">只补入记忆库，不触发旧命令或重新回复。</small>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- EXPERIMENTAL WORKSPACE (HIDDEN UNLESS ADVANCED) -->
+        <section class="panel" id="experimental-workspace" hidden>
+          <div class="panel-head">
+            <div>
+              <h3>实验性持续理解</h3>
+              <p>开启高级连接后，显示模型选择继续关注的认识。</p>
+            </div>
+          </div>
+          <div id="workspace" class="stack-list"></div>
+        </section>
+
+        <!-- RECENT RUNS STREAM -->
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>最近调用与执行轨迹</h3>
+              <p>点击任意一次调用，在右侧抽屉逐步检查图检索、模型思考输出与实际改图差分。</p>
+            </div>
+            <small id="runs-live-note" class="mono-muted">最近 30 次 · 北京时间</small>
+          </div>
+          <div class="table-scroll">
+            <table class="grid-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>任务 / 问题</th>
+                  <th>状态 / 最新步骤</th>
+                  <th>耗时</th>
+                  <th>Token</th>
+                  <th class="col-r">轨迹</th>
+                </tr>
+              </thead>
+              <tbody id="runs"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <p class="footnote">参数配置请在 AstrBot 插件配置页调整。控制台仅展示真实库记录，不补造未记录步骤。</p>
+      </section>
+
+      <!-- ==============================================================
+           WORKSPACE 2: SPATIAL MEMORY STAR MAP & INSPECTOR
+           ============================================================== -->
+      <section class="ws-memory" data-view="memory" hidden>
+        <!-- TOP FILTER & REGION STRIP -->
+        <form id="memory-search" class="mem-toolbar">
+          <div class="search-input-wrap">
+            <span class="search-ico" aria-hidden="true">⌕</span>
+            <input id="memory-query" type="search" placeholder="搜索群内经历、跨期桥、人物理解、规则边界或关键词…" />
+          </div>
+
+          <div class="region-seg" role="group" aria-label="按脑区筛选">
+            <button type="button" class="seg-btn active" data-region-filter="all">全部脑区</button>
+            <button type="button" class="seg-btn r-m" data-region-filter="M">M 经历</button>
+            <button type="button" class="seg-btn r-s" data-region-filter="S">S 社会脑</button>
+            <button type="button" class="seg-btn r-k" data-region-filter="K">K 规则</button>
+          </div>
+
+          <select id="memory-kind" class="kind-select" aria-label="按节点类型筛选">
+            <option value="all">全部节点类型</option>
+            <optgroup label="M 区 · 经历与跨期桥">
+              <option value="episode">共同经历 (episode)</option>
+              <option value="semantic">语义认识 (semantic)</option>
+              <option value="event">事件切片 (event)</option>
+              <option value="bridge">跨期桥 (bridge)</option>
+              <option value="field">主题场 (field)</option>
+            </optgroup>
+            <optgroup label="S 区 · 熟人社会脑">
+              <option value="understanding">人物理解 (understanding)</option>
+              <option value="observation">观察笔记 (observation)</option>
+              <option value="relationship">人际关系 (relationship)</option>
+              <option value="situated_knowledge">情境认识 (situated_knowledge)</option>
+              <option value="familiarity">熟识度 (familiarity)</option>
+              <option value="longitudinal_familiarity">长期熟识 (longitudinal)</option>
+              <option value="shared_social_state">群内共识态 (shared_state)</option>
+              <option value="atmosphere">氛围感知 (atmosphere)</option>
+            </optgroup>
+            <optgroup label="K 区 · 知识与边界">
+              <option value="content">知识条目 (content)</option>
+              <option value="veto">边界否决 (veto)</option>
+              <option value="scope">适用范围 (scope)</option>
+            </optgroup>
+            <optgroup label="旧版兼容类型">
+              <option value="association">语义连接 (association)</option>
+              <option value="topic">主题 (topic)</option>
+              <option value="pattern">跨经历理解 (pattern)</option>
+              <option value="node">人物与概念 (node)</option>
+              <option value="reflection">延续思路 (reflection)</option>
+            </optgroup>
+          </select>
+
+          <button class="btn primary" type="submit">检索星图</button>
+        </form>
+
+        <!-- 3-PANE SPATIAL WORKBENCH -->
+        <div class="mem-workbench" id="mem-workbench">
+          <!-- PANE 1: COMPACT DE-DUPLICATED MEMORY FEED -->
+          <aside class="mem-list-pane" aria-label="匹配记忆列表">
+            <div class="pane-head">
+              <strong id="mem-list-count">记忆条目</strong>
+              <span class="mono-muted">点击定位并检视</span>
+            </div>
+            <div id="memory-list" class="mem-list-scroll"></div>
+            <div id="mem-more-bar" class="mem-more-bar" hidden>
+              <button id="memory-more" class="btn small full" type="button">加载更多记忆</button>
+            </div>
+          </aside>
+
+          <!-- PANE 2: INTERACTIVE HIDPI 4-REGION CANVAS STAGE -->
+          <div class="canvas-stage" id="canvas-stage">
+            <canvas id="graph-canvas" aria-label="交互式四脑区记忆星图"></canvas>
+
+            <!-- FLOATING TOP-LEFT BREADCRUMB TRAIL -->
+            <div class="hud-top-left">
+              <nav id="graph-trail" class="graph-trail" aria-label="漫游路径"></nav>
+            </div>
+
+            <!-- FLOATING TOP-RIGHT GRAPH CONTROLS -->
+            <div class="hud-top-right">
+              <div class="hud-group" aria-label="采样视角与显隐脑区">
+                <button type="button" id="graph-view-backbone" class="hud-btn active" title="按跨月桥与高连接度枢纽采样全网骨架">全网骨架</button>
+                <button type="button" id="graph-view-recent" class="hud-btn" title="按最新时间采样近期前沿">近期前沿</button>
+                <span class="hud-sep"></span>
+                <button type="button" class="hud-pill r-m on" data-vis-region="M" title="显隐 M 区节点">M <em id="cnt-m">0</em></button>
+                <button type="button" class="hud-pill r-s on" data-vis-region="S" title="显隐 S 区节点">S <em id="cnt-s">0</em></button>
+                <button type="button" class="hud-pill r-k on" data-vis-region="K" title="显隐 K 区节点">K <em id="cnt-k">0</em></button>
+                <button type="button" class="hud-pill r-e on" data-vis-region="E" title="显隐 E 区原话节点">E <em id="cnt-e">0</em></button>
+              </div>
+              <div class="hud-group" aria-label="边槽位过滤">
+                <button type="button" class="hud-pill b-far on" data-vis-bin="far">跨月桥</button>
+                <button type="button" class="hud-pill b-cross on" data-vis-bin="cross">跨区</button>
+                <button type="button" class="hud-pill b-inside on" data-vis-bin="inside">区内</button>
+                <button type="button" class="hud-pill b-neg on" data-vis-bin="negative">边界</button>
+              </div>
+              <div class="hud-group">
+                <button type="button" id="graph-grow-toggle" class="hud-btn active" title="双击节点时：原地生长合并邻居 / 切单点聚焦">原地生长</button>
+                <button type="button" id="graph-layout-toggle" class="hud-btn" title="切换四区星图 / 自由力导">四区星图</button>
+                <button type="button" id="graph-label-toggle" class="hud-btn" title="切换智能标签 / 展开更多标签">智能标签</button>
+                <button type="button" id="graph-zoom-in" class="hud-btn" title="放大">+</button>
+                <button type="button" id="graph-zoom-out" class="hud-btn" title="缩小">−</button>
+                <button type="button" id="graph-fit" class="hud-btn" title="适应画布">适应</button>
+                <button type="button" id="graph-reset" class="hud-btn accent" title="回到初始视角">重置</button>
+              </div>
+            </div>
+
+            <!-- FLOATING BOTTOM HUD -->
+            <div class="hud-bottom">
+              <span id="graph-caption" class="hud-caption">加载图谱中…</span>
+              <span class="hud-hint">拖拽画布平移 · 滚轮缩放 · 单击检视 · 双击展开邻域</span>
+            </div>
+
+            <!-- FLOATING HOVER TOOLTIP -->
+            <div id="graph-tooltip" class="graph-tooltip" hidden></div>
+          </div>
+
+          <!-- PANE 3: DOCKED RIGHT INSPECTOR DRAWER -->
+          <aside id="node-inspector" class="inspector-pane" aria-label="节点详情检视" hidden>
+            <div class="inspector-head">
+              <div class="inspector-badges" id="inspector-badges"></div>
+              <button id="inspector-close" class="btn-icon small" type="button" aria-label="收起检视面板">×</button>
+            </div>
+            <div id="inspector-body" class="inspector-body"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ==============================================================
+           WORKSPACE 3: PEOPLE & PLATFORM MIGRATION
+           ============================================================== -->
+      <section class="ws-scroll" data-view="people" hidden>
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>群员资料与活跃前缀池</h3>
+              <p id="member-pool-summary">完整保存全员资料；点击左侧 UID 编辑该群员，群内命令 /mr uid 仅限修改本人。</p>
+            </div>
+            <form id="people-search" class="inline-search">
+              <input id="people-query" type="search" placeholder="搜索昵称、别名或 UID…" aria-label="搜索账户" />
+              <button class="btn small" type="submit">搜索</button>
+            </form>
+          </div>
+          <div class="prefix-meter-wrap">
+            <div class="meter-track"><div id="member-pool-fill" class="meter-fill" style="width:0%"></div></div>
+            <details class="inline-disclosure">
+              <summary>查看当前注入给模型的实际成员前缀原文</summary>
+              <pre id="member-prefix-preview"></pre>
+            </details>
+          </div>
+        </section>
+
+        <div class="people-grid">
+          <section class="panel">
+            <div class="table-scroll tall">
+              <table class="grid-table">
+                <thead>
+                  <tr>
+                    <th>UID / 前缀状态</th>
+                    <th>群名片 / 平台昵称</th>
+                    <th>历史与确认称呼</th>
+                    <th>希望称呼 / 避开称呼</th>
+                    <th>来源</th>
+                  </tr>
+                </thead>
+                <tbody id="people"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <aside class="panel sticky-side">
+            <div class="panel-head">
+              <div>
+                <h3>编辑群员资料</h3>
+                <p>从左侧点选 UID 载入；留空对应项会清空该字段。</p>
+              </div>
+            </div>
+            <form id="profile-form" class="form-stack">
+              <label class="field">
+                <span>选中 UID</span>
+                <input id="profile-account" required readonly placeholder="请在左侧点击群员 UID" />
+              </label>
+              <label class="field">
+                <span>希望称呼</span>
+                <input id="profile-name" placeholder="例如：段哥 / 气泡水" />
+              </label>
+              <label class="field">
+                <span>确认的别名（逗号分隔）</span>
+                <input id="profile-aliases" placeholder="多个别名用逗号隔开" />
+              </label>
+              <label class="field">
+                <span>不使用的称呼（逗号分隔）</span>
+                <input id="profile-avoided" placeholder="明确避开的称呼" />
+              </label>
+              <label class="field">
+                <span>本人 / 管理员说明</span>
+                <textarea id="profile-description" rows="3" placeholder="补充简短背景说明…"></textarea>
+              </label>
+              <button class="btn primary full" type="submit">保存此人资料</button>
+              <small class="muted-note">群名片与平台昵称由平台同步，不被手动称呼覆盖。</small>
+            </form>
+          </aside>
+        </div>
+
+        <details class="panel accordion" id="advanced-maintenance">
+          <summary class="accordion-head">
+            <span>⚙ 高级维护 · 平台迁移与跨号重绑定</span>
+            <small>仅在官方机器人换号或接续旧群记忆库时展开</small>
+          </summary>
+          <div class="accordion-content">
+            <details class="sub-accordion" id="platform-migration">
+              <summary>平台迁移 · 旧群记忆与成员重绑定</summary>
+              <div class="migration-box">
+                <p class="muted-note">先在顶部切换到新官方机器人所在群。开启「获取群内全部消息」后，MR 会根据收到的发言静默对照群名片和昵称。</p>
+                <div class="inline-bar">
+                  <label class="field grow">
+                    <span>对应的旧群记忆库</span>
+                    <select id="migration-legacy"><option value="">选择旧群记忆库</option></select>
+                  </label>
+                  <button type="button" id="migration-preview" class="btn">预览对照</button>
+                  <button type="button" id="migration-bind" class="btn primary" disabled>接续这个旧群</button>
+                </div>
+                <p id="migration-status" class="status-strip" role="status">展开后读取迁移状态。</p>
+                <p id="migration-bot-status" class="mono-muted">机器人自身随旧群接续自动关联，无需手动选择。</p>
+                <div class="table-scroll">
+                  <table class="grid-table">
+                    <thead>
+                      <tr>
+                        <th>新成员 / OpenID</th>
+                        <th>旧群成员 / QQ 号</th>
+                        <th>对照结果</th>
+                        <th class="col-r">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="migration-members"></tbody>
+                  </table>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
+      </section>
+
+      <!-- ==============================================================
+           WORKSPACE 4: MESSAGES TIMELINE & OPERATOR CORRECTION STUDIO
+           ============================================================== -->
+      <section class="ws-scroll" data-view="messages" hidden>
+        <div class="messages-grid">
+          <!-- LEFT: MESSAGE TIMELINE -->
+          <div class="messages-main">
+            <form id="message-search" class="panel search-panel">
+              <div class="search-input-wrap">
+                <span class="search-ico" aria-hidden="true">⌕</span>
+                <input id="message-query" type="search" placeholder="搜索原始群聊消息关键词；留空显示最新消息…" />
+              </div>
+              <button class="btn primary" type="submit">搜索原文</button>
+            </form>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>群聊原文时间线</h3>
+                  <p>包含群友发言、机器人实际发送、工具活动与管理员补充材料（最新在前）。</p>
+                </div>
+              </div>
+              <div id="message-list" class="feed-list"></div>
+              <div class="load-more-bar">
+                <button id="older" class="btn" type="button" hidden>读取更早的消息</button>
+              </div>
+            </section>
+          </div>
+
+          <!-- RIGHT: STICKY OPERATOR CORRECTION STUDIO -->
+          <aside class="panel manual-studio sticky-side" id="manual-panel">
+            <div class="panel-head">
+              <div>
+                <h3>管理员纠错投喂台</h3>
+                <p>以独立署名（<code>管理员补充</code>）写入记忆库待整理队列，不发往 QQ 群，也不伪造群友发言。</p>
+              </div>
+            </div>
+            <div id="manual-body" class="studio-body">
+              <form id="manual-form" class="form-stack">
+                <label class="field">
+                  <span>纠错或补充正文（空行可拆为多条）</span>
+                  <textarea id="manual-text" rows="5" required placeholder="例如：说明此前记串的两位群友各自对应的称呼与背景边界…"></textarea>
+                </label>
+
+                <label class="field">
+                  <span>涉及群友（可选，输入昵称或 UID 点选）</span>
+                  <div class="mention-picker">
+                    <input id="manual-mention-query" type="search" placeholder="搜索本群群友…" autocomplete="off" />
+                    <div id="manual-mention-suggestions" class="mention-dropdown" hidden></div>
+                  </div>
+                  <div id="manual-mention-chips" class="chip-wrap"></div>
+                </label>
+
+                <label class="field">
+                  <span>引用原话编号（可选，点左侧消息「↩ 引用纠错」自动带入）</span>
+                  <div class="reply-row">
+                    <input id="manual-reply-id" type="number" min="1" placeholder="留空或输入消息 ID" />
+                    <button id="manual-clear-reply" class="btn ghost small" type="button" hidden>清除</button>
+                  </div>
+                </label>
+
+                <div class="studio-cta-row">
+                  <button id="manual-submit-window" class="btn" type="button">加入下个时窗</button>
+                  <button id="manual-submit-now" class="btn primary" type="button">加入并立即整理</button>
+                </div>
+                <small class="muted-note">自动附带幂等 <code>request_id</code>，重复点击不会重复入库。</small>
+              </form>
+
+              <div id="manual-receipt" class="receipt-box" hidden></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- RIGHT SLIDE-OVER DRAWER FOR RUN TRAJECTORY & MESSAGE CONTEXT -->
+<dialog id="detail" class="slide-drawer">
+  <header class="drawer-head">
+    <h2 id="detail-title">详情</h2>
+    <button id="close-detail" class="btn ghost small" type="button" aria-label="关闭抽屉">关闭 ×</button>
+  </header>
+  <div id="detail-content" class="drawer-body"></div>
+</dialog>
 </body>
 </html>

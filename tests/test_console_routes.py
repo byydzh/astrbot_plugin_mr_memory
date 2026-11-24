@@ -88,6 +88,14 @@ async def exercise_routes(root):
         assert (await call("migration_bind", "POST", {"legacy_scope":old["scope_id"]}, **new))["imported_messages"] == 1
         await call("migration_member", "POST", {"account_id":"OPEN1","legacy_id":"100"}, **new)
         assert (await call("migration", **new))["matches"]["OPEN1"]["method"] == "manual"
+        manual = {"request_id": "test-note", "messages": [{"text": "记录刚才的称呼", "mentioned_account_ids": ["100"],
+                  "reply_to_message_id": row["id"]}]}
+        receipt = await call("submit_manual_messages", "POST", manual, **old)
+        assert receipt["state"] == "queued"
+        assert (await call("submit_manual_messages", "POST", manual, **old)) == receipt
+        assert (await call("manual_receipt", request_id="test-note", **old)) == receipt
+        saved = store.messages([receipt["messages"][0]["message_id"]])[0]
+        assert saved["author_kind"] == "operator" and saved["reply_to_message"]["id"] == row["id"]
         assert visited == routes.keys()
 
         current_event = event()

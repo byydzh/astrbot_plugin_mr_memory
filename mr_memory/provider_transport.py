@@ -137,6 +137,10 @@ async def _openai(provider, messages, prompt, tools, limit, thinking, choice, js
     host = urlsplit(str(endpoint)).hostname
     responses = callable(getattr(scoped, "_parse_response", None)) and "input" in payload
     model = str(payload.get("model", ""))
+    if host == "api.poe.com" and model.lower().rsplit("/", 1)[-1] == "gemini-4-hydrogen":
+        # MR looks up private group memories. Keep this option on its request-local copy.
+        payload.pop("web_search", None)
+        extra["web_search"] = False
     try:
         options = _chat_options.setdefault(provider, {}).setdefault((host, model), {})
     except TypeError:

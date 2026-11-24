@@ -181,7 +181,7 @@ class MemoryGraph:
                                or target.get("status") != "ACTIVE")})
         return result
 
-    def search(self, kind="all", terms=(), participant_id=None, limit=12, *, related_account_id=None, include_sources=False):
+    def search(self, kind="all", terms=(), participant_id=None, limit=12, *, related_account_id=None, include_sources=False, offset=0):
         words = [terms] if isinstance(terms, str) else list(terms)
         prefix, prefix_args = "", []
         clauses, args = ["m.umo=?", "m.status='ACTIVE'"], [self.umo]
@@ -214,16 +214,45 @@ class MemoryGraph:
                 AND json_extract(e.attributes_json,'$.target_ref.id')=r.id) """
             prefix_args = [self.umo, *accounts, *related_args, self.umo]
             clauses.append("(m.kind,m.id) IN (SELECT kind,id FROM related)")
-        rows = self.store._rows(prefix + "SELECT m.kind,m.id FROM mr_memory_objects m WHERE " + " AND ".join(clauses) + " ORDER BY m.updated_at DESC,m.kind,m.id DESC LIMIT ?", [*prefix_args, *args, max(1, min(500, int(limit)))])
+        rows = self.store._rows(prefix + "SELECT m.kind,m.id FROM mr_memory_objects m WHERE " + " AND ".join(clauses) + " ORDER BY m.updated_at DESC,m.kind,m.id DESC LIMIT ? OFFSET ?", [*prefix_args, *args, max(1, min(500, int(limit))), max(0, int(offset))])
         return [self.get(r["kind"], r["id"], include_sources=include_sources) for r in rows]
 
-    def graph(self, node_id=None, terms=(), limit=12, *, ref=None, related_account_id=None, include_sources=False, offset=0):
+    def graph(self, node_id=None, terms=(), limit=12, *, ref=None, related_account_id=None, include_sources=False,
+              offset=0, endpoint_kind="all", view="recent"):
         ref = reference(ref) if ref is not None else ({"kind": "node", "id": int(node_id)} if node_id is not None else None)
         clauses, args = ["umo=?", "kind='association'", "status='ACTIVE'"], [self.umo]
         if ref:
             clauses.append("((json_extract(attributes_json,'$.source_ref.kind')=? AND json_extract(attributes_json,'$.source_ref.id')=?) OR (json_extract(attributes_json,'$.target_ref.kind')=? AND json_extract(attributes_json,'$.target_ref.id')=?))")
             args.extend([ref["kind"], ref["id"]] * 2)
-        rows = self.store._rows("SELECT id FROM mr_memory_objects WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC,id DESC", args)
+        if endpoint_kind != "all":
+            clauses.append("(? IN (json_extract(attributes_json,'$.source_ref.kind'),json_extract(attributes_json,'$.target_ref.kind')))")
+            args.append(canonical(endpoint_kind))
+        if view == "backbone" and ref is None:
+            # Retained groups have typed object references but no routing slots or brain regions.
+            # Rank on their real object-to-object associations and their original creation dates.
+            rows = self.store._rows("""
+                WITH links AS (SELECT id,updated_at,
+                    json_extract(attributes_json,'$.source_ref.kind') AS sk,
+                    json_extract(attributes_json,'$.source_ref.id') AS si,
+                    json_extract(attributes_json,'$.target_ref.kind') AS tk,
+                    json_extract(attributes_json,'$.target_ref.id') AS ti
+                    FROM mr_memory_objects WHERE umo=? AND kind='association' AND status='ACTIVE'),
+                upper_links AS (SELECT l.*,
+                    strftime('%Y-%m',s.created_at,'unixepoch','+8 hours') <>
+                    strftime('%Y-%m',t.created_at,'unixepoch','+8 hours') AS bridge
+                    FROM links l JOIN mr_memory_objects s ON s.umo=? AND s.kind=l.sk AND s.id=l.si
+                    JOIN mr_memory_objects t ON t.umo=s.umo AND t.kind=l.tk AND t.id=l.ti
+                    WHERE s.status='ACTIVE' AND t.status='ACTIVE'),
+                ends AS (SELECT sk AS kind,si AS id FROM upper_links UNION ALL SELECT tk,ti FROM upper_links),
+                degree AS (SELECT kind,id,count(*) AS n FROM ends GROUP BY kind,id),
+                ranked AS (SELECT l.id,l.bridge,row_number() OVER (
+                    PARTITION BY l.bridge ORDER BY max(s.n,t.n) DESC,l.updated_at DESC,l.id DESC) AS position
+                    FROM upper_links l JOIN degree s ON s.kind=l.sk AND s.id=l.si
+                    JOIN degree t ON t.kind=l.tk AND t.id=l.ti WHERE ?='all' OR ? IN (l.sk,l.tk))
+                SELECT id FROM ranked ORDER BY position,bridge DESC""",
+                (self.umo, self.umo, canonical(endpoint_kind), canonical(endpoint_kind)))
+        else:
+            rows = self.store._rows("SELECT id FROM mr_memory_objects WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC,id DESC", args)
         words = [terms] if isinstance(terms, str) else list(terms)
         values = []
         for row in rows:

@@ -13,10 +13,12 @@ from astrbot.api import logger
 from astrbot.api.web import request
 
 from .store import Store
+from . import manual_messages
 from .settings import DEFAULTS
 from .schedule import work_window
 from .conversation import ConversationRepair
 from .identity import match_members, match_bots
+from .network import console_view
 
 
 class Console:
@@ -36,6 +38,8 @@ class Console:
             ("scopes/<scope_id>/participants/bind_alias", self.bind_alias, "POST"),
             ("scopes/<scope_id>/participants/profile", self.edit_profile, "POST"),
             ("scopes/<scope_id>/messages", self.messages, "GET"),
+            ("scopes/<scope_id>/manual-messages", self.submit_manual_messages, "POST"),
+            ("scopes/<scope_id>/manual-messages/<request_id>", self.manual_receipt, "GET"),
             ("scopes/<scope_id>/context/<message_id>", self.message_context, "GET"),
             ("scopes/<scope_id>/distill", self.distill, "POST"),
             ("scopes/<scope_id>/conversation/reset", self.reset_conversation, "POST"),
@@ -68,20 +72,38 @@ class Console:
             logger.exception("MR: console request failed")
             return {"status": "error", "message": f"读取或操作未完成：{exc}", "data": {}}
 
-    def discover(self):
+    def discover(self, *, with_activity=True):
         scopes, errors = [], []
+        activity = {}
+        week_ago = int(time.time()) - 7 * 86400
         for path in sorted(self.plugin.scope_dir.glob("*.db")):
             try:
                 with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
                     row = db.execute("SELECT umo,platform_id,group_id FROM scope_meta WHERE singleton=1").fetchone()
-                if row:
-                    scopes.append(dict(id=path.stem, umo=row[0], platform_id=row[1], group_id=row[2]))
+                    if row:
+                        scope = dict(id=path.stem, umo=row[0], platform_id=row[1], group_id=row[2])
+                        scopes.append(scope)
+                        if with_activity and self.plugin.identities.canonical(row[0]) == row[0]:
+                            # After a binding the shared store retains the original receiving platform and group.
+                            activity[row[0]] = {
+                                (platform, group): (last, total, recent)
+                                for platform, group, last, total, recent in db.execute(
+                                    """SELECT platform_id,group_id,max(sent_at),count(*),sum(sent_at>=?)
+                                       FROM messages WHERE umo=? AND is_deleted=0 AND role IN ('USER','BOT')
+                                       GROUP BY platform_id,group_id""", (week_ago, row[0]))
+                            }
             except sqlite3.Error as exc:
                 errors.append(f"{path.name}：{exc}")
+        if with_activity:
+            for scope in scopes:
+                origins = activity.get(self.plugin.identities.canonical(scope["umo"]))
+                counts = (None, None, None) if origins is None else origins.get(
+                    (scope["platform_id"], scope["group_id"]), (None, 0, 0))
+                scope["last_message_at"], scope["message_count"], scope["recent_message_count"] = counts
         return scopes, errors
 
     async def get_store(self, scope_id, *, raw=False):
-        scopes, _ = await asyncio.to_thread(self.discover)
+        scopes, _ = await asyncio.to_thread(self.discover, with_activity=False)
         scope = next((s for s in scopes if s["id"] == scope_id), None)
         if scope is None:
             raise FileNotFoundError("找不到这个群的记忆库，请刷新群列表")
@@ -181,6 +203,22 @@ class Console:
     async def scope_overview(self, scope_id):
         store = await self.get_store(scope_id)
         counts = await asyncio.to_thread(self.inventory, store)
+        if store.network_enabled:
+            def network_counts():
+                db=store.db
+                kinds=dict(db.execute("SELECT kind,count(*) FROM node WHERE region='M' AND status='ACTIVE' GROUP BY kind"))
+                semantic_edges=db.execute("""SELECT count(*) FROM edge WHERE active=1 AND
+                   rel NOT IN ('adjacent','source','REPLY_TO','same_l1','witness','voice','received','reply_to','reply_back')
+                   AND src NOT LIKE 'E|message:%' AND dst NOT LIKE 'E|message:%'""").fetchone()[0]
+                return {"engine":"plan_d","regions":dict(db.execute("SELECT region,count(*) FROM node GROUP BY region")),
+                        "edges":store.db.execute("SELECT count(*) FROM edge").fetchone()[0],
+                        "episodes":kinds.get("episode",0)+kinds.get("event",0),"semantics":kinds.get("semantic",0),
+                        "semantic_edges":semantic_edges,
+                        "seed_watermark":store.db.execute("SELECT watermark FROM network_scope WHERE umo=?",(store.umo,)).fetchone()[0]}
+            counts["network"] = await store.read_async(network_counts)
+            counts["legacy_counts"]={key:counts[key] for key in ("episodes","semantics","associations")}
+            counts.update(episodes=counts["network"]["episodes"],semantics=counts["network"]["semantics"],
+                          associations=counts["network"]["semantic_edges"])
         state = await asyncio.to_thread(store.load_working_state)
         history = await asyncio.to_thread(store.history_state)
         adapter = self.plugin.context.get_platform_inst(store.umo.split(":", 1)[0])
@@ -212,16 +250,44 @@ class Console:
             raise FileNotFoundError("这次调用没有保存详情")
         if result.get("request_id"):
             result["response_events"] = await asyncio.to_thread(store.response_events, result["request_id"])
+        for key,value in (await asyncio.to_thread(manual_messages.changes, store, run_id)).items():
+            if value or key not in result:result[key]=value
         return result
 
     async def memories(self, scope_id):
         store = await self.get_store(scope_id)
-        terms = [request.query.get("query")] if request.query.get("query") else []
-        kind = request.query.get("kind", "all")
-        return {"items": await asyncio.to_thread(store.search_memories, kind=kind, terms=terms, limit=60)}
+        args = request.query
+        query = args.get("query", "")
+        kind = args.get("kind", "all")
+        region = console_view.region_filter(args.get("region", "all"))
+        offset = console_view.integer_param("offset", args.get("offset", 0), 0)
+        limit = console_view.integer_param("limit", args.get("limit", 60), 1, 200)
+        legacy_layout = not any(k in args for k in ("region", "offset", "limit"))
+
+        def page():
+            total = console_view.item_count(store, kind, query, region) if store.network_enabled else 0
+            rows = (console_view.items(store, kind, query, region=region, offset=offset, limit=limit)
+                    if offset < total else [])
+            more = offset + len(rows) < total
+            if region == "all" and (legacy_layout or not more):
+                # Old clients received two lists of up to 60. V3 pages share a single limit
+                # across the same ordered catalog: first graph addresses, then retained records.
+                room = limit if legacy_layout else limit - len(rows)
+                old = store.search_memories(kind=kind, terms=[query] if query else [],
+                                            limit=room + 1, offset=max(0, offset - total))
+                rows.extend(old[:room])
+                more = more or len(old) > room
+            return {"items": rows, "has_more": more}
+
+        return await store.read_async(page)
 
     async def memory(self, scope_id, kind, item_id):
         store = await self.get_store(scope_id)
+        if store.network_enabled and ("|" in item_id or item_id.startswith("graph~")):
+            from .network.console_view import item
+            view = await store.read_async(item,store,item_id)
+            if view is None:raise FileNotFoundError("这条记忆不存在或已失效")
+            return view
         item = await asyncio.to_thread(store.memory, kind, item_id, include_history=True)
         if item is None:
             raise FileNotFoundError("这条记忆不存在或已失效")
@@ -233,8 +299,21 @@ class Console:
         store = await self.get_store(scope_id)
         node = request.query.get("node_id")
         terms = [request.query.get("query")] if request.query.get("query") else []
-        ref = {"kind": request.query.get("kind"), "id": int(request.query.get("id"))} if request.query.get("kind") and request.query.get("id") else None
-        edges = await asyncio.to_thread(store.graph, node_id=int(node) if node else None, ref=ref, terms=terms, limit=80)
+        addr = request.query.get("id", "")
+        limit = console_view.integer_param("limit", request.query.get("limit", 80), 1, 400)
+        region = console_view.region_filter(request.query.get("region", "all"))
+        kind = request.query.get("kind", "all")
+        view = request.query.get("view", "recent")
+        if view not in ("recent", "backbone"):
+            raise ValueError("view 须为 recent 或 backbone")
+        if store.network_enabled and not node and (not addr or "|" in addr):
+            return await store.read_async(console_view.graph, store, terms[0] if terms else "", addr or None,
+                                          region=region, kind=kind, view=view, limit=limit)
+        if region != "all":
+            return {"nodes": [], "edges": [], "limit": limit}
+        ref = {"kind": kind, "id": int(addr)} if kind != "all" and addr else None
+        edges = await store.read_async(store.graph, node_id=int(node) if node else None, ref=ref, terms=terms,
+                                       limit=limit, endpoint_kind=kind if not ref else "all", view=view)
         nodes = {}
         for edge in edges:
             for side in ("source", "target"):
@@ -242,7 +321,7 @@ class Console:
                 key = f"{address['kind']}:{address['id']}"
                 nodes[key] = {"key": key, **address, "label": edge[side]}
                 edge[f"{side}_key"] = key
-        return {"nodes": list(nodes.values()), "edges": edges, "limit": 80}
+        return {"nodes": list(nodes.values()), "edges": edges, "limit": limit}
 
     async def participants(self, scope_id):
         store = await self.get_store(scope_id)
@@ -310,6 +389,50 @@ class Console:
         store = await self.get_store(scope_id)
         return await self.plugin.consolidate(store, force=True)
 
+    async def submit_manual_messages(self, scope_id):
+        store = await self.get_store(scope_id)
+        allowed = {self.plugin.identities.canonical(umo) for umo in self.plugin.config["allowed_umos"]}
+        if allowed and store.umo not in allowed:
+            raise ValueError("此群未启用记忆")
+        key, created = await asyncio.to_thread(manual_messages.submit, store, await request.json())
+        result = await self.manual_receipt(scope_id, key)
+        if created and result["trigger"] == "now" and self.plugin.config["subconscious_enabled"]:
+            self.plugin.spawn(self.wake_manual(store, key))
+        return result
+
+    async def wake_manual(self, store, key):
+        while not self.plugin.stopping:
+            lock = self.plugin.learning_locks.setdefault(store.umo, asyncio.Lock())
+            async with lock:
+                pass
+            previous = await asyncio.to_thread(manual_messages.receipt, store, key)
+            if previous["state"] == "completed":
+                return
+            result = await self.plugin.learn(store, force=True)
+            if result.get("status") == "busy":
+                continue
+            current = await asyncio.to_thread(manual_messages.receipt, store, key)
+            if current["state"] == "completed" or (current["messages"] == previous["messages"] and
+                not (store.network_enabled and result.get("status") == "completed")):
+                return
+
+    async def manual_receipt(self, scope_id, request_id):
+        store = await self.get_store(scope_id)
+        result = await asyncio.to_thread(manual_messages.receipt, store, request_id)
+        status = self.plugin.learning_status.get(store.umo, {}).get("background", {}).get("status")
+        lock = self.plugin.learning_locks.get(store.umo)
+        if result["state"] in ("queued", "partial"):
+            if not self.plugin.config["subconscious_enabled"] or (result["trigger"] == "next_window" and not self.plugin.config["auto_distillation_enabled"]):
+                result["reason"] = "disabled"
+            elif status in ("budget_exhausted", "budget_wait"):
+                result["reason"] = "budget_exhausted"
+            elif lock and lock.locked():
+                result["reason"] = "busy"
+            elif result["trigger"] == "next_window" and not work_window(self.plugin.config)["open"]:
+                result["reason"] = "waiting_window"
+        result.setdefault("reason", "")
+        return result
+
     async def reset_conversation(self, scope_id):
         store = await self.get_store(scope_id)
         aliases = self.plugin.identities.aliases(store.umo)
@@ -317,7 +440,7 @@ class Console:
 
     async def migration(self, scope_id):
         current = await self.get_store(scope_id, raw=True)
-        scopes, _ = await asyncio.to_thread(self.discover)
+        scopes, _ = await asyncio.to_thread(self.discover, with_activity=False)
         bindings = self.plugin.identities
         binding = bindings.groups.get(current.umo)
         old_scope = next((s for s in scopes if s["umo"] == binding["legacy_umo"]), None) if binding else None

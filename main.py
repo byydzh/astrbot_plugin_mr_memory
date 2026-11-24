@@ -549,7 +549,11 @@ class MrMemoryPlugin(Star):
             model_current = {key: value for key, value in current.items()
                              if key not in ('astrbot_runtime', 'clock', 'participants', 'roster_fetched_at')}
             model_current['request_context'] = view
-            result = await agent.reconstruct(model_current, recent, working)
+            if store.network_enabled:
+                from .mr_memory.network.recall import reconstruct
+                result = await reconstruct(agent,model_current,recent)
+            else:
+                result = await agent.reconstruct(model_current, recent, working)
             payload.update(asdict(result))
             self.last_result[store.umo] = {"status": result.status, "seconds": result.elapsed_ms / 1000,
                                          "usage": result.usage, "tools": [call["name"] for call in result.tool_calls]}
@@ -662,6 +666,13 @@ class MrMemoryPlugin(Star):
         if lock.locked():
             return {"status": "busy", "reason": "此群正在整理记忆"}
         async with lock:
+            if store.network_enabled:
+                from .mr_memory.network.writer import consolidate as consolidate_network
+                from .mr_memory.manual_messages import pending_force
+                force = force or await asyncio.to_thread(pending_force,store)
+                status = await consolidate_network(self,store,force)
+                self.learning_status.setdefault(store.umo,{})[kind] = status
+                return status
             def report(status, reason, **detail):
                 value = {"status": status, "reason": reason, **detail}
                 self.learning_status.setdefault(store.umo, {})[kind] = value
@@ -902,7 +913,9 @@ class MrMemoryPlugin(Star):
                     if indexing:
                         await self.index_pending(store)
                     else:
-                        if self.config["auto_distillation_enabled"]:
+                        from .mr_memory.manual_messages import pending_force
+                        if self.config["auto_distillation_enabled"] or (store.network_enabled and
+                                await asyncio.to_thread(pending_force,store)):
                             await self.consolidate(store)
                 except asyncio.CancelledError:
                     raise

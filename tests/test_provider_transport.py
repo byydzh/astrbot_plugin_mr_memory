@@ -3,6 +3,7 @@ import asyncio
 import copy
 import json
 import unittest
+from contextlib import ExitStack
 from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +14,22 @@ from mr_memory.tool_calls import response_calls
 
 
 class CapabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poe_memory_requests_disable_web_search_on_request_copy(self):
+        from mr_memory.provider_transport import _openai
+        sent = []
+        class Gateway:
+            provider_config={"api_base":"https://api.poe.com/v1","custom_extra_body":{"web_search": True}}
+            async def _prepare_chat_payload(self,**kwargs):
+                return {"model":"gemini-4-hydrogen","web_search":True}, []
+            async def _query(self,payload,tools,**kwargs):
+                sent.append((dict(payload),dict(self.provider_config["custom_extra_body"])))
+                return SimpleNamespace()
+        provider=Gateway()
+        for mode in ("enabled","disabled"):
+            await _openai(provider,[],"",None,1024,mode,None,False)
+        assert all("web_search" not in p and e["web_search"] is False for p,e in sent)
+        assert provider.provider_config["custom_extra_body"]["web_search"] is True
+
     async def test_compatible_gateway_names_the_required_cap_once(self):
         class BadRequest(Exception):
             status_code = 400
@@ -77,13 +94,19 @@ class NativeTransportTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, provider, exchange):
         import httpx
         wire = []
-        async def send(client, request, **kwargs):
-            body = json.loads(request.content)
-            wire.append(body)
-            return httpx.Response(200, json=exchange(len(wire), body), request=request)
+        def mock_send(transport):
+            async def send(client, request, **kwargs):
+                body = json.loads(request.content)
+                wire.append(body)
+                return transport.Response(200, json=exchange(len(wire), body), request=request)
+            return send
         conversation = [{"role": "user", "content": "fixture JSON"}]
         options = dict(limit=222, thinking="disabled")
-        with patch.object(httpx.AsyncClient, "send", send):
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(httpx.AsyncClient, "send", mock_send(httpx)))
+            if find_spec("httpx2"):
+                import httpx2
+                mocks.enter_context(patch.object(httpx2.AsyncClient, "send", mock_send(httpx2)))
             r = await generate(provider, conversation, "fixture", _tool_set(), **options)
             calls = response_calls(r)
             self.assertEqual([c.name for c in calls], ["search_messages"])

@@ -134,6 +134,10 @@ class IdentityBindings:
             store.identity_links.update({account: value["legacy_id"]
                                          for account, value in self.groups[alias].get("bots", {}).items() if value["legacy_id"]})
         store.platform_migrated = bool(aliases)
+        if getattr(store, "network_enabled", False):
+            from .network.live import sync_accounts
+            with store._lock, store.db:
+                sync_accounts(store)
 
 
 def import_unlearned_messages(source, target):
