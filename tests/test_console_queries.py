@@ -10,10 +10,13 @@ from astrbot_plugin_mr_memory.mr_memory.identity import IdentityBindings
 from astrbot_plugin_mr_memory.mr_memory.network.storage import SCHEMA
 from astrbot_plugin_mr_memory.mr_memory.store import Store
 from tests.test_platform_migration import message
+from tests import seed_legacy_scope
 
 
 @pytest.fixture
-def scope(tmp_path):
+def scope(tmp_path, request):
+    if getattr(request, "param", None) == "legacy":
+        seed_legacy_scope(tmp_path / "one.db", "test:GroupMessage:one")
     store = Store(tmp_path / "one.db", "test:GroupMessage:one")
     page = console.Console.__new__(console.Console)
     page.plugin = SimpleNamespace(scope_dir=tmp_path, identities=IdentityBindings(tmp_path / "bindings.json"))
@@ -183,6 +186,7 @@ def test_graph_backbone_samples_old_bridges_and_global_hubs(scope):
     assert call(page, "graph", view="backbone", limit="2") == sampled
 
 
+@pytest.mark.parametrize("scope", ["legacy"], indirect=True)
 def test_legacy_graph_filters_before_sampling(scope):
     store, page = scope
     jan, jun = 1705276800, 1718409600

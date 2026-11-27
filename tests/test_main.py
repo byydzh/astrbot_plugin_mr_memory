@@ -26,6 +26,12 @@ from astrbot.core.platform.platform_metadata import PlatformMetadata
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot_plugin_mr_memory import main as plugin_module
 from astrbot_plugin_mr_memory.mr_memory.agent import ReconstructionResult
+from tests import seed_legacy_scope
+
+
+def seed_previous_group(plugin):
+    umo = event().unified_msg_origin
+    seed_legacy_scope(plugin.scope_dir / (hashlib.sha256(umo.encode()).hexdigest() + ".db"), umo)
 
 
 def event() -> AstrMessageEvent:
@@ -92,7 +98,30 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("test cleanup path is outside the test workspace")
         shutil.rmtree(directory)
 
+    async def test_first_group_reply_uses_network_with_configured_encoder(self):
+        current = event()
+        current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
+        self.embedder.model_id = "three-dimensional-fixture"
+        self.embedder.dimensions = 3
+        self.embedder.query = AsyncMock(return_value=[1., 0., 0.])
+        self.embedder.texts = AsyncMock(side_effect=lambda inputs: [[1., 0., 0.] for _ in inputs])
+        await self.plugin.capture_group_message(current)
+        store = await self.plugin.store_for(current)
+        self.assertTrue(store.network_enabled)
+        await self.plugin.index_pending(store)
+
+        async def model_turn(messages, purpose, menu, turn, **kw):
+            self.assertEqual(menu.tools[0].name, "explore_memory")
+            self.assertIn("E|message:", messages[0]["content"])
+            return SimpleNamespace(completion_text="已读到本群原话。", usage={})
+
+        with patch.object(plugin_module.MemoryAgent, "_model_turn", side_effect=model_turn):
+            request = ProviderRequest(prompt="刚才群里说了什么？")
+            await self.plugin.inject_subconscious_memory(current, request)
+        self.assertTrue(any("已读到本群原话。" in part.text for part in request.extra_user_content_parts))
+
     async def test_hook_delivers_background_without_forking_graph_understanding(self):
+        seed_previous_group(self.plugin)
         current = event()
         current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))
         store = await self.plugin.store_for(current)
@@ -182,6 +211,7 @@ class MainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.context.get_provider_by_id.assert_not_called()
 
     async def test_hot_reload_waits_for_memory_search_before_closing_its_store(self):
+        seed_previous_group(self.plugin)
         current = event()
         current.send = AsyncMock()
         current.bot = SimpleNamespace(get_group_member_list=AsyncMock(return_value=[]))

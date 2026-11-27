@@ -265,7 +265,7 @@ def context(reader, parts):
             "select dst,active,direct from edge where src=? and rel='local' order by dst", (k,)
         ):
             if reader.net.read(dest):
-                around.append([reverse[k], offer(dest), "有共同原话" if direct else "Harrier 相近", on])
+                around.append([reverse[k], offer(dest), "有共同原话" if direct else "语义向量相近", on])
     inp["本地时域邻接[较晚经历,较早经历,候选缘由,当前活跃]"] = around
     clocks = []
     for k, h in reverse.items():

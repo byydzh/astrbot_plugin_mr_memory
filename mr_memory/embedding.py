@@ -1,4 +1,4 @@
-"""The existing local Harrier model and its stored float32 vector index."""
+"""Local Sentence Transformers encoder and float32 vector search."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .settings import resolve_query_prompt
+
 
 class Embedder:
     def __init__(
@@ -17,7 +19,7 @@ class Embedder:
         cache_dir: str | Path,
         threads: int = 1,
         batch_size: int = 1,
-        query_prompt: str = "web_search_query",
+        query_prompt: str = "auto",
         max_seq_length: int = 512,
     ):
         if not model_name.strip() or min(threads, batch_size, max_seq_length) < 1:
@@ -26,7 +28,7 @@ class Embedder:
         self.cache_dir = Path(cache_dir)
         self.threads = int(threads)
         self.batch_size = int(batch_size)
-        self.query_prompt = query_prompt.strip()
+        self.query_prompt = resolve_query_prompt(self.model_name, query_prompt)
         self.max_seq_length = int(max_seq_length)
         self.model_id = (
             f"sentence-transformers/{self.model_name}"
@@ -36,7 +38,7 @@ class Embedder:
         self._model = None
         # Cancelling an async waiter cannot stop native inference. One executor
         # worker keeps it serialized with the next request even after cancellation.
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mr-harrier")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mr-embedding")
         self._closed = False
 
     async def _run(self, function, *args, **kwargs):

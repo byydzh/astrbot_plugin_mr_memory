@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +14,7 @@ from mr_memory.network import writer, recall
 from mr_memory.network.storage import SCHEMA
 from mr_memory.network.storage import opened
 from mr_memory.network.projection import full
+from tests import seed_legacy_scope
 
 
 def test_catchup_bridge_uses_witness_dates_and_releases_retired_support(tmp_path):
@@ -45,15 +48,26 @@ def test_catchup_bridge_uses_witness_dates_and_releases_retired_support(tmp_path
     store.close()
 
 
-def test_migrated_scope_consumes_once_and_reopens_with_evidence(tmp_path):
+@pytest.mark.parametrize(("width", "migrated"), [(512, False), (640, True)])
+def test_scope_consumes_once_and_reopens_with_evidence(tmp_path, width, migrated):
     async def exercise():
         umo = "test:GroupMessage:one"
+        vec = np.zeros(width, dtype="<f4")
+        vec[0] = 1
+        if migrated:
+            path = tmp_path / "scope.db"
+            seed_legacy_scope(path, umo)
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("CREATE TABLE network_scope(umo TEXT PRIMARY KEY,model TEXT NOT NULL,watermark INTEGER NOT NULL)")
+                db.executescript(SCHEMA)
+                db.execute("INSERT INTO network_scope VALUES(?,?,0)", (umo, "fixture"))
+                db.execute("INSERT INTO node VALUES('M|old','M','field','旧主题',1,'[]','ACTIVE',1)")
+                db.execute("INSERT INTO network_vector VALUES('M|old',1,?)", (vec.tobytes(),))
         store = Store(tmp_path / "scope.db", umo)
-        store.db.executescript(SCHEMA)
-        with store.db:
-            store.db.execute("INSERT INTO network_scope VALUES(?,?,0)", (umo, "fixture"))
-        store.close()
-        store = Store(tmp_path / "scope.db", umo)
+        assert store.network_enabled
+        if migrated:
+            assert tuple(store.db.execute("SELECT model,dimensions FROM network_scope").fetchone()) == ("fixture", width)
+            assert store.db.execute("SELECT vector FROM network_vector WHERE id='M|old'").fetchone()[0] == vec.tobytes()
         raw = store.append_message(
             dict(
                 platform_id="test",
@@ -82,10 +96,15 @@ def test_migrated_scope_consumes_once_and_reopens_with_evidence(tmp_path):
         assert manual.submit(store, body) == ("note", False)
         with pytest.raises(ValueError):
             manual.submit(store, dict(body, trigger="next_window"))
-        vec = np.zeros(640, dtype="<f4")
-        vec[0] = 1
+        store.put_vector("message", str(raw["id"]), "fixture", vec.tobytes(), width)
+        assert f"E|message:{raw['id']}" in recall.search(opened(store.db), [vec], "fixture", 4)["E"]
+        with pytest.raises(ValueError, match="空间不匹配"):
+            store.bind_network_space("different-model", width)
+        with pytest.raises(ValueError, match="空间不匹配"):
+            store.bind_network_space("fixture", width + 1)
         emb = SimpleNamespace(
             model_id="fixture",
+            dimensions=width,
             query=AsyncMock(return_value=vec.tolist()),
             texts=AsyncMock(side_effect=lambda t: [vec.tolist() for _ in t]),
         )
@@ -125,6 +144,9 @@ def test_migrated_scope_consumes_once_and_reopens_with_evidence(tmp_path):
         plugin = SimpleNamespace(agent=lambda *args, **kw: agent, embedder=emb, config=cfg)
         first = await writer.consolidate(plugin, store, True)
         assert first["written_count"] == 1 and manual.receipt(store, "note")["state"] == "running"
+        from mr_memory.identity import import_unlearned_messages
+        with pytest.raises(ValueError, match="四区整理"):
+            import_unlearned_messages(store, None)
         store.close()
         store = Store(tmp_path / "scope.db", umo)
         second = await writer.consolidate(plugin, store, True)

@@ -297,14 +297,10 @@ async def consolidate(plugin, store, force):
     agent = plugin.agent(store, background=True)
     emb = plugin.embedder
     if emb is None or not plugin.config["embedding_enabled"]:
-        raise RuntimeError("新网需要配置的 Harrier")
+        raise RuntimeError("四区整理需要启用当前群的向量编码器")
     phase = p["phase"]
     visible = []
-    expected = await store.read_async(
-        lambda: store.db.execute("SELECT model FROM network_scope WHERE umo=?", (store.umo,)).fetchone()[0]
-    )
-    if emb.model_id != expected:
-        raise ValueError("共享向量空间与迁移图不一致")
+    await asyncio.to_thread(store.bind_network_space, emb.model_id, emb.dimensions)
     if phase == "extract":
         inp = raw_packet(p["rows"])
         prompt = EXTRACT

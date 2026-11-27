@@ -90,24 +90,30 @@ def actors(store, current, recent):
 
 def search(net, vectors, model, count, people=(), *, both=False):
     db = net.db
+    heaps = {r: [] for r in "EMSK"}
+    directed = {r: [] for r in "EMSK"}
+    if len(vectors) == 0:
+        return (heaps, directed) if both else heaps
+    qs = np.asarray(vectors, dtype="<f4")
+    expected = db.execute("SELECT model,dimensions FROM network_scope").fetchone()
+    if qs.ndim != 2 or not expected or tuple(expected) != (model, qs.shape[1]) or not np.isfinite(qs).all():
+        raise ValueError("查询向量与群库的模型、维度不匹配或含有非有限值")
+    dimensions = qs.shape[1]
     account_set = {a for who in people for a in net.bindings(who)}
     scoped = {
         row[0] for a in account_set for row in db.execute("SELECT id FROM subject WHERE account=?", (a,))
     }
     active = " AND n.status IN ('ACTIVE','QUARANTINED','CONFLICTED')"
     cur = db.execute(
-        """SELECT n.id,v.vector FROM network_vector v JOIN node n ON n.id=v.id
+        """SELECT n.id,v.vector,NULL FROM network_vector v JOIN node n ON n.id=v.id
         WHERE n.revision=v.revision"""
         + active
         + """ UNION ALL
-        SELECT n.id,m.vector FROM memory_embeddings m JOIN node n ON n.id='E|message:'||m.owner_key
-        WHERE m.umo=(SELECT umo FROM network_scope) AND m.owner_type='message' AND m.model=? AND m.dimensions=640"""
+        SELECT n.id,m.vector,m.dimensions FROM memory_embeddings m JOIN node n ON n.id='E|message:'||m.owner_key
+        WHERE m.umo=(SELECT umo FROM network_scope) AND m.owner_type='message' AND m.model=?"""
         + active,
         (model,),
     )
-    qs = np.asarray(vectors, dtype="<f4")
-    heaps = {r: [] for r in "EMSK"}
-    directed = {r: [] for r in "EMSK"}
 
     def offer(heap, cap, k, score):
         item = (float(score), k)
@@ -121,9 +127,11 @@ def search(net, vectors, model, count, people=(), *, both=False):
             block = [r for r in block if r[0] in scoped]
             if not block:
                 continue
-        mat = np.frombuffer(b"".join(r[1] for r in block), dtype="<f4").reshape(len(block), 640)
+        if any(len(blob) != dimensions * 4 or declared not in (None, dimensions) for _, blob, declared in block):
+            raise ValueError("索引中的向量宽度与群库记录不匹配")
+        mat = np.frombuffer(b"".join(r[1] for r in block), dtype="<f4").reshape(len(block), dimensions)
         scores = np.einsum("ij,kj->ik", mat, qs, optimize=False).max(axis=1)
-        for (k, _), score in zip(block, scores):
+        for (k, _, _), score in zip(block, scores):
             offer(heaps[k[0]], count, k, score)
             if both and k in scoped:
                 offer(directed[k[0]], 2, k, score)
@@ -246,17 +254,11 @@ async def reconstruct(agent, current, recent):
     start = time.monotonic()
     result = ReconstructionResult()
     if not agent.embedder:
-        raise RuntimeError("新网需要当前群配置的 Harrier 编码器")
+        raise RuntimeError("四区回忆需要启用当前群的向量编码器")
     async with asyncio.timeout(agent.timeout_seconds):
         model = agent.embedder.model_id
-        expected = await agent.store.read_async(
-            lambda: agent.store.db.execute(
-                "SELECT model FROM network_scope WHERE umo=?", (agent.store.umo,)
-            ).fetchone()[0]
-        )
-        if model != expected:
-            raise ValueError("共享向量空间与迁移图不一致")
         v = await agent.embedder.query(current.get("question") or current.get("plain_text") or "群聊")
+        await asyncio.to_thread(agent.store.bind_network_space, model, agent.embedder.dimensions)
         packet = await snapshot(agent.store, locate, model, [v], current, recent)
         conv = [{"role": "user", "content": packed(packet)}]
         await agent._emit(

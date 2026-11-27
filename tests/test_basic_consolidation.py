@@ -12,7 +12,9 @@ from tests import test_main as fixtures
 
 class BasicConsolidationTests(unittest.IsolatedAsyncioTestCase):
     mode_settings = {}
-    asyncSetUp = fixtures.MainIntegrationTests.asyncSetUp
+    async def asyncSetUp(self):
+        await fixtures.MainIntegrationTests.asyncSetUp(self)
+        fixtures.seed_previous_group(self.plugin)
     asyncTearDown = fixtures.MainIntegrationTests.asyncTearDown
 
     async def test_slow_index_does_not_block_consolidation_schedule(self):

@@ -72,6 +72,44 @@ def opened(db):
     return AlignedGraph(AtomicConnection(db))
 
 
+def upgrade_vector_space(db, umo):
+    """Extend the three-column snapshot/import schema when opening a serving database."""
+    def has_dimensions():
+        return any(row[1] == "dimensions" for row in db.execute("PRAGMA table_info(network_scope)"))
+
+    if has_dimensions():
+        return
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if has_dimensions():
+            return
+        db.execute("ALTER TABLE network_scope ADD COLUMN dimensions INTEGER NOT NULL DEFAULT 0")
+        row = db.execute("SELECT length(vector) FROM network_vector LIMIT 1").fetchone()
+        if row:
+            width, remainder = divmod(row[0], 4)
+            if not width or remainder:
+                raise ValueError("旧图中的向量不是有效的 float32 向量")
+        else:
+            raw = db.execute("""SELECT e.dimensions FROM memory_embeddings e JOIN network_scope s
+                ON s.umo=e.umo AND s.model=e.model WHERE s.umo=? AND e.owner_type='message' LIMIT 1""",
+                (umo,)).fetchone()
+            width = raw[0] if raw else 0
+        db.execute("UPDATE network_scope SET dimensions=? WHERE umo=?", (width, umo))
+
+
+def bind_vector_space(db, umo, model, dimensions):
+    """Pin an empty index on first use. Never relabel vectors from a previous space."""
+    if not model or dimensions <= 0:
+        raise ValueError("向量编码器须提供模型标识和有效维度")
+    current = db.execute("SELECT model,dimensions FROM network_scope WHERE umo=?", (umo,)).fetchone()
+    if current and tuple(current) == (model, dimensions):
+        return
+    updated = db.execute("""UPDATE network_scope SET model=?, dimensions=?
+        WHERE umo=? AND model IN ('',?) AND dimensions IN (0,?)""", (model, dimensions, umo, model, dimensions))
+    if not updated.rowcount:
+        raise ValueError(f"向量空间不匹配：群库 {tuple(current) if current else None}，编码器 {(model, dimensions)}")
+
+
 def upper_context(db, ops, ids, queries, raw):
     from .consolidation import context
 
@@ -97,11 +135,12 @@ def upper_context(db, ops, ids, queries, raw):
 
 
 def upsert_vectors(db, keys, vectors):
+    dimensions = db.execute("SELECT dimensions FROM network_scope").fetchone()[0]
     for k, v in zip(keys, vectors, strict=True):
         row = db.execute("SELECT revision FROM node WHERE id=?", (k,)).fetchone()
         arr = np.asarray(v, dtype="<f4")
-        if not row or arr.shape != (640,) or not np.isfinite(arr).all():
-            raise ValueError("Invalid Harrier vector or graph address")
+        if not row or arr.shape != (dimensions,) or not np.isfinite(arr).all():
+            raise ValueError(f"节点 {k} 不存在或向量无效（群库维度 {dimensions}，收到 {arr.shape}）")
         db.execute("INSERT OR REPLACE INTO network_vector VALUES(?,?,?)", (k, row[0], arr.tobytes()))
 
 

@@ -27,6 +27,12 @@ _RENAMED = {
 }
 
 
+def resolve_query_prompt(model_name: str, prompt: str) -> str:
+    if prompt.strip().casefold() == "auto":
+        return "web_search_query" if "harrier" in model_name.casefold() else ""
+    return prompt.strip()
+
+
 def normalize_settings(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Return supported canonical fields; never mutate the caller's config.
 
@@ -47,8 +53,6 @@ def normalize_settings(raw: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("learning_window_start", "learning_window_end"):
         minutes = clock_minutes(result[key])
         result[key] = f"{minutes // 60:02d}:{minutes % 60:02d}"
-    if str(result["embedding_query_prompt_name"]).casefold() == "auto":
-        result["embedding_query_prompt_name"] = (
-            "web_search_query" if "harrier" in str(result["embedding_model_name"]).casefold() else ""
-        )
+    result["embedding_query_prompt_name"] = resolve_query_prompt(
+        str(result["embedding_model_name"]), str(result["embedding_query_prompt_name"]))
     return result

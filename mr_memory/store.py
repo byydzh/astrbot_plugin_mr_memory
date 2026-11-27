@@ -169,14 +169,23 @@ class Store:
         self.db.executescript(SCHEMA)
         self.db.executescript(REFLECTION_SCHEMA)
         parts = self.umo.split(":")
+        new_group = not self.db.execute("""SELECT 1 WHERE EXISTS (SELECT 1 FROM scope_meta)
+            OR EXISTS (SELECT 1 FROM messages) OR EXISTS (SELECT 1 FROM sqlite_master WHERE name='mr_memory_objects')""").fetchone()
+        if new_group:
+            from .network.storage import SCHEMA as network_schema
+            self.db.executescript(network_schema)
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO scope_meta(singleton,umo,platform_id,group_id) VALUES(1,?,?,?)",
-                            (self.umo, parts[0], parts[-1]))
+            created = self.db.execute("INSERT OR IGNORE INTO scope_meta(singleton,umo,platform_id,group_id) VALUES(1,?,?,?)",
+                                      (self.umo, parts[0], parts[-1]))
+            if new_group and created.rowcount:
+                self.db.execute("INSERT OR IGNORE INTO network_scope(umo,model,watermark) VALUES(?,'',0)", (self.umo,))
         self.tables = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.network_enabled = "network_scope" in self.tables and bool(self.db.execute(
             "SELECT 1 FROM network_scope WHERE umo=?", (self.umo,)).fetchone())
         if self.network_enabled:
             from .manual_messages import ensure_schema
+            from .network.storage import upgrade_vector_space
+            upgrade_vector_space(self.db, self.umo)
             ensure_schema(self)
         if not feedback_queue_exists:
             # The old cursor remains a legacy floor. Preserve sparse progress
@@ -1361,6 +1370,12 @@ class Store:
             cursor.close()
 
     @_serialized
+    def bind_network_space(self, model_id, dimensions):
+        from .network.storage import bind_vector_space
+        with self.db:
+            bind_vector_space(self.db, self.umo, model_id, dimensions)
+
+    @_serialized
     def put_vector(self, owner_type: str, owner_key: str, model_id: str, vector: bytes, dimensions: int) -> None:
         if int(dimensions) <= 0 or len(vector) != int(dimensions) * 4:
             raise ValueError("Vector must be float32 bytes with matching dimensions")
@@ -1370,6 +1385,9 @@ class Store:
         if owner is None or owner.get("status", "ACTIVE") != "ACTIVE":
             raise ValueError("Vector owner is not in this group")
         with self.db:
+            if self.network_enabled and owner_type == "message":
+                from .network.storage import bind_vector_space
+                bind_vector_space(self.db, self.umo, model_id, dimensions)
             self.db.execute("""INSERT INTO memory_embeddings(umo,owner_type,owner_key,model,dimensions,vector)
                 VALUES(?,?,?,?,?,?) ON CONFLICT(umo,owner_type,owner_key,model) DO UPDATE SET
                 dimensions=excluded.dimensions,vector=excluded.vector,updated_at=CURRENT_TIMESTAMP""", (self.umo, owner_type, str(owner_key), model_id, int(dimensions), vector))

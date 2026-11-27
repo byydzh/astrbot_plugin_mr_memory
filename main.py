@@ -152,7 +152,7 @@ class MrMemoryPlugin(Star):
         self.stopping = False
         self.history = HistoryRecovery(self)
         embedding_options = dict(
-            model_name=str(config.get("embedding_model_name", "microsoft/harrier-oss-v1-270m")),
+            model_name=str(config["embedding_model_name"]),
             query_prompt=str(self.config["embedding_query_prompt_name"]),
             max_seq_length=int(config.get("embedding_max_seq_length", 512)),
         )
@@ -891,12 +891,15 @@ class MrMemoryPlugin(Star):
     async def index_pending(self, store: Store) -> None:
         if not self.config["embedding_enabled"]:
             return
-        docs = await asyncio.to_thread(store.pending_embeddings, self.embedder.model_id, 16)
+        model = self.embedder.model_id
+        docs = await asyncio.to_thread(store.pending_embeddings, model, 16)
         if not docs:
             return
+        if store.network_enabled:
+            await asyncio.to_thread(store.bind_network_space, model, self.embedder.dimensions)
         vectors = await self.embedder.texts([d["text"] for d in docs])
         for doc, vector in zip(docs, vectors, strict=True):
-            await asyncio.to_thread(store.save_embedding, doc, self.embedder.model_id, vector)
+            await asyncio.to_thread(store.save_embedding, doc, model, vector)
 
     async def maintain(self, *, indexing: bool = False) -> None:
         while not self.stopping:

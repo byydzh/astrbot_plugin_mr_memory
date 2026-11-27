@@ -8,6 +8,7 @@ from astrbot.api.star import Context
 from astrbot_plugin_mr_memory import main
 from astrbot_plugin_mr_memory.mr_memory import console
 from tests.test_main import event
+from tests import seed_legacy_scope
 from tests.test_platform_migration import message
 
 
@@ -43,6 +44,8 @@ async def exercise_routes(root):
 
     def seed(umo, uid):
         scope_id = hashlib.sha256(umo.encode()).hexdigest()
+        if umo.startswith("old:"):
+            seed_legacy_scope(plugin.scope_dir / (scope_id + ".db"), umo)
         store = main.Store(plugin.scope_dir / (scope_id + ".db"), umo)
         plugin.stores[umo] = store
         plugin.state_locks[umo] = asyncio.Lock()

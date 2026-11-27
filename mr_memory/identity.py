@@ -145,6 +145,9 @@ def import_unlearned_messages(source, target):
     if source is None:
         return 0
     with source._lock:
+        if source.network_enabled and source.db.execute("""SELECT 1 WHERE
+            EXISTS (SELECT 1 FROM node WHERE region IN ('M','S','K')) OR EXISTS (SELECT 1 FROM network_work)""").fetchone():
+            raise ValueError("新群已有四区整理记录或任务，请先处理后再接续")
         if source.db.execute("SELECT count(*) FROM mr_memory_objects").fetchone()[0]:
             raise ValueError("新群已有独立整理的记忆，不能覆盖。两库已保留，需合并这些记忆后再接续")
         if source.db.execute("SELECT count(*) FROM mr_learning_tasks").fetchone()[0]:
